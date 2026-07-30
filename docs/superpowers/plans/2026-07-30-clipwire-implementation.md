@@ -1855,14 +1855,25 @@ stops when it goes away — a `gdbus monitor` against a dead session is not usef
         text = self.clipboard.read()
         if not text:
             return
-        if text == self._last_written:
-            self._last_written = None  # the echo of our own write; suppress once
+        # Consume the suppression on the FIRST observed change, whatever it is —
+        # not only on a match. Our write produces exactly one change event; if we
+        # observe a different one instead, ours is already gone, and a lingering
+        # hash would silently swallow the user's later deliberate copy of the
+        # same text. Mirrors EchoGuard.shouldSend on the Swift side, where the
+        # match-only variant was found to be a real defect.
+        expected, self._last_written = self._last_written, None
+        if text == expected:
             return
         if len(text) > MAX_PAYLOAD_BYTES:
             log("skipping a clip of %d bytes: over the frame cap" % len(text))
             return
         self.send(TYPE_CLIP, text)
 ```
+
+Pin the same scenario the Swift suite pins, so the two sides cannot drift on it: after
+the agent writes a clip locally, a poll that observes *different* content must still let
+a later deliberate re-copy of the original text through. Under the match-only variant
+that second copy is swallowed.
 
 Two more edits to `Agent`: add `self._watcher = None` and `self._last_written = None` to
 `__init__`, and change `_on_clip` to call `self._write_clip(payload)` instead of

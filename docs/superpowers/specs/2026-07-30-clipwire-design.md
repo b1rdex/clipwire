@@ -167,6 +167,13 @@ the local watcher observes a change with that hash, it stays silent. Without thi
 ping-pongs forever. The hash lives in memory and survives reconnects, so a reboot cannot
 trigger an echo storm.
 
+The suppression is consumed by the **first observed change, whatever it is** — not only by
+a matching one. Our write produces exactly one change event; if the watcher observed a
+different change instead (the poll interval can miss ours entirely), ours is already gone,
+and a lingering hash would silently swallow the user's later deliberate copy of the same
+text. That is a bug users cannot report clearly, so both implementations clear the stored
+hash unconditionally and only then decide whether the value matched.
+
 Concurrent edits on both sides: last write wins. With two nodes and echo suppression this
 converges on its own; vector clocks are not warranted.
 
