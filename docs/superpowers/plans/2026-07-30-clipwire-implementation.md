@@ -1218,7 +1218,7 @@ Expected: FAIL — `Agent` does not exist.
 
 - [ ] **Step 3: Implement**
 
-Append to `agent/clipwire-agent.py`:
+Add to `agent/clipwire-agent.py`, **inserted before the trailing `if __name__ == "__main__": sys.exit(main(...))` guard** — never after it. That guard exits the process, so anything defined below it is never defined in a real run, while tests still see it because `exec_module` skips the guard: green suite, `NameError` in production:
 
 ```python
 import json
@@ -1747,7 +1747,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-Append to `agent/clipwire-agent.py`:
+Add to `agent/clipwire-agent.py`, **inserted before the trailing `if __name__ == "__main__": sys.exit(main(...))` guard** — never after it. That guard exits the process, so anything defined below it is never defined in a real run, while tests still see it because `exec_module` skips the guard: green suite, `NameError` in production:
 
 ```python
 import threading
