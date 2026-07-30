@@ -33,7 +33,7 @@ final class FrameTests: XCTestCase {
     }
 
     func testOversizedLengthThrows() {
-        var buffer = Data([0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+        var buffer = Data([0xFF, 0xFF, 0xFF, 0xFF, 0x7F])
         XCTAssertThrowsError(try Frame.decode(from: &buffer)) { error in
             guard case FrameError.oversized = error else {
                 return XCTFail("expected .oversized, got \(error)")
@@ -53,5 +53,21 @@ final class FrameTests: XCTestCase {
     func testEmptyPayloadIsValid() throws {
         var buffer = Frame(type: .clip, payload: Data()).encode()
         XCTAssertEqual(try Frame.decode(from: &buffer)?.payload, Data())
+    }
+
+    func testMaxPayloadBoundaryIncomplete() throws {
+        // Frame declaring exactly MAX_PAYLOAD_BYTES (4_194_304) is incomplete, not oversized
+        var buffer = Data([0x00, 0x40, 0x00, 0x00, 0x00])
+        XCTAssertNil(try Frame.decode(from: &buffer))
+    }
+
+    func testMaxPayloadBoundaryExceeded() {
+        // Frame declaring MAX_PAYLOAD_BYTES + 1 (4_194_305) is oversized
+        var buffer = Data([0x00, 0x40, 0x00, 0x01, 0x00])
+        XCTAssertThrowsError(try Frame.decode(from: &buffer)) { error in
+            guard case FrameError.oversized = error else {
+                return XCTFail("expected .oversized, got \(error)")
+            }
+        }
     }
 }

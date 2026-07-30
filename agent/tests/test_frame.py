@@ -34,7 +34,7 @@ class TestFrame(unittest.TestCase):
 
     def test_oversized_length_raises(self):
         with self.assertRaises(OversizedFrame):
-            decode_frame(bytearray(b"\xff\xff\xff\xff\x01"))
+            decode_frame(bytearray(b"\xff\xff\xff\xff\x7f"))
 
     def test_unknown_type_raises(self):
         with self.assertRaises(UnknownFrameType):
@@ -43,6 +43,17 @@ class TestFrame(unittest.TestCase):
     def test_empty_payload_is_valid(self):
         buffer = bytearray(encode_frame(TYPE_CLIP, b""))
         self.assertEqual(decode_frame(buffer), (TYPE_CLIP, b""))
+
+    def test_max_payload_boundary_incomplete(self):
+        # Frame declaring exactly MAX_PAYLOAD_BYTES (4194304) is incomplete, not oversized
+        buffer = bytearray(b"\x00\x40\x00\x00\x00")
+        self.assertIsNone(decode_frame(buffer))
+
+    def test_max_payload_boundary_exceeded(self):
+        # Frame declaring MAX_PAYLOAD_BYTES + 1 (4194305) is oversized
+        buffer = bytearray(b"\x00\x40\x00\x01\x00")
+        with self.assertRaises(OversizedFrame):
+            decode_frame(buffer)
 
 
 if __name__ == "__main__":
