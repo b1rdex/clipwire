@@ -186,15 +186,72 @@ class NeverReadyClipboard:
         pass
 
 
+import subprocess
+
+SUBPROCESS_TIMEOUT = 3
+
+
+def runtime_dir(env=None):
+    env = os.environ if env is None else env
+    return env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+
+
+def wayland_socket_path(env=None):
+    return os.path.join(runtime_dir(env), "wayland-0")
+
+
+def clipboard_env(env=None):
+    base = dict(os.environ if env is None else env)
+    directory = runtime_dir(base)
+    base["XDG_RUNTIME_DIR"] = directory
+    base["WAYLAND_DISPLAY"] = "wayland-0"
+    base["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=%s/bus" % directory
+    return base
+
+
 class WaylandClipboard:
     def ready(self):
-        return False
+        return os.path.exists(wayland_socket_path())
 
     def read(self):
-        return None
+        """Current clipboard text, or None when empty or not text.
+
+        A non-zero exit from wl-paste means an empty or non-text selection.
+        That is a normal state, not an error.
+        """
+        try:
+            result = subprocess.run(
+                ["wl-paste", "-n", "--type", "text/plain;charset=utf-8"],
+                capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as error:
+            log("wl-paste failed: %r" % error)
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout or None
 
     def write(self, data):
-        pass
+        """wl-copy does not exit — it stays resident as the selection owner.
+
+        It must be spawned detached with its pipes closed. Waiting on it, or
+        holding its fds, hangs the agent.
+        """
+        try:
+            process = subprocess.Popen(
+                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True, env=clipboard_env(),
+            )
+        except FileNotFoundError:
+            log("wl-copy is not installed")
+            return
+        try:
+            process.stdin.write(data)
+        except BrokenPipeError:
+            log("wl-copy closed its pipe early")
+        finally:
+            process.stdin.close()  # hand off ownership; never wait()
 
 
 def _select_clipboard():
