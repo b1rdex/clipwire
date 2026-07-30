@@ -594,6 +594,33 @@ class TestEchoBookkeeping(unittest.TestCase):
             "a transient read() glitch that recovers to the same content must not resend it",
         )
 
+    def test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send(self):
+        """Second-round final review, Finding 1: _last_seen starts None, and
+        this agent lives exactly one connection (sshd spawns a fresh
+        process per SSH connection). Without a seed, ANY reconnect -- a
+        Mac sleep/wake or a network blip, not only a PC reboot, since
+        those also spawn a brand-new agent while the Wayland session is
+        already up -- lets the first spurious signal (GPasteWatcher's pump
+        has no content baseline of its own, unlike PollingWatcher) send
+        whatever the PC's clipboard already held, and the Mac applies it
+        unconditionally: destroying a copy made on the Mac while the
+        channel was down. clipboard_became_ready() must seed _last_seen
+        from the clipboard before the watcher can observe anything."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"already on the pc")  # the seed read
+        self.become_ready_without_a_real_watcher(agent)
+        self.assertEqual(agent._last_seen, b"already on the pc")
+
+        agent.clipboard.queue_read(b"already on the pc")  # the spurious signal's read
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(
+            sent, [],
+            "a spurious signal right after connect must not resend content the PC "
+            "already held before anything synced",
+        )
+
 
 class RacyClipboard:
     """A clipboard double that simulates a write landing on the main thread

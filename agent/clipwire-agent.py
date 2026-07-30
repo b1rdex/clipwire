@@ -147,7 +147,35 @@ class Agent:
 
     def clipboard_became_ready(self):
         self.phase = PHASE_READY
+        # Seed a content baseline before anything else in this function
+        # runs, so a brand-new watcher's very first observation has
+        # something to compare against. _last_seen otherwise starts None,
+        # and this agent lives exactly one connection (sshd spawns a fresh
+        # process per SSH connection) -- so without a seed, ANY reconnect
+        # (a Mac sleep/wake or a network blip, not only a PC reboot: these
+        # also spawn a brand-new agent while the Wayland session is
+        # already up) would let the first spurious signal (GPasteWatcher's
+        # pump has no baseline of its own, unlike PollingWatcher) send
+        # whatever the PC's clipboard already held, and the Mac applies it
+        # unconditionally -- destroying a copy the user made on the Mac
+        # while the channel was down. Read outside the lock, same as
+        # _local_change: clipboard.read() is a wl-paste round trip that
+        # can take up to SUBPROCESS_TIMEOUT=3s.
+        #
+        # Trade-off, accepted deliberately: re-copying on the PC to force a
+        # push no longer works as the FIRST action after a connect. That is
+        # correct, not a regression: it makes the two sides symmetric,
+        # since the Mac does not resend its own clipboard on reconnect
+        # either. The previous asymmetry ran in the destructive direction,
+        # which is worse than losing a convenience. Do not "fix" this back.
+        seed = self.clipboard.read()
+        with self._echo_lock:
+            self._last_seen = seed
         if self.pending_clip is not None:
+            # Supersedes the seed above with the more authoritative value:
+            # once a queued clip from the Mac has actually been applied,
+            # both sides genuinely hold ITS content, not whatever the PC's
+            # clipboard held a moment earlier.
             self._write_clip(self.pending_clip)
             self.pending_clip = None
         if self._watcher is None:
