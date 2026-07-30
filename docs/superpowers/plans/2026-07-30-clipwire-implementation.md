@@ -1705,16 +1705,29 @@ from agent_under_test import parse_gpaste_line
 
 
 class TestGPasteSignalParsing(unittest.TestCase):
-    def test_accepts_clipboard_update(self):
+    def test_accepts_the_real_captured_signal(self):
+        """This is a verbatim line captured from the target machine.
+
+        GPaste 45.3 reports target 'ALL' and a uint64 index — not 'CLIPBOARD'
+        and not uint32. Filtering on 'CLIPBOARD' rejects every real signal.
+        """
         line = ("/org/gnome/GPaste: org.gnome.GPaste2.Update "
-                "('REPLACE', 'CLIPBOARD', uint32 0)")
+                "('REPLACE', 'ALL', uint64 0)")
         self.assertTrue(parse_gpaste_line(line))
 
-    def test_ignores_primary_selection(self):
-        """PRIMARY fires on every mouse drag. Syncing it would be unusable."""
-        line = ("/org/gnome/GPaste: org.gnome.GPaste2.Update "
-                "('REPLACE', 'PRIMARY', uint32 0)")
-        self.assertFalse(parse_gpaste_line(line))
+    def test_accepts_any_target_including_ones_not_seen_yet(self):
+        """Targets are not filtered: the content comparison is the real gate.
+
+        GPaste's primary-to-history setting is off on the target machine, so
+        primary selections emit nothing today — but that is a user-flippable
+        setting, and a watcher that depends on it would break silently when it
+        is flipped. Accepting every Update and letting the content comparison
+        decide is immune to that.
+        """
+        for target in ("'ALL'", "'CLIPBOARD'", "'PRIMARY'"):
+            line = ("/org/gnome/GPaste: org.gnome.GPaste2.Update "
+                    "('REPLACE', %s, uint64 0)" % target)
+            self.assertTrue(parse_gpaste_line(line), target)
 
     def test_ignores_unrelated_signals(self):
         self.assertFalse(parse_gpaste_line(
@@ -1741,17 +1754,29 @@ import threading
 import time
 
 GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
+# The BUS name is org.gnome.GPaste; org.gnome.GPaste2 is the INTERFACE name on
+# that object. Verified on the target machine: --dest org.gnome.GPaste2 has no
+# owner, so probing it would make available() always false and silently leave
+# the watcher on the polling fallback forever.
+GPASTE_BUS_NAME = "org.gnome.GPaste"
 
 
 def parse_gpaste_line(line):
-    """True when a gdbus monitor line reports a CLIPBOARD update.
+    """True when a gdbus monitor line is a GPaste Update signal.
 
-    GPaste emits Update(action, target, index). PRIMARY targets fire on every
-    mouse-drag selection and must be ignored.
+    Verified against GPaste 45.3 on the target machine. The signal is
+    Update(s action, s target, t index) and a real line looks like:
+
+        /org/gnome/GPaste: org.gnome.GPaste2.Update ('REPLACE', 'ALL', uint64 0)
+
+    The target is 'ALL', not 'CLIPBOARD'. Do not filter on the target: the
+    observed value would reject every real signal, and the set of values
+    depends on GPaste's own settings. Treat the signal as "something may have
+    changed" and let the content comparison in Agent._local_change decide —
+    that is correct whatever GPaste reports, and it also absorbs duplicate
+    signals, which GPaste does emit.
     """
-    if "Update" not in line or GPASTE_OBJECT_PATH not in line:
-        return False
-    return "'CLIPBOARD'" in line or '"CLIPBOARD"' in line
+    return "Update" in line and GPASTE_OBJECT_PATH in line
 
 
 class GPasteWatcher:
@@ -1766,7 +1791,7 @@ class GPasteWatcher:
     def available(self):
         try:
             result = subprocess.run(
-                ["gdbus", "introspect", "--session", "--dest", "org.gnome.GPaste2",
+                ["gdbus", "introspect", "--session", "--dest", GPASTE_BUS_NAME,
                  "--object-path", GPASTE_OBJECT_PATH],
                 capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
             )
@@ -1776,7 +1801,7 @@ class GPasteWatcher:
 
     def start(self, on_change):
         self._process = subprocess.Popen(
-            ["gdbus", "monitor", "--session", "--dest", "org.gnome.GPaste2",
+            ["gdbus", "monitor", "--session", "--dest", GPASTE_BUS_NAME,
              "--object-path", GPASTE_OBJECT_PATH],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, env=clipboard_env(),
