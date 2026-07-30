@@ -28,3 +28,7 @@ jobs:
         # level. With -t agent this fails with "Start directory is not
         # importable".
         run: python3 -m unittest discover -s agent/tests -v
+      - name: Install clipboard tools
+        run: sudo apt-get update && sudo apt-get install -y wl-clipboard
+      - name: Agent self-test
+        run: python3 agent/clipwire-agent.py --selftest

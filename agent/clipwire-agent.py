@@ -338,7 +338,41 @@ def _select_clipboard():
 
 
 def selftest():
-    return 0
+    """Verify the deployed agent without needing a Wayland session.
+
+    Checks what install can check remotely; reports the rest as information.
+    """
+    ok = True
+
+    if sys.version_info < (3, 11):
+        log("FAIL python %s is older than 3.11" % ".".join(map(str, sys.version_info[:3])))
+        ok = False
+    else:
+        log("ok   python %s" % ".".join(map(str, sys.version_info[:3])))
+
+    probe = encode_frame(TYPE_CLIP, "clipwire selftest ✓".encode())
+    buffer = bytearray(probe)
+    decoded = decode_frame(buffer)
+    if decoded != (TYPE_CLIP, "clipwire selftest ✓".encode()) or buffer:
+        log("FAIL codec round trip")
+        ok = False
+    else:
+        log("ok   codec round trip")
+
+    for tool in ("wl-copy", "wl-paste"):
+        try:
+            found = subprocess.run(
+                ["which", tool], capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+            ).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            found = False
+        log("%s %s" % ("ok  " if found else "FAIL", tool))
+        ok = ok and found
+
+    log("info wayland session: %s" % ("present" if os.path.exists(wayland_socket_path()) else "absent (fine before login)"))
+    log("info gpaste: %s" % ("available" if GPasteWatcher().available() else "unavailable, will poll"))
+
+    return 0 if ok else 1
 
 
 import threading
