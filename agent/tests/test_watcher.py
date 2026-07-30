@@ -475,6 +475,73 @@ class TestEchoBookkeeping(unittest.TestCase):
         self.assertEqual(sent, [])
 
 
+class RacyClipboard:
+    """A clipboard double that simulates a write landing on the main thread
+    WHILE a read() is in flight -- deterministically, via a side effect
+    inside read() itself, rather than by timing two real threads. This is
+    the exact shape of the real race: a wl-paste round trip can take up to
+    SUBPROCESS_TIMEOUT=3 seconds, and a new frame can arrive and be
+    written locally (on the main thread) at any point during that
+    window."""
+
+    def __init__(self, agent, value_read, interleaved_write):
+        self._agent = agent
+        self._value_read = value_read
+        self._interleaved_write = interleaved_write
+
+    def read(self):
+        self._agent._write_clip(self._interleaved_write)  # lands mid-flight
+        return self._value_read  # what the fork had already captured
+
+    def write(self, data):
+        pass
+
+    def ready(self):
+        return True
+
+
+class TestLocalChangeRaceSafety(unittest.TestCase):
+    """_write_clip() always runs on the main thread (driven by run()'s
+    single-threaded loop); _local_change() always runs on the watcher's
+    background thread. clipboard.read() -- a wl-paste round trip -- can
+    take up to SUBPROCESS_TIMEOUT=3s, so a new _write_clip() can land on
+    the main thread at any point during that window, not just cleanly
+    before or after it."""
+
+    def test_a_write_that_lands_during_the_read_is_not_echoed(self):
+        """Sequence pinned here:
+        1. Mac sends clip A -> _write_clip(A) arms the suppression for A.
+        2. The watcher's read() begins; the underlying fork has already
+           captured A, but control has not yet returned to Python.
+        3. Before it returns, Mac sends clip B -> _write_clip(B) re-arms
+           the suppression for B, on the main thread.
+        4. read() finally returns A -- stale by the time _local_change
+           gets to compare it against whatever is now armed.
+
+        A version that snapshots _last_written only *after* read() returns
+        treats A as a genuine change relative to the now-current expected
+        value B, and sends A back to the Mac as if the user had copied it
+        -- our own echo. It must send nothing, and must leave B's
+        suppression armed so B's own echo (or a later genuine change) is
+        still judged correctly."""
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard())
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent._write_clip(b"A")
+        agent.clipboard = RacyClipboard(agent, value_read=b"A", interleaved_write=b"B")
+
+        agent._local_change()
+
+        self.assertEqual(
+            sent, [], "a write observed mid-read must not be echoed back as genuine"
+        )
+        self.assertEqual(
+            agent._last_written, b"B",
+            "the newer write's suppression must stay armed for its own echo",
+        )
+
+
 class TestModuleDefinitionOrder(unittest.TestCase):
     """The file ends with `if __name__ == "__main__": sys.exit(main(...))`.
     main() is only CALLED on that line, so any def/class placed AFTER it in

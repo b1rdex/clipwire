@@ -78,6 +78,12 @@ class Agent:
         self._write_lock = threading.Lock()
         self._watcher = None
         self._last_written = None
+        self._write_gen = 0
+        # Guards _last_written/_write_gen only. A separate lock from
+        # _write_lock (which guards stdout) on purpose: nesting them would
+        # invite a deadlock later, and this one is held across nothing that
+        # ever blocks.
+        self._echo_lock = threading.Lock()
 
     # --- outbound -------------------------------------------------------
 
@@ -147,21 +153,51 @@ class Agent:
 
     def _write_clip(self, payload):
         """Single place where we touch the local clipboard, so echo
-        bookkeeping cannot be forgotten on one of the paths."""
-        self._last_written = payload
+        bookkeeping cannot be forgotten on one of the paths.
+
+        Runs on the main thread. _local_change() (below) runs on the
+        watcher's background thread and reads this same bookkeeping, so the
+        two fields are only ever touched under _echo_lock.
+        """
+        with self._echo_lock:
+            self._last_written = payload
+            self._write_gen += 1
         self.clipboard.write(payload)
 
     def _local_change(self):
+        # Snapshot what we expect and the generation it belongs to BEFORE
+        # reading the clipboard. clipboard.read() is a wl-paste round trip
+        # that can take up to SUBPROCESS_TIMEOUT=3s, and _write_clip() can
+        # land on the main thread at any point during that window. Holding
+        # _echo_lock across the read would block _write_clip() for the
+        # whole round trip, so it is released before the read and
+        # re-acquired only to compare afterward.
+        with self._echo_lock:
+            expected = self._last_written
+            gen = self._write_gen
+
         text = self.clipboard.read()
         if not text:
             return
+
         # Consume the suppression on the FIRST observed change, whatever it is —
         # not only on a match. Our write produces exactly one change event; if we
         # observe a different one instead, ours is already gone, and a lingering
         # hash would silently swallow the user's later deliberate copy of the
         # same text. Mirrors EchoGuard.shouldSend on the Swift side, where the
         # match-only variant was found to be a real defect.
-        expected, self._last_written = self._last_written, None
+        with self._echo_lock:
+            stale = self._write_gen != gen
+            if not stale:
+                self._last_written = None
+
+        if stale:
+            # A newer write landed on the main thread while this read was in
+            # flight, so `text` might just be what the fork captured before
+            # that write happened — stale, not a genuine local change. Drop
+            # it and leave the newer write's suppression armed, so its own
+            # echo (or a later genuine change) is still judged correctly.
+            return
         if text == expected:
             return
         if len(text) > MAX_PAYLOAD_BYTES:
@@ -306,7 +342,6 @@ def selftest():
 
 
 import threading
-import time
 
 GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
 # The BUS name is org.gnome.GPaste; org.gnome.GPaste2 is the INTERFACE name on
