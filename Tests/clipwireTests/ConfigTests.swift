@@ -72,4 +72,22 @@ final class ConfigTests: XCTestCase {
             }
         }
     }
+
+    // Fix round 1: config.example.json is not documentation — `clipwire init`
+    // (a later task) writes a user's real config *from* this file, so it is
+    // a runtime input to a shipped code path, not prose. Load the actual
+    // committed file, resolving its path from #filePath the same way
+    // FixtureTests.swift resolves fixtures/frames.json, so that a later task
+    // adding a required field to Config and forgetting to update the example
+    // fails a test instead of silently shipping an example `init` cannot use.
+    func testExampleConfigLoadsAndValidates() throws {
+        // Tests/clipwireTests/ -> repo root -> config.example.json
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let config = try Config.load(from: root.appendingPathComponent("config.example.json"))
+        XCTAssertEqual(config.host, "your-pc-hostname")
+        XCTAssertEqual(config.fallbackIP, "192.168.1.10",
+                       "the example must not carry a real LAN address — see fix round 1")
+        XCTAssertEqual(config.maxFrameBytes, 4_194_304)
+    }
 }

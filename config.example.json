@@ -1,6 +1,6 @@
 {
   "host": "your-pc-hostname",
-  "fallback_ip": "192.168.1.45",
+  "fallback_ip": "192.168.1.10",
   "user": "your-username",
   "identity_file": "~/.ssh/id_ed25519",
   "remote_agent_path": "~/.local/share/clipwire/clipwire-agent.py",
