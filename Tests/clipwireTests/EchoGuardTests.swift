@@ -29,4 +29,17 @@ final class EchoGuardTests: XCTestCase {
         var guardian = EchoGuard()
         XCTAssertTrue(guardian.shouldSend(Data("anything".utf8)))
     }
+
+    /// If the poll observes some other change before it ever observes the echo
+    /// of our own write, our write's one event is already gone. A stored hash
+    /// that only clears on a match would stay armed forever, waiting to eat a
+    /// later, unrelated, deliberate re-copy of the same text.
+    func testDeliberateRecopyStillSyncsAfterAMissedEcho() {
+        var guardian = EchoGuard()
+        let ourWrite = Data("our own write".utf8)
+        let somethingElse = Data("a different clip the user made".utf8)
+        guardian.noteWrittenLocally(ourWrite)
+        XCTAssertTrue(guardian.shouldSend(somethingElse), "the poll missed our write and saw the user's clip")
+        XCTAssertTrue(guardian.shouldSend(ourWrite), "a deliberate re-copy of our own text must still sync")
+    }
 }
