@@ -46,14 +46,23 @@ final class AgentWiringTests: XCTestCase {
         wireAgent(channel: channel, watcher: watcher, pasteboard: pasteboard,
                   status: status, log: tempLog())
 
+        // Second-round final review, Finding 3: a bare "onChange does not
+        // re-fire" assertion cannot tell a correctly suppressed echo apart
+        // from wireAgent never having assigned watcher.onChange at all --
+        // in the latter case the count would ALSO stay 0, while Mac-to-PC
+        // sync is entirely dead. Failing here, immediately and separately
+        // from everything below, closes that gap directly.
+        guard let wiredOnChange = watcher.onChange else {
+            return XCTFail("wireAgent must assign watcher.onChange, or Mac-to-PC sync is dead")
+        }
+
         // Observe whether the real wiring's onChange fires, without
         // replacing what it does -- it must still forward to channel.send
         // exactly as wireAgent set it up.
         var onChangeFireCount = 0
-        let wiredOnChange = watcher.onChange
         watcher.onChange = { data in
             onChangeFireCount += 1
-            wiredOnChange?(data)
+            wiredOnChange(data)
         }
 
         watcher.poll() // establishes the baseline changeCount, emits nothing
@@ -74,5 +83,20 @@ final class AgentWiringTests: XCTestCase {
                        "the watcher must not bounce the very clip it just received back to " +
                        "the peer -- a mis-wired noteWrittenLocally leaves the guard unarmed " +
                        "and this fires")
+
+        // A GENUINE local change, unrelated to the echo above, must still
+        // reach onChange -- otherwise the assertion above could pass by
+        // wireAgent simply never wiring onChange to fire on anything at
+        // all, rather than by correctly suppressing the echo. (This proves
+        // the watcher fires and the wired closure gets invoked; it does
+        // not by itself prove that closure goes on to call channel.send --
+        // the guard above is what proves wireAgent assigned a real,
+        // non-nil closure in the first place.)
+        pasteboard.set("typed")
+        watcher.poll()
+        XCTAssertEqual(onChangeFireCount, 1,
+                       "a genuine local change must still reach onChange through the wiring -- " +
+                       "the previous assertion alone cannot tell a correctly suppressed echo " +
+                       "apart from onChange never firing at all")
     }
 }

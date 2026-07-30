@@ -81,6 +81,49 @@ final class ChannelTests: XCTestCase {
             "Channel.ignoreSIGPIPE() must already have set SIGPIPE's disposition to SIG_IGN")
     }
 
+    // Second-round final review, Finding 2: the test above calls
+    // `Channel.ignoreSIGPIPE()` itself, so it pins that function's own
+    // body -- not that `run()` actually calls it. Deleting the call at
+    // `run()`'s call site would leave the whole suite green while
+    // reinstating the exact process kill this exists to prevent, at the
+    // exact moment the PC reboots and a dead-pipe write races `ssh` dying.
+    //
+    // `run()` cannot be invoked from a test: it is a `while true` reconnect
+    // loop that never returns and needs a live ssh peer to do anything
+    // meaningful, so nothing behavioral can observe it running at all --
+    // launching it on a background thread would leak a thread spawning
+    // real `ssh` against a fake host for the rest of the test binary's
+    // life, which is exactly the kind of real-subprocess dependency every
+    // other Channel test in this file avoids. This is the same class of
+    // gap `TestModuleDefinitionOrder` (agent/tests/test_watcher.py)
+    // already accepts on the Python side, for the identical reason
+    // (behavior gated on a real Wayland session there, a real ssh peer
+    // here) -- pinned directly against the source there, and here.
+    //
+    // This does not observe `run()` executing at runtime. It proves the
+    // call is textually present in `run()`'s body, before the reconnect
+    // loop starts -- which is exactly what a source deletion would remove.
+    func testRunCallsIgnoreSIGPIPEBeforeItsReconnectLoop() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent("Sources/clipwire/Channel.swift"), encoding: .utf8)
+
+        guard let runRange = source.range(of: "func run() {") else {
+            return XCTFail("could not find func run() in Channel.swift -- has it been renamed?")
+        }
+        guard let loopRange = source.range(of: "while true {", range: runRange.upperBound..<source.endIndex) else {
+            return XCTFail("could not find run()'s reconnect loop")
+        }
+
+        let runPreamble = source[runRange.upperBound..<loopRange.lowerBound]
+        XCTAssertTrue(
+            runPreamble.contains("ignoreSIGPIPE()"),
+            "run() must call Channel.ignoreSIGPIPE() before its reconnect loop starts -- " +
+            "removing that call reinstates a process kill the instant a dead-pipe write " +
+            "races ssh exiting, exactly when the PC reboots")
+    }
+
     // Final review: `recordSent()` used to fire even when `channel.send`
     // dropped the frame because no pipe existed yet, so `clipwire status`
     // could report a clip that never left the machine. This pins the seam

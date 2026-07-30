@@ -70,6 +70,7 @@ be run from the repo root.
    binary (the shipped copy has a placeholder), then bootstrap it:
 
    ```sh
+   mkdir -p ~/Library/LaunchAgents
    cp launchd/dev.b1rdex.clipwire.plist ~/Library/LaunchAgents/
    # edit ~/Library/LaunchAgents/dev.b1rdex.clipwire.plist:
    # replace /Users/YOUR_USER/.local/bin/clipwire with the real path
