@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
+<!-- Replace /Users/YOUR_USER/.local/bin/clipwire below with the real path to
+     the installed binary (e.g. /Users/alice/.local/bin/clipwire) before
+     loading this agent -- see README.md's Installing section. -->
 <dict>
   <key>Label</key><string>dev.b1rdex.clipwire</string>
   <key>ProgramArguments</key>
