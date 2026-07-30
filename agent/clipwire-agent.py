@@ -224,7 +224,10 @@ class WaylandClipboard:
                 ["wl-paste", "-n", "--type", "text/plain;charset=utf-8"],
                 capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError) as error:
+        except FileNotFoundError:
+            log("wl-paste is not installed")
+            return None
+        except (subprocess.TimeoutExpired, OSError) as error:
             log("wl-paste failed: %r" % error)
             return None
         if result.returncode != 0:
@@ -245,6 +248,9 @@ class WaylandClipboard:
             )
         except FileNotFoundError:
             log("wl-copy is not installed")
+            return
+        except OSError as error:
+            log("wl-copy could not be started: %r" % error)
             return
         try:
             process.stdin.write(data)

@@ -1,9 +1,16 @@
 # agent/tests/test_clipboard.py
 import os
+import subprocess
 import unittest
 from unittest import mock
 
-from agent_under_test import WaylandClipboard, clipboard_env, runtime_dir, wayland_socket_path
+from agent_under_test import (
+    SUBPROCESS_TIMEOUT,
+    WaylandClipboard,
+    clipboard_env,
+    runtime_dir,
+    wayland_socket_path,
+)
 
 # agent_under_test registers the loaded module under this name in
 # sys.modules; grabbed here only to swap out log() for an in-memory capture,
@@ -73,6 +80,75 @@ class TestWriteSubprocessFailures(unittest.TestCase):
         self.assertTrue(
             any("wl-copy" in line for line in self.log_lines),
             "a close-time BrokenPipeError must be logged: %r" % self.log_lines,
+        )
+
+    def test_permission_denied_at_spawn_is_logged_not_raised(self):
+        """wl-copy present but not executable (wrong permissions, an AppArmor
+        denial) makes Popen raise PermissionError -- an OSError, but not a
+        FileNotFoundError. The spawn guard must catch OSError generally, not
+        just the missing-binary case, or this escapes write() uncaught."""
+        with mock.patch("subprocess.Popen", side_effect=PermissionError("denied")):
+            result = WaylandClipboard().write(b"hello")  # must not raise
+        self.assertIsNone(result)
+        self.assertTrue(
+            any("wl-copy" in line for line in self.log_lines),
+            "a PermissionError at spawn must be logged: %r" % self.log_lines,
+        )
+
+
+class TestReadSubprocessBehavior(unittest.TestCase):
+    """read()'s branching was previously verified only by reading the line.
+    Every case here patches subprocess.run, so no real process -- and
+    therefore no real hang -- is ever possible."""
+
+    def setUp(self):
+        self.log_lines = []
+        original_log = clipwire_agent.log
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def _completed(self, returncode, stdout=b""):
+        return subprocess.CompletedProcess(
+            args=["wl-paste"], returncode=returncode, stdout=stdout, stderr=b""
+        )
+
+    def test_exit_zero_with_content_is_returned(self):
+        with mock.patch("subprocess.run", return_value=self._completed(0, b"clip contents")):
+            self.assertEqual(WaylandClipboard().read(), b"clip contents")
+
+    def test_nonzero_exit_is_none_not_an_exception(self):
+        """The brief's own framing: a non-zero exit means an empty or
+        non-text selection, not an error -- and it must be treated as such
+        even if wl-paste wrote something to stdout before failing. Non-empty
+        stdout here is deliberate: it is what makes this test sensitive to a
+        broken returncode check, rather than passing by coincidence."""
+        with mock.patch("subprocess.run", return_value=self._completed(1, b"stale data")):
+            self.assertIsNone(WaylandClipboard().read())
+
+    def test_exit_zero_with_empty_stdout_is_none(self):
+        with mock.patch("subprocess.run", return_value=self._completed(0, b"")):
+            self.assertIsNone(WaylandClipboard().read())
+
+    def test_timeout_returns_none_and_logs(self):
+        with mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("wl-paste", SUBPROCESS_TIMEOUT)
+        ):
+            self.assertIsNone(WaylandClipboard().read())
+        self.assertTrue(
+            any("wl-paste" in line for line in self.log_lines),
+            "a timeout must be logged: %r" % self.log_lines,
+        )
+
+    def test_permission_denied_at_spawn_returns_none_and_logs(self):
+        """wl-paste present but not executable raises PermissionError, an
+        OSError that is not a FileNotFoundError -- the same latent escape
+        as write()'s spawn guard, just not yet reachable since nothing
+        calls read() until a later task wires up the watcher."""
+        with mock.patch("subprocess.run", side_effect=PermissionError("denied")):
+            self.assertIsNone(WaylandClipboard().read())
+        self.assertTrue(
+            any("wl-paste" in line for line in self.log_lines),
+            "a PermissionError at spawn must be logged: %r" % self.log_lines,
         )
 
 
