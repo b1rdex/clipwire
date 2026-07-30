@@ -14,7 +14,8 @@
 - **No third-party dependencies.** Not in the Swift package, not in the Python agent, not in the Python tests. The agent is deployed as one file with nothing alongside it; tests that need packages would stop resembling the target machine.
 - **Python floor: 3.11.** Ubuntu 25.10 ships 3.13; CI runs on `ubuntu-latest`. Do not use 3.12+ syntax.
 - **Swift floor: macOS 13.** `NSPasteboard.changeCount` long predates this; do not raise the floor.
-- **No bare top-level `let` in the Swift target.** `clipwire` is an `executableTarget`; a file the compiler treats as the implicit main file turns top-level bindings into statements of a `main()` that never runs under test, so the constants silently read as zero. Namespace shared constants as `static let` on an enum. Verified empirically in Task 1.
+- **No bare top-level `let` in the Swift target.** Namespace shared constants as `static let` on an enum, as `FrameConstants` and `StatusConstants` do. History: with a single file in the `executableTarget` the compiler treated it as the implicit main file and its top-level bindings silently read as zero under test (found in Task 1); once a second file arrived there was no main file at all and the target stopped linking (found in Task 6). A placeholder `Sources/clipwire/main.swift` now closes the second hazard, and the convention stays because it is immune to both.
+- **Verification counts only from a clean build.** Run `rm -rf .build` before `swift build` / `swift test` and paste that output as evidence. Incremental state masked the link failure above across two whole tasks, during which every local "all green" was meaningless. After pushing, the controller checks the actual CI run rather than trusting a local result.
 - **Frame format:** `[u32 big-endian payload length][u8 type][payload]`. The length counts **payload bytes only** — the 5-byte header is not included.
 - **Frame types:** `0x00` hello, `0x01` clip (`text/plain; charset=utf-8`). No others in v1.
 - **Protocol version: 1.** Carried in the hello payload.
@@ -2420,7 +2421,7 @@ git commit -m "Add SSH channel supervisor with serial writes and backoff"
 ### Task 15: CLI and end-to-end wiring
 
 **Files:**
-- Create: `Sources/clipwire/main.swift`
+- Replace: `Sources/clipwire/main.swift` — a placeholder already exists (it writes one line to stderr and exits 2), added early because the executable target could not link without an entry point. Replace its whole body; keep nothing.
 - Test: manual acceptance, below
 
 **Interfaces:**
