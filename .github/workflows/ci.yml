@@ -21,4 +21,8 @@ jobs:
       - name: Byte-compile the agent
         run: python3 -m compileall -q agent/clipwire-agent.py
       - name: Unit tests
-        run: python3 -m unittest discover -s agent/tests -t agent -v
+        # No -t: agent/tests has no __init__.py, and unittest's discover
+        # requires an importable start dir whenever it differs from the top
+        # level. With -t agent this fails with "Start directory is not
+        # importable".
+        run: python3 -m unittest discover -s agent/tests -v
