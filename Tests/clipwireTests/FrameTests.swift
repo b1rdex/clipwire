@@ -70,4 +70,14 @@ final class FrameTests: XCTestCase {
             }
         }
     }
+
+    func testFrameTypeRawValuesArePinned() {
+        // The golden fixtures (Task 3) round-trip whichever raw byte a case
+        // carries — FrameType(rawValue:) followed by .rawValue is an identity
+        // function regardless of which case owns which byte, so a consistent
+        // relabelling of hello/clip would stay green there. Pin the actual
+        // wire-format assignment explicitly here instead.
+        XCTAssertEqual(FrameType.hello.rawValue, 0x00, "hello must be wire type 0x00")
+        XCTAssertEqual(FrameType.clip.rawValue, 0x01, "clip must be wire type 0x01")
+    }
 }

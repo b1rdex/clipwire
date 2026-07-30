@@ -3,6 +3,7 @@ import unittest
 from agent_under_test import (
     OversizedFrame,
     TYPE_CLIP,
+    TYPE_HELLO,
     UnknownFrameType,
     decode_frame,
     encode_frame,
@@ -54,6 +55,14 @@ class TestFrame(unittest.TestCase):
         buffer = bytearray(b"\x00\x40\x00\x01\x00")
         with self.assertRaises(OversizedFrame):
             decode_frame(buffer)
+
+    def test_type_constants_are_pinned(self):
+        # The golden fixtures (Task 3) round-trip whichever raw integer a type
+        # carries, so a consistent relabelling of TYPE_HELLO/TYPE_CLIP would
+        # stay green there. Pin the actual wire-format assignment explicitly
+        # here instead.
+        self.assertEqual(TYPE_HELLO, 0x00, "hello must be wire type 0x00")
+        self.assertEqual(TYPE_CLIP, 0x01, "clip must be wire type 0x01")
 
 
 if __name__ == "__main__":
