@@ -21,36 +21,55 @@ final class SystemPasteboard: PasteboardReading {
 /// so a sub-second interval costs nothing — unlike the PC side, which has to
 /// fork a process and read the whole clipboard.
 ///
-/// Two actors touch `echo`: this class's own `poll()`, invoked on the
+/// Two actors touch this watcher's state: its own `poll()`, invoked on the
 /// timer's background queue, and `noteWrittenLocally(_:)`, called by the
 /// channel's frame handler (a later task) from a different thread when it
 /// writes an incoming clip to the pasteboard. Task 11 found the PC analogue
 /// of this — the watcher thread and the main thread shared echo-suppression
 /// state with no lock, and the watcher read the clipboard *before* consuming
 /// the suppression, so two back-to-back incoming clips made it compare a
-/// stale value and echo one of them back to the peer. The same shape exists
-/// here: without synchronization, a second incoming clip's arming could land
-/// between this poll's read of the pasteboard and its comparison against
-/// `echo`, corrupting that comparison. `stateLock` closes it by making
-/// [read text -> consult echo] one atomic step with respect to
-/// `noteWrittenLocally`'s mutation. Unlike the PC side, this does not need a
-/// generation counter: `SystemPasteboard.readText()` is an in-process
-/// NSPasteboard call, not a forked `wl-paste` that can take up to 3 seconds,
-/// so there is no slow operation whose lock-holding cost the counter was
-/// built to dodge. A plain lock is both sufficient and cheap here.
+/// stale value and echo one of them back to the peer.
 ///
-/// This lock alone is not a complete contract: it says nothing about the
-/// ORDER in which the future frame handler writes to the pasteboard versus
-/// calling `noteWrittenLocally`, because `PasteboardWatcher` does not
-/// perform that write. For the suppression to be armed before its own
-/// change becomes observable, that caller must call `noteWrittenLocally`
-/// *before* writing to the pasteboard, not after — arm-then-write. Ordering
-/// alone (without this lock) would still race, since `noteWrittenLocally`
-/// itself is not atomic with `poll()`'s read; this lock alone (with the
-/// wrong order) would still let a poll observe a written-but-unarmed change
-/// and echo it. Both are required together; the second is this class's
-/// responsibility, the first belongs to the task that builds the frame
-/// handler.
+/// `stateLock` guards `echo` *and* `lastChangeCount` together, and covers the
+/// entire [read changeCount -> compare -> read text -> consult echo] sequence
+/// in `poll()` as one critical section, matched by `noteWrittenLocally`
+/// taking the same lock for its arm. This is stricter than it looks like it
+/// needs to be, and deliberately so: an earlier version of this fix moved
+/// only `echo` under the lock and left `changeCount` read (and
+/// `lastChangeCount` written) beforehand, unlocked. That leaves a gap where a
+/// second incoming clip can arrive — armed *and* written — between this
+/// poll's changeCount read and its lock acquisition. The read-and-compare
+/// that follows still lands on consistent data (it reads whatever is
+/// actually current and correctly matches it against `echo`), but
+/// `lastChangeCount` gets recorded one generation behind what was actually
+/// consumed. The next poll then sees a changeCount it hasn't recorded,
+/// treats already-suppressed content as a fresh unobserved change, finds
+/// `echo` already spent, and resends it. Reading `changeCount` under the
+/// same lock as the rest closes this: whatever generation `poll()` records
+/// is provably the one it just read text and consulted `echo` for, because
+/// nothing else can touch `echo` in between. Unlike the PC side, none of
+/// this needs a generation counter: `SystemPasteboard.readText()` is an
+/// in-process NSPasteboard call, not a forked `wl-paste` that can take up to
+/// 3 seconds, so there is no slow operation whose lock-holding cost a
+/// counter would be needed to dodge — and a counter keyed off `echo`'s own
+/// arm count would not even catch this specific gap, since the arm that
+/// matters here can complete before `poll()` starts, leaving the counter
+/// unchanged across the whole call. A single lock around the full sequence
+/// is both sufficient and cheap.
+///
+/// This lock is still not a complete contract on its own: it says nothing
+/// about the ORDER in which the future frame handler writes to the
+/// pasteboard versus calling `noteWrittenLocally`, because `PasteboardWatcher`
+/// does not perform that write. For the suppression to be armed before its
+/// own change becomes observable, that caller must call `noteWrittenLocally`
+/// *before* writing to the pasteboard, not after — arm-then-write, which is
+/// also already the convention the Python agent's `_write_clip` follows on
+/// the PC side. Ordering alone (without this lock) would still race, since
+/// `noteWrittenLocally` itself is not atomic with `poll()`'s read; this lock
+/// alone (with the wrong order) would still let a poll observe a
+/// written-but-unarmed change and echo it. Both are required together; the
+/// second is this class's responsibility, the first belongs to the task
+/// that builds the frame handler.
 final class PasteboardWatcher {
     var onChange: ((Data) -> Void)?
 
@@ -60,10 +79,8 @@ final class PasteboardWatcher {
     private var echo = EchoGuard()
     private var timer: DispatchSourceTimer?
 
-    // Guards `echo` only. `lastChangeCount` is touched solely by poll(), and
-    // GCD never invokes a dispatch source's handler reentrantly with itself,
-    // so poll() cannot race against another poll() and lastChangeCount needs
-    // no lock of its own.
+    // Guards `echo` and `lastChangeCount` together — see the class doc
+    // comment for why both, not just `echo`, need to be under this lock.
     private let stateLock = NSLock()
 
     init(pasteboard: PasteboardReading, pollInterval: TimeInterval) {
@@ -79,31 +96,35 @@ final class PasteboardWatcher {
     }
 
     func poll() {
+        guard let toSend = pollLocked() else { return }
+        // Invoked after the lock is released, both because it can be slow
+        // (it hands off to the channel) and because a callback that
+        // re-entered the watcher while the lock was still held would
+        // deadlock against a non-reentrant NSLock.
+        onChange?(toSend)
+    }
+
+    /// The entire read-and-decide sequence, as one critical section shared
+    /// with `noteWrittenLocally`. `defer` releases the lock on every path,
+    /// including the early "nothing changed" return, so a raised guard can
+    /// never leak a held lock into the next `noteWrittenLocally` call.
+    private func pollLocked() -> Data? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
         let current = pasteboard.changeCount
-        guard current != lastChangeCount else { return }
+        guard current != lastChangeCount else { return nil }
         // Record the new count before any early return, so non-text content
-        // cannot wedge the watcher into rescanning the same item forever.
+        // cannot wedge the watcher into rescanning the same item forever —
+        // and, per the class doc comment, record the generation this same
+        // locked call is about to read and consult echo for, not one
+        // observed earlier and now stale.
         lastChangeCount = current
 
-        // Read the pasteboard and consult (and, on a match, consume) the
-        // echo guard as a single step under `stateLock`, so noteWrittenLocally
-        // cannot arm a *different* payload in the gap between this read and
-        // this comparison. onChange is deliberately invoked after the lock is
-        // released, both because it can be slow (it hands off to the channel)
-        // and because a callback that re-entered the watcher while the lock
-        // was still held would deadlock against a non-reentrant NSLock.
-        stateLock.lock()
-        let text = pasteboard.readText()
-        let toSend: Data?
-        if let text, !text.isEmpty, text.count <= FrameConstants.maxPayloadBytes, echo.shouldSend(text) {
-            toSend = text
-        } else {
-            toSend = nil
-        }
-        stateLock.unlock()
-
-        guard let toSend else { return }
-        onChange?(toSend)
+        guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
+        guard text.count <= FrameConstants.maxPayloadBytes else { return nil }
+        guard echo.shouldSend(text) else { return nil }
+        return text
     }
 
     func start() {

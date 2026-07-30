@@ -231,3 +231,143 @@ final class PasteboardConcurrencyTests: XCTestCase {
         seenLock.unlock()
     }
 }
+
+// MARK: - Fix round 1: changeCount read outside stateLock (see task-13-report.md)
+//
+// Review found that the first fix left `changeCount` itself read, and
+// `lastChangeCount` written, *before* `stateLock` was acquired — a gap the
+// BlockingPasteboard test above cannot see, because it interleaves inside
+// readText(), which was already under the lock. This double interleaves in
+// the changeCount getter instead, landing a complete second clip (arm and
+// write) in that earlier, still-unlocked gap:
+//
+//   1. poll() reads changeCount (N, clip A's generation) — unlocked.
+//   2. Before poll() reaches stateLock.lock(), clip B arrives complete:
+//      armed and written; the real changeCount becomes N+1.
+//   3. poll() locks, reads text (already B, since B is fully written by
+//      now), and shouldSend(B) correctly matches and suppresses it — but
+//      lastChangeCount was recorded as N, one generation behind what was
+//      actually read and consumed.
+//   4. Next tick: changeCount(N+1) != lastChangeCount(N) looks like a fresh,
+//      unobserved change. text is still B, but echo is now nil (consumed in
+//      step 3) — so shouldSend(B) returns true on an unarmed guard, and
+//      onChange(B) fires: our own already-suppressed clip goes out again.
+
+/// A double that pauses inside the `changeCount` getter itself (not
+/// `readText()`), to let a test land a complete second clip cycle in the gap
+/// between poll() observing a changeCount and poll() acquiring the lock that
+/// guards the read-and-compare that follows.
+final class ChangeCountGapPasteboard: PasteboardReading {
+    private(set) var realCount = 0
+    var text = Data()
+    var pauseOnNextRead = false
+    let pausedInChangeCount = DispatchSemaphore(value: 0)
+    let resumeChangeCount = DispatchSemaphore(value: 0)
+
+    func set(_ value: String) {
+        text = Data(value.utf8)
+        realCount += 1
+    }
+
+    var changeCount: Int {
+        let snapshot = realCount
+        if pauseOnNextRead {
+            pauseOnNextRead = false
+            pausedInChangeCount.signal()
+            _ = resumeChangeCount.wait(timeout: .now() + 2)
+        }
+        return snapshot
+    }
+
+    func readText() -> Data? { text }
+}
+
+final class PasteboardGenerationTests: XCTestCase {
+    /// Pins the reviewer's exact trace: clip A's own processing poll() is
+    /// paused right after reading changeCount (unlocked at the time of the
+    /// bug) and before reaching the lock. Clip B arrives completely — armed
+    /// and written — in that gap, on another thread. The bug does not show
+    /// up on the poll that raced B in (it happens to read B's text and
+    /// correctly suppress it) — it shows up on the *next* poll, once
+    /// `lastChangeCount` turns out to have recorded the wrong generation.
+    func testStaleLastChangeCountDoesNotResendAlreadySuppressedClip() {
+        // Safe because every cross-thread touch below is ordered by an
+        // explicit semaphore handshake; see the identical note on
+        // PasteboardConcurrencyTests above.
+        nonisolated(unsafe) let pasteboard = ChangeCountGapPasteboard()
+        nonisolated(unsafe) let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        var seen: [Data] = []
+        let seenLock = NSLock()
+        watcher.onChange = { data in
+            seenLock.lock(); seen.append(data); seenLock.unlock()
+        }
+
+        // Clip A: armed and written, but not yet polled.
+        watcher.noteWrittenLocally(Data("A".utf8))
+        pasteboard.set("A")
+
+        // Pause the poll that is about to process A right after it reads
+        // changeCount — the gap the reviewer's trace exploits.
+        pasteboard.pauseOnNextRead = true
+        let pollFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            watcher.poll()
+            pollFinished.signal()
+        }
+
+        XCTAssertEqual(pasteboard.pausedInChangeCount.wait(timeout: .now() + 2), .success,
+                       "poll() never reached the changeCount read")
+
+        // While that read is paused, clip B arrives *completely* on another
+        // thread: armed, then written. Dispatched (not waited on here) so
+        // this cannot deadlock against a fixed implementation, where poll()
+        // may already hold stateLock at this point and this call would
+        // correctly block until poll() releases it.
+        let armed = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            watcher.noteWrittenLocally(Data("B".utf8))
+            pasteboard.set("B")
+            armed.signal()
+        }
+
+        // Give B's arm-and-write a wide, uncontended head start before
+        // letting A's paused poll resume. This must be an unconditional
+        // sleep, not a wait on `armed`: waiting here would deadlock against
+        // a fixed implementation, where poll() already holds stateLock at
+        // the pause point, so B legitimately cannot complete until the
+        // resume below releases it. Pre-fix, nothing contends for anything
+        // at this point, so 100ms is a three-plus-orders-of-magnitude margin
+        // over the couple of in-process operations B needs — enough to land
+        // "B arrives complete" deterministically before the resume, which is
+        // the reviewer's exact precondition. Without this, the interleaving
+        // is unconstrained and can instead land B's arm without its write
+        // (or vice versa), which is a different bug (arm/write are not one
+        // atomic event — see the class doc comment) and not what this test
+        // targets.
+        Thread.sleep(forTimeInterval: 0.1)
+
+        pasteboard.resumeChangeCount.signal()
+
+        XCTAssertEqual(pollFinished.wait(timeout: .now() + 2), .success, "poll() never returned")
+        XCTAssertEqual(armed.wait(timeout: .now() + 2), .success,
+                       "the concurrent arm+write of B never completed")
+
+        // First tick: whichever of A or B this poll actually read, it must
+        // have matched what was armed at read time and been suppressed.
+        seenLock.lock()
+        XCTAssertTrue(seen.isEmpty, "the first poll must have suppressed what it read")
+        seenLock.unlock()
+
+        // Second tick: nothing new has been written since. If the first
+        // poll recorded the generation it actually consumed, this is a
+        // no-op. If it recorded a stale (earlier) generation instead, this
+        // looks like a fresh change and re-sends already-suppressed content.
+        watcher.poll()
+        seenLock.lock()
+        XCTAssertTrue(seen.isEmpty,
+                       "a clip already suppressed on the previous poll must not be " +
+                       "resent just because lastChangeCount lagged the generation " +
+                       "that poll actually read and consumed")
+        seenLock.unlock()
+    }
+}
