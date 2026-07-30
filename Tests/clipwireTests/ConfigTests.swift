@@ -14,8 +14,7 @@ final class ConfigTests: XCTestCase {
         let url = try write("""
         {"host":"pc","user":"me","identity_file":"~/.ssh/id_ed25519",
          "remote_agent_path":"~/.local/share/clipwire/clipwire-agent.py",
-         "mac_poll_interval_ms":400,"pc_fallback_poll_interval_ms":1000,
-         "max_frame_bytes":4194304}
+         "mac_poll_interval_ms":400}
         """)
         let config = try Config.load(from: url)
         XCTAssertEqual(config.host, "pc")
@@ -32,20 +31,10 @@ final class ConfigTests: XCTestCase {
         }
     }
 
-    func testRejectsFrameCapAboveProtocolMaximum() throws {
-        let url = try write("""
-        {"host":"pc","user":"me","identity_file":"k","remote_agent_path":"a",
-         "mac_poll_interval_ms":400,"pc_fallback_poll_interval_ms":1000,
-         "max_frame_bytes":99999999}
-        """)
-        XCTAssertThrowsError(try Config.load(from: url))
-    }
-
     func testRejectsNonPositivePollInterval() throws {
         let url = try write("""
         {"host":"pc","user":"me","identity_file":"k","remote_agent_path":"a",
-         "mac_poll_interval_ms":0,"pc_fallback_poll_interval_ms":1000,
-         "max_frame_bytes":4194304}
+         "mac_poll_interval_ms":0}
         """)
         XCTAssertThrowsError(try Config.load(from: url))
     }
@@ -88,6 +77,5 @@ final class ConfigTests: XCTestCase {
         XCTAssertEqual(config.host, "your-pc-hostname")
         XCTAssertEqual(config.fallbackIP, "192.168.1.10",
                        "the example must not carry a real LAN address — see fix round 1")
-        XCTAssertEqual(config.maxFrameBytes, 4_194_304)
     }
 }

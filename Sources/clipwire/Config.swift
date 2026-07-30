@@ -27,8 +27,6 @@ struct Config: Codable {
     let identityFile: String
     let remoteAgentPath: String
     let macPollIntervalMs: Int
-    let pcFallbackPollIntervalMs: Int
-    let maxFrameBytes: Int
 
     enum CodingKeys: String, CodingKey {
         case host
@@ -37,8 +35,6 @@ struct Config: Codable {
         case identityFile = "identity_file"
         case remoteAgentPath = "remote_agent_path"
         case macPollIntervalMs = "mac_poll_interval_ms"
-        case pcFallbackPollIntervalMs = "pc_fallback_poll_interval_ms"
-        case maxFrameBytes = "max_frame_bytes"
     }
 
     static var defaultURL: URL {
@@ -68,11 +64,8 @@ struct Config: Codable {
     func validate() throws {
         if host.isEmpty { throw ConfigError.invalid("host must not be empty") }
         if user.isEmpty { throw ConfigError.invalid("user must not be empty") }
-        if macPollIntervalMs <= 0 || pcFallbackPollIntervalMs <= 0 {
-            throw ConfigError.invalid("poll intervals must be positive")
-        }
-        if maxFrameBytes <= 0 || maxFrameBytes > FrameConstants.maxPayloadBytes {
-            throw ConfigError.invalid("max_frame_bytes must be between 1 and \(FrameConstants.maxPayloadBytes)")
+        if macPollIntervalMs <= 0 {
+            throw ConfigError.invalid("mac_poll_interval_ms must be positive")
         }
     }
 }

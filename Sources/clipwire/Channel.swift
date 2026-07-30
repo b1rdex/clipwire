@@ -62,12 +62,37 @@ final class Channel: @unchecked Sendable {
     }
 
     func send(_ frame: Frame) {
+        send(frame, onSent: nil)
+    }
+
+    /// Same single writer as `send(_:)`, but reports back whether the frame
+    /// actually reached the pipe -- `false` when no channel is established
+    /// (`stdinPipe` is nil) or the write itself throws, `true` only once
+    /// `write(contentsOf:)` has returned successfully. `onSent` runs on
+    /// `writeQueue`, asynchronously, the same as the write itself.
+    ///
+    /// Exists because a caller (`runAgent()`'s `watcher.onChange`) used to
+    /// call the plain `send(_:)` and then unconditionally record the clip
+    /// as sent for `clipwire status` purposes, even on a connection that
+    /// was never established -- reporting a clip that never left the
+    /// machine as delivered. A two-overload split (rather than a single
+    /// method with a defaulted parameter) keeps `send: channel.send`
+    /// type-checking unchanged at its existing call site in `runAgent()`
+    /// (`handleFrame`'s `send` parameter is `(Frame) -> Void`; a method
+    /// referenced as a bare value ignores default arguments and would
+    /// otherwise widen to `(Frame, ((Bool) -> Void)?) -> Void`).
+    func send(_ frame: Frame, onSent: (@Sendable (Bool) -> Void)?) {
         writeQueue.async { [self] in
-            guard let pipe = stdinPipe else { return }
+            guard let pipe = stdinPipe else {
+                onSent?(false)
+                return
+            }
             do {
                 try pipe.fileHandleForWriting.write(contentsOf: frame.encode())
+                onSent?(true)
             } catch {
                 log.line("write failed: \(error)")
+                onSent?(false)
             }
         }
     }

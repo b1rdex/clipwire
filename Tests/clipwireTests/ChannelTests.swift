@@ -7,8 +7,13 @@ final class ChannelTests: XCTestCase {
         Config(host: "pc", fallbackIP: fallback, user: "me",
                identityFile: "~/.ssh/id_ed25519",
                remoteAgentPath: "~/.local/share/clipwire/clipwire-agent.py",
-               macPollIntervalMs: 400, pcFallbackPollIntervalMs: 1000,
-               maxFrameBytes: FrameConstants.maxPayloadBytes)
+               macPollIntervalMs: 400)
+    }
+
+    private func tempLog() -> Log {
+        Log(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-channel-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path)
     }
 
     func testArgumentsPinEverythingExplicitly() {
@@ -52,6 +57,52 @@ final class ChannelTests: XCTestCase {
         try! pipe.fileHandleForReading.close()
         XCTAssertThrowsError(
             try pipe.fileHandleForWriting.write(contentsOf: Data("x".utf8)))
+    }
+
+    // Final review: the test above proves the EFFECT (a dead-pipe write
+    // throws instead of terminating the process) but not that
+    // `Channel.ignoreSIGPIPE()` -- which `Channel.run()` calls as its first
+    // line -- is what actually armed it. A regression that dropped that
+    // call would make that same test CRASH the whole XCTest binary instead
+    // of failing red, since it still performs a real write to a pipe with
+    // no reader; whether the crash happens depends entirely on the bug this
+    // test exists to catch. `signal()` reports the PRIOR disposition on
+    // every call, so calling it a second time with the same value reveals
+    // what `Channel.ignoreSIGPIPE()`'s call already set -- with no pipe
+    // write at all, so a regression here fails red instead of crashing.
+    func testIgnoreSIGPIPEActuallyArmsTheIgnoreDisposition() {
+        Channel.ignoreSIGPIPE()
+        let previousDisposition = signal(SIGPIPE, SIG_IGN)
+        // @convention(c) function pointer types are not Equatable in Swift;
+        // compare the underlying pointer bit pattern instead.
+        XCTAssertEqual(
+            unsafeBitCast(previousDisposition, to: Int.self),
+            unsafeBitCast(SIG_IGN, to: Int.self),
+            "Channel.ignoreSIGPIPE() must already have set SIGPIPE's disposition to SIG_IGN")
+    }
+
+    // Final review: `recordSent()` used to fire even when `channel.send`
+    // dropped the frame because no pipe existed yet, so `clipwire status`
+    // could report a clip that never left the machine. This pins the seam
+    // that fix depends on: `Channel.send(_:onSent:)` itself must report
+    // `false` when no connection has ever been established, so a caller
+    // gating a status update on that report cannot be fooled.
+    func testSendReportsFalseWhenNoChannelIsEstablished() {
+        let channel = Channel(config: config(), log: tempLog())
+        let expectation = XCTestExpectation(description: "onSent called")
+        // Safe despite the mutation happening on Channel's private
+        // writeQueue: wait(for:) below only returns once fulfill() has been
+        // called from inside this same closure, strictly after the
+        // assignment -- the same happens-before reasoning already used for
+        // the `nonisolated(unsafe)` captures in PasteboardTests.swift's
+        // concurrency tests.
+        nonisolated(unsafe) var result: Bool?
+        channel.send(Frame(type: .clip, payload: Data("x".utf8)), onSent: { sent in
+            result = sent
+            expectation.fulfill()
+        })
+        wait(for: [expectation], timeout: 2)
+        XCTAssertEqual(result, false, "no pipe exists yet -- the frame cannot have reached it")
     }
 
     // Fix round 1, finding 3. Injects `Date` values instead of sleeping to

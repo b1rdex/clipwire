@@ -225,16 +225,16 @@ only an example):
   "user": "your-username",
   "identity_file": "~/.ssh/id_ed25519",
   "remote_agent_path": "~/.local/share/clipwire/clipwire-agent.py",
-  "mac_poll_interval_ms": 400,
-  "pc_fallback_poll_interval_ms": 1000,
-  "max_frame_bytes": 4194304
+  "mac_poll_interval_ms": 400
 }
 ```
 
-The two intervals differ on purpose. The Mac's poll only compares an integer
-(`changeCount`) in-process, so 400 ms is free. The PC's fallback poll forks `wl-paste` and
-reads the entire clipboard every time — up to 4 MiB — so it runs at 1 s. That path is a
-degraded mode anyway; the GPaste subscription is event-driven and has no interval.
+`mac_poll_interval_ms` is the Mac's own poll interval — it only compares an integer
+(`changeCount`) in-process, so 400 ms is free. The PC has no equivalent knob: `sshd` spawns
+it with no arguments, so no config value could ever reach it. Its polling fallback (forking
+`wl-paste` and reading the whole clipboard every time, up to 4 MiB) is a hardcoded interval
+in the agent itself, and only a degraded mode besides — the GPaste subscription is
+event-driven and has no interval at all.
 
 `fallback_ip` is tried when the hostname does not resolve — today the name works only
 because the router serves it.

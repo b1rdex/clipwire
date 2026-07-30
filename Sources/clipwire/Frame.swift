@@ -8,8 +8,8 @@ import Foundation
 // ever invoking `main()`, so top-level `let maxPayloadBytes = ...` would sit at
 // zero-initialized memory (observed: reads as 0) when accessed from tests.
 // Namespacing them as `static let` makes them swift_once-guarded regardless of
-// entry-point status. This is scoped to Task 1: once main.swift exists (a later
-// task), Frame.swift stops being the main file and this hazard goes away.
+// entry-point status. This was scoped to Task 1: main.swift exists now, so
+// Frame.swift is no longer the main file and this hazard no longer applies here.
 enum FrameConstants {
     static let maxPayloadBytes = 4_194_304
     static let headerBytes = 5
