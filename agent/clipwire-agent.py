@@ -76,6 +76,8 @@ class Agent:
         self.phase = PHASE_PENDING
         self.pending_clip = None
         self._write_lock = threading.Lock()
+        self._watcher = None
+        self._last_written = None
 
     # --- outbound -------------------------------------------------------
 
@@ -124,18 +126,48 @@ class Agent:
             # once the session appears is noise, not a feature.
             self.pending_clip = payload
             return
-        self.clipboard.write(payload)
+        self._write_clip(payload)
 
     # --- phase transitions ----------------------------------------------
 
     def clipboard_became_ready(self):
         self.phase = PHASE_READY
         if self.pending_clip is not None:
-            self.clipboard.write(self.pending_clip)
+            self._write_clip(self.pending_clip)
             self.pending_clip = None
+        if self._watcher is None:
+            self._watcher = make_watcher(self.clipboard)
+            self._watcher.start(self._local_change)
 
     def clipboard_lost(self):
         self.phase = PHASE_PENDING
+        if self._watcher is not None:
+            self._watcher.stop()
+            self._watcher = None
+
+    def _write_clip(self, payload):
+        """Single place where we touch the local clipboard, so echo
+        bookkeeping cannot be forgotten on one of the paths."""
+        self._last_written = payload
+        self.clipboard.write(payload)
+
+    def _local_change(self):
+        text = self.clipboard.read()
+        if not text:
+            return
+        # Consume the suppression on the FIRST observed change, whatever it is —
+        # not only on a match. Our write produces exactly one change event; if we
+        # observe a different one instead, ours is already gone, and a lingering
+        # hash would silently swallow the user's later deliberate copy of the
+        # same text. Mirrors EchoGuard.shouldSend on the Swift side, where the
+        # match-only variant was found to be a real defect.
+        expected, self._last_written = self._last_written, None
+        if text == expected:
+            return
+        if len(text) > MAX_PAYLOAD_BYTES:
+            log("skipping a clip of %d bytes: over the frame cap" % len(text))
+            return
+        self.send(TYPE_CLIP, text)
 
     # --- main loop --------------------------------------------------------
 
@@ -271,6 +303,117 @@ def _select_clipboard():
 
 def selftest():
     return 0
+
+
+import threading
+import time
+
+GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
+# The BUS name is org.gnome.GPaste; org.gnome.GPaste2 is the INTERFACE name on
+# that object. Verified on the target machine: --dest org.gnome.GPaste2 has no
+# owner, so probing it would make available() always false and silently leave
+# the watcher on the polling fallback forever.
+GPASTE_BUS_NAME = "org.gnome.GPaste"
+
+
+def parse_gpaste_line(line):
+    """True when a gdbus monitor line is a GPaste Update signal.
+
+    Verified against GPaste 45.3 on the target machine. The signal is
+    Update(s action, s target, t index) and a real line looks like:
+
+        /org/gnome/GPaste: org.gnome.GPaste2.Update ('REPLACE', 'ALL', uint64 0)
+
+    The target is 'ALL', not 'CLIPBOARD'. Do not filter on the target: the
+    observed value would reject every real signal, and the set of values
+    depends on GPaste's own settings. Treat the signal as "something may have
+    changed" and let the content comparison in Agent._local_change decide —
+    that is correct whatever GPaste reports, and it also absorbs duplicate
+    signals, which GPaste does emit.
+    """
+    return "Update" in line and GPASTE_OBJECT_PATH in line
+
+
+class GPasteWatcher:
+    """Event-driven. Python has no stdlib DBus binding, so this shells out to
+    gdbus monitor and parses its output line by line."""
+
+    def __init__(self):
+        self._process = None
+        self._thread = None
+        self._stop = threading.Event()
+
+    def available(self):
+        try:
+            result = subprocess.run(
+                ["gdbus", "introspect", "--session", "--dest", GPASTE_BUS_NAME,
+                 "--object-path", GPASTE_OBJECT_PATH],
+                capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+        return result.returncode == 0
+
+    def start(self, on_change):
+        self._process = subprocess.Popen(
+            ["gdbus", "monitor", "--session", "--dest", GPASTE_BUS_NAME,
+             "--object-path", GPASTE_OBJECT_PATH],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env=clipboard_env(),
+        )
+
+        def pump():
+            for line in self._process.stdout:
+                if self._stop.is_set():
+                    return
+                if parse_gpaste_line(line):
+                    on_change()
+
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._process:
+            self._process.terminate()
+
+
+class PollingWatcher:
+    """Degraded mode: forks wl-paste and reads the whole clipboard each time,
+    so it runs at a slower interval than the Mac's in-process poll."""
+
+    def __init__(self, clipboard, interval_seconds):
+        self.clipboard = clipboard
+        self.interval = interval_seconds
+        self._stop = threading.Event()
+        self._thread = None
+
+    def available(self):
+        return True
+
+    def start(self, on_change):
+        def pump():
+            previous = self.clipboard.read()
+            while not self._stop.wait(self.interval):
+                current = self.clipboard.read()
+                if current != previous:
+                    previous = current
+                    on_change()
+
+        self._thread = threading.Thread(target=pump, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+
+def make_watcher(clipboard, fallback_interval_seconds=1.0):
+    watcher = GPasteWatcher()
+    if watcher.available():
+        log("watching the clipboard through GPaste")
+        return watcher
+    log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
+    return PollingWatcher(clipboard, fallback_interval_seconds)
 
 
 def main(argv):
