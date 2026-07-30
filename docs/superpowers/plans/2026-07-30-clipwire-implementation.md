@@ -1422,7 +1422,13 @@ class NeverReadyClipboard:
         pass
 
 
-    # --- main loop (a method of Agent) --------------------------------------
+```
+
+Then add `run` **to the `Agent` class defined in Task 8** — indented as a method of
+`Agent`, not of the test double above. Getting this wrong makes `run` a method of
+`NeverReadyClipboard`, which fails only at runtime and is easy to miss:
+
+```python
 
     def run(self):
         self.send_hello()
@@ -1456,6 +1462,11 @@ class NeverReadyClipboard:
                 log("clipboard went away, waiting for it to come back")
                 self.clipboard_lost()
 
+```
+
+Finally, still at module level:
+
+```python
 
 def _select_clipboard():
     if os.environ.get("CLIPWIRE_FAKE_CLIPBOARD") == "never-ready":
