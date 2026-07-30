@@ -1392,7 +1392,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd agent && python3 -m unittest tests.test_mainloop -v`
+Run: `python3 -m unittest discover -s agent/tests -p test_mainloop.py -v` (from the repository root — a dotted `tests.test_mainloop` path needs an `__init__.py` that deliberately does not exist)
 Expected: FAIL — the agent has no `__main__` entry point.
 
 - [ ] **Step 3: Implement**
@@ -1576,7 +1576,7 @@ An SSH session gets `XDG_RUNTIME_DIR` from `pam_systemd` but `WAYLAND_DISPLAY` i
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd agent && python3 -m unittest tests.test_clipboard -v`
+Run: `python3 -m unittest discover -s agent/tests -p test_clipboard.py -v` (from the repository root — a dotted `tests.test_clipboard` path needs an `__init__.py` that deliberately does not exist)
 Expected: FAIL — the helpers do not exist.
 
 - [ ] **Step 3: Implement**
@@ -1729,7 +1729,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd agent && python3 -m unittest tests.test_watcher -v`
+Run: `python3 -m unittest discover -s agent/tests -p test_watcher.py -v` (from the repository root — a dotted `tests.test_watcher` path needs an `__init__.py` that deliberately does not exist)
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
