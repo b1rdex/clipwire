@@ -264,6 +264,37 @@ func handleFrame(
     }
 }
 
+/// Wires the channel, the pasteboard watcher, and status reporting together.
+/// Pulled out of `runAgent()` so the last unpinned link in the echo chain --
+/// that the closures actually bind `watcher.noteWrittenLocally` into the
+/// frame handler, not something forgotten or a no-op -- is directly
+/// exercisable in a test, with no live ssh or real pasteboard needed. See
+/// `Tests/clipwireTests/AgentWiringTests.swift`.
+///
+/// `watcher.onChange` only calls `status.recordSent()` once `channel.send`
+/// reports the frame actually reached the pipe (`onSent(true)`) -- a send
+/// attempted before any channel is established (`stdinPipe` still nil) must
+/// not make `clipwire status` claim a clip that never left the machine.
+func wireAgent(
+    channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardWriting,
+    status: AgentStatus, log: Log
+) {
+    watcher.onChange = { payload in
+        channel.send(Frame(type: .clip, payload: payload), onSent: { sent in
+            if sent { status.recordSent() }
+        })
+    }
+
+    channel.onFrame = { frame in
+        handleFrame(frame, send: channel.send, noteWrittenLocally: watcher.noteWrittenLocally,
+                    pasteboard: pasteboard, status: status, log: log)
+    }
+
+    channel.onStateChange = { state, reason in
+        status.applyChannelState(state, reason)
+    }
+}
+
 func runAgent() -> Int32 {
     let log = Log(path: AgentPaths.logPath)
     let config: Config
@@ -290,19 +321,7 @@ func runAgent() -> Int32 {
         pasteboard: systemPasteboard,
         pollInterval: Double(config.macPollIntervalMs) / 1000.0)
 
-    watcher.onChange = { payload in
-        channel.send(Frame(type: .clip, payload: payload))
-        status.recordSent()
-    }
-
-    channel.onFrame = { frame in
-        handleFrame(frame, send: channel.send, noteWrittenLocally: watcher.noteWrittenLocally,
-                    pasteboard: systemPasteboard, status: status, log: log)
-    }
-
-    channel.onStateChange = { state, reason in
-        status.applyChannelState(state, reason)
-    }
+    wireAgent(channel: channel, watcher: watcher, pasteboard: systemPasteboard, status: status, log: log)
 
     watcher.start()
 
@@ -398,7 +417,10 @@ func install() -> Int32 {
         return 1
     }
 
-    guard ssh("chmod +x \(target)") == 0 else { return 1 }
+    guard ssh("chmod +x \(target)") == 0 else {
+        print("could not set the executable bit on \(target)")
+        return 1
+    }
     let selftest = ssh("\(target) --selftest")
     print(selftest == 0 ? "installed and verified" : "installed, but --selftest failed")
     return selftest

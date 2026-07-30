@@ -2,7 +2,13 @@
 import XCTest
 @testable import clipwire
 
-final class FakePasteboard: PasteboardReading {
+/// Conforms to both `PasteboardReading` and `PasteboardWriting` -- one fake
+/// object playing both roles, the same as `SystemPasteboard` does in
+/// production (see AgentWiringTests.swift, where a write through this
+/// object must be observable to a `PasteboardWatcher` reading the same
+/// instance, exactly as an incoming clip's write is observable to the real
+/// watcher polling `NSPasteboard.general`).
+final class FakePasteboard: PasteboardReading, PasteboardWriting {
     var changeCount = 0
     var text: Data?
 
@@ -17,6 +23,8 @@ final class FakePasteboard: PasteboardReading {
     }
 
     func readText() -> Data? { text }
+
+    func writeText(_ text: String) { set(text) }
 }
 
 final class PasteboardTests: XCTestCase {
