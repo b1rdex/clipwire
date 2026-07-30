@@ -290,10 +290,12 @@ class SpyWatcher:
 
     def __init__(self):
         self.started_with = None
+        self.start_count = 0
         self.stopped = False
 
     def start(self, on_change):
         self.started_with = on_change
+        self.start_count += 1
 
     def stop(self):
         self.stopped = True
@@ -337,6 +339,9 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
             agent.clipboard_became_ready()
             agent.clipboard_became_ready()
         self.assertEqual(factory.call_count, 1)
+        # factory.call_count alone would not catch a bug that re-called
+        # start() on the existing watcher instead of skipping it entirely.
+        self.assertEqual(spy.start_count, 1)
 
     def test_losing_a_clipboard_that_never_became_ready_does_not_raise(self):
         agent = self.build(ready=False)
