@@ -14,6 +14,7 @@
 - **No third-party dependencies.** Not in the Swift package, not in the Python agent, not in the Python tests. The agent is deployed as one file with nothing alongside it; tests that need packages would stop resembling the target machine.
 - **Python floor: 3.11.** Ubuntu 25.10 ships 3.13; CI runs on `ubuntu-latest`. Do not use 3.12+ syntax.
 - **Swift floor: macOS 13.** `NSPasteboard.changeCount` long predates this; do not raise the floor.
+- **No bare top-level `let` in the Swift target.** `clipwire` is an `executableTarget`; a file the compiler treats as the implicit main file turns top-level bindings into statements of a `main()` that never runs under test, so the constants silently read as zero. Namespace shared constants as `static let` on an enum. Verified empirically in Task 1.
 - **Frame format:** `[u32 big-endian payload length][u8 type][payload]`. The length counts **payload bytes only** — the 5-byte header is not included.
 - **Frame types:** `0x00` hello, `0x01` clip (`text/plain; charset=utf-8`). No others in v1.
 - **Protocol version: 1.** Carried in the hello payload.
@@ -57,7 +58,7 @@ Files that change together live together: the PC agent is deliberately one file 
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `enum FrameType: UInt8 { case hello = 0x00, clip = 0x01 }`; `struct Frame { let type: FrameType; let payload: Data }`; `Frame.encode() -> Data`; `static Frame.decode(from: inout Data) throws -> Frame?` returning `nil` when more bytes are needed; `enum FrameError: Error { case oversized(UInt32), unknownType(UInt8) }`; `let maxPayloadBytes = 4_194_304`.
+- Produces: `enum FrameType: UInt8 { case hello = 0x00, clip = 0x01 }`; `struct Frame { let type: FrameType; let payload: Data }`; `Frame.encode() -> Data`; `static Frame.decode(from: inout Data) throws -> Frame?` returning `nil` when more bytes are needed; `enum FrameError: Error { case oversized(UInt32), unknownType(UInt8) }`; `enum FrameConstants { static let maxPayloadBytes = 4_194_304; static let headerBytes = 5 }` — namespaced, never bare top-level `let`, for the reason given in Step 4.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -149,8 +150,15 @@ let package = Package(
 // Sources/clipwire/Frame.swift
 import Foundation
 
-let maxPayloadBytes = 4_194_304
-let headerBytes = 5
+// Namespaced deliberately. `clipwire` is an executableTarget, and until
+// main.swift exists the compiler treats a lone file as the implicit main
+// file: top-level `let` become statements of a main() that never runs when
+// the module is linked into the test target, so the constants read as zero.
+// Static members of an enum are swift_once-guarded regardless.
+enum FrameConstants {
+    static let maxPayloadBytes = 4_194_304
+    static let headerBytes = 5
+}
 
 enum FrameType: UInt8 {
     case hello = 0x00
@@ -167,7 +175,7 @@ struct Frame: Equatable {
     let payload: Data
 
     func encode() -> Data {
-        var out = Data(capacity: headerBytes + payload.count)
+        var out = Data(capacity: FrameConstants.headerBytes + payload.count)
         let length = UInt32(payload.count)
         out.append(UInt8((length >> 24) & 0xFF))
         out.append(UInt8((length >> 16) & 0xFF))
@@ -181,17 +189,17 @@ struct Frame: Equatable {
     /// Decodes one frame from the front of `buffer`, consuming its bytes.
     /// Returns nil when the buffer does not yet hold a complete frame.
     static func decode(from buffer: inout Data) throws -> Frame? {
-        guard buffer.count >= headerBytes else { return nil }
-        let bytes = [UInt8](buffer.prefix(headerBytes))
+        guard buffer.count >= FrameConstants.headerBytes else { return nil }
+        let bytes = [UInt8](buffer.prefix(FrameConstants.headerBytes))
         let length = (UInt32(bytes[0]) << 24) | (UInt32(bytes[1]) << 16)
             | (UInt32(bytes[2]) << 8) | UInt32(bytes[3])
-        guard length <= UInt32(maxPayloadBytes) else { throw FrameError.oversized(length) }
+        guard length <= UInt32(FrameConstants.maxPayloadBytes) else { throw FrameError.oversized(length) }
         guard let type = FrameType(rawValue: bytes[4]) else {
             throw FrameError.unknownType(bytes[4])
         }
-        let total = headerBytes + Int(length)
+        let total = FrameConstants.headerBytes + Int(length)
         guard buffer.count >= total else { return nil }
-        let payload = Data(buffer[(buffer.startIndex + headerBytes)..<(buffer.startIndex + total)])
+        let payload = Data(buffer[(buffer.startIndex + FrameConstants.headerBytes)..<(buffer.startIndex + total)])
         buffer.removeFirst(total)
         return Frame(type: type, payload: payload)
     }
@@ -716,8 +724,8 @@ struct Config: Codable {
         if macPollIntervalMs <= 0 || pcFallbackPollIntervalMs <= 0 {
             throw ConfigError.invalid("poll intervals must be positive")
         }
-        if maxFrameBytes <= 0 || maxFrameBytes > maxPayloadBytes {
-            throw ConfigError.invalid("max_frame_bytes must be between 1 and \(maxPayloadBytes)")
+        if maxFrameBytes <= 0 || maxFrameBytes > FrameConstants.maxPayloadBytes {
+            throw ConfigError.invalid("max_frame_bytes must be between 1 and \(FrameConstants.maxPayloadBytes)")
         }
     }
 }
@@ -2031,7 +2039,7 @@ final class PasteboardTests: XCTestCase {
         var seen: [Data] = []
         watcher.onChange = { seen.append($0) }
         watcher.poll()
-        pasteboard.set(String(repeating: "x", count: maxPayloadBytes + 1))
+        pasteboard.set(String(repeating: "x", count: FrameConstants.maxPayloadBytes + 1))
         watcher.poll()
         XCTAssertTrue(seen.isEmpty)
     }
@@ -2095,7 +2103,7 @@ final class PasteboardWatcher {
         lastChangeCount = current
 
         guard let text = pasteboard.readText(), !text.isEmpty else { return }
-        guard text.count <= maxPayloadBytes else { return }
+        guard text.count <= FrameConstants.maxPayloadBytes else { return }
         guard echo.shouldSend(text) else { return }
         onChange?(text)
     }
@@ -2153,7 +2161,7 @@ final class ChannelTests: XCTestCase {
                identityFile: "~/.ssh/id_ed25519",
                remoteAgentPath: "~/.local/share/clipwire/clipwire-agent.py",
                macPollIntervalMs: 400, pcFallbackPollIntervalMs: 1000,
-               maxFrameBytes: maxPayloadBytes)
+               maxFrameBytes: FrameConstants.maxPayloadBytes)
     }
 
     func testArgumentsPinEverythingExplicitly() {
