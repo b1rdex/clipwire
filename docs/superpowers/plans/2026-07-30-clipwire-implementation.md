@@ -98,8 +98,27 @@ final class FrameTests: XCTestCase {
     }
 
     func testOversizedLengthThrows() {
-        var buffer = Data([0xFF, 0xFF, 0xFF, 0xFF, 0x01])
+        // The type byte is deliberately INVALID (0x7F). With a valid type byte
+        // this assertion would hold whether the length or the type is checked
+        // first, so it could not detect a swapped guard order — and a swapped
+        // order is exactly how the two implementations would diverge on a
+        // corrupt stream.
+        var buffer = Data([0xFF, 0xFF, 0xFF, 0xFF, 0x7F])
         XCTAssertThrowsError(try Frame.decode(from: &buffer)) { error in
+            guard case FrameError.oversized = error else {
+                return XCTFail("expected .oversized, got \(error)")
+            }
+        }
+    }
+
+    func testBoundaryAtExactlyMaxPayload() throws {
+        // A header declaring exactly the cap is legal but incomplete: nil, not a throw.
+        var atCap = Data([0x00, 0x40, 0x00, 0x00, 0x01])
+        XCTAssertEqual(UInt32(FrameConstants.maxPayloadBytes), 0x0040_0000)
+        XCTAssertNil(try Frame.decode(from: &atCap))
+
+        var overCap = Data([0x00, 0x40, 0x00, 0x01, 0x01])
+        XCTAssertThrowsError(try Frame.decode(from: &overCap)) { error in
             guard case FrameError.oversized = error else {
                 return XCTFail("expected .oversized, got \(error)")
             }
@@ -271,8 +290,17 @@ class TestFrame(unittest.TestCase):
         self.assertIsNone(decode_frame(buffer))
 
     def test_oversized_length_raises(self):
+        # Invalid type byte (0x7f) on purpose: with a valid one this passes
+        # whether length or type is checked first, so it could not catch a
+        # swapped guard order.
         with self.assertRaises(OversizedFrame):
-            decode_frame(bytearray(b"\xff\xff\xff\xff\x01"))
+            decode_frame(bytearray(b"\xff\xff\xff\xff\x7f"))
+
+    def test_boundary_at_exactly_max_payload(self):
+        # Exactly the cap is legal but incomplete: None, not an exception.
+        self.assertIsNone(decode_frame(bytearray(b"\x00\x40\x00\x00\x01")))
+        with self.assertRaises(OversizedFrame):
+            decode_frame(bytearray(b"\x00\x40\x00\x01\x01"))
 
     def test_unknown_type_raises(self):
         with self.assertRaises(UnknownFrameType):
