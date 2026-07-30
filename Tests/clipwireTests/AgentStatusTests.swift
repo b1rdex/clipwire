@@ -69,6 +69,81 @@ final class AgentStatusTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(written.heartbeat), 5)
     }
 
+    // MARK: - Fix round 1, Finding 2: the "starting" reason must not go stale
+    //
+    // Channel.run()'s never-established path (the ordinary "PC is off"
+    // case) never calls onStateChange at all, so nothing would otherwise
+    // ever replace the startup placeholder -- a Mac that boots with the
+    // peer off would show "down — starting" for as long as it stays off,
+    // which is the single most common normal state `clipwire status`
+    // exists to explain.
+
+    func testZeroReconnectsIsStillLegitimatelyStarting() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.tickHeartbeat(reconnects: 0)
+        XCTAssertEqual(status.snapshot().reason, "starting",
+                       "no attempts have happened yet -- this is not the gap being fixed")
+    }
+
+    func testStaleStartingReasonIsReplacedOnceReconnectsClimb() {
+        let status = AgentStatus(pid: 1, url: url())
+        XCTAssertEqual(status.snapshot().reason, "starting")
+
+        status.tickHeartbeat(reconnects: 3)
+        let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .down)
+        XCTAssertNotEqual(snapshot.reason, "starting",
+                          "must not still say 'starting' once real reconnect attempts have been made")
+        XCTAssertTrue(snapshot.reason?.contains("(3 attempts)") == true,
+                      "expected an attempt count in: \(snapshot.reason ?? "nil")")
+        XCTAssertTrue(snapshot.reason?.contains("peer unreachable") == true)
+    }
+
+    func testSingularAttemptWordingForExactlyOneReconnect() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.tickHeartbeat(reconnects: 1)
+        let reason = status.snapshot().reason
+        XCTAssertTrue(reason?.contains("(1 attempt)") == true, "expected singular wording in: \(reason ?? "nil")")
+        XCTAssertFalse(reason?.contains("(1 attempts)") == true)
+    }
+
+    func testTheSynthesizedReasonTracksTheLatestAttemptCountNotTheFirst() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.tickHeartbeat(reconnects: 1)
+        XCTAssertTrue(status.snapshot().reason?.contains("(1 attempt)") == true)
+
+        status.tickHeartbeat(reconnects: 4)
+        XCTAssertTrue(status.snapshot().reason?.contains("(4 attempts)") == true,
+                      "the count must track the latest tick, not freeze at the first one ever computed")
+    }
+
+    func testOnceChannelHasReportedAnythingTheHeartbeatStopsSynthesizingAReason() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.applyChannelState(.down, "channel closed")
+        status.tickHeartbeat(reconnects: 5)
+        XCTAssertEqual(status.snapshot().reason, "channel closed",
+                       "once Channel has reported anything at all, the heartbeat must not override " +
+                       "it with a synthesized reason, however many attempts have piled up since")
+    }
+
+    func testAfterAMatchingHelloTheHeartbeatDoesNotReintroduceTheStaleReason() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.recordHelloMatched()
+        status.tickHeartbeat(reconnects: 2)
+        let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .up)
+        XCTAssertNil(snapshot.reason, "an established, healthy channel must not grow a synthesized " +
+                     "'unreachable' reason just because reconnects is nonzero from an earlier drop")
+    }
+
+    func testAPinnedProtocolMismatchIsNotOverwrittenByTheSynthesizedReason() {
+        let status = AgentStatus(pid: 1, url: url())
+        let mismatch = "protocol mismatch: peer speaks 2, we speak 1 — run `clipwire install`"
+        status.recordProtocolMismatch(mismatch)
+        status.tickHeartbeat(reconnects: 10)
+        XCTAssertEqual(status.snapshot().reason, mismatch)
+    }
+
     // MARK: - decodeHello / ProtocolConstants
 
     func testProtocolConstantsHelloPayloadRoundTripsThroughDecodeHello() {

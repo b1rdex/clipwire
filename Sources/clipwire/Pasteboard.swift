@@ -7,13 +7,29 @@ protocol PasteboardReading {
     func readText() -> Data?
 }
 
-final class SystemPasteboard: PasteboardReading {
+/// The one write operation an incoming clip needs. Kept separate from
+/// `PasteboardReading` (rather than folded into one protocol) because the
+/// two sides are consumed by different owners: `PasteboardWatcher` only
+/// ever reads, and the frame handler that applies an incoming clip
+/// (`handleFrame` in main.swift) only ever writes. Splitting them means a
+/// test can substitute a recording spy for the write side alone, without
+/// needing to fake `changeCount`/`readText` too — see `HandleFrameTests.swift`.
+protocol PasteboardWriting {
+    func writeText(_ text: String)
+}
+
+final class SystemPasteboard: PasteboardReading, PasteboardWriting {
     private let pasteboard = NSPasteboard.general
     var changeCount: Int { pasteboard.changeCount }
 
     func readText() -> Data? {
         guard let string = pasteboard.string(forType: .string) else { return nil }
         return Data(string.utf8)
+    }
+
+    func writeText(_ text: String) {
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 }
 

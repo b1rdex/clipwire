@@ -1,5 +1,4 @@
 // Sources/clipwire/main.swift
-import AppKit
 import Foundation
 
 // Namespaced rather than bare top-level `let`: main.swift is the file
@@ -76,6 +75,7 @@ func decodeHello(_ payload: Data) -> (version: Int, agent: String?)? {
 final class AgentStatus: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
+    private let startedAt = Date()
     private var status: Status
     // Set when the peer's declared protocol version does not match ours;
     // cleared the next time a MATCHING hello is processed. `Channel.run()`
@@ -84,6 +84,16 @@ final class AgentStatus: @unchecked Sendable {
     // see `applyChannelState` for why that generic reason must not
     // overwrite this more specific one.
     private var protocolMismatchReason: String?
+    // True the instant Channel has told us anything at all -- a state
+    // change or a frame. Needed because `Channel.run()`'s never-established
+    // path (the ordinary "PC is off" case) never calls `onStateChange`:
+    // nothing else would ever replace the startup placeholder in
+    // `status.reason`, so a Mac that boots with the peer off would show
+    // "down — starting" for as long as it stays off, which is the single
+    // most common normal state this whole file exists to explain. See
+    // `tickHeartbeat`, the one place that already has the reconnect count
+    // needed to say something better.
+    private var hasHeardFromChannel = false
 
     init(pid: Int32, url: URL) {
         self.url = url
@@ -117,6 +127,7 @@ final class AgentStatus: @unchecked Sendable {
 
     func recordHelloMatched() {
         locked {
+            hasHeardFromChannel = true
             protocolMismatchReason = nil
             status.state = .up
             status.reason = nil
@@ -125,6 +136,7 @@ final class AgentStatus: @unchecked Sendable {
 
     func recordProtocolMismatch(_ reason: String) {
         locked {
+            hasHeardFromChannel = true
             protocolMismatchReason = reason
             status.state = .down
             status.reason = reason
@@ -137,18 +149,118 @@ final class AgentStatus: @unchecked Sendable {
     /// the specific explanation instead of "channel closed".
     func applyChannelState(_ state: ChannelState, _ reason: String?) {
         locked {
+            hasHeardFromChannel = true
             status.state = state
             status.reason = protocolMismatchReason ?? reason
         }
     }
 
+    /// Ticks the heartbeat and, while the channel has never yet reported
+    /// anything at all, replaces the startup placeholder with the actual
+    /// attempt count and elapsed time -- see `hasHeardFromChannel`'s doc
+    /// comment for why this specific gap is fixed here rather than in
+    /// `Channel.swift`. Recomputed every tick (every 5s) for as long as
+    /// this condition holds, so the elapsed time keeps growing instead of
+    /// freezing at whatever it read the first time; the moment any real
+    /// signal arrives (a state change or a frame, matched or not),
+    /// `hasHeardFromChannel` flips and this stops touching `reason`
+    /// entirely, leaving it to whatever that real signal set.
     func tickHeartbeat(reconnects: Int) {
         let current: Status = locked {
             status.heartbeat = Date()
             status.reconnects = reconnects
+            if !hasHeardFromChannel && reconnects > 0 {
+                let elapsed = Int(Date().timeIntervalSince(startedAt))
+                let attempts = reconnects == 1 ? "1 attempt" : "\(reconnects) attempts"
+                status.reason = "peer unreachable for \(elapsed)s (\(attempts))"
+            }
             return status
         }
         try? current.write(to: url)
+    }
+}
+
+/// Handles one decoded frame. Pulled out of `runAgent()`'s inline closure
+/// so the two contracts this task exists for are directly assertable: the
+/// echo suppression must be armed strictly before the incoming clip is
+/// written to the pasteboard, and a received hello -- matched or not --
+/// must always produce a reply. Neither was testable when this lived as a
+/// closure inside a function that blocks forever and wrote straight to
+/// `NSPasteboard.general`; a later refactor could have swapped the
+/// arm/write order, or dropped the reply on a mismatch, and all existing
+/// tests would still have passed.
+///
+/// `send`/`noteWrittenLocally` are the two bound methods (`channel.send`,
+/// `watcher.noteWrittenLocally`) rather than the concrete `Channel`/
+/// `PasteboardWatcher` types themselves: both types are `final` classes
+/// with no test-observable hook into these specific calls (`Channel.send`
+/// only does anything once a real ssh pipe exists; nothing on either type
+/// records that it was invoked), so a test cannot substitute a spy for
+/// them directly. Passing the one function each call site actually needs
+/// makes both substitutable with a plain closure in a test, with no new
+/// protocol required for either. `pasteboard: PasteboardWriting` is that
+/// one new protocol, for the write side, per Pasteboard.swift.
+///
+/// See `Tests/clipwireTests/HandleFrameTests.swift` for the ordering
+/// assertions this exists to make possible.
+func handleFrame(
+    _ frame: Frame,
+    send: (Frame) -> Void,
+    noteWrittenLocally: (Data) -> Void,
+    pasteboard: PasteboardWriting,
+    status: AgentStatus,
+    log: Log
+) {
+    switch frame.type {
+    case .hello:
+        // Reply unconditionally, matched or not. `Channel` exposes no
+        // way to force-close the ssh process from here, so the peer
+        // noticing the SAME mismatch on its own side (it validates
+        // whatever hello it receives from us, exactly as we validate
+        // whatever it sends) and exiting is the only mechanism that
+        // actually drops the channel; withholding our reply on a
+        // mismatch would just leave it open with nothing to trigger
+        // the "channel closed" a user would expect. This also replaces
+        // the brief's one-shot `channel.send(hello)` called before
+        // `channel.run()` even starts: `Channel.send` looks up
+        // `stdinPipe` only when its queued write actually runs, and
+        // `stdinPipe` is set only inside `Channel.attempt`, which does
+        // not exist yet at that point in the brief's control flow --
+        // so that send is either silently dropped or wins a race that
+        // depends on GCD scheduling, and either way never fires again
+        // on a later reconnect. Sending here, in reaction to every
+        // received hello, fires exactly once per connection attempt,
+        // on every attempt, because `onFrame` is only ever invoked
+        // from inside `attempt()`'s read loop, which always runs after
+        // `stdinPipe` has already been assigned.
+        send(Frame(type: .hello, payload: ProtocolConstants.helloPayload))
+        guard let peer = decodeHello(frame.payload) else {
+            let reason = "malformed hello from peer — run `clipwire install`"
+            status.recordProtocolMismatch(reason)
+            log.line(reason)
+            return
+        }
+        guard peer.version == ProtocolConstants.version else {
+            let reason = "protocol mismatch: peer speaks \(peer.version), we speak "
+                + "\(ProtocolConstants.version) — run `clipwire install`"
+            status.recordProtocolMismatch(reason)
+            log.line(reason)
+            return
+        }
+        status.recordHelloMatched()
+        log.line("peer said hello (agent \(peer.agent ?? "unknown"))")
+    case .clip:
+        guard !frame.payload.isEmpty,
+              let text = String(data: frame.payload, encoding: .utf8) else { return }
+        // Arm suppression BEFORE writing to the pasteboard.
+        // PasteboardWatcher's lock keeps its own bookkeeping
+        // consistent, but it does not own this write, so only this
+        // ordering keeps the watcher from observing our write before
+        // the suppression exists and bouncing it straight back to the
+        // peer.
+        noteWrittenLocally(frame.payload)
+        pasteboard.writeText(text)
+        status.recordReceived()
     }
 }
 
@@ -173,8 +285,9 @@ func runAgent() -> Int32 {
     status.writeInitial()
 
     let channel = Channel(config: config, log: log)
+    let systemPasteboard = SystemPasteboard()
     let watcher = PasteboardWatcher(
-        pasteboard: SystemPasteboard(),
+        pasteboard: systemPasteboard,
         pollInterval: Double(config.macPollIntervalMs) / 1000.0)
 
     watcher.onChange = { payload in
@@ -183,58 +296,8 @@ func runAgent() -> Int32 {
     }
 
     channel.onFrame = { frame in
-        switch frame.type {
-        case .hello:
-            // Reply unconditionally, matched or not. `Channel` exposes no
-            // way to force-close the ssh process from here, so the peer
-            // noticing the SAME mismatch on its own side (it validates
-            // whatever hello it receives from us, exactly as we validate
-            // whatever it sends) and exiting is the only mechanism that
-            // actually drops the channel; withholding our reply on a
-            // mismatch would just leave it open with nothing to trigger
-            // the "channel closed" a user would expect. This also replaces
-            // the brief's one-shot `channel.send(hello)` called before
-            // `channel.run()` even starts: `Channel.send` looks up
-            // `stdinPipe` only when its queued write actually runs, and
-            // `stdinPipe` is set only inside `Channel.attempt`, which does
-            // not exist yet at that point in the brief's control flow --
-            // so that send is either silently dropped or wins a race that
-            // depends on GCD scheduling, and either way never fires again
-            // on a later reconnect. Sending here, in reaction to every
-            // received hello, fires exactly once per connection attempt,
-            // on every attempt, because `onFrame` is only ever invoked
-            // from inside `attempt()`'s read loop, which always runs after
-            // `stdinPipe` has already been assigned.
-            channel.send(Frame(type: .hello, payload: ProtocolConstants.helloPayload))
-            guard let peer = decodeHello(frame.payload) else {
-                let reason = "malformed hello from peer — run `clipwire install`"
-                status.recordProtocolMismatch(reason)
-                log.line(reason)
-                return
-            }
-            guard peer.version == ProtocolConstants.version else {
-                let reason = "protocol mismatch: peer speaks \(peer.version), we speak "
-                    + "\(ProtocolConstants.version) — run `clipwire install`"
-                status.recordProtocolMismatch(reason)
-                log.line(reason)
-                return
-            }
-            status.recordHelloMatched()
-            log.line("peer said hello (agent \(peer.agent ?? "unknown"))")
-        case .clip:
-            guard !frame.payload.isEmpty,
-                  let text = String(data: frame.payload, encoding: .utf8) else { return }
-            // Arm suppression BEFORE writing to the pasteboard.
-            // PasteboardWatcher's lock keeps its own bookkeeping
-            // consistent, but it does not own this write, so only this
-            // ordering keeps the watcher from observing our write before
-            // the suppression exists and bouncing it straight back to the
-            // peer.
-            watcher.noteWrittenLocally(frame.payload)
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-            status.recordReceived()
-        }
+        handleFrame(frame, send: channel.send, noteWrittenLocally: watcher.noteWrittenLocally,
+                    pasteboard: systemPasteboard, status: status, log: log)
     }
 
     channel.onStateChange = { state, reason in
