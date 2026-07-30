@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift build
+      - run: swift test
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 --version
+      - name: Byte-compile the agent
+        run: python3 -m compileall -q agent/clipwire-agent.py
+      - name: Unit tests
+        run: python3 -m unittest discover -s agent/tests -t agent -v
