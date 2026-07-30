@@ -586,14 +586,18 @@ jobs:
       - name: Byte-compile the agent
         run: python3 -m compileall -q agent/clipwire-agent.py
       - name: Unit tests
-        run: python3 -m unittest discover -s agent/tests -t agent -v
+        # No -t: agent/tests has no __init__.py, and unittest's discover
+        # requires an importable start dir whenever it differs from the top
+        # level. Verified: with -t agent this fails with
+        # "Start directory is not importable".
+        run: python3 -m unittest discover -s agent/tests -v
 ```
 
 Task 12 appends a self-test step to this job. It is deliberately absent here: adding a step that fails until a later task lands would leave CI red across several commits, which trains everyone to ignore it.
 
 - [ ] **Step 2: Verify locally what CI will run**
 
-Run: `swift test && python3 -m unittest discover -s agent/tests -t agent -v`
+Run: `swift test && python3 -m unittest discover -s agent/tests -v`
 Expected: both PASS.
 
 - [ ] **Step 3: Commit and confirm the run is green**
