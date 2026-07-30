@@ -7,8 +7,8 @@
 
 Two machines, one clipboard:
 
-- **Mac** — macOS Sequoia 15.7.4, LAN `192.168.1.34`
-- **PC** — Ubuntu 25.10, GNOME/Wayland, LAN `192.168.1.45`, **rebooted daily**
+- **Mac** — macOS Sequoia 15.7.4, LAN `192.168.1.11`
+- **PC** — Ubuntu 25.10, GNOME/Wayland, LAN `192.168.1.10`, **rebooted daily**
 
 Copy on one, paste on the other. No GUI. Two devices only.
 
@@ -46,7 +46,7 @@ These were measured, not assumed:
 |---|---|
 | Mac does not listen on SSH (port 22 closed; enabling Remote Login needs admin) | The Mac must initiate the connection. The PC cannot dial in. |
 | Mac → PC key auth works today; every key on the Mac is passphraseless | A launchd-spawned agent can use the existing key. `SSH_AUTH_SOCK` is irrelevant. |
-| No `anatoly-ubuntu` entry in `~/.ssh/config` — it resolves via router DNS, default username, and default identity order | Three implicit dependencies. The agent passes host, user and key explicitly. |
+| No `your-pc` entry in `~/.ssh/config` — it resolves via router DNS, default username, and default identity order | Three implicit dependencies. The agent passes host, user and key explicitly. |
 | `wl-clipboard` 2.2.1: `wl-paste --watch` reports *"Watch mode requires a compositor that supports the wlroots data-control protocol"* | No event-based clipboard watching on GNOME/Mutter out of the box. |
 | GPaste 45.3 daemon is active (`systemctl --user is-active org.gnome.GPaste`) | Its DBus signal is the event source, with polling as fallback. |
 | macOS Sequoia Local Network privacy gate does **not** block launchd-spawned processes or their children on 15.7.4 (verified with a live launchd experiment) | No foreground app or `nohup` workaround needed. Behaviour changed across 15.x, so re-check after macOS upgrades. |
@@ -209,9 +209,9 @@ only an example):
 
 ```json
 {
-  "host": "anatoly-ubuntu",
-  "fallback_ip": "192.168.1.45",
-  "user": "anatoly",
+  "host": "your-pc",
+  "fallback_ip": "192.168.1.10",
+  "user": "your-username",
   "identity_file": "~/.ssh/id_ed25519",
   "remote_agent_path": "~/.local/share/clipwire/clipwire-agent.py",
   "mac_poll_interval_ms": 400,

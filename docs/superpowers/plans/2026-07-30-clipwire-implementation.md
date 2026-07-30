@@ -770,7 +770,7 @@ Missing config is `.missing`, not `.invalid`: the agent must never fall back to 
 ```json
 {
   "host": "your-pc-hostname",
-  "fallback_ip": "192.168.1.45",
+  "fallback_ip": "192.168.1.10",
   "user": "your-username",
   "identity_file": "~/.ssh/id_ed25519",
   "remote_agent_path": "~/.local/share/clipwire/clipwire-agent.py",
@@ -2217,8 +2217,8 @@ final class ChannelTests: XCTestCase {
     }
 
     func testFallbackIPIsUsedAsAnAlternateHost() {
-        let args = sshArguments(for: config(fallback: "192.168.1.45"), host: "192.168.1.45")
-        XCTAssertTrue(args.contains("me@192.168.1.45"))
+        let args = sshArguments(for: config(fallback: "192.168.1.10"), host: "192.168.1.10")
+        XCTAssertTrue(args.contains("me@192.168.1.10"))
     }
 }
 ```
