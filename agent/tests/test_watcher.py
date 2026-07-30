@@ -85,6 +85,16 @@ class TestGPasteWatcherAvailability(unittest.TestCase):
         with mock.patch("subprocess.run", side_effect=error):
             self.assertFalse(GPasteWatcher().available())
 
+    def test_false_when_gdbus_is_not_executable(self):
+        """A gdbus present but not executable (wrong permissions, an
+        AppArmor denial) raises PermissionError at subprocess.run -- an
+        OSError, but not a FileNotFoundError. Mirrors the same class of
+        guard already fixed for wl-paste/wl-copy in test_clipboard.py;
+        uncaught here, this crashes selftest() instead of just reporting
+        GPaste unavailable."""
+        with mock.patch("subprocess.run", side_effect=PermissionError("denied")):
+            self.assertFalse(GPasteWatcher().available())
+
     def test_probes_the_bus_name_not_the_interface_name(self):
         """org.gnome.GPaste2 is the INTERFACE name, not the bus name.
         Probing it as --dest finds no owner on the target machine, which
@@ -401,6 +411,27 @@ class TestEchoBookkeeping(unittest.TestCase):
             agent._last_written, "the suppression must be consumed even on a match"
         )
 
+    def test_mismatched_echo_is_still_consumed(self):
+        """Consume-on-mismatch, pinned directly. This was a real defect
+        once (see EchoGuard's doc comment and its Swift mirror,
+        shouldSend): a suppression that only clears on a MATCH stays
+        armed forever once the watcher's one poll interval misses the
+        write's own change event and observes something else first --
+        silently swallowing the very next deliberate re-copy of the
+        original text. The suppression must be consumed by the first
+        observed change, whatever it is, not only by a matching one."""
+        agent = self.build(ready=True)
+        agent._write_clip(b"hello")
+        agent.clipboard.queue_read(b"something else")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(sent, [(TYPE_CLIP, b"something else")])
+        self.assertIsNone(
+            agent._last_written,
+            "the suppression must be consumed on a mismatch too, not only on a match",
+        )
+
     def test_fresh_agent_sends_a_genuine_local_change(self):
         agent = self.build(ready=True)
         agent.clipboard.queue_read(b"typed by the user")
@@ -473,6 +504,95 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
         self.assertEqual(sent, [])
+
+    # MARK: - _last_seen: persistent memory of what was last synced
+    #
+    # Final-review Finding 1: _local_change() used to decide "the user
+    # changed the clipboard" from *a signal fired* plus *content differs
+    # from the one-shot echo value* (_last_written/expected). With no
+    # memory of what was last synced, any signal that is not a real change
+    # -- a non-change GPaste Update (e.g. a history deletion), or a
+    # transient read() glitch in polling mode -- re-sends the current
+    # content even though nothing actually changed, and can race a real
+    # incoming write and clobber it. _last_seen is set in _write_clip
+    # (content arriving from the peer) and after a successful send
+    # (content leaving to the peer), and _local_change returns early
+    # whenever the freshly read text already matches it.
+
+    def test_non_change_signal_after_receiving_a_clip_produces_no_send(self):
+        """Failure A from the final review, receive side: "A" arrives from
+        the Mac (_write_clip). The watcher's own poll observes the echo of
+        that write (consuming _last_written) -- and then a LATER,
+        unrelated, non-change signal fires with the clipboard still
+        reading "A". _last_written is already spent, so only _last_seen
+        can recognize this as not a genuine change."""
+        agent = self.build(ready=True)
+        agent._write_clip(b"A")  # "A" arrived from the Mac
+        agent.clipboard.queue_read(b"A")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()  # the echo of our own write: consumed, no send
+        self.assertEqual(sent, [])
+
+        agent.clipboard.queue_read(b"A")  # a later, non-change signal
+        agent._local_change()
+        self.assertEqual(
+            sent, [],
+            "a non-change signal after the echo is already consumed must not "
+            "resend content already known to be in sync -- Failure A from the "
+            "final review",
+        )
+
+    def test_non_change_signal_after_a_send_produces_no_send(self):
+        """Failure A from the final review, send side: the PC itself sent
+        "A" earlier (a genuine local change). A later non-change signal
+        fires with the clipboard still reading "A" and nothing armed in
+        _last_written (never armed by an outgoing send in the first
+        place) -- only _last_seen, set after that earlier successful
+        send, can recognize this as not a genuine change."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"A")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()  # a genuine first sync of "A"
+        self.assertEqual(sent, [(TYPE_CLIP, b"A")])
+
+        agent.clipboard.queue_read(b"A")  # unchanged content, spurious signal
+        agent._local_change()
+        self.assertEqual(
+            sent, [(TYPE_CLIP, b"A")],
+            "a non-change signal must not resend content already known to be in sync",
+        )
+
+    def test_transient_read_glitch_does_not_cause_a_duplicate_send(self):
+        """Failure B from the final review: PollingWatcher's own
+        previous/current tracking is fooled by a transient read() that
+        returns None (e.g. a wl-paste timeout), which makes it treat the
+        next successful read of the SAME content as a change and fire
+        on_change() -- potentially on more than one tick. Without
+        _last_seen, _local_change has no way to recognize that content as
+        already synced and resends it every time it fires."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"A")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()  # "A" is now the known-synced value
+        self.assertEqual(sent, [(TYPE_CLIP, b"A")])
+
+        # PollingWatcher's read() returned None on a transient timeout, so it
+        # treats this tick's previous(A)->current(None) transition as a
+        # change and fires on_change() -- but _local_change's OWN read()
+        # call recovers immediately and sees "A" again, not None.
+        agent.clipboard.queue_read(b"A")
+        agent._local_change()
+        # The very next tick, the same recovery repeats.
+        agent.clipboard.queue_read(b"A")
+        agent._local_change()
+
+        self.assertEqual(
+            sent, [(TYPE_CLIP, b"A")],
+            "a transient read() glitch that recovers to the same content must not resend it",
+        )
 
 
 class RacyClipboard:

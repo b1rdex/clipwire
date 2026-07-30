@@ -151,6 +151,48 @@ class TestReadSubprocessBehavior(unittest.TestCase):
             "a PermissionError at spawn must be logged: %r" % self.log_lines,
         )
 
+    def test_repeated_timeout_logs_only_once_until_it_clears(self):
+        """The design promises this is logged once, not every few seconds
+        forever -- in polling mode, a hung selection owner makes every
+        tick's wl-paste time out, and an unconditional log line on every
+        occurrence would spam a line across the channel into the Mac's
+        log for as long as the hang lasts."""
+        clipboard = WaylandClipboard()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired("wl-paste", SUBPROCESS_TIMEOUT),
+        ):
+            clipboard.read()
+            clipboard.read()
+            clipboard.read()
+        self.assertEqual(
+            sum(1 for line in self.log_lines if "wl-paste" in line), 1,
+            "a repeated timeout must log once, not on every occurrence: %r" % self.log_lines,
+        )
+
+    def test_timeout_logs_again_after_a_successful_read_clears_it(self):
+        """Once the hang clears (a normal completed read, whatever its
+        return code), the condition has cleared -- a later, new timeout
+        is a fresh occurrence and must be logged again, not silenced
+        forever by the first one."""
+        clipboard = WaylandClipboard()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired("wl-paste", SUBPROCESS_TIMEOUT),
+        ):
+            clipboard.read()
+        with mock.patch("subprocess.run", return_value=self._completed(0, b"back")):
+            clipboard.read()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired("wl-paste", SUBPROCESS_TIMEOUT),
+        ):
+            clipboard.read()
+        self.assertEqual(
+            sum(1 for line in self.log_lines if "wl-paste" in line), 2,
+            "a new timeout after the condition clears must be logged again: %r" % self.log_lines,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

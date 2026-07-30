@@ -79,10 +79,19 @@ class Agent:
         self._watcher = None
         self._last_written = None
         self._write_gen = 0
-        # Guards _last_written/_write_gen only. A separate lock from
-        # _write_lock (which guards stdout) on purpose: nesting them would
-        # invite a deadlock later, and this one is held across nothing that
-        # ever blocks.
+        # Persistent memory of what was last synced between the two
+        # machines -- set in _write_clip (content arriving FROM the peer)
+        # and after a successful send in _local_change (content sent TO
+        # the peer). Unlike _last_written/_write_gen (a ONE-SHOT echo
+        # suppression, consumed by the very next observed change), this
+        # never expires on its own: it is what the Mac already holds,
+        # for as long as neither side has genuinely changed it. See
+        # _local_change for why a one-shot echo alone is not enough.
+        self._last_seen = None
+        # Guards _last_written/_write_gen/_last_seen only. A separate lock
+        # from _write_lock (which guards stdout) on purpose: nesting them
+        # would invite a deadlock later, and this one is held across
+        # nothing that ever blocks.
         self._echo_lock = threading.Lock()
 
     # --- outbound -------------------------------------------------------
@@ -162,6 +171,7 @@ class Agent:
         with self._echo_lock:
             self._last_written = payload
             self._write_gen += 1
+            self._last_seen = payload
         self.clipboard.write(payload)
 
     def _local_change(self):
@@ -175,6 +185,7 @@ class Agent:
         with self._echo_lock:
             expected = self._last_written
             gen = self._write_gen
+            last_seen = self._last_seen
 
         text = self.clipboard.read()
         if not text:
@@ -200,10 +211,28 @@ class Agent:
             return
         if text == expected:
             return
+        # _last_written/expected is a ONE-SHOT value: it is consumed by the
+        # very next observed change, whatever that change is (the block
+        # above), and is otherwise None. Signals here are deliberately
+        # unfiltered (a real GPaste Update can be a history deletion, not a
+        # clipboard change at all; a polling tick can follow a transient
+        # read() timeout that returned None instead of the real content) --
+        # so once the one-shot value is spent, ANY fired signal whose
+        # content merely differs from it looks like a fresh local change.
+        # _last_seen has no such expiry: it is what the peer already holds,
+        # for as long as neither side has genuinely changed it, and catches
+        # exactly the non-change signals the one-shot value cannot.
+        if text == last_seen:
+            return
         if len(text) > MAX_PAYLOAD_BYTES:
             log("skipping a clip of %d bytes: over the frame cap" % len(text))
             return
         self.send(TYPE_CLIP, text)
+        # Only after a successful send: if send() ever raises (e.g. a dead
+        # channel), _last_seen must not advance to content the peer never
+        # actually received.
+        with self._echo_lock:
+            self._last_seen = text
 
     # --- main loop --------------------------------------------------------
 
@@ -278,6 +307,15 @@ def clipboard_env(env=None):
 
 
 class WaylandClipboard:
+    def __init__(self):
+        # Set once a read() call times out (or otherwise fails as an
+        # OSError) and cleared the moment a call completes normally,
+        # whatever its returncode -- so a hung selection owner in polling
+        # mode logs the hang once, not once per tick for as long as it
+        # lasts, while a later, separate hang still gets its own
+        # first-occurrence log line once this one clears.
+        self._read_timeout_logged = False
+
     def ready(self):
         return os.path.exists(wayland_socket_path())
 
@@ -296,8 +334,11 @@ class WaylandClipboard:
             log("wl-paste is not installed")
             return None
         except (subprocess.TimeoutExpired, OSError) as error:
-            log("wl-paste failed: %r" % error)
+            if not self._read_timeout_logged:
+                log("wl-paste failed: %r" % error)
+                self._read_timeout_logged = True
             return None
+        self._read_timeout_logged = False
         if result.returncode != 0:
             return None
         return result.stdout or None
@@ -419,7 +460,7 @@ class GPasteWatcher:
                  "--object-path", GPASTE_OBJECT_PATH],
                 capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
             )
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+        except (subprocess.TimeoutExpired, OSError):
             return False
         return result.returncode == 0
 
