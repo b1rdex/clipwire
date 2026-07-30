@@ -90,9 +90,13 @@ reboot is a non-event — the Mac notices the channel died, waits, and dials aga
   `DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus`, falling back to
   `XDG_RUNTIME_DIR=/run/user/$(id -u)` when the variable is missing.
 - **Watcher** — Python has no stdlib DBus binding, so the agent spawns `gdbus monitor` as a
-  subprocess and parses its output line by line. GPaste emits
-  `Update(s action, s target, ...)` on `/org/gnome/GPaste`; **filter by `target`** — PRIMARY
-  selections fire on every mouse drag. Content is then read with `wl-paste -n`. If GPaste is
+  subprocess and parses its output line by line. Measured on the target machine (GPaste
+  45.3): the bus name is `org.gnome.GPaste` — `org.gnome.GPaste2` is the *interface* name on
+  that object, and probing it as a destination finds no owner — and a real line reads
+  `/org/gnome/GPaste: org.gnome.GPaste2.Update ('REPLACE', 'ALL', uint64 0)`. The target is
+  `ALL`, so **targets are not filtered**: doing so would reject every real signal, and the
+  values depend on GPaste's own settings. The signal means "something may have changed";
+  the content comparison decides. Content is read with `wl-paste -n`. If GPaste is
   unavailable, log once and degrade to polling `wl-paste -n` every second.
 - **Writer** — `wl-copy`, spawned **detached with its pipe fds closed**. `wl-copy` does not
   exit: it stays resident as the selection owner. Waiting on it hangs the agent.
