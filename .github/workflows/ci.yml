@@ -7,6 +7,7 @@ on:
 jobs:
   swift:
     runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
@@ -15,6 +16,7 @@ jobs:
 
   python:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: python3 --version

@@ -1,10 +1,10 @@
 # agent/tests/test_mainloop.py
-import contextlib
 import io
 import os
 import select
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import pathlib
@@ -50,13 +50,6 @@ def _read_exact(pipe, size, timeout):
             )
         data += chunk
     return bytes(data)
-
-
-def _safe_close(fd):
-    try:
-        os.close(fd)
-    except OSError:
-        pass
 
 
 class TestMainLoop(unittest.TestCase):
@@ -180,8 +173,19 @@ class ScriptedClipboard:
         value = self._script[min(self.calls, len(self._script) - 1)]
         self.calls += 1
         if self.calls > len(self._script):
-            os.close(self._write_fd)
+            self.close_write_end()
         return value
+
+    def close_write_end(self):
+        """Idempotent by design: the scripted end-of-run close (above) and
+        the test's own addCleanup both call this. Closing the same fd
+        *number* twice, from two places, is exactly how an unrelated fd
+        that the OS recycled in between gets closed by accident -- so this
+        tracks whether it already ran instead of relying on a caller to
+        know."""
+        if self._write_fd is not None:
+            os.close(self._write_fd)
+            self._write_fd = None
 
     def read(self):
         return None
@@ -203,10 +207,18 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             setattr, clipwire_agent, "CLIPBOARD_RECHECK_SECONDS", original_interval
         )
 
+        # run() calls the module-level log() by its bare name, resolved from
+        # clipwire_agent's globals at call time -- so replacing the module
+        # attribute captures every call, in whichever thread makes it,
+        # without touching the process-wide sys.stderr.
+        original_log = clipwire_agent.log
+        log_lines = []
+        clipwire_agent.log = log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
         read_fd, write_fd = os.pipe()
         stdin = os.fdopen(read_fd, "rb", buffering=0)
         self.addCleanup(stdin.close)
-        self.addCleanup(_safe_close, write_fd)
 
         # False, False, True, True, True, False, False: a multi-tick "ready"
         # run followed by a multi-tick "not ready" run, so a naive
@@ -214,23 +226,51 @@ class TestClipboardTransitionLogging(unittest.TestCase):
         clipboard = ScriptedClipboard(
             [False, False, True, True, True, False, False], write_fd
         )
+        self.addCleanup(clipboard.close_write_end)
         agent = Agent(stdin=stdin, stdout=io.BytesIO(), clipboard=clipboard)
 
-        captured = io.StringIO()
-        with contextlib.redirect_stderr(captured):
-            result = agent.run()
+        # This calls run() directly, not through a subprocess -- nothing
+        # external bounds it the way process.wait(timeout=...) bounds every
+        # test in TestMainLoop. A regression that dropped run()'s select()
+        # timeout would make clipboard.ready() (and the scripted
+        # close_write_end() that ends this test) unreachable: the loop would
+        # block in select() forever, stdin would never see EOF, and a bare
+        # `agent.run()` call here would hang this test -- and the whole
+        # suite -- rather than fail it. Run it in a daemon thread and bound
+        # the wait with join(timeout=...) so that regression fails fast
+        # instead. (The thread is left running, blocked, if this ever times
+        # out; being a daemon thread, it does not block interpreter exit.)
+        outcome = {}
+
+        def _call_run():
+            try:
+                outcome["result"] = agent.run()
+            except BaseException as error:  # pragma: no cover - surfaced below
+                outcome["error"] = error
+
+        runner = threading.Thread(target=_call_run, daemon=True)
+        runner.start()
+        runner.join(timeout=5)
+        self.assertFalse(
+            runner.is_alive(),
+            "run() did not return within 5s -- a regression likely dropped "
+            "the select() timeout, so the loop never reaches "
+            "clipboard.ready() and never notices stdin EOF",
+        )
+        if "error" in outcome:
+            raise outcome["error"]
 
         self.assertEqual(
-            result, 0, "run() must exit cleanly once the script ends and stdin closes"
-        )
-        log_output = captured.getvalue()
-        self.assertEqual(
-            log_output.count("clipboard is available"), 1,
-            "becoming ready must log once, not once per tick: %r" % log_output,
+            outcome.get("result"), 0,
+            "run() must exit cleanly once the script ends and stdin closes",
         )
         self.assertEqual(
-            log_output.count("clipboard went away"), 1,
-            "losing the clipboard must log once, not once per tick: %r" % log_output,
+            log_lines.count("clipboard is available"), 1,
+            "becoming ready must log once, not once per tick: %r" % log_lines,
+        )
+        self.assertEqual(
+            log_lines.count("clipboard went away, waiting for it to come back"), 1,
+            "losing the clipboard must log once, not once per tick: %r" % log_lines,
         )
         self.assertEqual(agent.phase, clipwire_agent.PHASE_PENDING)
 
