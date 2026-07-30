@@ -251,7 +251,10 @@ class WaylandClipboard:
         except BrokenPipeError:
             log("wl-copy closed its pipe early")
         finally:
-            process.stdin.close()  # hand off ownership; never wait()
+            try:
+                process.stdin.close()   # flushes; hand off ownership, never wait()
+            except OSError as error:
+                log("wl-copy went away before the clip was handed over: %r" % error)
 
 
 def _select_clipboard():
