@@ -51,12 +51,16 @@ def decode_frame(buffer):
 
 
 import json
+import os
+import select
 import sys
 import threading
 
 AGENT_VERSION = "0.1.0"
 PHASE_PENDING = "clipboard-pending"
 PHASE_READY = "ready"
+READ_CHUNK = 65536
+CLIPBOARD_RECHECK_SECONDS = 1.0
 
 
 def log(message):
@@ -104,6 +108,8 @@ class Agent:
             peer = json.loads(payload.decode())
         except (UnicodeDecodeError, ValueError):
             raise FrameError("malformed hello payload")
+        if not isinstance(peer, dict):
+            raise FrameError("malformed hello payload: not a JSON object")
         if peer.get("protocol") != PROTOCOL_VERSION:
             raise FrameError(
                 "protocol mismatch: peer speaks %r, this agent speaks %d — "
@@ -130,3 +136,89 @@ class Agent:
 
     def clipboard_lost(self):
         self.phase = PHASE_PENDING
+
+    # --- main loop --------------------------------------------------------
+
+    def run(self):
+        self.send_hello()
+        buffer = bytearray()
+        while True:
+            # select() with a timeout in EVERY phase. An agent that sleeps in a
+            # "wait for the Wayland socket" loop never reads stdin, never sees
+            # EOF, and lingers after the channel drops — so each Mac reconnect
+            # before login would leave another agent behind, and they would all
+            # race to write the clipboard once the session appears.
+            readable, _, _ = select.select([self.stdin], [], [], CLIPBOARD_RECHECK_SECONDS)
+
+            if readable:
+                chunk = os.read(self.stdin.fileno(), READ_CHUNK)
+                if not chunk:
+                    log("stdin closed, exiting")
+                    return 0
+                buffer += chunk
+                while True:
+                    frame = decode_frame(buffer)
+                    if frame is None:
+                        break
+                    self.on_frame(*frame)
+
+            was_ready = self.phase == PHASE_READY
+            is_ready = self.clipboard.ready()
+            if is_ready and not was_ready:
+                log("clipboard is available")
+                self.clipboard_became_ready()
+            elif was_ready and not is_ready:
+                log("clipboard went away, waiting for it to come back")
+                self.clipboard_lost()
+
+
+class NeverReadyClipboard:
+    """Test double selected by CLIPWIRE_FAKE_CLIPBOARD, so the main loop can be
+    exercised on a machine with no Wayland session — including CI."""
+
+    def ready(self):
+        return False
+
+    def read(self):
+        return None
+
+    def write(self, data):
+        pass
+
+
+class WaylandClipboard:
+    def ready(self):
+        return False
+
+    def read(self):
+        return None
+
+    def write(self, data):
+        pass
+
+
+def _select_clipboard():
+    if os.environ.get("CLIPWIRE_FAKE_CLIPBOARD") == "never-ready":
+        return NeverReadyClipboard()
+    return WaylandClipboard()
+
+
+def selftest():
+    return 0
+
+
+def main(argv):
+    if "--selftest" in argv:
+        return selftest()
+    agent = Agent(
+        stdin=sys.stdin.buffer, stdout=sys.stdout.buffer, clipboard=_select_clipboard()
+    )
+    try:
+        return agent.run()
+    except FrameError as error:
+        log("protocol error: %s" % error)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
