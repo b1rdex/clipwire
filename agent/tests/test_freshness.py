@@ -31,7 +31,11 @@ HASH_B = "bb" * 32
 
 
 def _pair(state):
-    """The (sha256, ts) shape both resolve_freshness and decode_clip_state share."""
+    """The (sha256, ts) shape resolve_freshness takes. Task 6 grew
+    decode_clip_state to a (sha256, ts, kind) triple, and deliberately did
+    NOT grow resolve_freshness to match (see its own docstring) -- so this
+    stays a 2-tuple, matching fixtures/freshness.json's rows, which are
+    (and must remain) kind-less by design."""
     return state["sha256"], state["ts"]
 
 
