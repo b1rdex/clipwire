@@ -732,7 +732,7 @@ final class HandleFrameTests: XCTestCase {
         try store.save(ClipState(sha256: sha256Hex(Data("same".utf8)), ts: 555))
         var sent: [Frame] = []
 
-        announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, now: 999_999)
+        announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 999_999)
 
         XCTAssertEqual(sent.count, 1)
         let decoded = try ClipState.decodePayload(sent[0].payload)
@@ -746,7 +746,7 @@ final class HandleFrameTests: XCTestCase {
         try store.save(ClipState(sha256: "some-other-hash-entirely", ts: 111))
         var sent: [Frame] = []
 
-        announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, now: 999_999)
+        announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 999_999)
 
         let decoded = try ClipState.decodePayload(sent[0].payload)
         XCTAssertEqual(decoded.ts, 999_999, "content changed while apart -- only now is honest")
@@ -760,7 +760,7 @@ final class HandleFrameTests: XCTestCase {
         pasteboard.textToRead = Data("fresh content".utf8)
         let store = tempClipStateStore()
 
-        announceClipState(send: { _ in }, pasteboard: pasteboard, clipStateStore: store, now: 42)
+        announceClipState(send: { _ in }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 42)
 
         XCTAssertEqual(store.load(), ClipState(sha256: sha256Hex(Data("fresh content".utf8)), ts: 42))
     }
@@ -785,8 +785,64 @@ final class HandleFrameTests: XCTestCase {
         var sent: [Frame] = []
 
         announceClipState(send: { sent.append($0) }, pasteboard: pasteboard,
-                          clipStateStore: unsaveableStore, now: 1)
+                          clipStateStore: unsaveableStore, log: tempLog(), now: 1)
 
         XCTAssertEqual(sent.count, 1, "a local disk failure must not prevent the announcement from going out")
+    }
+
+    // MARK: - Final wave: a failed save is logged, on all three Swift sites
+
+    /// A plain file occupying the name where the store needs a directory,
+    /// so `save()`'s very first step (`createDirectory`) throws for real
+    /// rather than being mocked. Asserts the setup itself before returning,
+    /// so a future change to `save()` that stopped failing here could not
+    /// leave these tests silently proving nothing.
+    private func unsaveableStore() throws -> ClipStateStore {
+        let blockingFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-handleframe-test-blocker-\(UUID().uuidString)")
+        try Data("occupying this name".utf8).write(to: blockingFile)
+        let store = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
+        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1)),
+                             "test setup must actually force a save failure, or this test proves nothing")
+        return store
+    }
+
+    private func persistFailures(at path: String) -> [String] {
+        loggedMessages(at: path).filter { $0.hasPrefix("could not persist clip state: ") }
+    }
+
+    /// All three of `agent/clipwire-agent.py`'s own `save_clip_state` call
+    /// sites log `could not persist clip state: %r`; all three Swift ones
+    /// were bare `try?`. The asymmetry matters because the silent side is
+    /// the one whose disk failure is the PRECONDITION for a store-goes-stale
+    /// clobber: with nothing on disk, the next reconciliation re-derives an
+    /// age from `now` and wins a comparison it should have lost.
+    func testAnnounceClipStateLogsAFailedSave() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("still send this".utf8)
+
+        announceClipState(send: { _ in }, pasteboard: pasteboard,
+                          clipStateStore: try unsaveableStore(), log: log, now: 1)
+
+        log.flush()
+        XCTAssertEqual(persistFailures(at: path).count, 1,
+                       "the announce path's failed save must not be silent")
+    }
+
+    func testAnAppliedClipLogsAFailedSave() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 424242, text: "peer's clip").encode()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: try unsaveableStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        XCTAssertEqual(persistFailures(at: path).count, 1,
+                       "an applied clip whose state cannot be persisted must not be silent")
     }
 }

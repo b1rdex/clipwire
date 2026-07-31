@@ -314,6 +314,32 @@ final class ClipStateAnnouncement {
     }
 }
 
+/// Saves, and logs rather than swallowing if it cannot. Every one of this
+/// file's three `clipStateStore.save` calls goes through here.
+///
+/// The line matches the text all three of `agent/clipwire-agent.py`'s own
+/// `save_clip_state` call sites already log (`could not persist clip state:
+/// %r`), the way the two "over the frame cap" lines and the two skew lines
+/// already match. All three Swift sites were bare `try?`, which mattered
+/// specifically because the silent side is the one whose disk failure is the
+/// PRECONDITION for a store-goes-stale clobber: with nothing readable on
+/// disk, the next reconciliation re-derives an age from `now` and wins a
+/// comparison it should have lost, which is the failure the persistent store
+/// exists to prevent.
+///
+/// One function rather than three copies of the same `do/catch`: three
+/// identical literals in one file is exactly the drift this project has
+/// already been bitten by, and `ClipStateStore.save` deliberately throws so
+/// that a CALLER can log -- it just should not be three callers writing the
+/// string out independently.
+func persistClipState(_ state: ClipState, to store: ClipStateStore, log: Log) {
+    do {
+        try store.save(state)
+    } catch {
+        log.line("could not persist clip state: \(error)")
+    }
+}
+
 /// Builds and sends this side's one-shot clip-state announcement: reconciles
 /// whatever the pasteboard currently holds against the persistent store (so
 /// unchanged content keeps its true recorded age instead of looking freshly
@@ -329,10 +355,11 @@ func announceClipState(
     send: (Frame) -> Void,
     pasteboard: PasteboardReading,
     clipStateStore: ClipStateStore,
+    log: Log,
     now: Double
 ) {
     let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: clipStateStore.load(), now: now)
-    try? clipStateStore.save(resolved)
+    persistClipState(resolved, to: clipStateStore, log: log)
     guard let payload = try? resolved.encodePayload() else { return }
     send(Frame(type: .clipState, payload: payload))
 }
@@ -420,7 +447,8 @@ func handleFrame(
         // ever arrives once: `wireAgent` resets it on the next
         // `.clipboardPending`, so it re-arms on every reconnect.
         if clipStateAnnouncement.markSent() {
-            announceClipState(send: send, pasteboard: pasteboard, clipStateStore: clipStateStore, now: now)
+            announceClipState(send: send, pasteboard: pasteboard, clipStateStore: clipStateStore,
+                              log: log, now: now)
         }
     case .clipState:
         guard let peerState = try? ClipState.decodePayload(frame.payload) else { return }
@@ -505,7 +533,8 @@ func handleFrame(
         // travels in the frame. Stamping it with `now` would make applied
         // content look freshly copied here and win the next
         // reconciliation against the machine it actually came from.
-        try? clipStateStore.save(ClipState(sha256: sha256Hex(textData), ts: decoded.ts))
+        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts),
+                         to: clipStateStore, log: log)
         status.recordReceived()
     }
 }
@@ -532,7 +561,8 @@ func wireAgent(
         // save must happen regardless of whether the send below ever reaches
         // the peer (no channel yet, or the write fails): the store's job is
         // "what do we hold and how old is it", independent of delivery.
-        try? clipStateStore.save(ClipState(sha256: sha256Hex(payload), ts: observedAt))
+        persistClipState(ClipState(sha256: sha256Hex(payload), ts: observedAt),
+                         to: clipStateStore, log: log)
         let text = String(decoding: payload, as: UTF8.self)
         let framePayload = ClipPayload(ts: observedAt, text: text).encode()
         channel.send(Frame(type: .clip, payload: framePayload), onSent: { sent in

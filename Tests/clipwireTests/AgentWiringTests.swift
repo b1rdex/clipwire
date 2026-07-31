@@ -193,4 +193,45 @@ final class AgentWiringTests: XCTestCase {
                        "otherwise the announcement fires on the process's first connection ever and " +
                        "never again, which defeats the entire feature")
     }
+
+    /// The third of the three Swift `clipStateStore.save` sites, and the
+    /// only one that lives in `wireAgent` rather than `handleFrame` (the
+    /// other two are pinned in HandleFrameTests). All three of the PC
+    /// agent's own `save_clip_state` calls already log
+    /// `could not persist clip state: %r`; these three were bare `try?`.
+    /// The asymmetry matters because the silent side is the one whose disk
+    /// failure is the precondition for a store-goes-stale clobber.
+    func testALocalChangeLogsAFailedSave() throws {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-wiring-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        let blockingFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-wiring-test-blocker-\(UUID().uuidString)")
+        try Data("occupying this name".utf8).write(to: blockingFile)
+        // A plain file where the store needs a directory, so `save()`'s own
+        // first step throws for real instead of being mocked.
+        let store = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
+        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1)),
+                             "test setup must actually force a save failure, or this test proves nothing")
+
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        wireAgent(channel: Channel(config: config(), log: tempLog()), watcher: watcher,
+                  pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                  log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+
+        // Drives the closure `wireAgent` actually installed, rather than a
+        // stand-in -- the point is that THIS wiring logs, not that some
+        // equivalent code would.
+        watcher.onChange?(Data("a local copy".utf8), 5)
+
+        log.flush()
+        let contents = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        let messages = contents.split(separator: "\n").map {
+            String($0.drop(while: { $0 != " " }).dropFirst())
+        }
+        XCTAssertEqual(messages.filter { $0.hasPrefix("could not persist clip state: ") }.count, 1,
+                       "an observed local change whose state cannot be persisted must not be silent")
+    }
 }
