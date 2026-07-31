@@ -718,6 +718,13 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def encode_clip_payload",
             "def decode_clip_payload",
             "TYPE_CLIP_STATE = 0x02",
+            "class ClipStateError",
+            "def encode_clip_state",
+            "def decode_clip_state",
+            "def resolve_freshness",
+            'SEND_MINE = "sendMine"',
+            'WAIT_FOR_PEER = "waitForPeer"',
+            'DO_NOTHING = "doNothing"',
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

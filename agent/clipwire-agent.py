@@ -73,6 +73,94 @@ def decode_clip_payload(payload):
 
 
 import json
+import math
+
+SEND_MINE = "sendMine"
+WAIT_FOR_PEER = "waitForPeer"
+DO_NOTHING = "doNothing"
+
+
+class ClipStateError(FrameError):
+    pass
+
+
+def encode_clip_state(sha256, ts):
+    """type-0x02 payload: {"sha256": <hex or null>, "ts": <float>}.
+
+    Refuses a non-finite ts (nan/inf/-inf) rather than emitting one: Python's
+    json.dumps would otherwise happily write a bare NaN/Infinity token that
+    is not valid JSON, which Swift's JSONDecoder rejects outright -- so a
+    non-finite ts stored locally would silently break the *peer's* handshake
+    instead of failing here, on the side that produced it.
+    """
+    if not math.isfinite(ts):
+        raise ClipStateError("refusing to encode a non-finite ts: %r" % ts)
+    return json.dumps({"sha256": sha256, "ts": ts}).encode()
+
+
+def decode_clip_state(payload):
+    """Inverse of encode_clip_state. Raises ClipStateError — a FrameError,
+    so main()'s existing `except FrameError` closes the connection exactly
+    as a malformed hello does — on anything that is not a well-formed
+    {"sha256": <str or null>, "ts": <finite number>} object.
+
+    The finiteness check is the load-bearing part: json.loads, unlike
+    Swift's JSONDecoder, accepts a bare NaN/Infinity/-Infinity and hands
+    back a float that compares False against everything (nan > x, nan < x,
+    and nan == nan are all False). Silently letting that reach
+    resolve_freshness would compare a non-finite ts against a real one and
+    send the decision somewhere neither side expects — so it is rejected
+    here, before the value ever reaches a comparison, rather than compared.
+    """
+    try:
+        parsed = json.loads(payload.decode())
+    except (UnicodeDecodeError, ValueError):
+        raise ClipStateError("malformed clip-state payload")
+    if not isinstance(parsed, dict):
+        raise ClipStateError("malformed clip-state payload: not a JSON object")
+    sha256 = parsed.get("sha256")
+    if sha256 is not None and not isinstance(sha256, str):
+        raise ClipStateError("malformed clip-state payload: sha256 must be a string or null")
+    ts = parsed.get("ts")
+    if not isinstance(ts, (int, float)):
+        raise ClipStateError("malformed clip-state payload: ts must be a number")
+    if not math.isfinite(ts):
+        raise ClipStateError("malformed clip-state payload: ts must be finite, got %r" % ts)
+    return sha256, float(ts)
+
+
+def resolve_freshness(mine, peer):
+    """Decides which side sends once both have announced what they hold.
+
+    `mine` and `peer` are (sha256, ts) pairs -- the same shape
+    decode_clip_state returns. Mirrors Sources/clipwire/Freshness.swift's
+    resolveFreshness one branch at a time, including the tie-break, so the
+    two files read side by side as one formula rather than a mirrored pair
+    of conditions: mirrored conditions drifting apart has already bitten
+    this project twice.
+
+    Timestamps are never compared when either hash is None: that comparison
+    is exactly what would put a float next to a None and raise TypeError,
+    taking this agent down on every handshake with an empty clipboard --
+    which is to say after every PC reboot.
+    """
+    mine_hash, mine_ts = mine
+    peer_hash, peer_ts = peer
+    if mine_hash is None and peer_hash is None:
+        return DO_NOTHING
+    if mine_hash is None:
+        return WAIT_FOR_PEER
+    if peer_hash is None:
+        return SEND_MINE
+    if mine_hash == peer_hash:
+        return DO_NOTHING
+    if mine_ts > peer_ts:
+        return SEND_MINE
+    if mine_ts < peer_ts:
+        return WAIT_FOR_PEER
+    return SEND_MINE if mine_hash > peer_hash else WAIT_FOR_PEER
+
+
 import os
 import select
 import sys
