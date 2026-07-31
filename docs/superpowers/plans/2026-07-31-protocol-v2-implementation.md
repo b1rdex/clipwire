@@ -301,11 +301,16 @@ Keep the existing structure. Replace the type-1 cases so their payloads carry a 
     {"name": "emoji-clip",   "type": 1, "payload_hex": "3ff0000000000000f09f94a5",                 "frame_hex": "0000000c013ff0000000000000f09f94a5"},
     {"name": "nfd-clip",     "type": 1, "payload_hex": "3ff000000000000065cc81",                   "frame_hex": "0000000b013ff000000000000065cc81"},
     {"name": "crlf-clip",    "type": 1, "payload_hex": "3ff0000000000000610d0a62",                 "frame_hex": "0000000c013ff0000000000000610d0a62"},
-    {"name": "hello",        "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"},
-    {"name": "clip-state-null", "type": 2, "payload_hex": "7b22736861323536223a6e756c6c7d",        "frame_hex": "0000000f027b22736861323536223a6e756c6c7d"}
+    {"name": "hello",        "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"}
   ]
 }
 ```
+
+No clip-state case appears here: type `0x02` is not registered until Task 4, so a vector
+for it would crash the Swift envelope test on an unknown raw value and raise
+`UnknownFrameType` in Python. Task 4 adds it, **decode-only** — the same treatment `hello`
+already gets, because JSON key order and float formatting differ between the two languages
+and a byte-exact vector would fail for reasons unrelated to the protocol.
 
 The `nfd-clip` and `crlf-clip` cases are deliberate: they pin that the codec passes a decomposed character and a CRLF through untouched, which is the byte-level half of the representation-fidelity concern.
 
@@ -342,7 +347,14 @@ git commit -m "Update golden vectors for protocol v2 clip payloads and clip-stat
 
 - [ ] **Step 1: Write the failing tests**
 
-In each language, assert: the new type's raw value is `0x02`; a frame of that type round-trips; `PROTOCOL_VERSION == 2`; and a hello payload contains `sent_at` as a number. Pin the raw values directly — `FrameType.clipState.rawValue == 0x02` and `TYPE_CLIP_STATE == 0x02` — for the same reason the other two are pinned: the fixtures route raw bytes through and cannot detect a relabelling.
+Add the clip-state vector to `fixtures/frames.json` here, where the type finally exists, and
+assert it **decode-only** in both suites: given
+`{"sha256": null, "ts": 1.0}` encoded as a type-2 frame, each side must decode it to type 2
+and a payload that parses to those values. Do not compare encoded bytes — key order and float
+formatting differ between the languages, and `hello` is already treated this way for the same
+reason.
+
+Then, in each language, assert: the new type's raw value is `0x02`; a frame of that type round-trips; `PROTOCOL_VERSION == 2`; and a hello payload contains `sent_at` as a number. Pin the raw values directly — `FrameType.clipState.rawValue == 0x02` and `TYPE_CLIP_STATE == 0x02` — for the same reason the other two are pinned: the fixtures route raw bytes through and cannot detect a relabelling.
 
 - [ ] **Step 2: Run to verify they fail**
 
