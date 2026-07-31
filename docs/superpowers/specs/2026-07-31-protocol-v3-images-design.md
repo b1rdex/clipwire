@@ -100,19 +100,36 @@ This removes **both** candidate mechanisms by construction rather than by diagno
 no longer takes the lock and no longer runs code that can throw. That is why the design does
 not gate on establishing which one it was.
 
-**Diagnosis stays anyway, permanently**, as insurance against a third mechanism:
+**The worker must not become the new blind spot.** Moving the handler out of the pump moves
+the hazard with it: a worker that dies leaves the pump alive and the counter climbing, so the
+safety net — whose criterion reads the counter — stays silent forever while sync is dead. That
+is the same defect one layer down. The rule:
 
-- The worker wraps its handler call and logs a traceback prefixed `observer died` if it ever
-  exits. A thread dying silently is a defect in its own right.
-- The safety net's verdict line gains `signals`, `signals_at_last_tick` and `pump_alive`, so
-  the next occurrence is diagnosable from the log alone.
+- **Non-fatal exceptions**: log `observer error` with the traceback and continue the loop. A
+  single observation is disposable; the next one re-reads the clipboard anyway.
+- **Fatal ones** — `BrokenPipeError`, a closed stdout — bring the whole agent down, mirroring
+  v1's rule for stdin EOF. The agent is one process per connection by design; exiting is how
+  it reports a dead channel.
+
+**Diagnosis stays permanently**, as insurance against a mechanism nobody has named yet:
+
+- The safety net's verdict line gains `signals`, `signals_at_last_tick`, `pump_alive` and
+  `worker_alive`. With those four fields the next occurrence is diagnosable from the log alone,
+  which this one was not.
 - The verdict's wording stops asserting a cause it cannot know. It currently blames the
   gnome-shell extension; it must report what was observed — signals absent while content
-  changed — and name the extension as one possible cause among others.
+  changed — and offer the extension as one possible cause among others.
 
 **The leak fix:** spawn `gdbus` with `prctl(PR_SET_PDEATHSIG, SIGTERM)` via `ctypes` in a
-`preexec_fn`. The kernel then kills the child whenever the agent dies, including `SIGKILL`
-from `sshd`. `stop()` keeps its `terminate()`; it stops being the only defence.
+`preexec_fn`, then re-check `os.getppid()` in the same `preexec_fn` — if the parent already
+died between the `fork` and the `prctl` call, the signal will never arrive and the child must
+exit itself. The kernel then kills the child whenever the agent dies, including `SIGKILL` from
+`sshd`. `stop()` keeps its `terminate()`; it stops being the only defence.
+
+**Read timeouts get room for images.** `SUBPROCESS_TIMEOUT` is 3 seconds, chosen for text, and
+text reads have already been observed timing out at that bound in production. A 4 MiB image
+through a pipe needs more: image reads get 5–10 seconds, and every read logs its duration so
+the next time this bound is wrong there is evidence rather than a guess.
 
 ## Part 2 — images
 
@@ -158,14 +175,62 @@ A new frame type `0x03`, image-clip, payload `[f64 big-endian ts][PNG bytes]` �
 timestamp-first shape as the text clip, for the same reason: the receiver must record the
 peer's timestamp for content it applies.
 
-**Only `image/png` crosses the wire.** macOS screenshots land on the pasteboard as TIFF, which
-the Mac converts natively via `NSBitmapImageRep`. The PC has nothing in the standard library
-to convert with, so any other `image/*` type is skipped with a log naming the type — a JPEG
-copied from a file manager will not sync, and the README must say so.
+**Only `image/png` crosses the wire**, and on the PC that costs nothing: GPaste re-offers
+whatever image it holds in a long list of types — measured on the live machine as `image/png`,
+`image/webp`, `image/tiff`, `image/jpeg`, `image/bmp`, `image/avif`, `image/jxl` and more — so
+the agent always requests `image/png` and always gets it. A JPEG copied from a file manager
+was verified to read back as 307,946 bytes of valid PNG. There is no format-skip path on the
+PC and the README must not promise one.
 
-Hashes and echo suppression are computed over the **final PNG bytes actually written and read
-back**, never over a pre-conversion representation. Hashing either side of a re-encode makes
-the two machines disagree about identical content and starts a ping-pong.
+macOS is where the conversion lives: screenshots land on the pasteboard as TIFF, which the Mac
+converts via `NSBitmapImageRep`.
+
+### The clipboard is not a faithful store — hash what you read, never what you wrote
+
+Measured on the live machine, writing a 105,700-byte PNG to the PC's clipboard:
+
+| When | sha256 (first 16) | Size |
+|---|---|---|
+| written | `0f22396b3f46ee45` | 105,700 |
+| read back at t+1s | `0f22396b3f46ee45` | 105,700 |
+| read back at t+4s | `09feee69b989fcab` | **180,287** |
+| read back at t+7s | `09feee69b989fcab` | 180,287 |
+
+GPaste takes over selection ownership a few seconds after the write and **re-encodes the
+image**. The result is stable afterwards, but it is not what was written, and it was 70%
+larger. The same probe on text returns the written bytes unchanged.
+
+This is the same disease as `trim-items`, which silently stripped whitespace and looked like a
+sync bug: **the clipboard does not necessarily hold what you put in it.**
+
+Two failures follow if the hash is taken from what was written:
+
+1. **A guaranteed extra round trip on every screenshot Mac→PC.** The PC writes PNG₀ (hash A),
+   GPaste re-offers PNG₁ (hash B), which raises an `Update`; the worker reads B, does not
+   recognise it as our own write, and sends up to 4 MiB straight back. It converges in one
+   round because the re-offer is stable, but it wastes the transfer and replaces the Mac's
+   clipboard with a re-encoded copy every time.
+2. **A systematic false `clipboard changed while apart`.** The store holds hash A while the
+   clipboard offers B, so *every* reconnect — that is, every Mac wake — sees a mismatch,
+   stamps `ts = now`, and lets a stale image win reconciliation against anything, including
+   fresher text on the Mac. That is a direct corruption of freshness, the exact class v2 was
+   built to close.
+
+**The invariant, one line:** every hash that reaches `_last_seen`, the echo guard, the
+persistent store or a clip-state frame is the hash of bytes **read from the clipboard**, never
+of bytes handed to the write tool. For text the two coincide; for images on the PC they
+provably do not.
+
+**The mechanism must not depend on guessing when the takeover lands.** The measurement above
+puts it between one and four seconds, and that is one observation on one machine — a fixed
+sleep would be a race dressed as a constant. Instead the PC consumes **the first subsequent
+image-kind observation as its own re-offer**: it records the read-back hash and does not send.
+This mirrors the echo guard's existing rule, which is consumed by the first observed change
+whatever it is, and which exists because a match-only version was a real v1 defect.
+
+**Size is checked after the read-back, not before the write.** A 105 KB image became 180 KB;
+an image near the 4 MiB limit can cross it on re-encode. The limit applies to what will
+actually be hashed and sent.
 
 ### The size limits must be separated
 
@@ -193,17 +258,54 @@ kind before the feature is correct:
   reboot, reconciliation would send the wrong thing — or nothing.
 - **Clip-state and the persistent store carry a hash and a timestamp, but no kind.** A hash
   alone cannot tell the two sides what they are agreeing about.
-- **`_last_seen` holds and compares text.** For images it must hold a hash: keeping 4 MiB of
-  pixels resident to answer "did this change" is the wrong trade.
+- **`_last_seen` holds and compares text.** It becomes `(kind, hash)` for **both** kinds — not
+  text compared by value and images by hash. Two comparison branches is exactly the mirrored
+  drift this project has been bitten by twice; one rule for both costs nothing and keeps 4 MiB
+  of pixels out of memory.
 - **"Bytes that are not valid UTF-8" is currently an error path** that logs and drops. It
   becomes, in part, the signal that the clipboard holds an image.
+- **The startup seed** — `resolveCurrentClipState` / `resolve_current_clip_state` — reads the
+  clipboard to decide whether it changed while the agent was away. It must read the same way
+  every other path does, or a reconnect with an image on the clipboard misreports.
+- **The size guards are per-kind now.** Two limits exist; whichever guard runs must pick by
+  kind rather than assume text.
 - **The polling fallback reads the whole clipboard body every tick.** Reading 4 MiB every
-  400 ms is not acceptable; in degraded mode the image body must be checked less often — off a
-  change in `wl-paste --list-types` rather than the content itself — with the added latency
-  documented.
+  400 ms is not acceptable; in degraded mode the image body must be checked off a change in
+  `wl-paste --list-types` rather than the content itself, with the added latency documented.
 
-Anyone decomposing this into tasks should grep both implementations for `text` and `readText`
-first, and treat the result as the task list.
+Grep both implementations for `text` and `readText` and treat the result as the starting task
+list — but note that the three rules below are behaviour, not identifiers, and grep will not
+find them.
+
+### Three rules the implementers would otherwise each invent differently
+
+**One canonical clipboard read.** A single function, used by the watcher, the startup seed,
+`clipboard_became_ready` and the reconciliation send branch alike: list the types, prefer
+`text/plain`, fall back to `image/png`, and return `(kind, bytes)`. Today the read order is
+written down only for the degraded path, which is how four call sites end up with four
+answers.
+
+**Clip-state and the store carry the kind.** Frame `0x02`'s JSON gains a `kind` field
+(`"text"` or `"image"`, `null` when the hash is null), and the persistent store gains the same.
+This is a wire change and belongs with `0x03`, with golden vectors covering both kinds and the
+null row — the vectors are what have kept the two codecs honest through two protocol versions.
+
+**The send branch verifies before it sends.** When reconciliation resolves to send, read the
+content of the kind recorded in `mine`, hash what was read, and compare it against
+`mine.sha256`. On a mismatch, send nothing and log: the clipboard changed between the
+announcement and the send, and the watcher will carry the new content on its own. Without this
+rule the branch sends whatever it happens to find under the announced timestamp — the wrong
+kind, at a stale age, which is a clobber the receiver cannot detect.
+
+### Freshness needs no kind, but the log does
+
+The resolution formula is unchanged and needs no notion of kind: SHA-256 of text and of a PNG
+will not collide, so "hashes equal → do nothing" stays safe, differing hashes are decided by
+timestamp, and the hex tie-break works across kinds exactly as it does within one.
+
+The **log line** does need it. `reconciled with the peer: sendMine` with both sides holding
+different kinds is undiagnosable after the fact — "why did a picture overwrite my text" has no
+answer in the current line. Both sides' kinds go into it.
 
 ### Secrets
 
@@ -236,18 +338,30 @@ bug fix, which is why it is scoped as v3.1 rather than folded in here.
 
 The v2 checklist still applies in full. New items:
 
-1. **Screenshot each direction.** Byte-identical PNG on arrival, one round per clip in the log.
-2. **Spreadsheet copy.** Select cells in a spreadsheet and copy: **text** must arrive, not a
+1. **Screenshot each direction.** The image arrives and opens. Mac→PC must show **one send and
+   zero image frames coming back** — that is the test for the re-encode echo rule, and it is
+   the item most likely to fail.
+2. **Reconnect after a screenshot Mac→PC.** Reconciliation must say `doNothing`, never
+   `clipboard changed while apart`. If it says the latter, the store is holding the written
+   hash instead of the read-back hash and every wake will clobber.
+3. **Spreadsheet copy.** Select cells in a spreadsheet and copy: **text** must arrive, not a
    picture of the table. This is the case that reversed the priority decision.
-3. **Oversized image.** An image above 4 MiB is skipped, and the log names the size.
-4. **Unsupported format.** A JPEG is skipped, and the log names the type.
-5. **No false degrade after a large transfer.** Send several images in succession and confirm
+4. **Re-copying the same screenshot sends nothing.** Copy one screenshot on the Mac twice. If
+   `NSBitmapImageRep`'s PNG encoding is not deterministic, this is the only place it surfaces.
+5. **Mixed-kind reconciliation.** With the channel dead, put an image on one machine and text
+   on the other, then reconnect. The fresher side must win, and the log line must name both
+   kinds.
+6. **Wake flow with an image.** Copy a screenshot on the PC with the Mac's agent stopped, then
+   start it. The screenshot must arrive — the v2 wake-flow test, now with the new kind.
+7. **Oversized image.** An image above 4 MiB is skipped, and the log names the size. Note that
+   re-encoding inflates: a source image comfortably under the limit can cross it.
+8. **No false degrade after large transfers.** Send several images in succession and confirm
    the safety net does not declare the event source dead — the defect this release fixes, made
    more likely by large payloads.
-6. **No orphaned children.** After several agent restarts,
+9. **No orphaned children.** After several agent restarts,
    `pgrep -f 'gdbus monitor.*GPaste'` returns exactly one process, owned by the live agent.
-7. **Degraded-mode image latency.** With the event path forced to polling, confirm an image
-   still arrives and note how long it takes.
+10. **Degraded-mode image latency.** With the event path forced to polling, confirm an image
+    still arrives and note how long it takes.
 
 ## What is deliberately unchanged
 
