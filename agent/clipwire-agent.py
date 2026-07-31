@@ -116,6 +116,29 @@ def encode_clip_state(sha256, ts):
     return json.dumps({"sha256": sha256, "ts": ts}).encode()
 
 
+def _is_sha256_hex(value):
+    """Exactly 64 characters of [0-9a-f] -- the shape, and the ONLY shape,
+    hashlib.sha256(...).hexdigest() produces and the wire contract allows.
+
+    This is not defensive typing; it is what keeps the cross-language
+    comparison valid. Both sides compare hashes with a plain ordering
+    operator, but they do not order strings the same way: Python orders by
+    code point, Swift's String by canonical Unicode equivalence. Those two
+    coincide over lowercase hex and nowhere else -- verified by execution,
+    not assumed: Python puts U+00C5 ABOVE the canonically equivalent
+    "A" + U+030A, while Swift calls those exact two strings EQUAL. A peer
+    announcing the composed form against a local decomposed one therefore
+    makes Swift resolve doNothing while this side resolves WAIT_FOR_PEER --
+    both sides wait, and the clip is lost with nothing logged on either
+    machine.
+
+    Checked with an explicit alphabet rather than int(value, 16), which
+    would accept uppercase, a leading sign, and "_" digit separators, or
+    str.isalnum()/isdigit(), which accept whole ranges of non-ASCII digits.
+    """
+    return len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
 def decode_clip_state(payload):
     """Inverse of encode_clip_state. Raises ClipStateError — a FrameError,
     so main()'s existing `except FrameError` closes the connection exactly
@@ -139,6 +162,10 @@ def decode_clip_state(payload):
     sha256 = parsed.get("sha256")
     if sha256 is not None and not isinstance(sha256, str):
         raise ClipStateError("malformed clip-state payload: sha256 must be a string or null")
+    if sha256 is not None and not _is_sha256_hex(sha256):
+        raise ClipStateError(
+            "malformed clip-state payload: sha256 must be 64 lowercase hex characters"
+        )
     ts = parsed.get("ts")
     if not isinstance(ts, (int, float)):
         raise ClipStateError("malformed clip-state payload: ts must be a number")

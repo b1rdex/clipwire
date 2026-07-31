@@ -73,11 +73,72 @@ final class FreshnessTests: XCTestCase {
     }
 
     func testClipStatePayloadRoundTrips() throws {
-        let withHash = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5)
+        // 64 lowercase hex: the only shape `decodePayload` accepts, and the
+        // only shape `sha256Hex` -- hence the wire -- ever produces.
+        let withHash = ClipState(sha256: String(repeating: "deadbeefcafe0123", count: 4),
+                                 ts: 1785400000.5)
         XCTAssertEqual(try ClipState.decodePayload(withHash.encodePayload()), withHash)
 
         let empty = ClipState(sha256: nil, ts: 0)
         XCTAssertEqual(try ClipState.decodePayload(empty.encodePayload()), empty)
+    }
+
+    /// The wire contract says `sha256` is `hexdigest()` output or null, and
+    /// the whole cross-language comparison rests on that domain: this side
+    /// orders hashes by canonical Unicode equivalence, the PC agent orders
+    /// them by code point, and the two coincide only over lowercase hex.
+    /// `testSwiftAndPythonOnlyAgreeOnHashOrderOverHex` below pins the
+    /// divergence this keeps out of reach.
+    func testDecodePayloadRejectsASHA256ThatIsNot64LowercaseHex() throws {
+        let bad = [
+            "",                                          // empty
+            "aa",                                        // too short
+            String(repeating: "0", count: 63),           // one short of the boundary
+            String(repeating: "0", count: 65),           // one past it
+            String(repeating: "A", count: 64),           // uppercase: hexdigest() never emits it
+            String(repeating: "g", count: 64),           // right length, outside the hex alphabet
+            String(repeating: "0", count: 63) + " ",     // trailing space
+            String(repeating: "\u{00C5}", count: 64),    // the composed character this exists for
+            "A\u{030A}" + String(repeating: "0", count: 62),  // its canonical decomposition
+        ]
+        for value in bad {
+            let payload = try ClipState(sha256: value, ts: 1).encodePayload()
+            XCTAssertThrowsError(try ClipState.decodePayload(payload),
+                                 "must reject a sha256 of \(value.debugDescription)") { error in
+                guard case ClipStateError.malformedSHA256 = error else {
+                    return XCTFail("expected .malformedSHA256, got \(error)")
+                }
+            }
+        }
+    }
+
+    /// The other half: the guard must not reject what the protocol actually
+    /// carries -- a real digest, and the null that means an empty or
+    /// unreadable clipboard.
+    func testDecodePayloadAcceptsARealDigestAndNull() throws {
+        let real = sha256Hex(Data("anything at all".utf8))
+        XCTAssertEqual(try ClipState.decodePayload(ClipState(sha256: real, ts: 1).encodePayload()).sha256,
+                       real)
+        XCTAssertNil(try ClipState.decodePayload(ClipState(sha256: nil, ts: 1).encodePayload()).sha256)
+    }
+
+    /// Why the guard above is not defensive typing. Pinned by execution
+    /// rather than argued from documentation: Swift's `String` compares by
+    /// canonical equivalence, so these two distinct byte sequences are EQUAL
+    /// here, while Python's `str` compares by code point and puts U+00C5
+    /// above "A" + U+030A. Feed both sides those two hashes with equal
+    /// timestamps and this side resolves `.doNothing` while the PC resolves
+    /// WAIT_FOR_PEER: both wait, and the clip is lost with nothing logged on
+    /// either machine. `resolveFreshness` is deliberately left domain-
+    /// agnostic -- one formula over valid input -- and the domain is enforced
+    /// at the decode boundary instead.
+    func testSwiftAndPythonOnlyAgreeOnHashOrderOverHex() {
+        XCTAssertEqual("\u{00C5}", "A\u{030A}",
+                       "Swift's String is canonically equivalent here; Python's str is not")
+        XCTAssertEqual(resolveFreshness(mine: ClipState(sha256: "A\u{030A}", ts: 1),
+                                        peer: ClipState(sha256: "\u{00C5}", ts: 1)),
+                       .doNothing,
+                       "this side sees agreement where the PC sees a conflict it expects US to lose")
     }
 
     /// `JSONEncoder` rejects a non-finite `Double` (`.nan`, `.infinity`,

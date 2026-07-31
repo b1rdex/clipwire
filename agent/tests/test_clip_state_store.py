@@ -19,6 +19,15 @@ from agent_under_test import (
 
 JOIN_TIMEOUT = 2  # generous relative to the millisecond-scale waits below
 
+# 64 lowercase hex characters: the only shape decode_clip_state accepts,
+# and the only shape hashlib.sha256(...).hexdigest() -- hence the wire --
+# ever produces. Obviously fake, but well-formed, so these tests exercise
+# the same path a real digest does instead of one the protocol forbids.
+# See _is_sha256_hex on why that validation exists at all. HASH_A sorts
+# below HASH_B, which resolve_freshness's hash tie-break depends on.
+HASH_A = "aa" * 32
+HASH_B = "bb" * 32
+
 
 class TestClipStatePath(unittest.TestCase):
     """Mirrors test_clipboard.py's TestEnvironment cases for runtime_dir:
@@ -58,13 +67,14 @@ class _TempPathCase(unittest.TestCase):
 
 class TestRoundTrip(_TempPathCase):
     def test_round_trip(self):
-        save_clip_state("deadbeefcafe", 1785400000.5, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), ("deadbeefcafe", 1785400000.5))
+        digest = "deadbeefcafe0123" * 4
+        save_clip_state(digest, 1785400000.5, path=self.path)
+        self.assertEqual(load_clip_state(path=self.path), (digest, 1785400000.5))
 
     def test_second_save_overwrites_the_first(self):
-        save_clip_state("aa", 1, path=self.path)
-        save_clip_state("bb", 2, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), ("bb", 2.0))
+        save_clip_state(HASH_A, 1, path=self.path)
+        save_clip_state(HASH_B, 2, path=self.path)
+        self.assertEqual(load_clip_state(path=self.path), (HASH_B, 2.0))
 
     def test_none_hash_round_trips(self):
         save_clip_state(None, 0, path=self.path)
@@ -92,7 +102,7 @@ class TestLoadNeverRaises(_TempPathCase):
 
     def test_file_missing_required_key_loads_as_none(self):
         with open(self.path, "wb") as handle:
-            handle.write(b'{"sha256": "aa"}')
+            handle.write(('{"sha256": "%s"}' % HASH_A).encode())
         self.assertIsNone(load_clip_state(path=self.path),
                            "valid JSON missing the required ts key is still not a clip state")
 
@@ -108,7 +118,7 @@ class TestLoadNeverRaises(_TempPathCase):
         different path through the standard library and needs its own
         test."""
         with open(self.path, "wb") as handle:
-            handle.write(b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}")
+            handle.write(('{"sha256": "%s", "ts": 1' % HASH_A).encode() + b"0" * 400 + b"}")
         self.assertIsNone(load_clip_state(path=self.path),
                            "an oversized ts must read as absent, not raise OverflowError")
 
@@ -119,21 +129,21 @@ class TestLoadNeverRaises(_TempPathCase):
         actually exercised a real tear, only argued from the shared
         atomic-write primitive -- pin the outcome directly here instead."""
         with open(self.path, "wb") as handle:
-            handle.write(b'{"sha256": "aa", "ts": 17')
+            handle.write(('{"sha256": "%s", "ts": 17' % HASH_A).encode())
         self.assertIsNone(load_clip_state(path=self.path),
                            "a write torn mid-JSON must read as absent, not raise")
 
 
 class TestSaveIsAtomic(_TempPathCase):
     def test_save_leaves_no_temp_file_behind(self):
-        save_clip_state("aa", 1, path=self.path)
+        save_clip_state(HASH_A, 1, path=self.path)
         self.assertFalse(os.path.exists(self.path + ".tmp"),
                           "the temp file used for the atomic replace must not linger")
 
     def test_save_creates_intermediate_directories(self):
         nested = os.path.join(self._tmp.name, "nested", "clip-state.json")
-        save_clip_state("aa", 1, path=nested)
-        self.assertEqual(load_clip_state(path=nested), ("aa", 1.0))
+        save_clip_state(HASH_A, 1, path=nested)
+        self.assertEqual(load_clip_state(path=nested), (HASH_A, 1.0))
 
 
 class TestSaveIsSerialized(_TempPathCase):
@@ -188,8 +198,8 @@ class TestSaveIsSerialized(_TempPathCase):
             if done is not None:
                 done.set()
 
-        first = threading.Thread(target=save, args=("aa", 1))
-        second = threading.Thread(target=save, args=("bb", 2),
+        first = threading.Thread(target=save, args=(HASH_A, 1))
+        second = threading.Thread(target=save, args=(HASH_B, 2),
                                   kwargs={"done": second_done})
         with mock.patch("os.replace", gated_replace):
             first.start()
@@ -348,7 +358,7 @@ class TestAnnounceClipState(unittest.TestCase):
         self.assertEqual(decoded[1], 555, "content unchanged since last recorded must keep its real age")
 
     def test_uses_now_when_content_changed_while_apart(self):
-        save_clip_state("some-other-hash-entirely", 111, path=self.path)
+        save_clip_state(HASH_B, 111, path=self.path)
         sent = []
 
         announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"new content"),
@@ -380,7 +390,7 @@ class TestAnnounceClipState(unittest.TestCase):
         unsaveable_path = os.path.join(blocker, "clip-state.json")
         # Confirm the setup actually forces a failure, or this test proves nothing.
         with self.assertRaises(OSError):
-            save_clip_state("aa", 1, path=unsaveable_path)
+            save_clip_state(HASH_A, 1, path=unsaveable_path)
 
         sent = []
         announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"still send this"),

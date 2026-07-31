@@ -44,6 +44,15 @@ JOIN_TIMEOUT = 2  # generous relative to the millisecond-scale intervals below
 GPASTE_UPDATE_LINE = ("/org/gnome/GPaste: org.gnome.GPaste2.Update "
                       "('REPLACE', 'ALL', uint64 0)")
 
+# 64 lowercase hex characters: the only shape decode_clip_state accepts,
+# and the only shape hashlib.sha256(...).hexdigest() -- hence the wire --
+# ever produces. Obviously fake, but well-formed, so these tests exercise
+# the same path a real digest does instead of one the protocol forbids.
+# See _is_sha256_hex on why that validation exists at all. HASH_A sorts
+# below HASH_B, which resolve_freshness's hash tie-break depends on.
+HASH_A = "aa" * 32
+HASH_B = "bb" * 32
+
 
 class TestGPasteSignalParsing(unittest.TestCase):
     def test_accepts_the_real_captured_signal(self):
@@ -1159,7 +1168,7 @@ class TestEchoBookkeeping(unittest.TestCase):
             handle.write(b"occupying this name")
         unsaveable_path = os.path.join(blocker, "clip-state.json")
         with self.assertRaises(OSError):
-            save_clip_state("aa", 1, path=unsaveable_path)
+            save_clip_state(HASH_A, 1, path=unsaveable_path)
 
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=True),
                       clip_state_path=unsaveable_path)
@@ -1452,7 +1461,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         unsaveable_path = os.path.join(blocker, "clip-state.json")
         # Confirm the setup actually forces a failure, or this test proves nothing.
         with self.assertRaises(OSError):
-            save_clip_state("aa", 1, path=unsaveable_path)
+            save_clip_state(HASH_A, 1, path=unsaveable_path)
 
         clipboard = OrderRecordingClipboard()
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
@@ -1678,12 +1687,18 @@ class TestIncomingClipState(unittest.TestCase):
         we wait. Conflating this with doNothing would be harmless here, but
         the point of a resend would be to CLOBBER a fresher peer -- exactly
         the defect this whole design exists to prevent."""
-        save_clip_state("aa", 5, path=self.clip_state_path)
-        agent = self.build()
+        save_clip_state(HASH_A, 5, path=self.clip_state_path)
+        # Real content on the clipboard, or a wrongly-resolved SEND_MINE
+        # would still send nothing (its first guard is a non-empty read)
+        # and this assertion would hold for the wrong reason. Mirrors
+        # HandleFrameTests.testLosingClipStateWithPeerFresherProducesNoSend.
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"something to wrongly send")
+        agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("bb", 9))  # peer fresher
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 9))  # peer fresher
 
         self.assertEqual(sent, [], "the peer is fresher -- we wait, we do not resend")
 
@@ -1691,12 +1706,16 @@ class TestIncomingClipState(unittest.TestCase):
         """resolve_freshness's doNothing outcome via equal hashes: "hashes
         equal" must mean "we agree", not "resend" -- conflating it with
         sendMine would ping-pong the same content back and forth forever."""
-        save_clip_state("aa", 5, path=self.clip_state_path)
-        agent = self.build()
+        save_clip_state(HASH_A, 5, path=self.clip_state_path)
+        # See the test above: without real content a wrongly-resolved
+        # SEND_MINE sends nothing anyway, and this would pass regardless.
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"something to wrongly send")
+        agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("aa", 999))  # same hash
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_A, 999))  # same hash
 
         self.assertEqual(sent, [], "hashes equal means we agree, not resend")
 
@@ -1706,7 +1725,7 @@ class TestIncomingClipState(unittest.TestCase):
         the PC was off). The resulting clip must carry OUR stored ts, not
         now -- resending with now would perpetually refresh its age and let
         it win every future reconciliation regardless of what happens next."""
-        save_clip_state("aa", 777, path=self.clip_state_path)
+        save_clip_state(HASH_A, 777, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
@@ -1743,7 +1762,7 @@ class TestIncomingClipState(unittest.TestCase):
         watcher does fire on non-changes (that is the entire reason
         _last_seen exists on this side at all), so the omission that is
         inert on the Mac is a real defect here."""
-        save_clip_state("aa", 777, path=self.clip_state_path)
+        save_clip_state(HASH_A, 777, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
@@ -1832,7 +1851,7 @@ class TestIncomingClipState(unittest.TestCase):
         reconciliation over content at or beyond the cap would build a
         frame that exceeds MAX_PAYLOAD_BYTES once wrapped -- the peer's
         decode_frame rejects that as oversized and drops the whole channel."""
-        save_clip_state("aa", 777, path=self.clip_state_path)
+        save_clip_state(HASH_A, 777, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
         agent = self.build(clipboard=clipboard)
@@ -1844,7 +1863,7 @@ class TestIncomingClipState(unittest.TestCase):
         self.assertEqual(sent, [], "content of exactly the cap would encode to a frame 8 bytes over it")
 
     def test_winning_clip_state_with_content_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
-        save_clip_state("aa", 777, path=self.clip_state_path)
+        save_clip_state(HASH_A, 777, path=self.clip_state_path)
         text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(text)
@@ -1862,7 +1881,7 @@ class TestIncomingClipState(unittest.TestCase):
         be sent has nothing to look at otherwise -- matches the existing
         "skipping a clip of N bytes: over the frame cap" line used for
         _local_change's own cap."""
-        save_clip_state("aa", 777, path=self.clip_state_path)
+        save_clip_state(HASH_A, 777, path=self.clip_state_path)
         oversized = MAX_PAYLOAD_BYTES
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * oversized)
@@ -1916,7 +1935,7 @@ class TestIncomingClipState(unittest.TestCase):
         can and already does for hello) or crashing with an uncaught
         OverflowError."""
         agent = self.build()
-        oversized = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+        oversized = ('{"sha256": "%s", "ts": 1' % HASH_A).encode() + b"0" * 400 + b"}"
 
         with self.assertRaises(ClipStateError):
             agent.on_frame(TYPE_CLIP_STATE, oversized)
@@ -1944,16 +1963,16 @@ class TestIncomingClipState(unittest.TestCase):
         peer's own decoded announcement ("bb", 42) -- not our local state,
         and not silently dropped -- which is a distinct assertion from
         "nothing was sent"."""
-        save_clip_state("aa", 5, path=self.clip_state_path)
+        save_clip_state(HASH_A, 5, path=self.clip_state_path)
         agent = self.build(already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("bb", 42))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 42))
 
         self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
         self.assertEqual(
-            agent._pending_peer_clip_state, ("bb", 42.0),
+            agent._pending_peer_clip_state, (HASH_B, 42.0),
             "the peer's own decoded state must be stashed, not silently dropped",
         )
 
@@ -2081,6 +2100,7 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "TYPE_CLIP_STATE = 0x02",
             "class ClipStateError",
             "def encode_clip_state",
+            "def _is_sha256_hex",
             "def decode_clip_state",
             "def resolve_freshness",
             'SEND_MINE = "sendMine"',

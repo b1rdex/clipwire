@@ -1,6 +1,16 @@
 // Sources/clipwire/Freshness.swift
 import Foundation
 
+/// Named after `agent/clipwire-agent.py`'s own `ClipStateError`, which this
+/// mirrors: the two sides reject the same clip-state payloads for the same
+/// reasons. Only the shape checks Foundation cannot express as a `Codable`
+/// conformance live here -- a malformed ts already fails inside
+/// `JSONDecoder` (see `decodePayload`), so `sha256` is the only field that
+/// needs one.
+enum ClipStateError: Error, Equatable {
+    case malformedSHA256
+}
+
 struct ClipState: Codable, Equatable {
     let sha256: String?
     let ts: Double
@@ -33,8 +43,53 @@ struct ClipState: Codable, Equatable {
     /// rejected by Foundation's JSON parser as undecodable rather than
     /// silently rounding to `.infinity`. So no extra `isFinite` guard is
     /// needed here to match Python's explicit one.
+    ///
+    /// The `sha256` shape check is the one thing `Codable` cannot express,
+    /// and it is not defensive typing: `resolveFreshness`'s tie-break orders
+    /// hashes, and the two implementations do not order strings the same
+    /// way. Swift's `String` compares by canonical Unicode equivalence,
+    /// Python's `str` by code point, and those coincide over lowercase hex
+    /// and nowhere else -- pinned by execution in
+    /// `testSwiftAndPythonOnlyAgreeOnHashOrderOverHex`. A peer announcing
+    /// U+00C5 against a local "A" + U+030A therefore makes this side resolve
+    /// `.doNothing` while the PC resolves WAIT_FOR_PEER: both sides wait and
+    /// the clip is lost with nothing logged anywhere.
+    ///
+    /// Enforced here, at the boundary, rather than inside `resolveFreshness`,
+    /// so that function stays exactly what it is on both sides -- one formula
+    /// over already-valid input.
+    ///
+    /// `ClipStateStore.load()` deliberately does NOT route through here: it
+    /// decodes this process's own prior write, whose hash always came from
+    /// `sha256Hex`, and a corrupt one would resolve to "content changed while
+    /// apart" (ts = now) either way -- the same outcome as the `nil` that
+    /// `load()` already returns for a torn file. The PC agent's own
+    /// `load_clip_state` does share its decoder with the wire path, so that
+    /// one validates its store file as a side effect; the asymmetry is
+    /// harmless in both directions.
     static func decodePayload(_ data: Data) throws -> ClipState {
-        try JSONDecoder().decode(ClipState.self, from: data)
+        let state = try JSONDecoder().decode(ClipState.self, from: data)
+        if let sha256 = state.sha256, !isSHA256Hex(sha256) {
+            throw ClipStateError.malformedSHA256
+        }
+        return state
+    }
+}
+
+/// Exactly 64 characters of `[0-9a-f]` -- the shape, and the only shape,
+/// `sha256Hex` produces and the wire contract allows. The twin of
+/// `agent/clipwire-agent.py`'s `_is_sha256_hex`, one condition at a time.
+///
+/// Counts UTF-8 BYTES rather than `String.count`, which counts grapheme
+/// clusters: "A" + U+030A is a single cluster, so a `count == 64` check
+/// would admit a 65-byte string built from composed characters -- the exact
+/// input class this guard exists to reject. 64 UTF-8 bytes all drawn from
+/// the ASCII hex alphabet can only be 64 ASCII hex characters.
+func isSHA256Hex(_ value: String) -> Bool {
+    guard value.utf8.count == 64 else { return false }
+    return value.utf8.allSatisfy { byte in
+        (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+            || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
     }
 }
 

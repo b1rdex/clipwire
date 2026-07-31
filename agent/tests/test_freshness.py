@@ -18,6 +18,15 @@ from agent_under_test import (
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "freshness.json"
 FRAMES_FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "frames.json"
 
+# 64 lowercase hex characters: the only shape decode_clip_state accepts,
+# and the only shape hashlib.sha256(...).hexdigest() -- hence the wire --
+# ever produces. Obviously fake, but well-formed, so these tests exercise
+# the same path a real digest does instead of one the protocol forbids.
+# See _is_sha256_hex on why that validation exists at all. HASH_A sorts
+# below HASH_B, which resolve_freshness's hash tie-break depends on.
+HASH_A = "aa" * 32
+HASH_B = "bb" * 32
+
 
 def _pair(state):
     """The (sha256, ts) shape both resolve_freshness and decode_clip_state share."""
@@ -76,8 +85,9 @@ class TestFreshnessFixture(unittest.TestCase):
 
 class TestClipStateCodec(unittest.TestCase):
     def test_round_trip(self):
-        encoded = encode_clip_state("deadbeefcafe", 1785400000.5)
-        self.assertEqual(decode_clip_state(encoded), ("deadbeefcafe", 1785400000.5))
+        digest = "deadbeefcafe0123" * 4
+        encoded = encode_clip_state(digest, 1785400000.5)
+        self.assertEqual(decode_clip_state(encoded), (digest, 1785400000.5))
 
     def test_round_trip_empty_hash(self):
         encoded = encode_clip_state(None, 0)
@@ -114,7 +124,7 @@ class TestClipStateCodec(unittest.TestCase):
         choice; silently returning it is not."""
         for literal in ("NaN", "Infinity", "-Infinity"):
             with self.subTest(literal):
-                payload = ('{"sha256": "aa", "ts": %s}' % literal).encode()
+                payload = ('{"sha256": "%s", "ts": %s}' % (HASH_A, literal)).encode()
                 with self.assertRaises(ClipStateError):
                     decode_clip_state(payload)
 
@@ -126,11 +136,53 @@ class TestClipStateCodec(unittest.TestCase):
         for bad_ts in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(bad_ts):
                 with self.assertRaises(ClipStateError):
-                    encode_clip_state("aa", bad_ts)
+                    encode_clip_state(HASH_A, bad_ts)
+
+    def test_decode_rejects_a_sha256_that_is_not_64_lowercase_hex(self):
+        """The wire contract says sha256 is `hashlib.sha256(...).hexdigest()`
+        or null, and the whole cross-language comparison rests on that: this
+        side orders hashes by CODE POINT, Swift's String orders them by
+        canonical Unicode equivalence, and the two coincide only over
+        lowercase hex.
+
+        Unvalidated, that domain assumption escapes. Verified by execution
+        rather than assumed: Python puts U+00C5 above the canonically
+        equivalent "A" + U+030A, while Swift calls those two strings EQUAL.
+        So a peer announcing "\\u00c5" against a local "A\\u030a" makes Swift
+        resolve doNothing (hashes equal) while this side resolves
+        WAIT_FOR_PEER (hashes differ, then the tie-break puts the peer's
+        above ours) -- both sides wait, and the clip is lost with nothing
+        logged anywhere. Hostile input only today, since both agents only
+        ever put hexdigest() output on the wire; the point is that the
+        branch's own principle is that both sides run ONE formula, and this
+        is the domain that formula is only valid over."""
+        for bad in (
+            "",                    # empty
+            "aa",                  # too short
+            "0" * 63,              # one short of the boundary
+            "0" * 65,              # one past it
+            "A" * 64,              # uppercase: hexdigest() never emits it
+            "g" * 64,              # right length, outside the hex alphabet
+            "0" * 63 + " ",        # trailing space
+            "Å" * 64,         # the composed character this fix exists for
+            "Å" + "0" * 61,  # and its canonically equivalent decomposition
+        ):
+            with self.subTest(bad):
+                payload = json.dumps({"sha256": bad, "ts": 1.0}).encode()
+                with self.assertRaises(ClipStateError):
+                    decode_clip_state(payload)
+
+    def test_decode_accepts_a_real_hexdigest_and_null(self):
+        """The other half: the guard above must not reject what the protocol
+        actually carries. A real hexdigest, and the null that means an empty
+        or unreadable clipboard."""
+        real = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        self.assertEqual(decode_clip_state(encode_clip_state(real, 1.0)), (real, 1.0))
+        self.assertEqual(decode_clip_state(encode_clip_state(None, 1.0)), (None, 1.0))
 
     def test_decode_rejects_missing_ts(self):
         with self.assertRaises(ClipStateError):
-            decode_clip_state(b'{"sha256": "aa"}')
+            decode_clip_state(('{"sha256": "%s"}' % HASH_A).encode())
 
     def test_decode_rejects_non_object_payload(self):
         with self.assertRaises(ClipStateError):
@@ -163,7 +215,7 @@ class TestClipStateCodec(unittest.TestCase):
         holds if decode_clip_state itself never raises anything outside the
         FrameError family -- which is what this test pins, at the source,
         rather than only at one caller."""
-        oversized = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+        oversized = ('{"sha256": "%s", "ts": 1' % HASH_A).encode() + b"0" * 400 + b"}"
         with self.assertRaises(ClipStateError):
             decode_clip_state(oversized)
 

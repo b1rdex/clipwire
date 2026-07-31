@@ -72,6 +72,17 @@ final class HandleFrameTests: XCTestCase {
     /// directory -- mirroring `tempStatusURL()`/`tempLog()`'s existing
     /// pattern of injecting real-but-disposable dependencies rather than
     /// mocking file I/O.
+    /// 64 lowercase hex characters: the only shape `ClipState.decodePayload`
+    /// accepts, and the only shape `sha256Hex` -- hence the wire -- ever
+    /// produces. Obviously fake, but well-formed, so these tests exercise the
+    /// same path a real digest does instead of one the protocol forbids. A
+    /// peer hash that is NOT protocol-shaped now fails at the decode point,
+    /// which would make every "no send expected" assertion below pass without
+    /// resolveFreshness ever running. `hashA` sorts below `hashB`, which the
+    /// hash tie-break depends on.
+    private static let hashA = String(repeating: "aa", count: 32)
+    private static let hashB = String(repeating: "bb", count: 32)
+
     private func tempClipStateStore() -> ClipStateStore {
         ClipStateStore(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString).json").path)
@@ -522,13 +533,18 @@ final class HandleFrameTests: XCTestCase {
     /// the defect this whole design exists to prevent.
     func testLosingClipStateWithPeerFresherProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 5))
+        try store.save(ClipState(sha256: Self.hashA, ts: 5))
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: "bb", ts: 9) // peer fresher -> waitForPeer
+        let peerState = ClipState(sha256: Self.hashB, ts: 9) // peer fresher -> waitForPeer
+        // Real content on the pasteboard, or a wrongly-resolved sendMine
+        // would still send nothing (its first guard is a non-empty read)
+        // and this assertion would hold for the wrong reason.
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("something to wrongly send".utf8)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
-                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
         XCTAssertTrue(sent.isEmpty, "the peer is fresher -- we wait, we do not resend")
@@ -539,13 +555,17 @@ final class HandleFrameTests: XCTestCase {
     /// `sendMine` would ping-pong the same content back and forth forever.
     func testAgreeingClipStateWithEqualHashesProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 5))
+        try store.save(ClipState(sha256: Self.hashA, ts: 5))
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: "aa", ts: 999) // same hash -> doNothing regardless of ts
+        let peerState = ClipState(sha256: Self.hashA, ts: 999) // same hash -> doNothing regardless of ts
+        // See the test above: without real content a wrongly-resolved
+        // sendMine sends nothing anyway, and this would pass regardless.
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("something to wrongly send".utf8)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
-                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
         XCTAssertTrue(sent.isEmpty, "hashes equal means we agree, not resend")
@@ -559,7 +579,7 @@ final class HandleFrameTests: XCTestCase {
     /// happens next.
     func testWinningClipStateProducesExactlyOneClipFrameCarryingOurStoredTimestamp() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("current clip text".utf8)
         var sent: [Frame] = []
@@ -588,7 +608,7 @@ final class HandleFrameTests: XCTestCase {
     /// pins for the watcher's send path.
     func testWinningClipStateWithContentAtExactlyTheCapProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxPayloadBytes)
         var sent: [Frame] = []
@@ -609,7 +629,7 @@ final class HandleFrameTests: XCTestCase {
     /// actually supports.
     func testWinningClipStateWithContentLeavingExactRoomForTheTimestampPrefixStillSends() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
         let text = String(repeating: "a",
                           count: FrameConstants.maxPayloadBytes - ClipPayloadConstants.timestampBytes)
@@ -633,7 +653,7 @@ final class HandleFrameTests: XCTestCase {
     /// for the watcher's own send-side guard.
     func testWinningClipStateWithOversizedContentIsLoggedWithItsSize() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "aa", ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
         let oversized = FrameConstants.maxPayloadBytes
         pasteboard.textToRead = Data(repeating: 0x61, count: oversized)
@@ -743,7 +763,7 @@ final class HandleFrameTests: XCTestCase {
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("new content".utf8)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: "some-other-hash-entirely", ts: 111))
+        try store.save(ClipState(sha256: Self.hashB, ts: 111))
         var sent: [Frame] = []
 
         announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 999_999)

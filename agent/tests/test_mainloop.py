@@ -168,7 +168,10 @@ class TestMainLoop(unittest.TestCase):
         self.addCleanup(process.kill)
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.stdin.close)
-        oversized_ts_payload = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+        # 64 lowercase hex: decode_clip_state rejects any other shape, and
+        # this case is about the oversized TS, so the hash must be valid or
+        # the test would pass on the wrong rejection.
+        oversized_ts_payload = ('{"sha256": "%s", "ts": 1' % ("aa" * 32)).encode() + b"0" * 400 + b"}"
         process.stdin.write(encode_frame(TYPE_CLIP_STATE, oversized_ts_payload))
         process.stdin.flush()
         self.assertEqual(
