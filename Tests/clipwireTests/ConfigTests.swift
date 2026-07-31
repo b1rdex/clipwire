@@ -1,0 +1,81 @@
+// Tests/clipwireTests/ConfigTests.swift
+import XCTest
+@testable import clipwire
+
+final class ConfigTests: XCTestCase {
+    private func write(_ json: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-test-\(UUID().uuidString).json")
+        try json.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
+    func testLoadsValidConfig() throws {
+        let url = try write("""
+        {"host":"pc","user":"me","identity_file":"~/.ssh/id_ed25519",
+         "remote_agent_path":"~/.local/share/clipwire/clipwire-agent.py",
+         "mac_poll_interval_ms":400}
+        """)
+        let config = try Config.load(from: url)
+        XCTAssertEqual(config.host, "pc")
+        XCTAssertEqual(config.macPollIntervalMs, 400)
+        XCTAssertNil(config.fallbackIP)
+    }
+
+    func testMissingFileThrowsMissingNotInvalid() throws {
+        let url = URL(fileURLWithPath: "/nonexistent/clipwire/config.json")
+        XCTAssertThrowsError(try Config.load(from: url)) { error in
+            guard case ConfigError.missing = error else {
+                return XCTFail("expected .missing, got \(error)")
+            }
+        }
+    }
+
+    func testRejectsNonPositivePollInterval() throws {
+        let url = try write("""
+        {"host":"pc","user":"me","identity_file":"k","remote_agent_path":"a",
+         "mac_poll_interval_ms":0}
+        """)
+        XCTAssertThrowsError(try Config.load(from: url))
+    }
+
+    func testExpandsTilde() {
+        let home = NSHomeDirectory()
+        XCTAssertEqual(expandTilde("~/x"), home + "/x")
+        XCTAssertEqual(expandTilde("/abs/x"), "/abs/x")
+        XCTAssertEqual(expandTilde("~"), home, "a bare ~ must expand to the home directory itself")
+    }
+
+    // Not in the brief. The brief's own self-review checklist asks: "does an
+    // unreadable or malformed one produce something a user can act on?" The
+    // verbatim Step 3 `load()` answers no — a malformed file lets a raw
+    // JSONDecoder error (a Swift DecodingError reflection dump) propagate
+    // uncaught, instead of the ConfigError the rest of this type is built
+    // around. Pinning that gap here before closing it, the same way Task 1
+    // pinned the FrameConstants zero-init hazard before fixing it.
+    func testMalformedJSONThrowsInvalidNotRawDecodingError() throws {
+        let url = try write("this is not json")
+        XCTAssertThrowsError(try Config.load(from: url)) { error in
+            guard case ConfigError.invalid = error else {
+                return XCTFail("expected .invalid, got \(error)")
+            }
+        }
+    }
+
+    // Fix round 1: config.example.json is not documentation — `clipwire init`
+    // (a later task) writes a user's real config *from* this file, so it is
+    // a runtime input to a shipped code path, not prose. Load the actual
+    // committed file, resolving its path from #filePath the same way
+    // FixtureTests.swift resolves fixtures/frames.json, so that a later task
+    // adding a required field to Config and forgetting to update the example
+    // fails a test instead of silently shipping an example `init` cannot use.
+    func testExampleConfigLoadsAndValidates() throws {
+        // Tests/clipwireTests/ -> repo root -> config.example.json
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let config = try Config.load(from: root.appendingPathComponent("config.example.json"))
+        XCTAssertEqual(config.host, "your-pc-hostname")
+        XCTAssertEqual(config.fallbackIP, "192.168.1.10",
+                       "the example must not carry a real LAN address — see fix round 1")
+    }
+}

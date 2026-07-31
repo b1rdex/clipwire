@@ -1,0 +1,12 @@
+{
+  "comment": "Golden frame vectors. Both codecs must encode payload_hex to frame_hex and decode frame_hex back. Do not edit by hand without recomputing.",
+  "cases": [
+    {"name": "empty-clip",  "type": 1, "payload_hex": "",                         "frame_hex": "0000000001"},
+    {"name": "ascii-clip",  "type": 1, "payload_hex": "6869",                     "frame_hex": "00000002016869"},
+    {"name": "utf8-clip",   "type": 1, "payload_hex": "d0bfd180d0b8d0b2d0b5d182", "frame_hex": "0000000c01d0bfd180d0b8d0b2d0b5d182"},
+    {"name": "emoji-clip",  "type": 1, "payload_hex": "f09f94a5",                 "frame_hex": "0000000401f09f94a5"},
+    {"name": "newline-clip","type": 1, "payload_hex": "610a62",                   "frame_hex": "0000000301610a62"},
+    {"name": "nul-clip",    "type": 1, "payload_hex": "610062",                   "frame_hex": "0000000301610062"},
+    {"name": "hello",       "type": 0, "payload_hex": "7b2270726f746f636f6c223a317d", "frame_hex": "0000000e007b2270726f746f636f6c223a317d"}
+  ]
+}
