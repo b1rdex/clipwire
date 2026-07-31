@@ -56,8 +56,8 @@ class FakeClipboard:
     def read(self):
         return None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class AsyncWriteClipboard:
@@ -90,10 +90,12 @@ class AsyncWriteClipboard:
         return self._ready
 
     def read(self):
-        return self._read_value  # never reflects write() below -- the real race
+        # Kind-aware since Task 7 -- always KIND_TEXT here, the only kind
+        # any test in this file constructs one of these with.
+        return (KIND_TEXT, self._read_value) if self._read_value else None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class TestLifecycle(unittest.TestCase):
@@ -145,7 +147,7 @@ class TestLifecycle(unittest.TestCase):
         clipboard.become_ready()
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
-        self.assertEqual(clipboard.written, [b"third"])
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"third")])
 
     def test_a_non_finite_timestamp_in_a_pending_clip_does_not_tear_down_the_channel(self):
         """Fix round 1, Finding 2: struct.unpack(">d", ...) inside
@@ -197,7 +199,7 @@ class TestLifecycle(unittest.TestCase):
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
         agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"now"))
-        self.assertEqual(clipboard.written, [b"now"])
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"now")])
         self.assertIsNone(agent.pending_clip)
 
     def test_empty_clip_is_never_written(self):

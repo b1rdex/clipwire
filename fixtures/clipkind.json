@@ -1,0 +1,7 @@
+[
+  {"name": "text only",        "types": ["text/plain;charset=utf-8", "TEXT"], "expect": "text"},
+  {"name": "image only",       "types": ["image/png", "image/tiff", "TARGETS"], "expect": "image"},
+  {"name": "both, text wins",  "types": ["text/plain;charset=utf-8", "image/png"], "expect": "text"},
+  {"name": "neither",          "types": ["TARGETS", "TIMESTAMP"], "expect": null},
+  {"name": "empty",            "types": [], "expect": null}
+]

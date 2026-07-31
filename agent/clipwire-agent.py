@@ -674,7 +674,22 @@ class Agent:
         if last_seen and sha256_hex(last_seen) == mine[0]:
             text = last_seen
         else:
-            text = self.clipboard.read()
+            # Task 7 made read() kind-aware; this branch stays text-only
+            # until Task 11 teaches it to read by mine's OWN kind and
+            # verify the hash before sending -- see _observe_local_change's
+            # own comment on this same scope boundary. mine[2] can already
+            # be KIND_IMAGE here now that resolve_startup_state no longer
+            # hardcodes KIND_TEXT: an image-only clipboard resolves a real
+            # (hash, ts, KIND_IMAGE) triple instead of a None hash, which
+            # makes SEND_MINE reachable for it where it previously never
+            # was. Sending that hash's bytes as a TYPE_CLIP text frame
+            # would be a worse outcome than not sending at all, so a
+            # non-text read is treated the same as no read -- this
+            # connection silently does not sync the image, exactly as it
+            # silently does not today; Task 11 is where it starts verifying
+            # and sending it correctly instead.
+            read = self.clipboard.read()
+            text = read[1] if read is not None and read[0] == KIND_TEXT else None
         if not text:
             return
         # The size bound matches _local_change's own send-side guard: this
@@ -740,7 +755,14 @@ class Agent:
         # since the Mac does not resend its own clipboard on reconnect
         # either. The previous asymmetry ran in the destructive direction,
         # which is worse than losing a convenience. Do not "fix" this back.
-        seed = self.clipboard.read()
+        read = self.clipboard.read()
+        # _last_seen stays a text-only value until Task 9 makes it a
+        # (kind, hash) pair -- see _observe_local_change's own comment on
+        # this same scope boundary. An image-only clipboard at connect
+        # time therefore seeds no baseline yet, exactly as an empty one
+        # already seeds none: there is nothing for _observe_local_change's
+        # own text-only read to ever compare an image against.
+        seed = read[1] if read is not None and read[0] == KIND_TEXT else None
         with self._echo_lock:
             self._last_seen = seed
         applied_pending = None
@@ -883,7 +905,10 @@ class Agent:
             self._last_written = text
             self._write_gen += 1
             self._last_seen = text
-        self.clipboard.write(text)
+        # KIND_TEXT: see the same reasoning spelled out just below, at the
+        # save_clip_state call this write() mirrors -- this method's only
+        # caller ever feeds it a TYPE_CLIP (text) payload.
+        self.clipboard.write(KIND_TEXT, text)
         # WaylandClipboard.write() spawns wl-copy DETACHED (Popen(...,
         # start_new_session=True)) and returns as soon as its own stdin pipe
         # is closed -- a hand-off, not a confirmation that wl-copy has
@@ -971,12 +996,29 @@ class Agent:
             gen = self._write_gen
             last_seen = self._last_seen
 
-        text = self.clipboard.read()
+        read = self.clipboard.read()
         # The moment of OBSERVATION -- as close to the read as possible --
         # not whenever the rest of this method happens to run afterward.
         # Persisted and sent below, once we know this is a genuine change.
         observed_at = time.time()
-        if not text:
+        if read is None:
+            return
+        kind, text = read
+        if kind != KIND_TEXT or not text:
+            # Task 7 made read() kind-aware -- before it, a non-text
+            # clipboard could only ever read back as None, so this method
+            # was already, structurally, text-or-nothing. Keeping it that
+            # way here is a scope boundary, not an oversight: syncing a
+            # local IMAGE change is Task 12's job (on_frame, _write_clip,
+            # this method and clipboard_became_ready all need the image
+            # apply/announce wiring together, not one call site at a
+            # time). Until then an image observation is treated exactly
+            # like the pre-existing "nothing changed" outcome -- silently
+            # not synced -- rather than mis-sent as a text frame. The two
+            # other read() call sites this task touches (the connect-time
+            # seed below, and _resolve_clip_state's SEND_MINE branch) draw
+            # this same line for the same reason; see this comment rather
+            # than repeating it there.
             return
 
         # Consume the suppression on the FIRST observed change, whatever it is —
@@ -1088,13 +1130,20 @@ class NeverReadyClipboard:
     def read(self):
         return None
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
 
 import subprocess
 
 SUBPROCESS_TIMEOUT = 3
+# Text reads have already been observed timing out at SUBPROCESS_TIMEOUT in
+# production. An image body can be up to MAX_IMAGE_BYTES (4 MiB) flowing
+# through a pipe, not a few kilobytes of text, so it gets its own, longer
+# bound rather than inheriting the text one. Both bounds are logged against
+# in WaylandClipboard._run_wl_paste, so the next time either is wrong there
+# is evidence of how long the read actually took, not a guess.
+IMAGE_SUBPROCESS_TIMEOUT = 10
 
 
 def _xdg_dir(var_name, default, env=None):
@@ -1220,11 +1269,13 @@ def save_clip_state(sha256, ts, kind, path=None):
         os.replace(tmp, target)
 
 
-def resolve_startup_state(current_hash, stored, now):
-    """The judgement that makes the wake flow work. `current_hash` is the
-    clipboard's hash *right now*, at startup; `stored` is whatever
-    load_clip_state() last returned (a (sha256, ts, kind) triple, or None);
-    `now` is the caller's clock. Returns a (sha256, ts, kind) triple.
+def resolve_startup_state(current_hash, current_kind, stored, now):
+    """The judgement that makes the wake flow work. `current_hash` and
+    `current_kind` are the clipboard's hash and kind *right now*, at
+    startup -- both produced by the same clipboard.read() call, never
+    derived independently; `stored` is whatever load_clip_state() last
+    returned (a (sha256, ts, kind) triple, or None); `now` is the caller's
+    clock. Returns a (sha256, ts, kind) triple.
 
     A timestamp can come from three places, in precedence order: a local
     change this process watched happen, a clip received from the peer
@@ -1236,42 +1287,55 @@ def resolve_startup_state(current_hash, stored, now):
     copied on one side while the other slept or was disconnected.
 
     If the hash on disk matches what the clipboard holds now, the content
-    has not changed since it was last recorded, so the *stored* timestamp --
-    and, by the same reasoning, its *stored* kind -- is the real age (and
-    kind) of that content and is returned unchanged. Returning `now` here
-    instead would make every such clip look freshly copied, winning it
-    every reconciliation and clobbering the peer systematically on every
-    reconnect. If the hashes differ, or nothing was ever stored, the
-    content changed (or first appeared) while nothing was watching, and
-    only `now` is honest -- and its kind is KIND_TEXT, hardcoded rather
-    than threaded through as a parameter: resolve_current_clip_state below
-    is this function's only non-test caller, and it derives `current_hash`
-    from clipboard.read() alone, a text/plain read -- there is no
-    independent "current kind" input to thread through yet. **Task 7** is
-    where that changes -- it makes clipboard.read() itself kind-aware --
-    NOT Task 11, which only wires the send branch that reads `kind` back
-    out once it is already correct. The test suite will not catch a missed
-    revisit here: this function's signature is untouched by Task 7, so no
-    call-site failure points at it. What DOES change, visibly, is
-    resolve_current_clip_state's own body one frame up -- and a mechanical
-    adaptation there (e.g. `current_hash = sha256_hex(read.data)`, the new
-    kind quietly dropped on the floor) runs clean and passes the whole
-    suite while silently fabricating KIND_TEXT for a PNG hash, right here,
-    one frame below the line that actually changed. Revisit THIS
-    hardcoding, not just the caller above it.
+    has not changed since it was last recorded, so the *stored* timestamp
+    and the *stored* kind -- not `current_kind` -- are the real age and
+    kind of that content, and are returned unchanged: unchanged content
+    did not change what kind of content it is either, and the stored value
+    is the one this agent already announced to a peer, possibly on an
+    earlier connection. Returning `now` here instead would make every such
+    clip look freshly copied, winning it every reconciliation and
+    clobbering the peer systematically on every reconnect. If the hashes
+    differ, or nothing was ever stored, the content changed (or first
+    appeared) while nothing was watching, and only `now` is honest about
+    its age -- `current_kind` is equally honest about what it is, since it
+    came from that exact same read, and is returned as-is rather than
+    guessed.
+
+    Before Task 7 made clipboard.read() itself kind-aware, this parameter
+    did not exist and this branch hardcoded KIND_TEXT: resolve_current_clip_state
+    below, this function's only non-test caller, could only ever derive
+    `current_hash` from a text/plain read, so there was no independent
+    "current kind" to thread through yet. Task 6's report on this
+    function named the exact failure a purely mechanical fix to THIS
+    function's caller (not its own signature) would have left behind: once
+    read() became kind-aware, a caller that computed `current_hash` from
+    the new (kind, bytes) pair while quietly dropping the kind would run
+    clean and pass the whole suite, silently fabricating KIND_TEXT for a
+    PNG hash right here -- one frame below the line that actually changed,
+    with no call-site failure to point at it, since a same-arity caller
+    changing its body is invisible to every test that only checks THIS
+    function's behaviour. Fixed by threading the kind through as a real
+    parameter instead of leaving it something only the caller could
+    derive: a caller that now drops it fails to call this function at all
+    (TypeError), everywhere it is tested, rather than silently returning a
+    wrong answer only the one production call site would ever produce. See
+    resolve_current_clip_state's own docstring for the other half: it is
+    what actually derives `current_kind` from clipboard.read()'s pair.
 
     A None current_hash (clipboard empty or unreadable right now) always
     wins over whatever is on disk, regardless of what was previously
     stored: resolve_freshness never compares timestamps when either side's
     hash is None, so the timestamp returned here is never actually read.
     Its kind is None too, matching the null-iff-null rule decode_clip_state
-    enforces on the wire.
+    enforces on the wire -- a literal None, not `current_kind`, since a
+    caller reporting a None hash (an empty or unreadable clipboard) has no
+    real kind to go with it either.
     """
     if current_hash is None:
         return None, now, None
     if stored is not None and stored[0] == current_hash:
         return current_hash, stored[1], stored[2]
-    return current_hash, now, KIND_TEXT
+    return current_hash, now, current_kind
 
 
 import hashlib
@@ -1303,14 +1367,29 @@ def sha256_hex(data):
 def resolve_current_clip_state(clipboard, stored, now):
     """Reconciles what the clipboard holds RIGHT NOW against what was last
     persisted. Mirrors Sources/clipwire/ClipStateStore.swift's
-    resolveCurrentClipState: `clipboard.read()` returning None or empty is
-    never hashed, matching the wire contract that sha256 is null for
-    exactly that clipboard state -- see resolve_startup_state for the rule
-    this applies once a current hash is in hand.
+    resolveCurrentClipState: `clipboard.read()` returning None, or a pair
+    whose body is empty, is never hashed, matching the wire contract that
+    sha256 is null for exactly that clipboard state -- see
+    resolve_startup_state for the rule this applies once a current hash is
+    in hand.
+
+    `current_kind` -- the OTHER half of resolve_startup_state's signature
+    -- comes from this exact same read() call, never derived separately:
+    clipboard.read() is Task 7's one canonical read, returning (kind,
+    bytes) or None, so the kind of what was just hashed is sitting right
+    there in the pair already. This is the one place in the file that
+    turns a raw clipboard.read() into a (hash, kind) pair; every caller of
+    resolve_startup_state goes through here rather than reading the
+    clipboard and computing a kind independently, which is what keeps a
+    hash and a kind from ever being paired up wrong.
     """
-    text = clipboard.read()
-    current_hash = sha256_hex(text) if text else None
-    return resolve_startup_state(current_hash, stored, now)
+    read = clipboard.read()
+    if read is None:
+        current_hash, current_kind = None, None
+    else:
+        current_kind, data = read
+        current_hash = sha256_hex(data) if data else None
+    return resolve_startup_state(current_hash, current_kind, stored, now)
 
 
 def announce_clip_state(send, clipboard, now=None, path=None):
@@ -1378,52 +1457,131 @@ def clipboard_env(env=None):
     return base
 
 
+def choose_kind(types):
+    """Which kind to sync, given the clipboard's offered MIME types.
+
+    Text wins. Spreadsheets put a bitmap of the copied cells alongside the
+    text, so preferring the image would turn every copied range into a picture
+    of a table -- a regression of the primary flow in exchange for the new one.
+    Screenshots and "Copy image" carry no text/plain, so they still arrive as
+    images.
+
+    Only image/png is considered, and on the PC that costs nothing: GPaste
+    re-offers whatever image it holds in a long list of types, PNG among them,
+    verified on the live machine down to a JPEG reading back as valid PNG.
+    """
+    if any(t.startswith("text/plain") or t in ("UTF8_STRING", "STRING", "TEXT")
+           for t in types):
+        return KIND_TEXT
+    if "image/png" in types:
+        return KIND_IMAGE
+    return None
+
+
 class WaylandClipboard:
     def __init__(self):
-        # Set once a read() call times out (or otherwise fails as an
+        # Set once a wl-paste call times out (or otherwise fails as an
         # OSError) and cleared the moment a call completes normally,
         # whatever its returncode -- so a hung selection owner in polling
         # mode logs the hang once, not once per tick for as long as it
         # lasts, while a later, separate hang still gets its own
-        # first-occurrence log line once this one clears.
+        # first-occurrence log line once this one clears. Shared by every
+        # wl-paste invocation read() makes (see _run_wl_paste): this flag
+        # tracks "wl-paste is currently hanging", not which of the two
+        # calls a single read() makes is the one that hung.
         self._read_timeout_logged = False
 
     def ready(self):
         return os.path.exists(wayland_socket_path())
 
     def read(self):
-        """Current clipboard text, or None when empty or not text.
+        """(kind, bytes) for whatever the clipboard currently holds, or
+        None when nothing is offered, choose_kind picks neither kind this
+        agent syncs, or the chosen read comes back empty.
 
-        A non-zero exit from wl-paste means an empty or non-text selection.
-        That is a normal state, not an error.
+        The one canonical read. The watcher, the startup seed,
+        clipboard_became_ready and the reconciliation send branch all go
+        through this single method, so which content wins when more than
+        one kind is on offer is decided in exactly one place (choose_kind)
+        instead of reimplemented at each call site.
+
+        Two wl-paste invocations. The first, `--list-types`, is cheap and
+        says what is on offer; choose_kind picks a kind from the answer --
+        text over image, see its own docstring -- and the second asks for
+        the body of exactly that kind, nothing else. A non-zero exit from
+        either invocation means an empty or unreadable selection, matching
+        the single-read behaviour this replaces: a normal state, not an
+        error.
         """
+        listed = self._run_wl_paste(["--list-types"], SUBPROCESS_TIMEOUT)
+        if listed is None or listed.returncode != 0:
+            return None
+        kind = choose_kind(listed.stdout.decode("utf-8", "replace").splitlines())
+        if kind is None:
+            return None
+        if kind == KIND_TEXT:
+            result = self._run_wl_paste(
+                ["-n", "--type", "text/plain;charset=utf-8"], SUBPROCESS_TIMEOUT)
+        else:
+            # No -n here: verified against the wl-clipboard manual that
+            # --no-newline is applied automatically for any non-text MIME
+            # type, so passing it explicitly would be redundant, never
+            # incorrect. Left off so this call visibly differs from the
+            # text one above, rather than carrying a flag that does nothing.
+            result = self._run_wl_paste(["--type", "image/png"], IMAGE_SUBPROCESS_TIMEOUT)
+        if result is None or result.returncode != 0 or not result.stdout:
+            return None
+        return kind, result.stdout
+
+    def _run_wl_paste(self, args, timeout):
+        """One wl-paste invocation, shared by every call read() makes --
+        `--list-types` and both body-fetch shapes -- so the failure
+        handling and the one-shot hang log live in exactly one place
+        rather than duplicated per call site.
+
+        Logs this call's own duration on every path that actually reaches
+        the subprocess: success, a timeout, or any other OSError -- "every
+        read's duration", so the next time SUBPROCESS_TIMEOUT or
+        IMAGE_SUBPROCESS_TIMEOUT turns out wrong there is evidence of how
+        long the read actually took, not a guess. Skipped only when
+        wl-paste is not installed at all, where there is no duration worth
+        reporting and it would just be noise next to the "not installed"
+        line. Deliberately worded without the literal text "wl-paste" in
+        it, unlike the hang log below -- so a log-line-counting test that
+        greps for that word keeps counting failures, not every read.
+
+        Returns the CompletedProcess, or None on a missing binary, a
+        timeout, or any other OSError -- all three already logged here, so
+        callers only need to treat None as "nothing to read".
+        """
+        started = time.monotonic()
         try:
             result = subprocess.run(
-                ["wl-paste", "-n", "--type", "text/plain;charset=utf-8"],
-                capture_output=True, timeout=SUBPROCESS_TIMEOUT, env=clipboard_env(),
+                ["wl-paste"] + args, capture_output=True, timeout=timeout, env=clipboard_env(),
             )
         except FileNotFoundError:
             log("wl-paste is not installed")
             return None
         except (subprocess.TimeoutExpired, OSError) as error:
+            log("clipboard read (%s) took %.3fs" % (" ".join(args), time.monotonic() - started))
             if not self._read_timeout_logged:
                 log("wl-paste failed: %r" % error)
                 self._read_timeout_logged = True
             return None
+        log("clipboard read (%s) took %.3fs" % (" ".join(args), time.monotonic() - started))
         self._read_timeout_logged = False
-        if result.returncode != 0:
-            return None
-        return result.stdout or None
+        return result
 
-    def write(self, data):
+    def write(self, kind, data):
         """wl-copy does not exit — it stays resident as the selection owner.
 
         It must be spawned detached with its pipes closed. Waiting on it, or
         holding its fds, hangs the agent.
         """
+        mime_type = "image/png" if kind == KIND_IMAGE else "text/plain;charset=utf-8"
         try:
             process = subprocess.Popen(
-                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                ["wl-copy", "--type", mime_type],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True, env=clipboard_env(),
             )

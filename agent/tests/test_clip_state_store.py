@@ -9,6 +9,7 @@ from unittest import mock
 from agent_under_test import (
     KIND_IMAGE,
     KIND_TEXT,
+    TYPE_CLIP_STATE,
     announce_clip_state,
     clip_state_path,
     decode_clip_state,
@@ -239,7 +240,15 @@ class TestSaveIsSerialized(_TempPathCase):
 
 class TestResolveStartupState(unittest.TestCase):
     """The four cases that make the wake flow work -- mirrors
-    ClipStateStoreTests.swift's own MARK section, case for case."""
+    ClipStateStoreTests.swift's own MARK section, case for case.
+
+    current_kind is deliberately set to a WRONG guess in every case below
+    where the rule says it must be ignored (the stored-hash-matches case,
+    and the None-hash case), and to KIND_IMAGE -- deliberately not the
+    KIND_TEXT everything else in this file defaults to -- in every case
+    where the rule says it must be threaded through. Either direction, a
+    bug that used the wrong source for the returned kind cannot pass by
+    coincidence."""
 
     def test_stored_hash_matches_current_returns_stored_timestamp_not_now(self):
         """The load-bearing case: content that has not changed since it
@@ -248,41 +257,54 @@ class TestResolveStartupState(unittest.TestCase):
         kind of content it is either. stored's ts (100) and now (999) are
         deliberately different values -- a bug that returns `now` instead
         of the stored timestamp would still pass a test where the two
-        happen to coincide; this one actually fails it."""
+        happen to coincide; this one actually fails it. current_kind is
+        passed as KIND_TEXT, the wrong answer for this stored row, so a
+        bug that returned current_kind instead of the stored one cannot
+        pass by coincidence either."""
         stored = ("aa", 100, KIND_IMAGE)
-        result = resolve_startup_state("aa", stored, 999)
+        result = resolve_startup_state("aa", KIND_TEXT, stored, 999)
         self.assertEqual(result, ("aa", 100, KIND_IMAGE))
 
-    def test_stored_hash_differs_returns_now(self):
-        """Content that changed while apart is read fresh -- here, always
-        through resolve_current_clip_state's own clipboard.read(), which is
-        text-only today, so the kind of newly-observed content is KIND_TEXT.
-        (There is no image-reading call site on this path yet; Task 7 is
-        where that changes, by making clipboard.read() itself kind-aware --
-        see resolve_startup_state's own docstring for why that revisit
-        needs a human, not the test suite, to catch it.)"""
+    def test_stored_hash_differs_returns_the_reads_own_kind(self):
+        """Content that changed while apart is read fresh, and Task 7 made
+        that fresh read kind-aware: the kind returned here must be
+        current_kind, the kind that SAME read reported -- not a hardcoded
+        KIND_TEXT guess (the bug this task exists to prevent; see the
+        integration-level reproduction of it in
+        test_clip_state_store.py::TestResolveCurrentClipState::test_content_differing_from_the_store_uses_the_reads_own_kind).
+        KIND_IMAGE here, against a stored KIND_TEXT, is what makes this
+        assertion distinguish "threaded through" from "copied from
+        stored"."""
         stored = ("aa", 100, KIND_TEXT)
-        result = resolve_startup_state("bb", stored, 999)
-        self.assertEqual(result, ("bb", 999, KIND_TEXT))
+        result = resolve_startup_state("bb", KIND_IMAGE, stored, 999)
+        self.assertEqual(result, ("bb", 999, KIND_IMAGE))
 
-    def test_nothing_stored_returns_now(self):
-        result = resolve_startup_state("aa", None, 999)
-        self.assertEqual(result, ("aa", 999, KIND_TEXT))
+    def test_nothing_stored_returns_the_reads_own_kind(self):
+        """Same rule as the row above, for the OTHER branch that reaches
+        `return current_hash, now, current_kind`: nothing on disk is not
+        distinguishable, from this function's point of view, from stored
+        content that no longer matches -- both mean "trust the read"."""
+        result = resolve_startup_state("aa", KIND_IMAGE, None, 999)
+        self.assertEqual(result, ("aa", 999, KIND_IMAGE))
 
-    def test_current_hash_none_returns_none_hash_regardless_of_stored(self):
+    def test_current_hash_none_returns_none_hash_and_none_kind_regardless_of_stored_or_current_kind(self):
         """A None current hash always wins over whatever is on disk, and
         it takes precedence even when something IS stored: resolve_freshness
         never compares timestamps when either side's hash is None, so `ts`
         is unread downstream here -- this pins current behaviour (`now`)
-        rather than asserting a hard requirement on its exact value."""
+        rather than asserting a hard requirement on its exact value.
+        current_kind is passed as KIND_TEXT -- not None -- specifically to
+        prove the returned kind is a literal None, not current_kind passed
+        through: an empty/unreadable clipboard has no real kind to report,
+        whatever a caller mistakenly supplied for it."""
         stored = ("aa", 100, KIND_TEXT)
-        result = resolve_startup_state(None, stored, 999)
+        result = resolve_startup_state(None, KIND_TEXT, stored, 999)
         self.assertIsNone(result[0])
         self.assertEqual(result[1], 999)
         self.assertIsNone(result[2], "a null hash must carry a null kind")
 
     def test_current_hash_none_and_nothing_stored_returns_none_hash(self):
-        result = resolve_startup_state(None, None, 999)
+        result = resolve_startup_state(None, None, None, 999)
         self.assertIsNone(result[0])
 
 
@@ -293,7 +315,12 @@ class FixedReadClipboard:
     per call, so either double would work here; this one is used so a test
     that calls it more than once (never needed today, but cheap to keep
     true) still sees the SAME clipboard content each time, matching how a
-    real clipboard behaves between two reads with nothing in between."""
+    real clipboard behaves between two reads with nothing in between.
+
+    `value` is whatever WaylandClipboard.read() itself would return: a
+    (kind, bytes) pair, or None. Passed through completely unshaped -- this
+    double does no wrapping of its own, so a test's own construction call
+    is the one place that says what kind of read is being simulated."""
 
     def __init__(self, value):
         self._value = value
@@ -306,10 +333,10 @@ class TestResolveCurrentClipState(unittest.TestCase):
     """Mirrors Sources/clipwire/ClipStateStore.swift's
     resolveCurrentClipState / ClipStateStoreTests.swift coverage of it:
     reconciles what the clipboard holds RIGHT NOW against what was last
-    persisted. A None or empty clipboard must never be hashed -- it must
-    resolve exactly like resolve_startup_state's own None-hash case,
-    matching the wire contract that sha256 is null for exactly that
-    clipboard state."""
+    persisted. A None read, or a pair whose body is empty, must never be
+    hashed -- it must resolve exactly like resolve_startup_state's own
+    None-hash case, matching the wire contract that sha256 is null for
+    exactly that clipboard state."""
 
     def test_empty_clipboard_resolves_to_a_none_hash(self):
         clipboard = FixedReadClipboard(None)
@@ -318,12 +345,18 @@ class TestResolveCurrentClipState(unittest.TestCase):
         self.assertEqual(result[1], 999)
 
     def test_blank_but_non_none_clipboard_also_resolves_to_a_none_hash(self):
-        """b"" is falsy but not None -- resolve_current_clip_state must
-        treat it the same as a totally empty clipboard, not hash zero
-        bytes and treat that as real content."""
-        clipboard = FixedReadClipboard(b"")
+        """(KIND_TEXT, b"") is a pair whose BODY is falsy but not None --
+        resolve_current_clip_state must treat it the same as a totally
+        empty clipboard (read() returning None outright), not hash zero
+        bytes and treat that as real content. In production
+        WaylandClipboard.read() never actually returns this shape (an
+        empty body always collapses to a bare None, see its own
+        docstring), but the resolver stays defensive against a double that
+        does, exactly as it already was before Task 7."""
+        clipboard = FixedReadClipboard((KIND_TEXT, b""))
         result = resolve_current_clip_state(clipboard, stored=None, now=999)
         self.assertIsNone(result[0])
+        self.assertIsNone(result[2], "a null hash must carry a null kind here too")
 
     def test_content_matching_the_store_keeps_the_stored_timestamp(self):
         """The load-bearing case: unchanged content must keep its true
@@ -331,20 +364,25 @@ class TestResolveCurrentClipState(unittest.TestCase):
         copied (or of some other kind) just because a new process is
         asking. now (999) and the stored ts (100) are deliberately
         different, so a bug that returns `now` instead cannot pass by
-        coincidence; KIND_IMAGE here (rather than the KIND_TEXT everything
-        else in this file uses) is deliberately the wrong guess for "text
-        just read off the clipboard", so a bug that overwrote the stored
-        kind with a fresh KIND_TEXT guess cannot pass by coincidence either."""
+        coincidence; KIND_IMAGE in `stored` (against a KIND_TEXT read,
+        the actual kind of `text`) is deliberately the wrong guess for
+        "the kind this connection just read off the clipboard", so a bug
+        that overwrote the stored kind with the freshly-read KIND_TEXT
+        cannot pass by coincidence either."""
         text = b"unchanged clip"
-        clipboard = FixedReadClipboard(text)
+        clipboard = FixedReadClipboard((KIND_TEXT, text))
         stored = (hashlib.sha256(text).hexdigest(), 100, KIND_IMAGE)
         result = resolve_current_clip_state(clipboard, stored, now=999)
         self.assertEqual(result, (stored[0], 100, KIND_IMAGE))
 
     def test_content_differing_from_the_store_uses_now(self):
-        """New content observed here always comes from clipboard.read(),
-        which is text-only on this path today, so it resolves KIND_TEXT."""
-        clipboard = FixedReadClipboard(b"brand new content")
+        """New content observed here comes from clipboard.read(), which
+        Task 7 made kind-aware -- so the kind it resolves must be the
+        read's OWN kind, not an assumed KIND_TEXT. See
+        test_content_differing_from_the_store_uses_the_reads_own_kind
+        immediately below for the case that actually distinguishes the
+        two (this one uses KIND_TEXT for both, so it cannot)."""
+        clipboard = FixedReadClipboard((KIND_TEXT, b"brand new content"))
         stored = ("some-other-hash-entirely", 100, KIND_TEXT)
         result = resolve_current_clip_state(clipboard, stored, now=999)
         self.assertEqual(
@@ -352,8 +390,23 @@ class TestResolveCurrentClipState(unittest.TestCase):
             (hashlib.sha256(b"brand new content").hexdigest(), 999, KIND_TEXT),
         )
 
+    def test_content_differing_from_the_store_uses_the_reads_own_kind(self):
+        """The regression this task exists to prevent, reproduced directly:
+        resolve_startup_state's docstring warns that a mechanical
+        adaptation of THIS function (`current_hash = sha256_hex(read[1])`,
+        the new kind quietly dropped on the floor) runs clean and passes
+        the whole suite while silently fabricating KIND_TEXT for a PNG
+        hash. stored deliberately describes a DIFFERENT kind (KIND_TEXT)
+        than what is read (KIND_IMAGE), so a bug that just reused stored's
+        kind, or hardcoded KIND_TEXT, cannot pass by coincidence either."""
+        png = b"\x89PNG-a-screenshot"
+        clipboard = FixedReadClipboard((KIND_IMAGE, png))
+        stored = ("some-other-hash-entirely", 100, KIND_TEXT)
+        result = resolve_current_clip_state(clipboard, stored, now=999)
+        self.assertEqual(result, (sha256_hex(png), 999, KIND_IMAGE))
+
     def test_nothing_stored_uses_now(self):
-        clipboard = FixedReadClipboard(b"first time seeing this")
+        clipboard = FixedReadClipboard((KIND_TEXT, b"first time seeing this"))
         result = resolve_current_clip_state(clipboard, stored=None, now=999)
         self.assertEqual(
             result,
@@ -394,7 +447,7 @@ class TestAnnounceClipState(unittest.TestCase):
         save_clip_state(HASH_B, 111, KIND_TEXT, path=self.path)
         lines = self.capture_log()
 
-        announce_clip_state(lambda t, p: None, FixedReadClipboard(b"new content"),
+        announce_clip_state(lambda t, p: None, FixedReadClipboard((KIND_TEXT, b"new content")),
                             now=999999, path=self.path)
 
         self.assertIn("clipboard changed while apart", lines)
@@ -404,7 +457,7 @@ class TestAnnounceClipState(unittest.TestCase):
         nothing was watching, and only now is honest about its age."""
         lines = self.capture_log()
 
-        announce_clip_state(lambda t, p: None, FixedReadClipboard(b"first ever content"),
+        announce_clip_state(lambda t, p: None, FixedReadClipboard((KIND_TEXT, b"first ever content")),
                             now=42, path=self.path)
 
         self.assertIn("clipboard changed while apart", lines)
@@ -418,7 +471,7 @@ class TestAnnounceClipState(unittest.TestCase):
         save_clip_state(sha256_hex(text), 555, KIND_TEXT, path=self.path)
         lines = self.capture_log()
 
-        announce_clip_state(lambda t, p: None, FixedReadClipboard(text),
+        announce_clip_state(lambda t, p: None, FixedReadClipboard((KIND_TEXT, text)),
                             now=999999, path=self.path)
 
         self.assertNotIn("clipboard changed while apart", lines)
@@ -439,7 +492,7 @@ class TestAnnounceClipState(unittest.TestCase):
         save_clip_state(sha256_hex(text), 555, KIND_TEXT, path=self.path)
         sent = []
 
-        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(text),
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, text)),
                             now=999999, path=self.path)
 
         self.assertEqual(len(sent), 1)
@@ -450,7 +503,7 @@ class TestAnnounceClipState(unittest.TestCase):
         save_clip_state(HASH_B, 111, KIND_TEXT, path=self.path)
         sent = []
 
-        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"new content"),
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, b"new content")),
                             now=999999, path=self.path)
 
         decoded = decode_clip_state(sent[0][1])
@@ -461,7 +514,7 @@ class TestAnnounceClipState(unittest.TestCase):
         afterward) sees the reconciled value, not whatever was on disk
         before this connection began."""
         sent = []
-        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"fresh content"),
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, b"fresh content")),
                             now=42, path=self.path)
 
         self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0, KIND_TEXT))
@@ -482,11 +535,37 @@ class TestAnnounceClipState(unittest.TestCase):
             save_clip_state(HASH_A, 1, KIND_TEXT, path=unsaveable_path)
 
         sent = []
-        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"still send this"),
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, b"still send this")),
                             now=1, path=unsaveable_path)
 
         self.assertEqual(len(sent), 1,
                          "a local disk failure must not prevent the announcement from going out")
+
+    def test_an_image_only_clipboard_announces_its_real_kind_not_a_fabricated_text(self):
+        """The end-to-end proof, one level closer to production than
+        TestResolveCurrentClipState's own direct-call version: an
+        image-only clipboard (no text at all -- Task 7's whole point is
+        that this no longer reads back as an empty clipboard) must
+        announce kind: "image" on the wire, not silently drop the kind and
+        announce (or persist) a PNG's hash mislabelled as text. This is
+        exactly the store-corruption half of the bug resolve_startup_state's
+        docstring warns about: a fabricated KIND_TEXT here would be
+        WRITTEN to the store by the save_clip_state call below, not just
+        wrong in memory for one connection."""
+        png = b"\x89PNG-a-screenshot-only-clipboard"
+        sent = []
+
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_IMAGE, png)),
+                            now=42, path=self.path)
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], TYPE_CLIP_STATE)
+        decoded = decode_clip_state(sent[0][1])
+        self.assertEqual(decoded, (sha256_hex(png), 42.0, KIND_IMAGE))
+        self.assertEqual(
+            load_clip_state(path=self.path), (sha256_hex(png), 42.0, KIND_IMAGE),
+            "the persisted store must carry the real kind too, not just the sent frame",
+        )
 
 
 class TestV2StoreIsRejected(_TempPathCase):

@@ -16,6 +16,7 @@ from agent_under_test import (
     DEGRADED_POLL_SECONDS,
     GPASTE_BUS_NAME,
     GPasteWatcher,
+    KIND_IMAGE,
     KIND_TEXT,
     MAX_TEXT_BYTES,
     PollingWatcher,
@@ -1514,7 +1515,14 @@ class QueueClipboard:
     """A clipboard double whose read() replays a queue of scripted values --
     lets a test dictate exactly what Agent._local_change observes on each
     call, independent of any subprocess or timing. write() records what the
-    agent wrote locally."""
+    agent wrote locally.
+
+    queue_read(value) queues a TEXT read -- the shape every test in this
+    file that predates Task 7 already exercises -- auto-wrapped here as
+    (KIND_TEXT, value) to match WaylandClipboard.read()'s (kind, bytes)
+    contract, so none of those existing call sites needed to change.
+    None still queues a "nothing there" read. queue_image_read(value)
+    queues an image read directly, for the tests that need one."""
 
     def __init__(self, ready=True):
         self._ready = ready
@@ -1522,7 +1530,10 @@ class QueueClipboard:
         self.written = []
 
     def queue_read(self, value):
-        self._queue.append(value)
+        self._queue.append(None if value is None else (KIND_TEXT, value))
+
+    def queue_image_read(self, value):
+        self._queue.append(None if value is None else (KIND_IMAGE, value))
 
     def ready(self):
         return self._ready
@@ -1530,8 +1541,8 @@ class QueueClipboard:
     def read(self):
         return self._queue.pop(0) if self._queue else None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class SpyWatcher:
@@ -1704,14 +1715,14 @@ class TestEchoBookkeeping(unittest.TestCase):
     def test_write_clip_writes_and_arms_the_suppression(self):
         agent = self.build(ready=True)
         agent._write_clip(encode_clip_payload(1.0, b"hello"))
-        self.assertEqual(agent.clipboard.written, [b"hello"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"hello")])
         self.assertEqual(agent._last_written, b"hello")
 
     def test_immediate_clip_delivery_arms_the_suppression(self):
         agent = self.build(ready=True)
         self.become_ready_without_a_real_watcher(agent)
         agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"now"))
-        self.assertEqual(agent.clipboard.written, [b"now"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"now")])
         self.assertEqual(agent._last_written, b"now")
 
     def test_pending_clip_delivery_arms_the_same_suppression(self):
@@ -1723,7 +1734,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"queued while pending"))
         agent.clipboard._ready = True
         self.become_ready_without_a_real_watcher(agent)
-        self.assertEqual(agent.clipboard.written, [b"queued while pending"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"queued while pending")])
         self.assertEqual(agent._last_written, b"queued while pending")
 
     def test_matching_echo_is_suppressed_and_consumed(self):
@@ -2079,6 +2090,46 @@ class TestEchoBookkeeping(unittest.TestCase):
             "already held before anything synced",
         )
 
+    def test_an_image_only_clipboard_at_connect_seeds_no_baseline_but_still_announces_its_kind(self):
+        """The Agent-level close of the loop resolve_startup_state's fix
+        opens, one frame up from TestResolveCurrentClipState's direct-call
+        coverage in test_clip_state_store.py: clipboard_became_ready's own
+        seed read AND announce_clip_state's read (called from inside it)
+        both go through this same kind-aware clipboard.read() now.
+
+        _last_seen stays a text-only value until Task 9 (see
+        clipboard_became_ready's own comment) -- an image-only clipboard at
+        connect seeds no baseline, exactly like an empty one already seeds
+        none. But the CLIP_STATE announcement that goes out in the same
+        call is a different matter: that frame is what gets PERSISTED to
+        the store and put on the wire, and a fabricated KIND_TEXT there is
+        exactly the regression resolve_startup_state's docstring warns
+        about -- not just wrong in memory for one connection, but wrong on
+        disk for every connection after it too."""
+        agent = self.build(ready=True)
+        png = b"\x89PNG-the-only-thing-on-the-clipboard"
+        # Same double-read shape as
+        # test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send
+        # just above: the seed read, and announce_clip_state's own read.
+        agent.clipboard.queue_image_read(png)  # the seed read
+        agent.clipboard.queue_image_read(png)  # the announce step's own read
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        self.become_ready_without_a_real_watcher(agent)
+
+        self.assertIsNone(
+            agent._last_seen,
+            "_last_seen stays text-only until Task 9 -- an image seeds no baseline yet",
+        )
+        announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
+        self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
+        decoded = decode_clip_state(announced[0][1])
+        self.assertEqual(
+            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
+            "the announced kind must be the real one, not a fabricated KIND_TEXT",
+        )
+
 
 class OrderRecordingClipboard:
     """write() snapshots agent._last_written at the exact moment it is
@@ -2101,8 +2152,8 @@ class OrderRecordingClipboard:
     def read(self):
         return None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
         self.armed_at_write_time.append(self.agent._last_written if self.agent else None)
 
 
@@ -2129,7 +2180,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
 
         agent._write_clip(encode_clip_payload(1.0, b"hello"))
 
-        self.assertEqual(clipboard.written, [b"hello"])
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"hello")])
         self.assertEqual(
             clipboard.armed_at_write_time, [b"hello"],
             "the suppression must already be armed with the decoded text at "
@@ -2242,7 +2293,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
 
         agent._write_clip(encode_clip_payload(1.0, b"still write this"))
 
-        self.assertEqual(clipboard.written, [b"still write this"],
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"still write this")],
                          "a local disk failure must not prevent the clipboard write")
         self.assertEqual(agent._last_written, b"still write this",
                          "the suppression must still be armed despite the disk failure")
@@ -2264,9 +2315,11 @@ class RacyClipboard:
 
     def read(self):
         self._agent._write_clip(self._interleaved_write)  # lands mid-flight
-        return self._value_read  # what the fork had already captured
+        # what the fork had already captured -- every test constructing one
+        # of these passes text, so KIND_TEXT unconditionally.
+        return (KIND_TEXT, self._value_read)
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
     def ready(self):
@@ -2293,9 +2346,9 @@ class GatedReadClipboard:
         with self._lock:
             self.reads += 1
         self._gate.wait(JOIN_TIMEOUT)
-        return self._text
+        return (KIND_TEXT, self._text)
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
 
@@ -3011,6 +3064,11 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def announce_clip_state",
             "SKEW_WARN_SECONDS = 5.0",
             "def skew_log_line",
+            # Task 7: the one canonical clipboard read, and its longer
+            # image timeout, defined alongside SUBPROCESS_TIMEOUT and
+            # WaylandClipboard.
+            "IMAGE_SUBPROCESS_TIMEOUT = 10",
+            "def choose_kind",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

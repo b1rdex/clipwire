@@ -247,7 +247,7 @@ class ScriptedClipboard:
     def read(self):
         return None
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
 
@@ -384,10 +384,13 @@ class ScriptedClipboardWithContent:
             self._write_fd = None
 
     def read(self):
-        return self._read_value
+        # Kind-aware since Task 7 -- always KIND_TEXT here, the only kind
+        # this file's own TestClipStateOrderingAcrossRealDispatch constructs
+        # one of these with.
+        return (KIND_TEXT, self._read_value) if self._read_value else None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
