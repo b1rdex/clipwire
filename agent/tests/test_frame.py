@@ -1,5 +1,6 @@
 import io
 import json
+import time
 import unittest
 
 from agent_under_test import (
@@ -181,6 +182,32 @@ class TestHelloSkew(unittest.TestCase):
         # runs on, and a sleep would only make it slower, not deterministic.
         self.agent._on_hello(self._hello(sent_at=1000.0), now=1000.5)
         self.assertEqual(self._skew_lines(), ["peer clock skew 0.5s"])
+
+    def test_the_wall_clock_default_is_used_when_now_is_not_injected(self):
+        """The one branch production always takes, and the only one every
+        other test here would leave unpinned.
+
+        run() dispatches through on_frame, which deliberately does not thread
+        `now` -- so the real agent always reaches `now = time.time()`. Every
+        other test in this class passes `now=` explicitly and would stay green
+        with that fallback deleted, while the real Mac (which always sends
+        sent_at) would hand skew_log_line a None `now`: TypeError, caught
+        neither by skew_log_line's `except OverflowError` nor by main()'s
+        `except FrameError`, so the channel is torn down on the first hello
+        of every connection -- exactly what Ruling 2 exists to prevent.
+
+        Deterministic without a sleep and without a mock: sent_at is read
+        from the same clock the fallback reads, microseconds earlier, so the
+        measured skew is far below the threshold on any machine. The
+        assertion is on the SHAPE (one line, not a warning), never on an
+        exact duration.
+        """
+        self.agent._on_hello(self._hello(sent_at=time.time()))   # no now=
+        self.assertEqual(len(self._skew_lines()), 1,
+                         "a hello carrying sent_at must report skew against the "
+                         "wall clock when no now is injected")
+        self.assertNotIn("over 5s", self._skew_lines()[0],
+                         "this machine's clock against itself is not a skew warning")
 
     def test_a_badly_skewed_peer_warns(self):
         self.agent._on_hello(self._hello(sent_at=1000.0), now=1060.0)
