@@ -246,7 +246,7 @@ final class AgentStatusTests: XCTestCase {
     //
     // The twin of agent/clipwire-agent.py's skew_log_line, asserted against
     // the same strings: both sides are meant to log the same quantity in the
-    // same shape, the way the two "over the frame cap" lines already do.
+    // same shape, the way the two "over the text limit" lines already do.
     // agent/tests/test_frame.py's TestSkewLogLine is the mirror of this
     // section, case for case.
 

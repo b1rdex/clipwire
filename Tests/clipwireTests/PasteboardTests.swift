@@ -176,7 +176,7 @@ final class PasteboardTests: XCTestCase {
 
     /// A user whose large local copy silently never reaches the peer has
     /// nothing to look at otherwise -- the Python agent already logs its
-    /// analogous skip ("skipping a clip of N bytes: over the frame cap").
+    /// analogous skip ("skipping a clip of N bytes: over the text limit").
     /// `log` is optional and defaulted to `nil` on every other test in this
     /// file precisely so this is the only one that needs to pass a real one.
     func testOversizedClipIsLoggedWithItsSize() {

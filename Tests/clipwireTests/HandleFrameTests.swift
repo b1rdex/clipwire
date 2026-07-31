@@ -669,7 +669,7 @@ final class HandleFrameTests: XCTestCase {
 
     /// A user whose large paste wins a reconciliation but can't actually be
     /// sent has nothing to look at otherwise -- matches the Python agent's
-    /// existing "skipping a clip of N bytes: over the frame cap" line for
+    /// existing "skipping a clip of N bytes: over the text limit" line for
     /// the same cap, and `PasteboardTests.testOversizedClipIsLoggedWithItsSize`
     /// for the watcher's own send-side guard.
     func testWinningClipStateWithOversizedContentIsLoggedWithItsSize() throws {

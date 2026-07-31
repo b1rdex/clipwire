@@ -2652,7 +2652,7 @@ class TestIncomingClipState(unittest.TestCase):
     def test_winning_clip_state_with_oversized_content_is_logged_with_its_size(self):
         """A user whose large paste wins a reconciliation but can't actually
         be sent has nothing to look at otherwise -- matches the existing
-        "skipping a clip of N bytes: over the frame cap" line used for
+        "skipping a clip of N bytes: over the text limit" line used for
         _local_change's own cap."""
         save_clip_state(HASH_A, 777, path=self.clip_state_path)
         oversized = MAX_TEXT_BYTES

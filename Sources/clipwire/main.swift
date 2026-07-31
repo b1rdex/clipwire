@@ -378,7 +378,7 @@ final class ClipStateAnnouncement {
 ///
 /// The line matches the text all three of `agent/clipwire-agent.py`'s own
 /// `save_clip_state` call sites already log (`could not persist clip state:
-/// %r`), the way the two "over the frame cap" lines and the two skew lines
+/// %r`), the way the two "over the text limit" lines and the two skew lines
 /// already match. All three Swift sites were bare `try?`, which mattered
 /// specifically because the silent side is the one whose disk failure is the
 /// PRECONDITION for a store-goes-stale clobber: with nothing readable on

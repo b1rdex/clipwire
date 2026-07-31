@@ -413,6 +413,19 @@ class Agent:
             self._on_clip(payload)
         elif frame_type == TYPE_CLIP_STATE:
             self._on_clip_state(payload)
+        elif frame_type == TYPE_IMAGE_CLIP:
+            # Task 4 adds TYPE_IMAGE_CLIP to _KNOWN_TYPES, which removes
+            # decode_frame's UnknownFrameType raise for this byte -- before
+            # this task a stray 0x03 tore the connection down loudly
+            # (main()'s `except FrameError` logs "protocol error: ...").
+            # Without this branch the same byte would now vanish in total
+            # silence instead: nothing else here handles it, and stderr is
+            # this agent's only diagnostic surface. Image sync itself is
+            # Task 5+'s job; this is deliberately the smallest legal body,
+            # matching Sources/clipwire/main.swift's handleFrame `.imageClip`
+            # case, which the same addition forces there via Swift's
+            # exhaustive switch.
+            log("received an image clip — image sync is not implemented yet")
 
     def _on_hello(self, payload, now=None):
         """`now` is injectable for the same reason handleFrame's is on the

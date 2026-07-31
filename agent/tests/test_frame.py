@@ -135,12 +135,41 @@ class TestV3Constants(unittest.TestCase):
         self.assertEqual(PROTOCOL_VERSION, 3)
 
 
+class TestImageClipDispatch(unittest.TestCase):
+    """Adding TYPE_IMAGE_CLIP to _KNOWN_TYPES removes decode_frame's
+    UnknownFrameType raise for 0x03: before this task, a stray 0x03 tore the
+    connection down loudly, caught by main()'s `except FrameError` and
+    logged as "protocol error: ...". on_frame's dispatch (if/elif, no else)
+    has no branch for the new type, so without this fix the exact same byte
+    that used to raise now vanishes in total silence -- decode_frame hands
+    it over, on_frame drops it, nothing reaches stderr, the one stream this
+    agent's diagnostics depend on. Mirrors
+    HandleFrameTests.testImageClipFrameIsReceivedAndLoggedButNotYetHandled
+    on the Swift side, whose forcing function is a compile error rather
+    than a lost exception path -- but the same minimal, one-line fix."""
+
+    def test_an_image_clip_is_received_and_logged_but_not_yet_handled(self):
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=None)
+        original_log = clipwire_agent.log
+        log_lines = []
+        clipwire_agent.log = log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_IMAGE_CLIP, b"not yet a real image")
+
+        self.assertEqual(sent, [], "must not reply to or forward an image clip yet")
+        self.assertTrue(any("image clip" in line for line in log_lines),
+                        "expected the receipt to be logged; got: %r" % log_lines)
+
+
 class TestSkewLogLine(unittest.TestCase):
     """The pure half of skew reporting: value in, log line (or None) out.
 
     Mirrors Sources/clipwire/main.swift's skewLogLine, whose own tests in
     AgentStatusTests.swift assert the same strings -- the two log lines are
-    meant to be byte-identical, the way the two "over the frame cap" lines
+    meant to be byte-identical, the way the two "over the text limit" lines
     already are.
     """
 
