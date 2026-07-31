@@ -74,10 +74,10 @@ final class FreshnessTests: XCTestCase {
 
     func testClipStatePayloadRoundTrips() throws {
         let withHash = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5)
-        XCTAssertEqual(try ClipState.decodePayload(try withHash.encodePayload()), withHash)
+        XCTAssertEqual(try ClipState.decodePayload(withHash.encodePayload()), withHash)
 
         let empty = ClipState(sha256: nil, ts: 0)
-        XCTAssertEqual(try ClipState.decodePayload(try empty.encodePayload()), empty)
+        XCTAssertEqual(try ClipState.decodePayload(empty.encodePayload()), empty)
     }
 
     /// `JSONEncoder` rejects a non-finite `Double` (`.nan`, `.infinity`,

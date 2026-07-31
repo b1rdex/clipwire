@@ -5,15 +5,23 @@ import XCTest
 final class ClipStateStoreTests: XCTestCase {
     private var url: URL!
     private var store: ClipStateStore!
+    private var nestedRoot: URL!
 
     override func setUp() {
         url = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-clip-state-\(UUID().uuidString).json")
         store = ClipStateStore(path: url.path)
+        nestedRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-clip-state-\(UUID().uuidString)")
     }
 
+    // tearDown always runs, pass or fail or throw, so this is the only
+    // cleanup point that can't leave droppings behind on a failing `try` in
+    // the middle of a test -- unlike a cleanup line at the end of a test
+    // body, which a thrown error skips entirely.
     override func tearDown() {
         try? FileManager.default.removeItem(at: url)
+        try? FileManager.default.removeItem(at: nestedRoot)
     }
 
     // MARK: - load/save round trip
@@ -72,13 +80,10 @@ final class ClipStateStoreTests: XCTestCase {
     }
 
     func testSaveCreatesIntermediateDirectories() throws {
-        let nested = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clipwire-clip-state-\(UUID().uuidString)")
-            .appendingPathComponent("nested/clip-state.json")
+        let nested = nestedRoot.appendingPathComponent("nested/clip-state.json")
         let nestedStore = ClipStateStore(path: nested.path)
         try nestedStore.save(ClipState(sha256: "aa", ts: 1))
         XCTAssertEqual(nestedStore.load(), ClipState(sha256: "aa", ts: 1))
-        try? FileManager.default.removeItem(at: nested.deletingLastPathComponent().deletingLastPathComponent())
     }
 
     // MARK: - init(path:) expands ~
