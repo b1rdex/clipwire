@@ -1,4 +1,5 @@
 // Sources/clipwire/main.swift
+import CryptoKit
 import Foundation
 
 // Namespaced rather than bare top-level `let`: main.swift is the file
@@ -193,6 +194,88 @@ final class AgentStatus: @unchecked Sendable {
     }
 }
 
+/// Lowercase hex, no separators -- the exact shape `hashlib.sha256(data).hexdigest()`
+/// produces on the Python side, and the shape every `ClipState.sha256` on the wire
+/// must match byte-for-byte: `resolveStartupState`/`resolveFreshness` compare these
+/// strings with plain `==`, so a case or separator difference here would make every
+/// startup comparison see "hashes differ" and take the `now` branch meant only for
+/// content that genuinely changed while nothing was watching -- the systematic
+/// clobber the persistent store exists to prevent. `EchoGuard` already computes a
+/// `SHA256.Digest` elsewhere in this target and never hexes it, so there is no
+/// existing conversion to reuse here; this is the first, and is pinned against a
+/// known vector in `Tests/clipwireTests/HandleFrameTests.swift`.
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+/// Reconciles what the pasteboard holds right now against what was last persisted.
+/// `nil` (an empty or unreadable pasteboard) is never hashed, matching the wire
+/// contract that `sha256` is `null` for exactly that case -- see `resolveStartupState`
+/// for the rule this applies once a current hash is in hand.
+func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double) -> ClipState {
+    let currentHash: String?
+    if let data = pasteboard.readText(), !data.isEmpty {
+        currentHash = sha256Hex(data)
+    } else {
+        currentHash = nil
+    }
+    return resolveStartupState(currentHash: currentHash, stored: stored, now: now)
+}
+
+/// Whether THIS connection's one-shot clip-state announcement has already gone out.
+/// `handleFrame` checks and claims it via `markSent()`, on a matched hello only;
+/// `wireAgent` calls `reset()` on `.clipboardPending`, the signal `Channel` raises
+/// exactly once per established connection attempt (see `Channel.attempt()`'s
+/// `established` guard) -- so the announcement re-arms on every reconnect, not only
+/// the process's first connection ever. That re-arming is the entire point: Mac
+/// sleep/wake cycles reconnect constantly, and each one needs its own reconciliation,
+/// which is exactly what v1 never did.
+///
+/// Holds no lock, unlike `AgentStatus`: this is only ever touched from
+/// `channel.onFrame`/`channel.onStateChange`, both invoked synchronously from
+/// whichever single thread drives `Channel.run()`'s decode loop -- never from
+/// `PasteboardWatcher`'s timer or the heartbeat timer, which is what forces a lock
+/// onto `AgentStatus`.
+final class ClipStateAnnouncement {
+    private(set) var sent = false
+
+    func reset() {
+        sent = false
+    }
+
+    /// Marks it sent and returns whether THIS call is the one that did so --
+    /// `false` if an earlier call already claimed it this connection.
+    @discardableResult
+    func markSent() -> Bool {
+        guard !sent else { return false }
+        sent = true
+        return true
+    }
+}
+
+/// Builds and sends this side's one-shot clip-state announcement: reconciles
+/// whatever the pasteboard currently holds against the persistent store (so
+/// unchanged content keeps its true recorded age instead of looking freshly
+/// copied -- see `resolveStartupState`), persists the reconciled value, and sends
+/// it. The send is unconditional on the save's success -- a local disk failure is
+/// not the peer's fault, and must not silently disable reconciliation for this
+/// connection the way gating the send behind the save's result would.
+///
+/// Pulled out of `wireAgent` for the same reason `handleFrame` was pulled out of
+/// `runAgent()`: a `send` spy can verify the exact frame this produces without a
+/// live channel. See `Tests/clipwireTests/HandleFrameTests.swift`.
+func announceClipState(
+    send: (Frame) -> Void,
+    pasteboard: PasteboardReading,
+    clipStateStore: ClipStateStore,
+    now: Double
+) {
+    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: clipStateStore.load(), now: now)
+    try? clipStateStore.save(resolved)
+    guard let payload = try? resolved.encodePayload() else { return }
+    send(Frame(type: .clipState, payload: payload))
+}
+
 /// Handles one decoded frame. Pulled out of `runAgent()`'s inline closure
 /// so the two contracts this task exists for are directly assertable: the
 /// echo suppression must be armed strictly before the incoming clip is
@@ -220,9 +303,12 @@ func handleFrame(
     _ frame: Frame,
     send: (Frame) -> Void,
     noteWrittenLocally: (Data) -> Void,
-    pasteboard: PasteboardWriting,
+    pasteboard: PasteboardReading & PasteboardWriting,
     status: AgentStatus,
-    log: Log
+    log: Log,
+    clipStateStore: ClipStateStore,
+    clipStateAnnouncement: ClipStateAnnouncement,
+    now: Double = Date().timeIntervalSince1970
 ) {
     switch frame.type {
     case .hello:
@@ -262,22 +348,63 @@ func handleFrame(
         }
         status.recordHelloMatched()
         log.line("peer said hello (agent \(peer.agent ?? "unknown"))")
+        // Sent exactly once per connection, immediately after a matched
+        // hello -- per the design spec. `clipStateAnnouncement` is what
+        // makes "once" true, not the assumption that hello itself only
+        // ever arrives once: `wireAgent` resets it on the next
+        // `.clipboardPending`, so it re-arms on every reconnect.
+        if clipStateAnnouncement.markSent() {
+            announceClipState(send: send, pasteboard: pasteboard, clipStateStore: clipStateStore, now: now)
+        }
     case .clipState:
-        // Registered so the envelope can decode a type-2 frame at all --
-        // this task adds no sender, no receiver behaviour, and no
-        // resolution rule. Those land when the Mac side is wired up.
-        break
+        guard let peerState = try? ClipState.decodePayload(frame.payload) else { return }
+        // `clipStateStore.load()` should already reflect our own current
+        // state -- either from this connection's own announcement above,
+        // or from an ordinary local-change/applied-clip save since -- so
+        // the fallback below only matters if an earlier save failed. It
+        // must still resolve a REAL state from the live pasteboard rather
+        // than a bare nil-hash placeholder: a wrong nil here would make
+        // both sides resolve waitForPeer against each other's (correctly
+        // announced) state and silently lose the clip, reintroducing v1's
+        // bug through the fallback path instead of the main one.
+        let mine = clipStateStore.load()
+            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
+        switch resolveFreshness(mine: mine, peer: peerState) {
+        case .sendMine:
+            guard let data = pasteboard.readText(), !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            // `mine.ts`, not `now`: the content has not changed, only been
+            // re-announced, so its recorded age must be preserved. Sending
+            // with `now` would perpetually refresh it and let it win every
+            // future reconciliation regardless of what happens next.
+            send(Frame(type: .clip, payload: ClipPayload(ts: mine.ts, text: text).encode()))
+        case .waitForPeer, .doNothing:
+            // Hashes equal means we agree -- not a signal to resend. A
+            // peer that is fresher means we wait. Conflating either with
+            // sendMine reintroduces a clobber or a ping-pong.
+            break
+        }
     case .clip:
-        guard !frame.payload.isEmpty,
-              let text = String(data: frame.payload, encoding: .utf8) else { return }
-        // Arm suppression BEFORE writing to the pasteboard.
-        // PasteboardWatcher's lock keeps its own bookkeeping
-        // consistent, but it does not own this write, so only this
-        // ordering keeps the watcher from observing our write before
-        // the suppression exists and bouncing it straight back to the
-        // peer.
-        noteWrittenLocally(frame.payload)
-        pasteboard.writeText(text)
+        guard let decoded = try? ClipPayload.decode(frame.payload), !decoded.text.isEmpty else { return }
+        let textData = Data(decoded.text.utf8)
+        // Arm suppression BEFORE writing to the pasteboard, with the
+        // PLAIN TEXT bytes -- not `frame.payload`, which carries the
+        // 8-byte timestamp prefix. PasteboardWatcher's own poll() hashes
+        // whatever `pasteboard.readText()` returns, which is this text
+        // alone; arming with the ts-prefixed payload would make
+        // EchoGuard's digest never match, `shouldSend` would always
+        // return true, and every applied remote clip would bounce
+        // straight back out to the peer it came from. PasteboardWatcher's
+        // lock keeps its own bookkeeping consistent, but it does not own
+        // this write, so only this ordering keeps the watcher from
+        // observing our write before the suppression exists.
+        noteWrittenLocally(textData)
+        pasteboard.writeText(decoded.text)
+        // The peer's timestamp, never `now`: this is the entire reason it
+        // travels in the frame. Stamping it with `now` would make applied
+        // content look freshly copied here and win the next
+        // reconciliation against the machine it actually came from.
+        try? clipStateStore.save(ClipState(sha256: sha256Hex(textData), ts: decoded.ts))
         status.recordReceived()
     }
 }
@@ -294,22 +421,40 @@ func handleFrame(
 /// attempted before any channel is established (`stdinPipe` still nil) must
 /// not make `clipwire status` claim a clip that never left the machine.
 func wireAgent(
-    channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardWriting,
-    status: AgentStatus, log: Log
+    channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardReading & PasteboardWriting,
+    status: AgentStatus, log: Log, clipStateStore: ClipStateStore, clipStateAnnouncement: ClipStateAnnouncement
 ) {
-    watcher.onChange = { payload in
-        channel.send(Frame(type: .clip, payload: payload), onSent: { sent in
+    watcher.onChange = { payload, observedAt in
+        // A genuine local change: `observedAt` -- the moment PasteboardWatcher
+        // actually read it, not whenever this closure happens to run -- is
+        // the timestamp both for what we persist and for what we send. The
+        // save must happen regardless of whether the send below ever reaches
+        // the peer (no channel yet, or the write fails): the store's job is
+        // "what do we hold and how old is it", independent of delivery.
+        try? clipStateStore.save(ClipState(sha256: sha256Hex(payload), ts: observedAt))
+        let text = String(decoding: payload, as: UTF8.self)
+        let framePayload = ClipPayload(ts: observedAt, text: text).encode()
+        channel.send(Frame(type: .clip, payload: framePayload), onSent: { sent in
             if sent { status.recordSent() }
         })
     }
 
     channel.onFrame = { frame in
         handleFrame(frame, send: channel.send, noteWrittenLocally: watcher.noteWrittenLocally,
-                    pasteboard: pasteboard, status: status, log: log)
+                    pasteboard: pasteboard, status: status, log: log,
+                    clipStateStore: clipStateStore, clipStateAnnouncement: clipStateAnnouncement)
     }
 
     channel.onStateChange = { state, reason in
         status.applyChannelState(state, reason)
+        // Channel raises `.clipboardPending` exactly once per established
+        // connection attempt (see `Channel.attempt()`'s `established`
+        // guard) -- the reset point that lets the one-shot announcement
+        // re-arm on every reconnect rather than firing only on the
+        // process's first connection ever.
+        if state == .clipboardPending {
+            clipStateAnnouncement.reset()
+        }
     }
 }
 
@@ -338,8 +483,11 @@ func runAgent() -> Int32 {
     let watcher = PasteboardWatcher(
         pasteboard: systemPasteboard,
         pollInterval: Double(config.macPollIntervalMs) / 1000.0)
+    let clipStateStore = ClipStateStore(path: ClipStateStoreConstants.defaultPath)
+    let clipStateAnnouncement = ClipStateAnnouncement()
 
-    wireAgent(channel: channel, watcher: watcher, pasteboard: systemPasteboard, status: status, log: log)
+    wireAgent(channel: channel, watcher: watcher, pasteboard: systemPasteboard, status: status, log: log,
+              clipStateStore: clipStateStore, clipStateAnnouncement: clipStateAnnouncement)
 
     watcher.start()
 

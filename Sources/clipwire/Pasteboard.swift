@@ -87,7 +87,7 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// second is this class's responsibility, the first belongs to the task
 /// that builds the frame handler.
 final class PasteboardWatcher {
-    var onChange: ((Data) -> Void)?
+    var onChange: ((Data, Double) -> Void)?
 
     private let pasteboard: PasteboardReading
     private let pollInterval: TimeInterval
@@ -112,19 +112,27 @@ final class PasteboardWatcher {
     }
 
     func poll() {
-        guard let toSend = pollLocked() else { return }
+        guard let (toSend, observedAt) = pollLocked() else { return }
         // Invoked after the lock is released, both because it can be slow
         // (it hands off to the channel) and because a callback that
         // re-entered the watcher while the lock was still held would
         // deadlock against a non-reentrant NSLock.
-        onChange?(toSend)
+        onChange?(toSend, observedAt)
     }
 
     /// The entire read-and-decide sequence, as one critical section shared
     /// with `noteWrittenLocally`. `defer` releases the lock on every path,
     /// including the early "nothing changed" return, so a raised guard can
     /// never leak a held lock into the next `noteWrittenLocally` call.
-    private func pollLocked() -> Data? {
+    ///
+    /// The timestamp is read here, under the same lock as the text it is
+    /// paired with, because it must be the moment of OBSERVATION -- this
+    /// poll's read -- not the moment `onChange` eventually runs, which is
+    /// deliberately invoked outside the lock and can lag behind it. This
+    /// timestamp becomes the outgoing clip's `ts`; a receiving peer stores
+    /// it unchanged (see `handleFrame`'s `.clip` case), so inflating it here
+    /// would misstate how old the content actually is everywhere downstream.
+    private func pollLocked() -> (Data, Double)? {
         stateLock.lock()
         defer { stateLock.unlock() }
 
@@ -140,7 +148,7 @@ final class PasteboardWatcher {
         guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
         guard text.count <= FrameConstants.maxPayloadBytes else { return nil }
         guard echo.shouldSend(text) else { return nil }
-        return text
+        return (text, Date().timeIntervalSince1970)
     }
 
     func start() {

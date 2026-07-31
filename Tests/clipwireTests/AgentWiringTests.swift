@@ -33,6 +33,11 @@ final class AgentWiringTests: XCTestCase {
                macPollIntervalMs: 400)
     }
 
+    private func tempClipStateStore() -> ClipStateStore {
+        ClipStateStore(path: FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-wiring-test-\(UUID().uuidString).json").path)
+    }
+
     func testAnIncomingClipDoesNotBounceBackThroughTheWiredWatcher() {
         // One FakePasteboard plays both roles -- read (for the watcher) and
         // write (for handleFrame) -- exactly as the single SystemPasteboard
@@ -44,7 +49,8 @@ final class AgentWiringTests: XCTestCase {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
         wireAgent(channel: channel, watcher: watcher, pasteboard: pasteboard,
-                  status: status, log: tempLog())
+                  status: status, log: tempLog(), clipStateStore: tempClipStateStore(),
+                  clipStateAnnouncement: ClipStateAnnouncement())
 
         // Second-round final review, Finding 3: a bare "onChange does not
         // re-fire" assertion cannot tell a correctly suppressed echo apart
@@ -60,9 +66,9 @@ final class AgentWiringTests: XCTestCase {
         // replacing what it does -- it must still forward to channel.send
         // exactly as wireAgent set it up.
         var onChangeFireCount = 0
-        watcher.onChange = { data in
+        watcher.onChange = { data, observedAt in
             onChangeFireCount += 1
-            wiredOnChange(data)
+            wiredOnChange(data, observedAt)
         }
 
         watcher.poll() // establishes the baseline changeCount, emits nothing
@@ -71,8 +77,10 @@ final class AgentWiringTests: XCTestCase {
         // If wireAgent correctly bound noteWrittenLocally to THIS watcher,
         // handleFrame arms its suppression before writing "hello" to the
         // shared pasteboard -- which also bumps its changeCount, exactly as
-        // a real incoming write bumps NSPasteboard.general's.
-        channel.onFrame?(Frame(type: .clip, payload: Data("hello".utf8)))
+        // a real incoming write bumps NSPasteboard.general's. The payload is
+        // a real ClipPayload encoding (ts + text), not bare text, since v2's
+        // clip frame carries its own timestamp.
+        channel.onFrame?(Frame(type: .clip, payload: ClipPayload(ts: 1, text: "hello").encode()))
         XCTAssertEqual(pasteboard.text, Data("hello".utf8), "the clip must have been written")
 
         // The watcher's own next poll must not treat that write as a new
@@ -98,5 +106,65 @@ final class AgentWiringTests: XCTestCase {
                        "a genuine local change must still reach onChange through the wiring -- " +
                        "the previous assertion alone cannot tell a correctly suppressed echo " +
                        "apart from onChange never firing at all")
+    }
+
+    /// Proves `wireAgent`'s `watcher.onChange` wiring does the freshness half
+    /// of its job, not only the echo-forwarding half already covered above:
+    /// a genuine local change must hash the new content and persist it
+    /// alongside the moment it was OBSERVED (not some later moment), so
+    /// `resolveStartupState`/`resolveFreshness` have something accurate to
+    /// compare against on the next connection.
+    func testAGenuineLocalChangeStoresItsHashAndObservationTimestamp() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        let channel = Channel(config: config(), log: tempLog())
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+        let clipStateStore = tempClipStateStore()
+
+        wireAgent(channel: channel, watcher: watcher, pasteboard: pasteboard, status: status,
+                  log: tempLog(), clipStateStore: clipStateStore, clipStateAnnouncement: ClipStateAnnouncement())
+
+        watcher.poll() // baseline
+        let before = Date().timeIntervalSince1970
+        pasteboard.set("typed by the user")
+        watcher.poll()
+        let after = Date().timeIntervalSince1970
+
+        let stored = clipStateStore.load()
+        XCTAssertEqual(stored?.sha256, sha256Hex(Data("typed by the user".utf8)))
+        guard let ts = stored?.ts else { return XCTFail("expected a stored timestamp") }
+        XCTAssertTrue(ts >= before && ts <= after,
+                      "expected \(ts) to fall within [\(before), \(after)] -- the moment of observation")
+    }
+
+    /// The property that makes the whole feature work across the case it
+    /// exists for: reconnects happen on every Mac sleep/wake cycle, not just
+    /// reboots, and `wireAgent` is wired exactly once at process start, so
+    /// whatever tracks "have we announced yet" must be reset on EVERY new
+    /// connection, not just consulted once. A gate that resets would look
+    /// identical to one that doesn't on a test that only checks the FIRST
+    /// connection -- this drives a second `.clipboardPending` transition and
+    /// checks the gate re-arms, using the SAME `ClipStateAnnouncement`
+    /// instance `wireAgent` was given, so its state is directly observable
+    /// without needing a live channel.send to prove anything happened.
+    func testClipStateAnnouncementResetsOnEveryNewConnectionNotOnlyTheFirst() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        let channel = Channel(config: config(), log: tempLog())
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+        let announcement = ClipStateAnnouncement()
+
+        wireAgent(channel: channel, watcher: watcher, pasteboard: pasteboard, status: status,
+                  log: tempLog(), clipStateStore: tempClipStateStore(), clipStateAnnouncement: announcement)
+
+        channel.onStateChange?(.clipboardPending, nil)
+        channel.onFrame?(Frame(type: .hello, payload: ProtocolConstants.helloPayload))
+        XCTAssertTrue(announcement.sent, "a matched hello on the first connection must claim the gate")
+
+        channel.onStateChange?(.clipboardPending, nil)
+        XCTAssertFalse(announcement.sent,
+                       "a NEW connection (the ordinary sleep/wake reconnect) must re-arm the gate -- " +
+                       "otherwise the announcement fires on the process's first connection ever and " +
+                       "never again, which defeats the entire feature")
     }
 }

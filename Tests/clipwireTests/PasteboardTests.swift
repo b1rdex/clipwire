@@ -32,7 +32,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
 
         watcher.poll()            // establishes the baseline, emits nothing
         pasteboard.set("hello")
@@ -40,11 +40,31 @@ final class PasteboardTests: XCTestCase {
         XCTAssertEqual(seen, [Data("hello".utf8)])
     }
 
+    /// The timestamp half of `onChange`'s contract: it must be the moment of
+    /// OBSERVATION (this poll), not some later moment `onChange` itself runs.
+    func testOnChangeCarriesAnObservationTimestamp() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        var seenTimestamps: [Double] = []
+        watcher.onChange = { _, observedAt in seenTimestamps.append(observedAt) }
+
+        watcher.poll()
+        let before = Date().timeIntervalSince1970
+        pasteboard.set("hello")
+        watcher.poll()
+        let after = Date().timeIntervalSince1970
+
+        XCTAssertEqual(seenTimestamps.count, 1)
+        guard let ts = seenTimestamps.first else { return }
+        XCTAssertTrue(ts >= before && ts <= after,
+                      "expected \(ts) to fall within [\(before), \(after)]")
+    }
+
     func testUnchangedCountEmitsNothing() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
         pasteboard.set("hello")
         watcher.poll()
         watcher.poll()
@@ -56,7 +76,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.setNonText()   // e.g. an image
         watcher.poll()
@@ -72,7 +92,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.set("")
         watcher.poll()
@@ -83,7 +103,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
 
         watcher.noteWrittenLocally(Data("from the peer".utf8))
@@ -100,7 +120,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { seen.append($0) }
+        watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.set(String(repeating: "x", count: FrameConstants.maxPayloadBytes + 1))
         watcher.poll()
@@ -176,7 +196,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
         nonisolated(unsafe) let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
         let seenLock = NSLock()
-        watcher.onChange = { data in
+        watcher.onChange = { data, _ in
             seenLock.lock(); seen.append(data); seenLock.unlock()
         }
 
@@ -306,7 +326,7 @@ final class PasteboardGenerationTests: XCTestCase {
         nonisolated(unsafe) let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
         let seenLock = NSLock()
-        watcher.onChange = { data in
+        watcher.onChange = { data, _ in
             seenLock.lock(); seen.append(data); seenLock.unlock()
         }
 
