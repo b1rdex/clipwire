@@ -17,9 +17,31 @@ jobs:
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      # Both legs always run: when the floor breaks and production does not
+      # (or the reverse), which one broke IS the finding.
+      fail-fast: false
+      matrix:
+        # 3.13 is what the PC actually runs, so it is the version under
+        # test. 3.11 is the floor the design doc promises and nothing
+        # verified before this: a bare `python3` here tested only whatever
+        # ubuntu-latest happened to ship, which is neither. Quoted, because
+        # unquoted YAML reads these as floats and a future "3.10" would
+        # become 3.1.
+        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
-      - run: python3 --version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Confirm python3 is the matrix version
+        # Every step below invokes `python3`, which setup-python points at
+        # the selected interpreter. Assert that rather than trust it: if it
+        # ever stopped happening, both legs would quietly retest the runner's
+        # own python3 and the matrix would prove nothing while staying green.
+        run: |
+          python3 --version
+          python3 -c 'import sys; assert "%d.%d" % sys.version_info[:2] == "${{ matrix.python-version }}", sys.version'
       - name: Byte-compile the agent
         run: python3 -m compileall -q agent/clipwire-agent.py
       - name: Unit tests
