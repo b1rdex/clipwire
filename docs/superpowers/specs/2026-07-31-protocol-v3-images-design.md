@@ -129,7 +129,16 @@ milliseconds before a tick's read can be judged missed while its `Update` is sti
 flight — a false "source is dead", degrading a healthy installation to 1-second polling for
 the rest of the connection. That is the very defect this release exists to fix.
 
-**The rule: a divergence must survive two consecutive ticks before the verdict fires.** The
+**The rule: a divergence arms the verdict, and the next tick confirms it if the counter is
+still unmoved.** What resets the run is the counter moving — or a read failing, which proves
+nothing either way. **The content settling does not reset it**, and getting that wrong is
+easy: an earlier draft of this rule said a settled tick resets the run, which sounds
+symmetrical and quietly makes a dead source undiagnosable whenever the user's copies fall
+more than one tick apart. Copies at t=0 and t=90 with a 30-second tick would arm at 30, reset
+at 60, arm at 120, reset at 150, forever. The armed state is a claim about the *event
+source*, not about the clipboard, so only evidence about the source may clear it.
+
+The
 discriminator compares two asynchronous observation streams — content and counter — with no
 happens-before between them, and any single-point check of such a pair has a window. It
 closes by synchronisation or by hysteresis. Synchronisation was rejected: an acknowledgement
