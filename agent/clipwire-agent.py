@@ -50,6 +50,27 @@ def decode_frame(buffer):
     return frame_type, payload
 
 
+import struct
+
+TIMESTAMP_BYTES = 8
+
+
+class ClipPayloadError(FrameError):
+    pass
+
+
+def encode_clip_payload(ts, text):
+    """[f64 big-endian ts][text bytes]. Text stays bytes end to end."""
+    return struct.pack(">d", ts) + text
+
+
+def decode_clip_payload(payload):
+    if len(payload) < TIMESTAMP_BYTES:
+        raise ClipPayloadError("clip payload shorter than its timestamp: %d bytes" % len(payload))
+    (ts,) = struct.unpack(">d", payload[:TIMESTAMP_BYTES])
+    return ts, bytes(payload[TIMESTAMP_BYTES:])
+
+
 import json
 import os
 import select
