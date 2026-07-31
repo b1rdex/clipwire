@@ -6,6 +6,8 @@ import unittest
 from agent_under_test import (
     ClipStateError,
     DO_NOTHING,
+    KIND_IMAGE,
+    KIND_TEXT,
     SEND_MINE,
     TYPE_CLIP_STATE,
     WAIT_FOR_PEER,
@@ -86,32 +88,40 @@ class TestFreshnessFixture(unittest.TestCase):
 class TestClipStateCodec(unittest.TestCase):
     def test_round_trip(self):
         digest = "deadbeefcafe0123" * 4
-        encoded = encode_clip_state(digest, 1785400000.5)
-        self.assertEqual(decode_clip_state(encoded), (digest, 1785400000.5))
+        encoded = encode_clip_state(digest, 1785400000.5, KIND_TEXT)
+        self.assertEqual(decode_clip_state(encoded), (digest, 1785400000.5, KIND_TEXT))
 
     def test_round_trip_empty_hash(self):
-        encoded = encode_clip_state(None, 0)
-        self.assertEqual(decode_clip_state(encoded), (None, 0.0))
+        encoded = encode_clip_state(None, 0, None)
+        self.assertEqual(decode_clip_state(encoded), (None, 0.0, None))
 
     def test_decodes_existing_frames_fixture(self):
-        """Pins decode_clip_state against the *existing* `clip-state` vector
-        in fixtures/frames.json -- committed decode-only back in an earlier
-        task specifically because this codec did not exist yet. That vector
-        is the payload this codec must decode through, checked directly
-        against the fixture file rather than assumed from its shape."""
+        """Pins decode_clip_state against the type-2 vectors in
+        fixtures/frames.json: the original null-hash/null-kind vector
+        (decode-only since an earlier task, before this codec existed) and
+        the real-hash/text-kind vector this task adds alongside it. Checked
+        directly against the fixture file, not assumed from its shape."""
         cases = json.loads(FRAMES_FIXTURES.read_text())["cases"]
         clip_state_cases = [c for c in cases if c["type"] == TYPE_CLIP_STATE]
-        self.assertEqual(len(clip_state_cases), 1, "expected exactly 1 type-2 fixture case in frames.json")
-        c = clip_state_cases[0]
+        self.assertEqual(len(clip_state_cases), 2, "expected exactly 2 type-2 fixture cases in frames.json")
 
-        buffer = bytearray(bytes.fromhex(c["frame_hex"]))
+        by_name = {c["name"]: c for c in clip_state_cases}
+        empty = by_name["clip-state"]
+        buffer = bytearray(bytes.fromhex(empty["frame_hex"]))
         frame_type, payload = decode_frame(buffer)
         self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state fixture must decode as type 2")
         self.assertEqual(len(buffer), 0)
+        self.assertEqual(decode_clip_state(payload), (None, 1.0, None))
 
-        sha256, ts = decode_clip_state(payload)
-        self.assertIsNone(sha256, "clip-state fixture's sha256 must decode to None")
+        texted = by_name["clip-state-text"]
+        buffer = bytearray(bytes.fromhex(texted["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state-text fixture must decode as type 2")
+        self.assertEqual(len(buffer), 0)
+        sha256, ts, kind = decode_clip_state(payload)
+        self.assertEqual(sha256, "ab" * 32)
         self.assertEqual(ts, 1.0)
+        self.assertEqual(kind, KIND_TEXT)
 
     def test_decode_rejects_non_finite_timestamp(self):
         """json.loads, unlike Swift's JSONDecoder, accepts a bare NaN /
@@ -136,7 +146,7 @@ class TestClipStateCodec(unittest.TestCase):
         for bad_ts in (float("nan"), float("inf"), float("-inf")):
             with self.subTest(bad_ts):
                 with self.assertRaises(ClipStateError):
-                    encode_clip_state(HASH_A, bad_ts)
+                    encode_clip_state(HASH_A, bad_ts, KIND_TEXT)
 
     def test_decode_rejects_a_sha256_that_is_not_64_lowercase_hex(self):
         """The wire contract says sha256 is `hashlib.sha256(...).hexdigest()`
@@ -177,8 +187,8 @@ class TestClipStateCodec(unittest.TestCase):
         actually carries. A real hexdigest, and the null that means an empty
         or unreadable clipboard."""
         real = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        self.assertEqual(decode_clip_state(encode_clip_state(real, 1.0)), (real, 1.0))
-        self.assertEqual(decode_clip_state(encode_clip_state(None, 1.0)), (None, 1.0))
+        self.assertEqual(decode_clip_state(encode_clip_state(real, 1.0, KIND_TEXT)), (real, 1.0, KIND_TEXT))
+        self.assertEqual(decode_clip_state(encode_clip_state(None, 1.0, None)), (None, 1.0, None))
 
     def test_decode_rejects_missing_ts(self):
         with self.assertRaises(ClipStateError):
@@ -218,6 +228,52 @@ class TestClipStateCodec(unittest.TestCase):
         oversized = ('{"sha256": "%s", "ts": 1' % HASH_A).encode() + b"0" * 400 + b"}"
         with self.assertRaises(ClipStateError):
             decode_clip_state(oversized)
+
+
+class TestClipStateKind(unittest.TestCase):
+    """Task 6: a hash alone cannot tell the two sides what they are
+    agreeing about, so clip-state now carries a `kind`. This does NOT touch
+    resolve_freshness itself -- the resolution formula is unchanged and
+    still compares only (sha256, ts) pairs (see TestFreshnessFixture above,
+    run unmodified against fixtures/freshness.json); `kind` is for the send
+    branch (Task 11) and the log (Task 14).
+
+    Two validation rules, enforced at decode -- the wire is peer-controlled
+    input: `kind` must be None exactly when `sha256` is None, and otherwise
+    must be one of the two known values, so an unknown kind can never reach
+    the send branch that switches on it.
+    """
+
+    def test_round_trip_carries_the_kind(self):
+        for kind in (KIND_TEXT, KIND_IMAGE):
+            with self.subTest(kind=kind):
+                payload = encode_clip_state("ab" * 32, 1.5, kind)
+                self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, kind))
+
+    def test_a_null_hash_carries_a_null_kind(self):
+        payload = encode_clip_state(None, 1.5, None)
+        self.assertEqual(decode_clip_state(payload), (None, 1.5, None))
+
+    def test_an_unknown_kind_is_rejected(self):
+        """Peer-controlled input. An unknown kind must not reach the send
+        branch, which switches on it."""
+        payload = json.dumps({"sha256": "ab" * 32, "ts": 1.5, "kind": "video"}).encode()
+        with self.assertRaises(ClipStateError):
+            decode_clip_state(payload)
+
+    def test_a_hash_without_a_kind_is_rejected(self):
+        payload = json.dumps({"sha256": "ab" * 32, "ts": 1.5, "kind": None}).encode()
+        with self.assertRaises(ClipStateError):
+            decode_clip_state(payload)
+
+    def test_a_kind_without_a_hash_is_rejected(self):
+        """The other direction of the same rule: a v2 store file (real
+        hash, no kind at all) is the practical case that matters
+        (test_clip_state_store.py's TestV2StoreIsRejected), but the rule
+        itself is symmetric, so both directions are pinned here."""
+        payload = json.dumps({"sha256": None, "ts": 1.5, "kind": "text"}).encode()
+        with self.assertRaises(ClipStateError):
+            decode_clip_state(payload)
 
 
 if __name__ == "__main__":

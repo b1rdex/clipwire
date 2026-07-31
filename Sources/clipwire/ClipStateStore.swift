@@ -100,23 +100,32 @@ struct ClipStateStore {
 /// on one side while the other slept or was disconnected.
 ///
 /// If the hash on disk matches what the clipboard holds now, the content
-/// has not changed since it was last recorded, so the *stored* timestamp is
-/// the real age of that content and is returned unchanged. Returning `now`
-/// here instead would make every such clip look freshly copied, winning it
-/// every reconciliation and clobbering the peer systematically. If the
-/// hashes differ, or nothing was ever stored, the content changed (or
-/// appeared) while nothing was watching, and only `now` is honest.
+/// has not changed since it was last recorded, so the *stored* timestamp --
+/// and, by the same reasoning, its *stored* kind -- is the real age (and
+/// kind) of that content and is returned unchanged. Returning `now` here
+/// instead would make every such clip look freshly copied, winning it every
+/// reconciliation and clobbering the peer systematically. If the hashes
+/// differ, or nothing was ever stored, the content changed (or appeared)
+/// while nothing was watching, and only `now` is honest -- and its kind is
+/// `.text`, hardcoded rather than threaded through as a parameter:
+/// `resolveCurrentClipState` below is this function's only non-test caller,
+/// and it derives `currentHash` from `pasteboard.readText()` alone -- there
+/// is no independent "current kind" input to thread through yet. Task 11,
+/// which wires image reconciliation, is where this stops being true;
+/// revisit this hardcoding there rather than adding an unused parameter now.
 ///
 /// A `nil` currentHash (clipboard empty or unreadable right now) always
 /// wins over whatever is on disk, regardless of what was previously stored:
 /// `resolveFreshness` never compares timestamps when either side's hash is
-/// `nil`, so the timestamp attached here is never actually read.
+/// `nil`, so the timestamp attached here is never actually read. Its kind is
+/// `nil` too, matching the nil-iff-nil rule `ClipState.init(from:)` enforces
+/// on the wire.
 func resolveStartupState(currentHash: String?, stored: ClipState?, now: Double) -> ClipState {
     guard let currentHash else {
-        return ClipState(sha256: nil, ts: now)
+        return ClipState(sha256: nil, ts: now, kind: nil)
     }
     if let stored, stored.sha256 == currentHash {
-        return ClipState(sha256: currentHash, ts: stored.ts)
+        return ClipState(sha256: currentHash, ts: stored.ts, kind: stored.kind)
     }
-    return ClipState(sha256: currentHash, ts: now)
+    return ClipState(sha256: currentHash, ts: now, kind: .text)
 }

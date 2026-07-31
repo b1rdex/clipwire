@@ -220,7 +220,7 @@ final class AgentWiringTests: XCTestCase {
         // A plain file where the store needs a directory, so `save()`'s own
         // first step throws for real instead of being mocked.
         let store = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
-        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1)),
+        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1, kind: .text)),
                              "test setup must actually force a save failure, or this test proves nothing")
 
         let pasteboard = FakePasteboard()

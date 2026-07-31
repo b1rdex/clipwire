@@ -534,7 +534,7 @@ final class HandleFrameTests: XCTestCase {
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: announcement)
 
-        handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0).encodePayload()),
+        handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0, kind: nil).encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: announcement)
@@ -552,9 +552,9 @@ final class HandleFrameTests: XCTestCase {
     /// the defect this whole design exists to prevent.
     func testLosingClipStateWithPeerFresherProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 5))
+        try store.save(ClipState(sha256: Self.hashA, ts: 5, kind: .text))
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: Self.hashB, ts: 9) // peer fresher -> waitForPeer
+        let peerState = ClipState(sha256: Self.hashB, ts: 9, kind: .text) // peer fresher -> waitForPeer
         // Real content on the pasteboard, or a wrongly-resolved sendMine
         // would still send nothing (its first guard is a non-empty read)
         // and this assertion would hold for the wrong reason.
@@ -574,9 +574,9 @@ final class HandleFrameTests: XCTestCase {
     /// `sendMine` would ping-pong the same content back and forth forever.
     func testAgreeingClipStateWithEqualHashesProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 5))
+        try store.save(ClipState(sha256: Self.hashA, ts: 5, kind: .text))
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: Self.hashA, ts: 999) // same hash -> doNothing regardless of ts
+        let peerState = ClipState(sha256: Self.hashA, ts: 999, kind: .text) // same hash -> doNothing regardless of ts
         // See the test above: without real content a wrongly-resolved
         // sendMine sends nothing anyway, and this would pass regardless.
         let pasteboard = RecordingPasteboard()
@@ -598,11 +598,11 @@ final class HandleFrameTests: XCTestCase {
     /// happens next.
     func testWinningClipStateProducesExactlyOneClipFrameCarryingOurStoredTimestamp() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("current clip text".utf8)
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: nil, ts: 0) // peer empty -> sendMine
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
@@ -629,11 +629,11 @@ final class HandleFrameTests: XCTestCase {
     /// this number.
     func testWinningClipStateWithContentAtExactlyTheCapProducesNoSend() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxTextBytes)
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: nil, ts: 0)
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
@@ -650,13 +650,13 @@ final class HandleFrameTests: XCTestCase {
     /// actually supports.
     func testWinningClipStateWithContentLeavingExactRoomForTheTimestampPrefixStillSends() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
         let text = String(repeating: "a",
                           count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
         pasteboard.textToRead = Data(text.utf8)
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: nil, ts: 0)
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
@@ -674,11 +674,11 @@ final class HandleFrameTests: XCTestCase {
     /// for the watcher's own send-side guard.
     func testWinningClipStateWithOversizedContentIsLoggedWithItsSize() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777))
+        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
         let oversized = FrameConstants.maxTextBytes
         pasteboard.textToRead = Data(repeating: 0x61, count: oversized)
-        let peerState = ClipState(sha256: nil, ts: 0)
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
         let logPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString)")
             .appendingPathComponent("test.log").path
@@ -708,7 +708,7 @@ final class HandleFrameTests: XCTestCase {
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("what we actually hold".utf8)
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: nil, ts: 0) // peer empty -> sendMine, if mine resolves non-nil
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine, if mine resolves non-nil
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
@@ -770,7 +770,7 @@ final class HandleFrameTests: XCTestCase {
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("same".utf8)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: sha256Hex(Data("same".utf8)), ts: 555))
+        try store.save(ClipState(sha256: sha256Hex(Data("same".utf8)), ts: 555, kind: .text))
         var sent: [Frame] = []
 
         announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 999_999)
@@ -784,7 +784,7 @@ final class HandleFrameTests: XCTestCase {
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("new content".utf8)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashB, ts: 111))
+        try store.save(ClipState(sha256: Self.hashB, ts: 111, kind: .text))
         var sent: [Frame] = []
 
         announceClipState(send: { sent.append($0) }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 999_999)
@@ -803,7 +803,7 @@ final class HandleFrameTests: XCTestCase {
 
         announceClipState(send: { _ in }, pasteboard: pasteboard, clipStateStore: store, log: tempLog(), now: 42)
 
-        XCTAssertEqual(store.load(), ClipState(sha256: sha256Hex(Data("fresh content".utf8)), ts: 42))
+        XCTAssertEqual(store.load(), ClipState(sha256: sha256Hex(Data("fresh content".utf8)), ts: 42, kind: .text))
     }
 
     /// Self-review: a local disk failure is not the peer's fault, and must
@@ -818,7 +818,7 @@ final class HandleFrameTests: XCTestCase {
         // The store's directory-creation step must fail: `blockingFile` is a
         // plain file, not a directory, sitting where the store needs one.
         let unsaveableStore = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
-        XCTAssertThrowsError(try unsaveableStore.save(ClipState(sha256: "aa", ts: 1)),
+        XCTAssertThrowsError(try unsaveableStore.save(ClipState(sha256: "aa", ts: 1, kind: .text)),
                              "test setup must actually force a save failure, or this test proves nothing")
 
         let pasteboard = RecordingPasteboard()
@@ -869,7 +869,7 @@ final class HandleFrameTests: XCTestCase {
 
         // The peer is fresher than what we announced (2000 > 1000) but older
         // than the clock a re-derivation would stamp (2000 < 3000).
-        let peer = ClipState(sha256: Self.hashB, ts: 2000)
+        let peer = ClipState(sha256: Self.hashB, ts: 2000, kind: .text)
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
@@ -939,12 +939,12 @@ final class HandleFrameTests: XCTestCase {
         // channel thread, so it can land at any point before the frame below.
         let copied = "copied while the peer's frame was still in flight"
         pasteboard.textToRead = Data(copied.utf8)
-        try store.save(ClipState(sha256: sha256Hex(Data(copied.utf8)), ts: 3000))
+        try store.save(ClipState(sha256: sha256Hex(Data(copied.utf8)), ts: 3000, kind: .text))
         XCTAssertEqual(store.load()?.ts, 3000,
                        "the local change must really have replaced the announced value on disk, " +
                        "or this test proves nothing")
 
-        let peer = ClipState(sha256: Self.hashB, ts: 2000)
+        let peer = ClipState(sha256: Self.hashB, ts: 2000, kind: .text)
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
@@ -987,7 +987,7 @@ final class HandleFrameTests: XCTestCase {
 
     func testAPeersClipStateReportsUp() throws {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
-        let peer = ClipState(sha256: Self.hashB, ts: 9)
+        let peer = ClipState(sha256: Self.hashB, ts: 9, kind: .text)
 
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
                     send: { _ in }, noteWrittenLocally: { _ in },
@@ -1005,7 +1005,7 @@ final class HandleFrameTests: XCTestCase {
     func testAPeersEmptyClipStateStillReportsUp() throws {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
-        handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0).encodePayload()),
+        handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0, kind: nil).encodePayload()),
                     send: { _ in }, noteWrittenLocally: { _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
@@ -1050,7 +1050,11 @@ final class HandleFrameTests: XCTestCase {
     func testAnUndecodableClipStateIsLogged() {
         let path = tempLogPath()
         let log = Log(path: path)
-        let wellFormedJSONWithABadHash = Data(#"{"sha256":"not-a-sha256","ts":1}"#.utf8)
+        // "kind":"text" pairs validly with the non-null (if malformed) hash,
+        // so the kind/hash equivalence check in `ClipState.init(from:)`
+        // passes and this payload reaches `decodePayload`'s own sha256
+        // shape check instead -- the thing this test actually pins.
+        let wellFormedJSONWithABadHash = Data(#"{"sha256":"not-a-sha256","ts":1,"kind":"text"}"#.utf8)
 
         handleFrame(Frame(type: .clipState, payload: wellFormedJSONWithABadHash),
                     send: { _ in XCTFail("a rejected clip-state must not produce any frame") },
@@ -1080,7 +1084,7 @@ final class HandleFrameTests: XCTestCase {
         let path = tempLogPath()
         let log = Log(path: path)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashB, ts: 111))
+        try store.save(ClipState(sha256: Self.hashB, ts: 111, kind: .text))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("new content".utf8)
 
@@ -1115,7 +1119,7 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: path)
         let text = Data("unchanged".utf8)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: sha256Hex(text), ts: 555))
+        try store.save(ClipState(sha256: sha256Hex(text), ts: 555, kind: .text))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = text
 
@@ -1150,15 +1154,15 @@ final class HandleFrameTests: XCTestCase {
     /// one file shows the conflict and which side won it.
     func testEveryReconciliationOutcomeIsLogged() throws {
         let cases: [(storedTs: Double, peer: ClipState, expected: String)] = [
-            (5, ClipState(sha256: Self.hashB, ts: 9), "waitForPeer"),
-            (5, ClipState(sha256: Self.hashA, ts: 999), "doNothing"),
-            (777, ClipState(sha256: nil, ts: 0), "sendMine"),
+            (5, ClipState(sha256: Self.hashB, ts: 9, kind: .text), "waitForPeer"),
+            (5, ClipState(sha256: Self.hashA, ts: 999, kind: .text), "doNothing"),
+            (777, ClipState(sha256: nil, ts: 0, kind: nil), "sendMine"),
         ]
         for c in cases {
             let path = tempLogPath()
             let log = Log(path: path)
             let store = tempClipStateStore()
-            try store.save(ClipState(sha256: Self.hashA, ts: c.storedTs))
+            try store.save(ClipState(sha256: Self.hashA, ts: c.storedTs, kind: .text))
             let pasteboard = RecordingPasteboard()
             pasteboard.textToRead = Data("whatever we hold".utf8)
 
@@ -1186,7 +1190,7 @@ final class HandleFrameTests: XCTestCase {
             .appendingPathComponent("clipwire-handleframe-test-blocker-\(UUID().uuidString)")
         try Data("occupying this name".utf8).write(to: blockingFile)
         let store = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
-        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1)),
+        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1, kind: .text)),
                              "test setup must actually force a save failure, or this test proves nothing")
         return store
     }

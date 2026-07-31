@@ -27,15 +27,17 @@ final class ClipStateStoreTests: XCTestCase {
     // MARK: - load/save round trip
 
     func testRoundTrip() throws {
-        let state = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5)
+        let state = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5, kind: .text)
         try store.save(state)
         XCTAssertEqual(store.load(), state)
     }
 
+    /// Different kinds on the two saves, not just different hashes: the
+    /// second save must overwrite kind too, not only sha256/ts.
     func testSecondSaveOverwritesTheFirst() throws {
-        try store.save(ClipState(sha256: "aa", ts: 1))
-        try store.save(ClipState(sha256: "bb", ts: 2))
-        XCTAssertEqual(store.load(), ClipState(sha256: "bb", ts: 2))
+        try store.save(ClipState(sha256: "aa", ts: 1, kind: .text))
+        try store.save(ClipState(sha256: "bb", ts: 2, kind: .image))
+        XCTAssertEqual(store.load(), ClipState(sha256: "bb", ts: 2, kind: .image))
     }
 
     /// The deliberate asymmetry the final wave introduced, pinned so it is a
@@ -54,7 +56,7 @@ final class ClipStateStoreTests: XCTestCase {
     /// documented contract. It also never reaches the wire: what gets
     /// announced is the LOCALLY computed hash, never the stored one.
     func testLoadDoesNotValidateTheStoredHashTheWayTheWireDecoderDoes() throws {
-        let malformed = ClipState(sha256: "not a hex digest at all", ts: 100)
+        let malformed = ClipState(sha256: "not a hex digest at all", ts: 100, kind: .text)
         try store.save(malformed)
         XCTAssertEqual(store.load(), malformed, "the store is deliberately lenient")
 
@@ -63,12 +65,12 @@ final class ClipStateStoreTests: XCTestCase {
         XCTAssertEqual(
             resolveStartupState(currentHash: sha256Hex(Data("current".utf8)),
                                 stored: malformed, now: 999),
-            ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999),
+            ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999, kind: .text),
             "a corrupt stored hash resolves to `now`, exactly as nothing-stored does")
     }
 
     func testNilHashRoundTrips() throws {
-        let state = ClipState(sha256: nil, ts: 0)
+        let state = ClipState(sha256: nil, ts: 0, kind: nil)
         try store.save(state)
         XCTAssertEqual(store.load(), state)
     }
@@ -102,7 +104,7 @@ final class ClipStateStoreTests: XCTestCase {
     // MARK: - atomic write
 
     func testSaveLeavesNoTempFileBehind() throws {
-        try store.save(ClipState(sha256: "aa", ts: 1))
+        try store.save(ClipState(sha256: "aa", ts: 1, kind: .text))
         let tmp = url.appendingPathExtension("tmp")
         XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.path),
                        "the temp file used for the atomic replace must not linger")
@@ -111,8 +113,8 @@ final class ClipStateStoreTests: XCTestCase {
     func testSaveCreatesIntermediateDirectories() throws {
         let nested = nestedRoot.appendingPathComponent("nested/clip-state.json")
         let nestedStore = ClipStateStore(path: nested.path)
-        try nestedStore.save(ClipState(sha256: "aa", ts: 1))
-        XCTAssertEqual(nestedStore.load(), ClipState(sha256: "aa", ts: 1))
+        try nestedStore.save(ClipState(sha256: "aa", ts: 1, kind: .text))
+        XCTAssertEqual(nestedStore.load(), ClipState(sha256: "aa", ts: 1, kind: .text))
     }
 
     // MARK: - concurrent saves must not corrupt the file
@@ -151,7 +153,7 @@ final class ClipStateStoreTests: XCTestCase {
     func testConcurrentSavesNeverLeaveAFileThatFailsToLoad() {
         let concurrentStore = store!
         DispatchQueue.concurrentPerform(iterations: 200) { i in
-            try? concurrentStore.save(ClipState(sha256: "writer-\(i)", ts: Double(i)))
+            try? concurrentStore.save(ClipState(sha256: "writer-\(i)", ts: Double(i), kind: .text))
         }
         XCTAssertNotNil(concurrentStore.load(),
                         "concurrent saves must never leave a file that fails to load")
@@ -181,21 +183,30 @@ final class ClipStateStoreTests: XCTestCase {
     /// would make a clip copied while the peer was asleep look freshly
     /// copied, winning it every reconciliation and clobbering the peer
     /// systematically in the other direction.
+    /// Content that has not changed since it was last recorded must keep
+    /// its real recorded kind too, not just its timestamp: `stored` here is
+    /// deliberately `.image`, the "wrong" guess a bug hardcoding `.text`
+    /// onto this branch would produce, so such a bug cannot pass by
+    /// coincidence.
     func testStoredHashMatchesCurrentReturnsStoredTimestampNotNow() {
-        let stored = ClipState(sha256: "aa", ts: 100)
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .image)
         let result = resolveStartupState(currentHash: "aa", stored: stored, now: 999)
-        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 100))
+        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 100, kind: .image))
     }
 
+    /// New content observed here is always `.text`, hardcoded --
+    /// `resolveCurrentClipState`'s only production caller derives
+    /// `currentHash` from `pasteboard.readText()` alone; see
+    /// `resolveStartupState`'s own doc comment.
     func testStoredHashDiffersReturnsNow() {
-        let stored = ClipState(sha256: "aa", ts: 100)
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
         let result = resolveStartupState(currentHash: "bb", stored: stored, now: 999)
-        XCTAssertEqual(result, ClipState(sha256: "bb", ts: 999))
+        XCTAssertEqual(result, ClipState(sha256: "bb", ts: 999, kind: .text))
     }
 
     func testNothingStoredReturnsNow() {
         let result = resolveStartupState(currentHash: "aa", stored: nil, now: 999)
-        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 999))
+        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 999, kind: .text))
     }
 
     /// A `nil` current hash always wins over whatever is on disk, and it
@@ -204,14 +215,40 @@ final class ClipStateStoreTests: XCTestCase {
     /// is unread downstream here -- this pins current behaviour (`now`)
     /// rather than asserting a hard requirement on its exact value.
     func testCurrentHashNilReturnsNilHashRegardlessOfStored() {
-        let stored = ClipState(sha256: "aa", ts: 100)
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
         let result = resolveStartupState(currentHash: nil, stored: stored, now: 999)
         XCTAssertNil(result.sha256)
         XCTAssertEqual(result.ts, 999)
+        XCTAssertNil(result.kind, "a nil hash must carry a nil kind")
     }
 
     func testCurrentHashNilAndNothingStoredReturnsNilHash() {
         let result = resolveStartupState(currentHash: nil, stored: nil, now: 999)
         XCTAssertNil(result.sha256)
+    }
+
+    // MARK: - Task 6: a v2 store on disk must be rejected, not loaded as kindless
+
+    /// protocol v3 adds `kind` to the clip-state wire AND store format
+    /// (this task). A store file written by a v2 agent -- a real scenario
+    /// after any upgrade, not a hypothetical -- has a real (non-null)
+    /// `sha256` and no `"kind"` key at all.
+    ///
+    /// `ClipState.init(from:)` enforces "kind is nil exactly when sha256 is
+    /// nil" directly (not only inside `decodePayload`), specifically so
+    /// `load()`'s own direct `JSONDecoder().decode(ClipState.self, from:)`
+    /// call -- which deliberately skips the sha256-hex-shape check above,
+    /// see `testLoadDoesNotValidateTheStoredHashTheWayTheWireDecoderDoes`
+    /// -- still enforces this one: `decodeIfPresent` returns `nil`
+    /// identically whether the `"kind"` key is absent or explicitly `null`,
+    /// so a non-null `sha256` with an absent `kind` key fails that
+    /// equivalence exactly as a malformed wire payload would. Silently
+    /// accepting it instead -- as "a hash of unknown kind" -- would feed
+    /// `resolveStartupState`, and eventually the send branch (Task 11), a
+    /// state with no kind to act on.
+    func testAV2StoreFileIsRejectedNotLoadedAsKindless() throws {
+        try Data(#"{"sha256": "\#(String(repeating: "aa", count: 32))", "ts": 100}"#.utf8).write(to: url)
+        XCTAssertNil(store.load(),
+                     "a v2 store (real hash, no kind key) must be rejected, not silently treated as a hash of unknown kind")
     }
 }

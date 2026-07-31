@@ -60,21 +60,33 @@ class TestFixtures(unittest.TestCase):
         formatting differ between Swift and Python, so a byte-exact encode
         vector would fail for reasons that have nothing to do with the
         protocol. Decodes the frame envelope (proving the type byte is
-        really 2, not just that some payload was found) and then parses the
-        payload's JSON directly -- there is no clip-state payload codec yet;
-        that lands in a later task."""
+        really 2, not just that some payload was found) and then parses each
+        payload's JSON directly, asserting the full (sha256, ts, kind) triple
+        for both the null-hash/null-kind row and the real-hash/text-kind row
+        Task 6 added alongside it."""
         clip_state_cases = [c for c in self.cases if c["type"] == TYPE_CLIP_STATE]
-        self.assertEqual(len(clip_state_cases), 1, "expected exactly 1 type-2 fixture case")
-        c = clip_state_cases[0]
+        self.assertEqual(len(clip_state_cases), 2, "expected exactly 2 type-2 fixture cases")
+        by_name = {c["name"]: c for c in clip_state_cases}
 
-        buffer = bytearray(bytes.fromhex(c["frame_hex"]))
+        empty = by_name["clip-state"]
+        buffer = bytearray(bytes.fromhex(empty["frame_hex"]))
         frame_type, payload = decode_frame(buffer)
         self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state fixture must decode as type 2")
         self.assertEqual(len(buffer), 0)
-
         parsed = json.loads(payload.decode())
         self.assertIsNone(parsed["sha256"], "sha256 must parse to null")
         self.assertEqual(parsed["ts"], 1.0)
+        self.assertIsNone(parsed["kind"], "a null hash must carry a null kind")
+
+        texted = by_name["clip-state-text"]
+        buffer = bytearray(bytes.fromhex(texted["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state-text fixture must decode as type 2")
+        self.assertEqual(len(buffer), 0)
+        parsed = json.loads(payload.decode())
+        self.assertEqual(parsed["sha256"], "ab" * 32)
+        self.assertEqual(parsed["ts"], 1.0)
+        self.assertEqual(parsed["kind"], "text")
 
     def test_image_payload_decodes_golden(self):
         """Pins the fixtures' type-3 payload against the image payload codec

@@ -713,7 +713,11 @@ func handleFrame(
         // travels in the frame. Stamping it with `now` would make applied
         // content look freshly copied here and win the next
         // reconciliation against the machine it actually came from.
-        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts),
+        // `.text` unconditionally: this case decoded the payload via
+        // `ClipPayload.decode` two lines up -- the text-clip codec, `.clip`
+        // (type 0x01) exclusively. An image applied from the peer arrives
+        // as `.imageClip` instead, which does not reach this branch.
+        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts, kind: .text),
                          to: clipStateStore, log: log)
         status.recordReceived()
     case .imageClip:
@@ -753,7 +757,9 @@ func wireAgent(
         // save must happen regardless of whether the send below ever reaches
         // the peer (no channel yet, or the write fails): the store's job is
         // "what do we hold and how old is it", independent of delivery.
-        persistClipState(ClipState(sha256: sha256Hex(payload), ts: observedAt),
+        // `.text`: `payload` above is `PasteboardWatcher`'s own observed
+        // text bytes -- there is no image-watching call site here yet.
+        persistClipState(ClipState(sha256: sha256Hex(payload), ts: observedAt, kind: .text),
                          to: clipStateStore, log: log)
         let text = String(decoding: payload, as: UTF8.self)
         let framePayload = ClipPayload(ts: observedAt, text: text).encode()

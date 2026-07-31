@@ -72,25 +72,40 @@ final class FixtureTests: XCTestCase {
     /// formatting differ between Swift and Python, so a byte-exact encode
     /// vector would fail for reasons that have nothing to do with the
     /// protocol. This decodes the frame envelope (proving the type byte is
-    /// really 2, not just that some payload was found) and then parses the
-    /// payload's JSON directly -- there is no ClipStatePayload codec yet;
-    /// that lands in a later task.
+    /// really 2, not just that some payload was found) and then parses each
+    /// payload's JSON directly, asserting the full (sha256, ts, kind) triple
+    /// for both the null-hash/null-kind row and the real-hash/text-kind row
+    /// Task 6 added alongside it.
     func testClipStatePayloadDecodesGolden() throws {
         let cases = try loadFixtures().filter { $0.type == FrameType.clipState.rawValue }
-        XCTAssertEqual(cases.count, 1, "expected exactly 1 type-2 fixture case")
-        guard let clipState = cases.first else { return }
+        XCTAssertEqual(cases.count, 2, "expected exactly 2 type-2 fixture cases")
+        let byName = Dictionary(uniqueKeysWithValues: cases.map { ($0.name, $0) })
 
-        var buffer = hex(clipState.frame_hex)
-        let frame = try Frame.decode(from: &buffer)
-        XCTAssertEqual(frame?.type, .clipState, "clip-state fixture must decode as type 2")
-        XCTAssertTrue(buffer.isEmpty, "leftover bytes for \(clipState.name)")
-
-        guard let payload = frame?.payload,
-              let json = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+        guard let empty = byName["clip-state"] else { return XCTFail("clip-state fixture case missing") }
+        var emptyBuffer = hex(empty.frame_hex)
+        let emptyFrame = try Frame.decode(from: &emptyBuffer)
+        XCTAssertEqual(emptyFrame?.type, .clipState, "clip-state fixture must decode as type 2")
+        XCTAssertTrue(emptyBuffer.isEmpty, "leftover bytes for \(empty.name)")
+        guard let emptyPayload = emptyFrame?.payload,
+              let emptyJSON = try JSONSerialization.jsonObject(with: emptyPayload) as? [String: Any] else {
             return XCTFail("clip-state payload must parse as a JSON object")
         }
-        XCTAssertTrue(json["sha256"] is NSNull, "sha256 must parse to null")
-        XCTAssertEqual(json["ts"] as? Double, 1.0)
+        XCTAssertTrue(emptyJSON["sha256"] is NSNull, "sha256 must parse to null")
+        XCTAssertEqual(emptyJSON["ts"] as? Double, 1.0)
+        XCTAssertTrue(emptyJSON["kind"] is NSNull, "a null hash must carry a null kind")
+
+        guard let texted = byName["clip-state-text"] else { return XCTFail("clip-state-text fixture case missing") }
+        var textedBuffer = hex(texted.frame_hex)
+        let textedFrame = try Frame.decode(from: &textedBuffer)
+        XCTAssertEqual(textedFrame?.type, .clipState, "clip-state-text fixture must decode as type 2")
+        XCTAssertTrue(textedBuffer.isEmpty, "leftover bytes for \(texted.name)")
+        guard let textedPayload = textedFrame?.payload,
+              let textedJSON = try JSONSerialization.jsonObject(with: textedPayload) as? [String: Any] else {
+            return XCTFail("clip-state-text payload must parse as a JSON object")
+        }
+        XCTAssertEqual(textedJSON["sha256"] as? String, String(repeating: "ab", count: 32))
+        XCTAssertEqual(textedJSON["ts"] as? Double, 1.0)
+        XCTAssertEqual(textedJSON["kind"] as? String, "text")
     }
 
     /// Pins the fixtures' type-3 payload against the *image* payload codec

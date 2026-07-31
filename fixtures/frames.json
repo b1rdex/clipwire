@@ -1,5 +1,5 @@
 {
-  "comment": "Golden frame vectors, protocol v3. Type 1 payloads are [f64 BE ts][utf-8]; type 3 payloads are [f64 BE ts][PNG bytes], opaque after the timestamp -- same shape as type 1, just not UTF-8. Types 0 (hello) and 2 (clip-state) carry JSON; their bodies are validated by decoding and parsing only, never by comparing a language's own JSON encoder against these bytes, since key order and float formatting differ between Swift and Python. Do not edit by hand without recomputing.",
+  "comment": "Golden frame vectors, protocol v3. Type 1 payloads are [f64 BE ts][utf-8]; type 3 payloads are [f64 BE ts][PNG bytes], opaque after the timestamp -- same shape as type 1, just not UTF-8. Types 0 (hello) and 2 (clip-state) carry JSON; their bodies are validated by decoding and parsing only, never by comparing a language's own JSON encoder against these bytes, since key order and float formatting differ between Swift and Python. Type 2 gained a `kind` field in protocol v3 (Task 6): `clip-state` covers the null-hash/null-kind row, `clip-state-text` the real-hash/text-kind row. Do not edit by hand without recomputing.",
   "cases": [
     {"name": "empty-clip", "type": 1, "payload_hex": "3ff0000000000000",                         "frame_hex": "00000008013ff0000000000000"},
     {"name": "ascii-clip", "type": 1, "payload_hex": "3ff00000000000006869",                     "frame_hex": "0000000a013ff00000000000006869"},
@@ -9,7 +9,8 @@
     {"name": "crlf-clip",  "type": 1, "payload_hex": "3ff0000000000000610d0a62",                 "frame_hex": "0000000c013ff0000000000000610d0a62"},
     {"name": "nul-clip",   "type": 1, "payload_hex": "3ff0000000000000610062",                   "frame_hex": "0000000b013ff0000000000000610062"},
     {"name": "hello",      "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"},
-    {"name": "clip-state", "type": 2, "payload_hex": "7b22736861323536223a6e756c6c2c227473223a312e307d", "frame_hex": "00000018027b22736861323536223a6e756c6c2c227473223a312e307d"},
+    {"name": "clip-state", "type": 2, "payload_hex": "7b22736861323536223a206e756c6c2c20227473223a20312e302c20226b696e64223a206e756c6c7d", "frame_hex": "00000029027b22736861323536223a206e756c6c2c20227473223a20312e302c20226b696e64223a206e756c6c7d"},
+    {"name": "clip-state-text", "type": 2, "payload_hex": "7b22736861323536223a202261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c20227473223a20312e302c20226b696e64223a202274657874227d", "frame_hex": "00000069027b22736861323536223a202261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162222c20227473223a20312e302c20226b696e64223a202274657874227d"},
     {"name": "image-clip", "type": 3, "payload_hex": "41da9ac2b020000089504e470d0a1a0a0000000d49484452", "frame_hex": "000000180341da9ac2b020000089504e470d0a1a0a0000000d49484452"}
   ]
 }

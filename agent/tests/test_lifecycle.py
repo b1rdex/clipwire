@@ -7,6 +7,7 @@ from unittest import mock
 
 from agent_under_test import (
     Agent,
+    KIND_TEXT,
     PROTOCOL_VERSION,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
@@ -326,7 +327,7 @@ class TestLifecycle(unittest.TestCase):
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
 
-        expected = (sha256_hex(b"the peer's pending clip"), peers_ts)
+        expected = (sha256_hex(b"the peer's pending clip"), peers_ts, KIND_TEXT)
         self.assertEqual(
             load_clip_state(path=self.clip_state_path), expected,
             "the pending clip's own correct, just-persisted state must survive "

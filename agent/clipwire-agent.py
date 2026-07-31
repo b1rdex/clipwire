@@ -143,23 +143,40 @@ SEND_MINE = "sendMine"
 WAIT_FOR_PEER = "waitForPeer"
 DO_NOTHING = "doNothing"
 
+# A hash alone cannot tell the two sides what they are agreeing about, so
+# clip-state carries a `kind` alongside `sha256`/`ts` (Task 6). Only two
+# kinds exist today; a peer announcing anything else is rejected at decode
+# (see decode_clip_state) so an unknown kind can never reach the send
+# branch that switches on it (Task 11).
+KIND_TEXT = "text"
+KIND_IMAGE = "image"
+_KNOWN_KINDS = (KIND_TEXT, KIND_IMAGE)
+
 
 class ClipStateError(FrameError):
     pass
 
 
-def encode_clip_state(sha256, ts):
-    """type-0x02 payload: {"sha256": <hex or null>, "ts": <float>}.
+def encode_clip_state(sha256, ts, kind):
+    """type-0x02 payload: {"sha256": <hex or null>, "ts": <float>, "kind":
+    <"text" | "image" | null>}.
 
     Refuses a non-finite ts (nan/inf/-inf) rather than emitting one: Python's
     json.dumps would otherwise happily write a bare NaN/Infinity token that
     is not valid JSON, which Swift's JSONDecoder rejects outright -- so a
     non-finite ts stored locally would silently break the *peer's* handshake
     instead of failing here, on the side that produced it.
+
+    `kind` is not validated here: the two decode-side rules (null iff
+    sha256 is null, otherwise one of the known kinds -- see
+    decode_clip_state) exist to police PEER-controlled input arriving off
+    the wire. Every caller here is this agent's own code, already holding a
+    (sha256, ts, kind) triple it derived correctly a moment earlier; there
+    is no peer to protect against on this side of the codec.
     """
     if not math.isfinite(ts):
         raise ClipStateError("refusing to encode a non-finite ts: %r" % ts)
-    return json.dumps({"sha256": sha256, "ts": ts}).encode()
+    return json.dumps({"sha256": sha256, "ts": ts, "kind": kind}).encode()
 
 
 def _is_sha256_hex(value):
@@ -189,7 +206,8 @@ def decode_clip_state(payload):
     """Inverse of encode_clip_state. Raises ClipStateError — a FrameError,
     so main()'s existing `except FrameError` closes the connection exactly
     as a malformed hello does — on anything that is not a well-formed
-    {"sha256": <str or null>, "ts": <finite number>} object.
+    {"sha256": <str or null>, "ts": <finite number>, "kind": <"text" |
+    "image" | null>} object.
 
     The finiteness check is the load-bearing part: json.loads, unlike
     Swift's JSONDecoder, accepts a bare NaN/Infinity/-Infinity and hands
@@ -198,6 +216,23 @@ def decode_clip_state(payload):
     resolve_freshness would compare a non-finite ts against a real one and
     send the decision somewhere neither side expects — so it is rejected
     here, before the value ever reaches a comparison, rather than compared.
+
+    Two more rules police `kind`, both enforced here because the wire is
+    peer-controlled input: `kind` must be None exactly when `sha256` is
+    None (a hash with no kind, or a kind with no hash, is malformed), and
+    otherwise must be one of _KNOWN_KINDS -- an unknown kind must never
+    reach the send branch (Task 11), which switches on it. Deliberately
+    NOT applied to encode_clip_state: that side only ever emits a triple
+    this agent's own code already derived correctly, and there is no peer
+    to protect against there.
+
+    Note this is peer-controlled input's decoder, but it is ALSO what
+    load_clip_state (below) reuses to read this agent's own store back --
+    which is exactly what makes a v2-era store file on disk (a real
+    sha256, no "kind" key at all) fail the null-iff-null rule the same way
+    a malformed wire payload would, rather than loading silently as "a
+    hash of unknown kind" (test_clip_state_store.py's
+    TestV2StoreIsRejected).
     """
     try:
         parsed = json.loads(payload.decode())
@@ -237,18 +272,31 @@ def decode_clip_state(payload):
         raise ClipStateError("malformed clip-state payload: ts out of range, got %r" % ts)
     if not finite:
         raise ClipStateError("malformed clip-state payload: ts must be finite, got %r" % ts)
-    return sha256, float(ts)
+    kind = parsed.get("kind")
+    if (kind is None) != (sha256 is None):
+        raise ClipStateError(
+            "malformed clip-state payload: kind must be null exactly when sha256 is null"
+        )
+    if kind is not None and kind not in _KNOWN_KINDS:
+        raise ClipStateError("malformed clip-state payload: unknown kind %r" % kind)
+    return sha256, float(ts), kind
 
 
 def resolve_freshness(mine, peer):
     """Decides which side sends once both have announced what they hold.
 
-    `mine` and `peer` are (sha256, ts) pairs -- the same shape
-    decode_clip_state returns. Mirrors Sources/clipwire/Freshness.swift's
-    resolveFreshness one branch at a time, including the tie-break, so the
-    two files read side by side as one formula rather than a mirrored pair
-    of conditions: mirrored conditions drifting apart has already bitten
-    this project twice.
+    `mine` and `peer` are (sha256, ts) pairs. Task 6 grew decode_clip_state
+    et al. to a (sha256, ts, kind) triple, and deliberately did NOT grow
+    this function to match: SHA-256 of text and of a PNG will not collide,
+    so hash equality stays safe, differing hashes are still decided by
+    timestamp, and the hex tie-break still works across kinds exactly as
+    within one. `kind` is for the send branch (Task 11) and the log (Task
+    14), never for this comparison -- callers holding a triple pass only
+    its first two elements (see Agent._resolve_clip_state). Mirrors
+    Sources/clipwire/Freshness.swift's resolveFreshness one branch at a
+    time, including the tie-break, so the two files read side by side as
+    one formula rather than a mirrored pair of conditions: mirrored
+    conditions drifting apart has already bitten this project twice.
 
     Timestamps are never compared when either hash is None: that comparison
     is exactly what would put a float next to a None and raise TypeError,
@@ -552,8 +600,8 @@ class Agent:
         already run once this connection) or from clipboard_became_ready
         itself (a clip-state that arrived before it and was stashed).
 
-        `mine` is that second caller's own just-computed (sha256, ts) pair,
-        passed in rather than re-derived. It is the authoritative value by
+        `mine` is that second caller's own just-computed (sha256, ts, kind)
+        triple, passed in rather than re-derived. It is the authoritative value by
         construction: clipboard_became_ready computed it one line earlier
         and ANNOUNCED IT TO THIS VERY PEER. Re-loading the store instead
         only diverges when the store cannot be read back -- and since all
@@ -580,7 +628,10 @@ class Agent:
             # and silently lose the clip, reintroducing v1's bug through the
             # fallback path instead of the main one.
             mine = resolve_current_clip_state(self.clipboard, None, time.time())
-        decision = resolve_freshness(mine, peer)
+        # resolve_freshness's formula is unchanged by Task 6 and takes only
+        # (sha256, ts) -- kind plays no part in the comparison (see its own
+        # docstring) -- so only the first two elements of each triple go in.
+        decision = resolve_freshness(mine[:2], peer[:2])
         # Every reconciliation outcome is reported, not only the interesting
         # ones. Acceptance item 2 requires the conflict to appear in the log,
         # and the design's accepted trade-off -- with both clipboards changed
@@ -814,10 +865,10 @@ class Agent:
         was added -- and reads this same bookkeeping, so the two fields are
         only ever touched under _echo_lock.
 
-        Returns the (sha256, ts) pair that was applied and (best-effort)
-        persisted, or None if the payload never decoded or decoded with
-        empty text and nothing was applied. clipboard_became_ready uses
-        this to announce a just-applied pending clip's state DIRECTLY,
+        Returns the (sha256, ts, kind) triple that was applied and
+        (best-effort) persisted, or None if the payload never decoded or
+        decoded with empty text and nothing was applied. clipboard_became_ready
+        uses this to announce a just-applied pending clip's state DIRECTLY,
         rather than re-deriving it through a fresh clipboard read -- see
         that method's own comment for why a read immediately after this
         call cannot be trusted to reflect it yet.
@@ -850,11 +901,17 @@ class Agent:
         # against the machine it actually came from. A local disk failure
         # here is not the peer's fault and must not undo the write above or
         # propagate as a FrameError and tear down the channel.
+        #
+        # KIND_TEXT unconditionally: this method's only caller ever feeds it
+        # a TYPE_CLIP payload, decoded two lines above by decode_clip_payload
+        # -- the text-clip codec. An image applied from the peer would arrive
+        # as TYPE_IMAGE_CLIP instead, which on_frame does not route here (see
+        # its own comment); that wiring is later work.
         try:
-            save_clip_state(sha256, ts, path=self._clip_state_path)
+            save_clip_state(sha256, ts, KIND_TEXT, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
-        return sha256, ts
+        return sha256, ts, KIND_TEXT
 
     def _local_change(self):
         """The single funnel for an observed local change, and the one entry
@@ -971,8 +1028,12 @@ class Agent:
         # observed, regardless of whether the peer ever receives it. A local
         # disk failure here is not the peer's fault and must not prevent the
         # send below.
+        #
+        # KIND_TEXT unconditionally: `text` above came from self.clipboard.read()
+        # (WaylandClipboard, a text/plain read) and is about to go out as a
+        # TYPE_CLIP frame -- the text-clip type -- two lines down.
         try:
-            save_clip_state(sha256_hex(text), observed_at, path=self._clip_state_path)
+            save_clip_state(sha256_hex(text), observed_at, KIND_TEXT, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
         self.send(TYPE_CLIP, encode_clip_payload(observed_at, text))
@@ -1075,7 +1136,7 @@ def clip_state_path(env=None):
 
 
 def load_clip_state(path=None):
-    """(sha256, ts) last persisted by save_clip_state, or None.
+    """(sha256, ts, kind) last persisted by save_clip_state, or None.
 
     None covers three distinct failure reasons identically, on purpose: no
     file has ever been written, the file exists but cannot be opened as a
@@ -1135,8 +1196,8 @@ def load_clip_state(path=None):
 _clip_state_write_lock = threading.Lock()
 
 
-def save_clip_state(sha256, ts, path=None):
-    """Persists (sha256, ts) atomically: encode, write to a `.tmp`
+def save_clip_state(sha256, ts, kind, path=None):
+    """Persists (sha256, ts, kind) atomically: encode, write to a `.tmp`
     sibling, then os.replace it over the real path. os.replace is an
     atomic rename on POSIX, so load_clip_state above -- quite possibly
     running in an entirely different process, since the PC agent is a new
@@ -1152,7 +1213,7 @@ def save_clip_state(sha256, ts, path=None):
     target = clip_state_path() if path is None else path
     with _clip_state_write_lock:
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        payload = encode_clip_state(sha256, ts)
+        payload = encode_clip_state(sha256, ts, kind)
         tmp = target + ".tmp"
         with open(tmp, "wb") as handle:
             handle.write(payload)
@@ -1162,8 +1223,8 @@ def save_clip_state(sha256, ts, path=None):
 def resolve_startup_state(current_hash, stored, now):
     """The judgement that makes the wake flow work. `current_hash` is the
     clipboard's hash *right now*, at startup; `stored` is whatever
-    load_clip_state() last returned (a (sha256, ts) pair, or None); `now`
-    is the caller's clock.
+    load_clip_state() last returned (a (sha256, ts, kind) triple, or None);
+    `now` is the caller's clock. Returns a (sha256, ts, kind) triple.
 
     A timestamp can come from three places, in precedence order: a local
     change this process watched happen, a clip received from the peer
@@ -1175,24 +1236,33 @@ def resolve_startup_state(current_hash, stored, now):
     copied on one side while the other slept or was disconnected.
 
     If the hash on disk matches what the clipboard holds now, the content
-    has not changed since it was last recorded, so the *stored* timestamp
-    is the real age of that content and is returned unchanged. Returning
-    `now` here instead would make every such clip look freshly copied,
-    winning it every reconciliation and clobbering the peer systematically
-    on every reconnect. If the hashes differ, or nothing was ever stored,
-    the content changed (or first appeared) while nothing was watching,
-    and only `now` is honest.
+    has not changed since it was last recorded, so the *stored* timestamp --
+    and, by the same reasoning, its *stored* kind -- is the real age (and
+    kind) of that content and is returned unchanged. Returning `now` here
+    instead would make every such clip look freshly copied, winning it
+    every reconciliation and clobbering the peer systematically on every
+    reconnect. If the hashes differ, or nothing was ever stored, the
+    content changed (or first appeared) while nothing was watching, and
+    only `now` is honest -- and its kind is KIND_TEXT, hardcoded rather
+    than threaded through as a parameter: resolve_current_clip_state below
+    is this function's only non-test caller, and it derives `current_hash`
+    from clipboard.read() alone, a text/plain read -- there is no
+    independent "current kind" input to thread through yet. Task 11, which
+    wires image reconciliation, is where this stops being true; revisit
+    this hardcoding there rather than adding an unused parameter now.
 
     A None current_hash (clipboard empty or unreadable right now) always
     wins over whatever is on disk, regardless of what was previously
     stored: resolve_freshness never compares timestamps when either side's
     hash is None, so the timestamp returned here is never actually read.
+    Its kind is None too, matching the null-iff-null rule decode_clip_state
+    enforces on the wire.
     """
     if current_hash is None:
-        return None, now
+        return None, now, None
     if stored is not None and stored[0] == current_hash:
-        return current_hash, stored[1]
-    return current_hash, now
+        return current_hash, stored[1], stored[2]
+    return current_hash, now, KIND_TEXT
 
 
 import hashlib

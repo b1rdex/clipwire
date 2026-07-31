@@ -13,6 +13,7 @@ from unittest import mock
 
 from agent_under_test import (
     Agent,
+    KIND_TEXT,
     PROTOCOL_VERSION,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
@@ -433,7 +434,7 @@ class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
         clip_state_path = os.path.join(tmp.name, "clip-state.json")
 
         hash_a, ts_a = sha256_hex(b"A"), 100.0
-        save_clip_state(hash_a, ts_a, path=clip_state_path)
+        save_clip_state(hash_a, ts_a, KIND_TEXT, path=clip_state_path)
 
         original_interval = clipwire_agent.CLIPBOARD_RECHECK_SECONDS
         clipwire_agent.CLIPBOARD_RECHECK_SECONDS = 0.01
@@ -448,7 +449,7 @@ class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
         # read and dispatched on the very first loop iteration, well before
         # the clipboard is ever checked. False on the first ready() call
         # guarantees _on_clip_state runs while still PHASE_PENDING.
-        peer_announcement = encode_frame(TYPE_CLIP_STATE, encode_clip_state(hash_a, ts_a))
+        peer_announcement = encode_frame(TYPE_CLIP_STATE, encode_clip_state(hash_a, ts_a, KIND_TEXT))
         os.write(write_fd, peer_announcement)
 
         clipboard = ScriptedClipboardWithContent(
