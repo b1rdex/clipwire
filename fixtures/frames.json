@@ -1,12 +1,12 @@
 {
-  "comment": "Golden frame vectors. Both codecs must encode payload_hex to frame_hex and decode frame_hex back. Do not edit by hand without recomputing.",
+  "comment": "Golden frame vectors, protocol v2. Type 1 payloads are [f64 BE ts][utf-8]. Type 2 (clip-state JSON) has no vector here yet: 0x02 is not a recognized frame type until Task 4 registers it on both sides, and the one clip-state payload this task's brief supplied omitted the spec's required ts field. Do not edit by hand without recomputing.",
   "cases": [
-    {"name": "empty-clip",  "type": 1, "payload_hex": "",                         "frame_hex": "0000000001"},
-    {"name": "ascii-clip",  "type": 1, "payload_hex": "6869",                     "frame_hex": "00000002016869"},
-    {"name": "utf8-clip",   "type": 1, "payload_hex": "d0bfd180d0b8d0b2d0b5d182", "frame_hex": "0000000c01d0bfd180d0b8d0b2d0b5d182"},
-    {"name": "emoji-clip",  "type": 1, "payload_hex": "f09f94a5",                 "frame_hex": "0000000401f09f94a5"},
-    {"name": "newline-clip","type": 1, "payload_hex": "610a62",                   "frame_hex": "0000000301610a62"},
-    {"name": "nul-clip",    "type": 1, "payload_hex": "610062",                   "frame_hex": "0000000301610062"},
-    {"name": "hello",       "type": 0, "payload_hex": "7b2270726f746f636f6c223a317d", "frame_hex": "0000000e007b2270726f746f636f6c223a317d"}
+    {"name": "empty-clip", "type": 1, "payload_hex": "3ff0000000000000",                         "frame_hex": "00000008013ff0000000000000"},
+    {"name": "ascii-clip", "type": 1, "payload_hex": "3ff00000000000006869",                     "frame_hex": "0000000a013ff00000000000006869"},
+    {"name": "utf8-clip",  "type": 1, "payload_hex": "3ff0000000000000d0bfd180d0b8d0b2d0b5d182", "frame_hex": "00000014013ff0000000000000d0bfd180d0b8d0b2d0b5d182"},
+    {"name": "emoji-clip", "type": 1, "payload_hex": "3ff0000000000000f09f94a5",                 "frame_hex": "0000000c013ff0000000000000f09f94a5"},
+    {"name": "nfd-clip",   "type": 1, "payload_hex": "3ff000000000000065cc81",                   "frame_hex": "0000000b013ff000000000000065cc81"},
+    {"name": "crlf-clip",  "type": 1, "payload_hex": "3ff0000000000000610d0a62",                 "frame_hex": "0000000c013ff0000000000000610d0a62"},
+    {"name": "hello",      "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"}
   ]
 }

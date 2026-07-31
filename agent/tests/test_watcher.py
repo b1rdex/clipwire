@@ -713,6 +713,10 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "class GPasteWatcher",
             "class PollingWatcher",
             "def parse_gpaste_line",
+            "TIMESTAMP_BYTES = 8",
+            "class ClipPayloadError",
+            "def encode_clip_payload",
+            "def decode_clip_payload",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(
