@@ -51,7 +51,7 @@
 - Test: `Tests/clipwireTests/ClipPayloadTests.swift`
 
 **Interfaces:**
-- Consumes: `FrameConstants` from `Frame.swift`.
+- Consumes: nothing. The 4 MiB cap is enforced by the frame envelope layer, not here — this codec is a pure payload format.
 - Produces: `struct ClipPayload { let ts: Double; let text: String }`; `func encode() -> Data`; `static func decode(_ data: Data) throws -> ClipPayload`; `enum ClipPayloadError: Error { case tooShort(Int), invalidUTF8 }`; `ClipPayloadConstants.timestampBytes = 8`.
 
 - [ ] **Step 1: Write the failing test**
