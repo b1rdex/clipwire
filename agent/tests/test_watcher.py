@@ -690,6 +690,29 @@ class TestMakeWatcher(unittest.TestCase):
             watcher = make_watcher(clipboard=object())
         self.assertEqual(watcher.interval, DEGRADED_POLL_SECONDS)
 
+    def test_the_fallback_interval_is_the_one_knob_for_both_degraded_modes(self):
+        """The previous test only pins the never-had-GPaste branch, and pins the
+        default value at that -- so it cannot see the GPaste branch quietly
+        keeping its own hardcoded rate. `fallback_interval_seconds` means "how
+        fast we poll when signals cannot be relied on", and there are two ways
+        to arrive there: GPaste was never available, or its event source was
+        diagnosed silent. Tuning the knob has to move both, or make_watcher ends
+        up logging one value while polling another."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)
+        self.assertEqual(
+            watcher._degraded_interval, 2.5,
+            "the GPaste watcher's degraded rate must come from the same knob",
+        )
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            rebuilt = make_watcher(clipboard=object(), fallback_interval_seconds=2.5,
+                                   degraded=True)
+        self.assertEqual(
+            rebuilt._safety_net.interval, 2.5,
+            "and a watcher rebuilt already degraded must come up polling at it",
+        )
+
 
 class QueueClipboard:
     """A clipboard double whose read() replays a queue of scripted values --

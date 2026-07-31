@@ -1435,14 +1435,22 @@ class PollingWatcher:
 
 def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                  degraded=False, on_degrade=None):
-    """`degraded`/`on_degrade` carry the dead-event-source verdict in and out,
-    so it belongs to the connection rather than to whichever watcher reached it
-    -- see Agent._event_source_degraded."""
-    watcher = GPasteWatcher(clipboard, degraded=degraded, on_degrade=on_degrade)
+    """`fallback_interval_seconds` is the ONE knob for "how fast we poll when
+    signals cannot be relied on", and there are two ways to arrive there:
+    GPaste was never available, or its event source was diagnosed silent. It
+    therefore reaches both branches below -- as the GPaste watcher's degraded
+    rate and as the plain poller's interval -- so tuning it moves both and
+    neither can quietly keep a hardcoded rate the log line then misquotes.
+
+    `degraded`/`on_degrade` carry the dead-event-source verdict in and out, so
+    it belongs to the connection rather than to whichever watcher reached it --
+    see Agent._event_source_degraded."""
+    watcher = GPasteWatcher(clipboard, degraded_interval_seconds=fallback_interval_seconds,
+                            degraded=degraded, on_degrade=on_degrade)
     if watcher.available():
         if degraded:
             log("watching the clipboard through GPaste, already diagnosed as silent "
-                "this connection, so polling every %.1fs" % DEGRADED_POLL_SECONDS)
+                "this connection, so polling every %.1fs" % fallback_interval_seconds)
         else:
             log("watching the clipboard through GPaste, with a safety-net poll every %.0fs"
                 % SAFETY_NET_POLL_SECONDS)
