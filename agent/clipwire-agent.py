@@ -485,13 +485,30 @@ class Agent:
             return
         self._resolve_clip_state(peer)
 
-    def _resolve_clip_state(self, peer):
+    def _resolve_clip_state(self, peer, mine=None):
         """The resolution logic _on_clip_state defers until our own side
         has reconciled -- see its own doc comment for why. Called either
         directly (a clip-state arriving after clipboard_became_ready has
         already run once this connection) or from clipboard_became_ready
-        itself (a clip-state that arrived before it and was stashed)."""
-        mine = load_clip_state(path=self._clip_state_path)
+        itself (a clip-state that arrived before it and was stashed).
+
+        `mine` is that second caller's own just-computed (sha256, ts) pair,
+        passed in rather than re-derived. It is the authoritative value by
+        construction: clipboard_became_ready computed it one line earlier
+        and ANNOUNCED IT TO THIS VERY PEER. Re-loading the store instead
+        only diverges when the store cannot be read back -- and since all
+        three save_clip_state call sites swallow their failure, an
+        unwritable state directory is exactly that, silently. The fallback
+        below would then rebuild the pair from a fresh clipboard read
+        stamped time.time(), so the value we reconcile with would not be
+        the value on the wire: an age we invented, inflated past the one we
+        announced, able to win a comparison it should have lost.
+
+        The direct caller passes nothing: a clip-state arriving after this
+        connection already reconciled has no just-computed pair to offer,
+        and the store is the right source there."""
+        if mine is None:
+            mine = load_clip_state(path=self._clip_state_path)
         if mine is None:
             # load_clip_state should already reflect our own current state --
             # from this connection's own announcement, or an ordinary
@@ -664,8 +681,10 @@ class Agent:
                 # race entirely; there is nothing left for a fresh read to
                 # tell us that _write_clip does not already know.
                 self.send(TYPE_CLIP_STATE, encode_clip_state(*applied_pending))
+                announced = applied_pending
             else:
-                announce_clip_state(self.send, self.clipboard, path=self._clip_state_path)
+                announced = announce_clip_state(
+                    self.send, self.clipboard, path=self._clip_state_path)
             if self._pending_peer_clip_state is not None:
                 # Fix round 1, Finding 1: a peer clip-state that arrived
                 # (via _on_clip_state) before we ever reached this point
@@ -679,7 +698,11 @@ class Agent:
                 # this method depends on the store being current.
                 peer = self._pending_peer_clip_state
                 self._pending_peer_clip_state = None
-                self._resolve_clip_state(peer)
+                # `announced` -- the pair we just put on the wire -- rather
+                # than a re-read of the store. Whichever branch above ran,
+                # it is the authoritative value, and it is what this peer
+                # was told we hold.
+                self._resolve_clip_state(peer, mine=announced)
         if self._watcher is None:
             # The degraded verdict is handed back IN on a rebuild and reported
             # back OUT when it is first reached, so it belongs to the
@@ -1192,6 +1215,10 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     except (OSError, ClipStateError) as error:
         log("could not persist clip state: %r" % error)
     send(TYPE_CLIP_STATE, encode_clip_state(*resolved))
+    # Returned so the caller does not have to re-derive what it just sent.
+    # The save above is best-effort, so reading the store back is not a
+    # reliable way to recover this -- see Agent._resolve_clip_state's `mine`.
+    return resolved
 
 
 def wayland_socket_path(env=None):

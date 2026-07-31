@@ -22,6 +22,7 @@ from agent_under_test import (
     TYPE_CLIP,
     TYPE_CLIP_STATE,
     decode_clip_payload,
+    decode_clip_state,
     encode_clip_payload,
     encode_clip_state,
     load_clip_state,
@@ -2016,6 +2017,64 @@ class TestIncomingClipState(unittest.TestCase):
             "A announcement -- B must be sent, not silently dropped",
         )
         self.assertEqual(decode_clip_payload(clip_frames[0][1])[1], b"B")
+
+    def test_a_stashed_clip_state_resolves_against_the_pair_just_computed(self):
+        """_resolve_clip_state re-loaded the store even when reached from
+        clipboard_became_ready, which had JUST computed the authoritative
+        pair one line earlier and announced it to this very peer.
+
+        That only diverges when the store cannot be read back -- every
+        save_clip_state call site swallows its failure, so an unwritable
+        state directory is silent and this is the shape it takes. The
+        fallback then re-derives from a FRESH clipboard read and stamps
+        time.time(), so the value we reconcile with is not the value we
+        just announced to the peer: an age we invented, inflated past the
+        one on the wire, able to win a comparison it should have lost.
+
+        Pinned two ways: the clipboard must not be read a third time at
+        all (the seed and the announce step are the only two legitimate
+        reads), and the clip we send after winning must carry the exact
+        timestamp we announced. The queued third read is what a
+        re-derivation would consume, and it returns DIFFERENT content so a
+        re-derivation cannot accidentally agree."""
+        blocker = os.path.join(self._tmp.name, "blocker")
+        with open(blocker, "wb") as handle:
+            handle.write(b"occupying this name")
+        unsaveable = os.path.join(blocker, "clip-state.json")
+        with self.assertRaises(OSError):
+            save_clip_state(HASH_A, 1, path=unsaveable)
+
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"A")          # the connect-time seed
+        clipboard.queue_read(b"A")          # announce_clip_state's own read
+        clipboard.queue_read(b"DIFFERENT")  # only a re-derivation consumes this
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(),
+                      clipboard=clipboard, clip_state_path=unsaveable)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        # The peer holds something else and is OLDER, so we win and send.
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1.0))
+        self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
+
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
+            agent.clipboard_became_ready()
+
+        self.assertEqual(
+            len(clipboard._queue), 1,
+            "the store's own pair was already in hand -- re-reading the clipboard "
+            "to rebuild it is what invents a timestamp nobody announced",
+        )
+        announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
+        clips = [f for f in sent if f[0] == TYPE_CLIP]
+        self.assertEqual(len(announced), 1)
+        self.assertEqual(len(clips), 1, "we are fresher than the peer, so we send")
+        self.assertEqual(decode_clip_payload(clips[0][1])[1], b"A")
+        self.assertEqual(
+            decode_clip_payload(clips[0][1])[0], decode_clip_state(announced[0][1])[1],
+            "the clip we send must carry the timestamp we just announced to this "
+            "same peer, not one re-derived from a later clock reading",
+        )
 
     def test_every_reconciliation_outcome_is_logged(self):
         """No reconciliation decision was logged at all, on either side.
