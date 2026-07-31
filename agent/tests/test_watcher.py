@@ -519,6 +519,40 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "stay on the detection budget",
         )
 
+    def test_after_switching_the_loop_actually_ticks_at_the_degraded_rate(self):
+        """Assigning the field is not the requirement -- polling at the new
+        rate is. An implementation that captured `interval` into a local before
+        the loop, or restarted nothing, would pass every other assertion here
+        while leaving PC->Mac sync a full detection budget behind and
+        reporting itself as working, which is exactly the failure the interval
+        ruling names. So this counts TICKS in a window shorter than the budget:
+        at the degraded rate three of them need ~15ms, while a loop still on
+        the budget cannot deliver even one, since Event.wait does not return
+        early."""
+        budget, degraded, window = 0.05, 0.002, 0.04
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, safety_net_interval_seconds=budget,
+            degraded_interval_seconds=degraded)
+
+        self.wait_until(lambda: self.switch_log_lines())
+        self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
+
+        # Every tick reads, change or not, so the script needs nothing more.
+        at_switch = clipboard.calls
+        deadline = time.monotonic() + window
+        while clipboard.calls < at_switch + 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        observed = clipboard.calls - at_switch
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            observed, 3,
+            "expected at least 3 ticks within %ss of the switch (the degraded "
+            "rate needs ~%ss for them); a loop still on the %ss budget delivers "
+            "none. Got %d" % (window, 3 * degraded, budget, observed),
+        )
+
     def test_the_gdbus_child_survives_the_switch_and_recovered_signals_still_report(self):
         """Deliberately NOT terminating the subscription on the switch: if the
         extension is re-enabled the signals resume and still funnel through the
