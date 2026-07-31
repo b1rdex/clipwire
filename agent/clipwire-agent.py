@@ -1393,6 +1393,7 @@ def parse_gpaste_line(line):
     return "Update" in line and GPASTE_OBJECT_PATH in line
 
 
+import ctypes
 import signal
 
 PR_SET_PDEATHSIG = 1
@@ -1407,10 +1408,26 @@ def _load_libc():
     take the whole module down.
     """
     try:
-        import ctypes
         return ctypes.CDLL("libc.so.6", use_errno=True)
     except (ImportError, OSError):
         return None
+
+
+# Resolved ONCE, here, at module import time -- on the only thread that
+# exists at that point, long before GPasteWatcher.start() ever forks
+# anything. _pdeathsig_preexec reads this global instead of calling
+# _load_libc() itself: lazy would be an import inside preexec_fn, which can
+# deadlock a forked child in a threaded process. preexec_fn runs in a forked
+# child of a process that is genuinely multi-threaded by the time start()
+# runs (the previous watcher's pump thread, the safety-net poll thread), and
+# Python's import machinery takes a lock that fork() does not release --
+# fork() only clones the calling thread, so if some other thread held that
+# lock at the instant of fork, the child inherits it permanently held and
+# hangs forever trying to import. That wedges the gdbus child before it ever
+# execs: the same symptom this task removes, reintroduced by a subtler path.
+# Resolving here means the import already happened before any thread or fork
+# existed, so _pdeathsig_preexec itself touches no lock at all.
+_LIBC = _load_libc()
 
 
 def _pdeathsig_preexec():
@@ -1422,10 +1439,9 @@ def _pdeathsig_preexec():
     its own -- glib installs SIG_IGN for SIGPIPE, so the orphan survives its
     stdout closing and lingers until the session ends.
     """
-    libc = _load_libc()
-    if libc is None:
+    if _LIBC is None:
         return
-    libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
     # The parent can die between the fork above and the prctl call just made,
     # in which case the signal we just asked for will never be delivered and
     # this child would outlive it anyway. getppid() == 1 means exactly that.

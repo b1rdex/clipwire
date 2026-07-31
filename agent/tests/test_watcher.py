@@ -260,6 +260,16 @@ class TestGPasteWatcherLifecycle(unittest.TestCase):
 
 
 class TestPdeathsigPreexec(unittest.TestCase):
+    def test_load_libc_is_none_when_libc_is_unavailable(self):
+        """The macOS path: CDLL("libc.so.6") raises OSError there (no such
+        library), and _load_libc() must come back with None rather than let
+        it propagate -- this is what lets the whole module still import
+        cleanly on the machine this suite runs on. Mocked rather than relying
+        on the real macOS behavior, so this also pins the same contract on
+        Linux, where CDLL would otherwise succeed for real."""
+        with mock.patch.object(clipwire_agent.ctypes, "CDLL", side_effect=OSError):
+            self.assertIsNone(clipwire_agent._load_libc())
+
     def test_it_requests_sigterm_when_the_parent_dies(self):
         calls = []
 
@@ -268,7 +278,7 @@ class TestPdeathsigPreexec(unittest.TestCase):
                 calls.append((option, sig))
                 return 0
 
-        with mock.patch.object(clipwire_agent, "_load_libc", return_value=FakeLibc()), \
+        with mock.patch.object(clipwire_agent, "_LIBC", FakeLibc()), \
              mock.patch.object(clipwire_agent.os, "getppid", return_value=42):
             clipwire_agent._pdeathsig_preexec()
 
@@ -288,14 +298,14 @@ class TestPdeathsigPreexec(unittest.TestCase):
             def prctl(self, option, sig, *rest):
                 return 0
 
-        with mock.patch.object(clipwire_agent, "_load_libc", return_value=FakeLibc()), \
+        with mock.patch.object(clipwire_agent, "_LIBC", FakeLibc()), \
              mock.patch.object(clipwire_agent.os, "getppid", return_value=1), \
              mock.patch.object(clipwire_agent.os, "_exit") as exit_call:
             clipwire_agent._pdeathsig_preexec()
         exit_call.assert_called_once_with(0)
 
     def test_it_is_a_no_op_where_prctl_is_unavailable(self):
-        with mock.patch.object(clipwire_agent, "_load_libc", return_value=None):
+        with mock.patch.object(clipwire_agent, "_LIBC", None):
             clipwire_agent._pdeathsig_preexec()   # must not raise
 
 
@@ -2239,9 +2249,11 @@ class TestModuleDefinitionOrder(unittest.TestCase):
         guard_index = source.index('if __name__ == "__main__"')
         for needle in (
             "def make_watcher",
+            "import ctypes",
             "import signal",
             "PR_SET_PDEATHSIG = 1",
             "def _load_libc",
+            "_LIBC = _load_libc()",
             "def _pdeathsig_preexec",
             "class GPasteWatcher",
             "class PollingWatcher",
