@@ -356,7 +356,8 @@ class TestGPasteSafetyNet(unittest.TestCase):
 
     def start_watcher(self, clipboard, on_change=None,
                       safety_net_interval_seconds=0.01,
-                      degraded_interval_seconds=0.01):
+                      degraded_interval_seconds=0.01,
+                      degraded=False, on_degrade=None):
         fake_process = FakeGPasteProcess()
         # A clipboard that drives the signal source from inside its own read()
         # must hold the process BEFORE anything reads: PollingWatcher takes
@@ -371,6 +372,8 @@ class TestGPasteSafetyNet(unittest.TestCase):
             clipboard,
             safety_net_interval_seconds=safety_net_interval_seconds,
             degraded_interval_seconds=degraded_interval_seconds,
+            degraded=degraded,
+            on_degrade=on_degrade,
         )
         # Stopped in cleanup as well as in the tests themselves, so a failing
         # assertion cannot leave a poll thread running against a torn-down
@@ -599,6 +602,48 @@ class TestGPasteSafetyNet(unittest.TestCase):
 
         safety_net_start.assert_called_once_with(callback)
 
+    def test_a_watcher_built_already_degraded_polls_fast_and_stays_quiet(self):
+        """One half of the flap fix: `clipboard_lost` discards the watcher and
+        `clipboard_became_ready` builds a fresh one, so the verdict has to be
+        handed back IN. A rebuilt watcher must come up on the degraded interval
+        and must not log the diagnosis a second time on the same connection."""
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, safety_net_interval_seconds=0.20,
+            degraded_interval_seconds=0.01, degraded=True)
+
+        self.assertEqual(
+            watcher._safety_net.interval, 0.01,
+            "a watcher built already degraded must poll at the degraded interval "
+            "from its first tick, not re-arm the detection budget",
+        )
+
+        self.wait_until(lambda: self.changes)
+        self.quiesce(watcher)
+
+        self.assertEqual(self.changes, [b"b"], "the change must still be reported")
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "the diagnosis must not be logged a second time on one connection",
+        )
+
+    def test_the_diagnosis_is_reported_outward_exactly_once(self):
+        """The other half: an Agent-level latch is only connection-scoped if
+        the watcher actually tells it. Two missed changes, one notification."""
+        notified = []
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher, _ = self.start_watcher(
+            clipboard, on_degrade=lambda: notified.append(1))
+
+        self.wait_until(lambda: len(self.changes) >= 2)
+        self.quiesce(watcher)
+
+        self.assertEqual(len(self.changes), 2, "both missed changes must be reported")
+        self.assertEqual(
+            notified, [1],
+            "the diagnosis must be reported outward exactly once, like the log line",
+        )
+
     def test_stop_ends_the_safety_net_poll_too(self):
         """A leaked poll thread keeps forking wl-paste against a session that
         has gone away -- and Agent.clipboard_lost() drops its reference to the
@@ -682,6 +727,30 @@ class SpyWatcher:
         self.stopped = True
 
 
+class FlapRecordingWatcher:
+    """Records the degraded-latch wiring make_watcher was handed, and can fire
+    the diagnosis on demand -- standing in for a real safety-net verdict
+    without any thread or subprocess."""
+
+    def __init__(self, degraded=False, on_degrade=None):
+        self.degraded = degraded
+        self._on_degrade = on_degrade
+        self.started_with = None
+        self.stopped = False
+
+    def start(self, on_change):
+        self.started_with = on_change
+
+    def stop(self):
+        self.stopped = True
+
+    def diagnose(self):
+        """What GPasteWatcher._observe_tick does once it concludes the event
+        source is dead."""
+        self.degraded = True
+        self._on_degrade()
+
+
 class TestWatcherLifecycleWiring(unittest.TestCase):
     """clipboard_became_ready()/clipboard_lost() must create and start a
     watcher exactly once per session, and stop it the moment the session
@@ -737,6 +806,48 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
         agent = self.build(ready=False)
         agent.clipboard_lost()  # must be a no-op, not an AttributeError
         self.assertIsNone(agent._watcher)
+
+    def test_a_wayland_flap_does_not_re_arm_the_detection_budget(self):
+        """clipboard_lost() discards the watcher and clipboard_became_ready()
+        builds a fresh one, so a dead-event-source verdict living only on the
+        watcher resets on any mid-connection Wayland flap (a logout/login with
+        the SSH channel still up): the switch line logs a second time and
+        PC->Mac sync drops back to 30-second latency for another full detection
+        cycle on an installation already diagnosed.
+
+        This agent is one process per SSH connection (see _clip_state_sent), so
+        an Agent-level flag is connection-scoped by construction -- which is
+        exactly what "for the rest of the connection" means. And re-enabling
+        the gnome-shell extension, the one thing that actually fixes a dead
+        source, does not tear down the Wayland session, so a flap is no
+        evidence whatsoever that the source recovered."""
+        agent = self.build(ready=True)
+        built = []
+
+        def factory(clipboard, **kwargs):
+            watcher = FlapRecordingWatcher(**kwargs)
+            built.append(watcher)
+            return watcher
+
+        with mock.patch.object(clipwire_agent, "make_watcher", factory):
+            agent.clipboard_became_ready()
+            self.assertFalse(
+                built[0].degraded, "a fresh connection starts on the detection budget"
+            )
+            built[0].diagnose()          # the safety net's verdict lands
+            agent.clipboard_lost()
+            agent.clipboard_became_ready()
+
+        self.assertEqual(len(built), 2, "the flap must have rebuilt the watcher")
+        self.assertTrue(
+            built[1].degraded,
+            "the watcher rebuilt after a flap must start already degraded: the "
+            "diagnosis has to outlive the watcher the flap discarded",
+        )
+        self.assertEqual(
+            built[1].started_with, agent._local_change,
+            "and it must still be wired to the one observation funnel",
+        )
 
 
 class TestEchoBookkeeping(unittest.TestCase):

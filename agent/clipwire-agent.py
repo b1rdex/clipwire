@@ -250,6 +250,24 @@ class Agent:
         # See _on_clip_state's own doc comment for why resolving against
         # the store before it has been reconciled is unsafe.
         self._pending_peer_clip_state = None
+        # Whether the GPaste event source has already been diagnosed as
+        # silently dead THIS CONNECTION. Lives here rather than on the
+        # watcher, because clipboard_lost() discards the watcher and
+        # clipboard_became_ready() builds a fresh one: a mid-connection
+        # Wayland flap (a logout/login with the SSH channel still up) would
+        # otherwise re-log the diagnosis and put PC->Mac sync back on the
+        # 30-second detection budget for another full cycle, on an
+        # installation already known to be broken. And re-enabling the
+        # gnome-shell extension -- the one thing that actually fixes a dead
+        # source -- does not tear down the Wayland session, so a flap is no
+        # evidence at all that the source recovered.
+        #
+        # One process per SSH connection (see _clip_state_sent above), so an
+        # Agent-level flag is connection-scoped by construction, which is what
+        # "for the rest of the connection" means. Set from the watcher's poll
+        # thread via _note_event_source_degraded and read on run()'s thread in
+        # clipboard_became_ready: a plain bool with a single writer, so no lock.
+        self._event_source_degraded = False
         # Persistent memory of what was last synced between the two
         # machines -- set in _write_clip (content arriving FROM the peer)
         # and after a successful send in _local_change (content sent TO
@@ -536,8 +554,22 @@ class Agent:
                 self._pending_peer_clip_state = None
                 self._resolve_clip_state(peer)
         if self._watcher is None:
-            self._watcher = make_watcher(self.clipboard)
+            # The degraded verdict is handed back IN on a rebuild and reported
+            # back OUT when it is first reached, so it belongs to the
+            # connection rather than to whichever watcher happened to reach it.
+            self._watcher = make_watcher(
+                self.clipboard,
+                degraded=self._event_source_degraded,
+                on_degrade=self._note_event_source_degraded,
+            )
             self._watcher.start(self._local_change)
+
+    def _note_event_source_degraded(self):
+        """Called once by the watcher when it diagnoses a dead event source, so
+        the verdict outlives the watcher that reached it. Runs on the safety
+        net's poll thread; see _event_source_degraded on why that needs no
+        lock."""
+        self._event_source_degraded = True
 
     def clipboard_lost(self):
         self.phase = PHASE_PENDING
@@ -1168,7 +1200,8 @@ class GPasteWatcher:
 
     def __init__(self, clipboard,
                  safety_net_interval_seconds=SAFETY_NET_POLL_SECONDS,
-                 degraded_interval_seconds=DEGRADED_POLL_SECONDS):
+                 degraded_interval_seconds=DEGRADED_POLL_SECONDS,
+                 degraded=False, on_degrade=None):
         self.clipboard = clipboard
         self._process = None
         self._thread = None
@@ -1182,23 +1215,30 @@ class GPasteWatcher:
         self._signals = 0
         # Only ever touched by _observe_tick, i.e. by that one poll thread.
         self._signals_at_last_tick = 0
-        # Latch, mirroring Agent._clip_state_sent's shape: assigned in exactly
-        # one place (_observe_tick) and never cleared, so the switch is logged
-        # once however many further changes the poll goes on to catch.
-        #
-        # It lives on the watcher, so a mid-connection Wayland flap
-        # (clipboard_lost -> clipboard_became_ready) builds a fresh one and
-        # re-arms the detection budget. Deliberate: that flap terminated the
-        # old gdbus child, the new subscription's liveness is genuinely
-        # unproven, and re-detection lands in exactly the same place. What it
-        # is not is a latch that survives everything for the whole process.
-        self._degraded = False
+        # Latch, mirroring Agent._clip_state_sent's shape AND its lifetime:
+        # assigned in exactly one place (_observe_tick), never cleared, and
+        # carried across a watcher rebuild by Agent._event_source_degraded,
+        # which is where the connection-scoped copy lives and why `degraded`
+        # is an argument here at all. A watcher-only latch would re-arm the
+        # detection budget on every mid-connection Wayland flap -- see that
+        # attribute's own comment.
+        self._degraded = degraded
         self._degraded_interval = degraded_interval_seconds
+        # Reports the diagnosis back to whoever owns the connection-scoped
+        # copy. Called at most once, from _observe_tick, behind the same latch
+        # that gates the log line.
+        self._on_degrade = on_degrade
         # PollingWatcher is defined below this class: resolved at call time
         # from module globals, so the forward reference is fine -- nothing
         # constructs a GPasteWatcher until main() runs.
+        #
+        # Already-degraded watchers start ON the degraded interval: coming up
+        # on the detection budget would leave PC->Mac 30 seconds behind for
+        # another full cycle on an installation already diagnosed.
         self._safety_net = PollingWatcher(
-            clipboard, safety_net_interval_seconds, on_tick=self._observe_tick)
+            clipboard,
+            degraded_interval_seconds if degraded else safety_net_interval_seconds,
+            on_tick=self._observe_tick)
 
     def _observe_tick(self, previous, current):
         """Judge the event source from one safety-net tick.
@@ -1240,6 +1280,10 @@ class GPasteWatcher:
                 "extension enabled?), polling every %.1fs for the rest of this "
                 "connection" % self._degraded_interval)
             self._safety_net.interval = self._degraded_interval
+            if self._on_degrade is not None:
+                # Last, so this watcher's own state is fully consistent before
+                # the verdict escapes it.
+                self._on_degrade()
         self._signals_at_last_tick = signals
 
     def available(self):
@@ -1359,11 +1403,19 @@ class PollingWatcher:
         self._stop.set()
 
 
-def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS):
-    watcher = GPasteWatcher(clipboard)
+def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
+                 degraded=False, on_degrade=None):
+    """`degraded`/`on_degrade` carry the dead-event-source verdict in and out,
+    so it belongs to the connection rather than to whichever watcher reached it
+    -- see Agent._event_source_degraded."""
+    watcher = GPasteWatcher(clipboard, degraded=degraded, on_degrade=on_degrade)
     if watcher.available():
-        log("watching the clipboard through GPaste, with a safety-net poll every %.0fs"
-            % SAFETY_NET_POLL_SECONDS)
+        if degraded:
+            log("watching the clipboard through GPaste, already diagnosed as silent "
+                "this connection, so polling every %.1fs" % DEGRADED_POLL_SECONDS)
+        else:
+            log("watching the clipboard through GPaste, with a safety-net poll every %.0fs"
+                % SAFETY_NET_POLL_SECONDS)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
     return PollingWatcher(clipboard, fallback_interval_seconds)
