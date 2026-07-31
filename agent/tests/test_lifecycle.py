@@ -67,11 +67,17 @@ class AsyncWriteClipboard:
     does NOT change what a subsequent read() returns; the two are
     decoupled in time, exactly like the real asynchronous pair.
 
-    FakeClipboard/QueueClipboard (used everywhere else in this file and in
-    test_watcher.py) are both synchronous: write() and read() agree
-    instantly. That is the right model for most of this suite, but it is
-    the WRONG model for clipboard_became_ready's pending-clip path, whose
-    correctness this double exists to pin.
+    FakeClipboard above genuinely cannot express this: its read() is
+    hardcoded to always return None, regardless of what write() was just
+    called with, so it has no "stale content" state to return at all.
+    test_watcher.py's QueueClipboard actually CAN express the same
+    decoupling already -- its read() only ever pops from an explicitly
+    queued sequence, never derived from write(), which is exactly this
+    same shape (see TestIncomingClipState's own version of this bug in
+    test_watcher.py, reproduced by simply not queuing the applied text as
+    a read value). AsyncWriteClipboard exists here only because this file
+    has no queue-based double to reuse, and a name that says what the
+    race is beats "queue nothing and rely on the empty-queue path."
     """
 
     def __init__(self, read_value, ready=True):
