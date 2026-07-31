@@ -9,7 +9,7 @@ import time
 import unittest
 import pathlib
 
-from agent_under_test import Agent, TYPE_HELLO, decode_frame, encode_frame
+from agent_under_test import Agent, PROTOCOL_VERSION, TYPE_HELLO, decode_frame, encode_frame
 
 # agent_under_test registers the loaded module under this name in
 # sys.modules; grabbed here only to reach a module-level tuning constant
@@ -144,7 +144,11 @@ class TestMainLoop(unittest.TestCase):
         self.addCleanup(process.kill)
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.stdin.close)
-        frame = encode_frame(TYPE_HELLO, b'{"protocol":1}')
+        # Built from PROTOCOL_VERSION rather than a hardcoded literal: a
+        # hardcoded "1" would silently become a MISMATCHED hello once the
+        # agent's own version bumps, flipping this test's outcome for a
+        # reason unrelated to what it actually checks (reassembly).
+        frame = encode_frame(TYPE_HELLO, ('{"protocol":%d}' % PROTOCOL_VERSION).encode())
         split = len(frame) // 2
         process.stdin.write(frame[:split])
         process.stdin.flush()

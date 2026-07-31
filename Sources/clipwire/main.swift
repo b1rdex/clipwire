@@ -15,24 +15,37 @@ enum AgentPaths {
 }
 
 enum ProtocolConstants {
-    static let version = 1
+    static let version = 2
     static let agentVersion = "0.1.0"
 
     static var helloPayload: Data {
-        (try? JSONEncoder().encode(HelloPayload(version: version, agent: agentVersion))) ?? Data()
+        (try? JSONEncoder().encode(
+            HelloPayload(version: version, agent: agentVersion,
+                         sentAt: Date().timeIntervalSince1970)
+        )) ?? Data()
     }
 }
 
-/// Wire shape of a hello frame's JSON payload: `{"protocol": <int>, "agent": "<version>"}`.
+/// Wire shape of a hello frame's JSON payload:
+/// `{"protocol": <int>, "agent": "<version>", "sent_at": <epoch seconds>}`.
 /// `version` maps to the wire key `protocol` (a Swift keyword) via `CodingKeys`,
 /// the same pattern `Config` already uses for its own snake_case wire keys.
 private struct HelloPayload: Codable {
     let version: Int
     let agent: String?
+    // Optional, like `agent`: this task only adds sent_at to what WE build
+    // (always populated there -- see `helloPayload` above). Decoding stays
+    // tolerant of a peer that omits it -- an old v1 peer, or any hand-built
+    // test payload -- so `decodeHello` keeps reporting the real version
+    // mismatch instead of degrading to "malformed hello" the moment a v1
+    // peer's payload lacks a key v2 introduced. Nothing reads this field
+    // back out yet; skew measurement is later work.
+    let sentAt: Double?
 
     enum CodingKeys: String, CodingKey {
         case version = "protocol"
         case agent
+        case sentAt = "sent_at"
     }
 }
 
@@ -249,6 +262,11 @@ func handleFrame(
         }
         status.recordHelloMatched()
         log.line("peer said hello (agent \(peer.agent ?? "unknown"))")
+    case .clipState:
+        // Registered so the envelope can decode a type-2 frame at all --
+        // this task adds no sender, no receiver behaviour, and no
+        // resolution rule. Those land when the Mac side is wired up.
+        break
     case .clip:
         guard !frame.payload.isEmpty,
               let text = String(data: frame.payload, encoding: .utf8) else { return }

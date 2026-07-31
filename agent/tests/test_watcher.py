@@ -717,6 +717,7 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "class ClipPayloadError",
             "def encode_clip_payload",
             "def decode_clip_payload",
+            "TYPE_CLIP_STATE = 0x02",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

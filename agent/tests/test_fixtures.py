@@ -2,7 +2,7 @@ import json
 import pathlib
 import unittest
 
-from agent_under_test import decode_clip_payload, decode_frame, encode_frame
+from agent_under_test import TYPE_CLIP_STATE, decode_clip_payload, decode_frame, encode_frame
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "frames.json"
 
@@ -32,7 +32,7 @@ class TestFixtures(unittest.TestCase):
         too, not just the frame envelope -- otherwise the fixture file pins
         the envelope while the new [ts][text] inner layout drifts freely."""
         clip_cases = [c for c in self.cases if c["type"] == 1]
-        self.assertEqual(len(clip_cases), 6, "expected exactly 6 type-1 fixture cases")
+        self.assertEqual(len(clip_cases), 7, "expected exactly 7 type-1 fixture cases")
         for c in clip_cases:
             with self.subTest(c["name"]):
                 payload = bytes.fromhex(c["payload_hex"])
@@ -46,6 +46,27 @@ class TestFixtures(unittest.TestCase):
         ts, text = decode_clip_payload(bytes.fromhex(ascii_case["payload_hex"]))
         self.assertEqual(ts, 1.0)
         self.assertEqual(text, b"hi")
+
+    def test_clip_state_payload_decodes_golden(self):
+        """Pinned decode-only, same as hello: JSON key order and float
+        formatting differ between Swift and Python, so a byte-exact encode
+        vector would fail for reasons that have nothing to do with the
+        protocol. Decodes the frame envelope (proving the type byte is
+        really 2, not just that some payload was found) and then parses the
+        payload's JSON directly -- there is no clip-state payload codec yet;
+        that lands in a later task."""
+        clip_state_cases = [c for c in self.cases if c["type"] == TYPE_CLIP_STATE]
+        self.assertEqual(len(clip_state_cases), 1, "expected exactly 1 type-2 fixture case")
+        c = clip_state_cases[0]
+
+        buffer = bytearray(bytes.fromhex(c["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state fixture must decode as type 2")
+        self.assertEqual(len(buffer), 0)
+
+        parsed = json.loads(payload.decode())
+        self.assertIsNone(parsed["sha256"], "sha256 must parse to null")
+        self.assertEqual(parsed["ts"], 1.0)
 
 
 if __name__ == "__main__":

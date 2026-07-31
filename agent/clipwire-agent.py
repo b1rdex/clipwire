@@ -9,8 +9,9 @@ MAX_PAYLOAD_BYTES = 4194304
 HEADER_BYTES = 5
 TYPE_HELLO = 0x00
 TYPE_CLIP = 0x01
-PROTOCOL_VERSION = 1
-_KNOWN_TYPES = (TYPE_HELLO, TYPE_CLIP)
+TYPE_CLIP_STATE = 0x02
+PROTOCOL_VERSION = 2
+_KNOWN_TYPES = (TYPE_HELLO, TYPE_CLIP, TYPE_CLIP_STATE)
 
 
 class FrameError(Exception):
@@ -76,6 +77,7 @@ import os
 import select
 import sys
 import threading
+import time
 
 AGENT_VERSION = "0.1.0"
 PHASE_PENDING = "clipboard-pending"
@@ -118,8 +120,12 @@ class Agent:
     # --- outbound -------------------------------------------------------
 
     def hello_payload(self):
+        # sent_at is this side's clock at the moment of sending, used later
+        # for skew measurement -- nothing reads it back out yet. Read fresh
+        # on every call (not cached at import time) since "the moment of
+        # sending" is exactly when this method runs.
         return json.dumps(
-            {"protocol": PROTOCOL_VERSION, "agent": AGENT_VERSION}
+            {"protocol": PROTOCOL_VERSION, "agent": AGENT_VERSION, "sent_at": time.time()}
         ).encode()
 
     def send_hello(self):

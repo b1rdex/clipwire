@@ -1,5 +1,5 @@
 {
-  "comment": "Golden frame vectors, protocol v2. Type 1 payloads are [f64 BE ts][utf-8]. Type 2 (clip-state JSON) has no vector here yet: 0x02 is not a registered frame type on either side, and the clip-state schema requires both sha256 and ts. Do not edit by hand without recomputing.",
+  "comment": "Golden frame vectors, protocol v2. Type 1 payloads are [f64 BE ts][utf-8]. Types 0 (hello) and 2 (clip-state) carry JSON; their bodies are validated by decoding and parsing only, never by comparing a language's own JSON encoder against these bytes, since key order and float formatting differ between Swift and Python. Do not edit by hand without recomputing.",
   "cases": [
     {"name": "empty-clip", "type": 1, "payload_hex": "3ff0000000000000",                         "frame_hex": "00000008013ff0000000000000"},
     {"name": "ascii-clip", "type": 1, "payload_hex": "3ff00000000000006869",                     "frame_hex": "0000000a013ff00000000000006869"},
@@ -7,6 +7,8 @@
     {"name": "emoji-clip", "type": 1, "payload_hex": "3ff0000000000000f09f94a5",                 "frame_hex": "0000000c013ff0000000000000f09f94a5"},
     {"name": "nfd-clip",   "type": 1, "payload_hex": "3ff000000000000065cc81",                   "frame_hex": "0000000b013ff000000000000065cc81"},
     {"name": "crlf-clip",  "type": 1, "payload_hex": "3ff0000000000000610d0a62",                 "frame_hex": "0000000c013ff0000000000000610d0a62"},
-    {"name": "hello",      "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"}
+    {"name": "nul-clip",   "type": 1, "payload_hex": "3ff0000000000000610062",                   "frame_hex": "0000000b013ff0000000000000610062"},
+    {"name": "hello",      "type": 0, "payload_hex": "7b2270726f746f636f6c223a327d",             "frame_hex": "0000000e007b2270726f746f636f6c223a327d"},
+    {"name": "clip-state", "type": 2, "payload_hex": "7b22736861323536223a6e756c6c2c227473223a312e307d", "frame_hex": "00000018027b22736861323536223a6e756c6c2c227473223a312e307d"}
   ]
 }
