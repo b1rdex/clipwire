@@ -347,6 +347,16 @@ git commit -m "Update golden vectors for protocol v2 clip payloads and clip-stat
 
 - [ ] **Step 1: Write the failing tests**
 
+Also restore the `nul-clip` case that v1 had and v2's list dropped:
+
+```json
+    {"name": "nul-clip", "type": 1, "payload_hex": "3ff0000000000000610062", "frame_hex": "0000000b013ff0000000000000610062"},
+```
+
+Its text is `a\0b`. Without it, any future path through C interop that truncates at the
+first NUL byte passes every golden vector — a coverage regression against v1, not a new
+concern.
+
 Add the clip-state vector to `fixtures/frames.json` here, where the type finally exists, and
 assert it **decode-only** in both suites: given
 `{"sha256": null, "ts": 1.0}` encoded as a type-2 frame, each side must decode it to type 2
