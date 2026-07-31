@@ -511,6 +511,29 @@ final class HandleFrameTests: XCTestCase {
                        "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4")
     }
 
+    /// Closes a gap the test above cannot: comparing the stored hash against
+    /// `sha256Hex(Data("hi".utf8))` itself would still pass even if
+    /// `handleFrame` hashed the WRONG bytes (`frame.payload`, the
+    /// timestamp-prefixed wire payload, instead of `textData`) -- as long as
+    /// it did so consistently with `sha256Hex`'s own behavior on whatever it
+    /// was given. This pins the LITERAL, independently-verified digest at
+    /// the actual call site instead. See fixtures/hashes.json, read by both
+    /// suites (FixtureTests.testSha256HexMatchesSharedVectors and Python's
+    /// test_fixtures.py::TestHashFixtures), so this exact vector cannot
+    /// drift between them.
+    func testIncomingClipStoresTheLiteralKnownHashForAPinnedVector() throws {
+        let store = tempClipStateStore()
+        let framePayload = ClipPayload(ts: 1, text: "hi").encode()
+
+        handleFrame(Frame(type: .clip, payload: framePayload),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(store.load()?.sha256,
+                       "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4")
+    }
+
     // MARK: - announceClipState: the outgoing announcement, tested directly
 
     /// The load-bearing case, tested directly against `announceClipState`

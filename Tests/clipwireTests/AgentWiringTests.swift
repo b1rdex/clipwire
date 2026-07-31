@@ -137,6 +137,32 @@ final class AgentWiringTests: XCTestCase {
                       "expected \(ts) to fall within [\(before), \(after)] -- the moment of observation")
     }
 
+    /// The outgoing-path twin of
+    /// HandleFrameTests.testIncomingClipStoresTheLiteralKnownHashForAPinnedVector:
+    /// comparing against `sha256Hex(Data("hi".utf8))` itself (as the test
+    /// above does) cannot catch `wireAgent`'s `onChange` hashing the WRONG
+    /// bytes -- it would still pass as long as it did so consistently with
+    /// sha256Hex's own behavior. This pins the LITERAL, independently
+    /// verified digest instead. See fixtures/hashes.json, read by both
+    /// suites.
+    func testAGenuineLocalChangeStoresTheLiteralKnownHashForAPinnedVector() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        let channel = Channel(config: config(), log: tempLog())
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+        let clipStateStore = tempClipStateStore()
+
+        wireAgent(channel: channel, watcher: watcher, pasteboard: pasteboard, status: status,
+                  log: tempLog(), clipStateStore: clipStateStore, clipStateAnnouncement: ClipStateAnnouncement())
+
+        watcher.poll() // baseline
+        pasteboard.set("hi")
+        watcher.poll()
+
+        XCTAssertEqual(clipStateStore.load()?.sha256,
+                       "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4")
+    }
+
     /// The property that makes the whole feature work across the case it
     /// exists for: reconnects happen on every Mac sleep/wake cycle, not just
     /// reboots, and `wireAgent` is wired exactly once at process start, so
