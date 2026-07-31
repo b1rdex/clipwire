@@ -1557,12 +1557,12 @@ class GPasteWatcher:
         self._signals = 0
         # Only ever touched by _observe_tick, i.e. by that one poll thread.
         self._signals_at_last_tick = 0
-        # The first half of the two-tick verdict: did the PREVIOUS tick see a
-        # divergence? Deliberately NOT carried across a watcher rebuild the way
-        # _degraded is -- a Wayland flap restarts the run from scratch, exactly
-        # as _signals_at_last_tick already does, because the counter it would
-        # be compared against starts over too.
-        self._diverged_last_tick = False
+        # The first half of the two-tick verdict: a divergence is waiting to be
+        # confirmed or cleared by the next tick. Deliberately NOT carried across
+        # a watcher rebuild the way _degraded is -- a Wayland flap restarts the
+        # run from scratch, exactly as _signals_at_last_tick already does,
+        # because the counter it would be compared against starts over too.
+        self._armed = False
         # Latch, mirroring Agent._clip_state_sent's shape AND its lifetime:
         # assigned in exactly one place (_observe_tick), never cleared, and
         # carried across a watcher rebuild by Agent._event_source_degraded,
@@ -1632,10 +1632,11 @@ class GPasteWatcher:
         # missed. Cost: with an empty clipboard at connect, the first
         # None->text change is still REPORTED but is not counted as evidence,
         # so the verdict waits for the change after it -- deferred, never lost.
-        diverged = (previous is not None and current is not None
-                    and previous != current
-                    and signals == self._signals_at_last_tick)
-        # ONE diverging tick is not evidence, and this is a reversal of v2's
+        read_ok = previous is not None and current is not None
+        # "Still" as in since the previous tick: _signals_at_last_tick is
+        # assigned at the bottom of every one.
+        still_silent = signals == self._signals_at_last_tick
+        # ONE diverging tick is not a verdict, and this is a reversal of v2's
         # rule rather than an accident -- see the design doc, "The verdict now
         # needs two consecutive ticks". v2 judged from a single tick, which was
         # safe only because the poll loop called the handler SYNCHRONOUSLY:
@@ -1647,16 +1648,29 @@ class GPasteWatcher:
         #
         # What replaces it is hysteresis, because the alternative -- an
         # acknowledgement from the worker -- would re-couple this thread to it
-        # and restore the wedge path the decoupling exists to remove. A
-        # divergence must outlive a whole tick, three orders of magnitude
-        # longer than any signal lag, so a false verdict would need two
-        # independent millisecond-window hits in a row. Anything that breaks
-        # the run resets it, and the three ways are the three clauses above:
-        # the counter moved, the content settled, or a read failed.
+        # and restore the wedge path the decoupling exists to remove.
         #
-        # DO NOT restore the one-tick verdict without restoring the
-        # synchronous call. Two ticks will look like one too many to a reader
-        # who cannot see the premise that died.
+        # A divergence ARMS; the next tick CONFIRMS if the counter is still
+        # unmoved. What may clear an armed run is the crux, and the first
+        # version of this rule got it wrong: the armed state is a claim about
+        # the EVENT SOURCE, not about the clipboard, so only evidence about the
+        # source may clear it.
+        #
+        #   - the counter MOVED: the source is alive. A signal that was merely
+        #     in flight when the run was armed lands here, which is exactly the
+        #     race this shape exists to absorb. Reset.
+        #   - a read FAILED: read() returns None for a timed-out wl-paste and
+        #     for an empty selection alike, so it is evidence either way about
+        #     nothing at all. Reset.
+        #   - the content SETTLED: says nothing whatever about the source. It
+        #     must NOT reset, and a rule that cleared the run here looked
+        #     symmetrical and was not: a dead source on any machine whose copies
+        #     fall more than one tick apart would arm, clear, arm, clear and
+        #     never once be diagnosed.
+        #
+        # DO NOT restore the one-tick verdict without restoring the synchronous
+        # call. Two ticks will look like one too many to a reader who cannot
+        # see the premise that died.
         #
         # The cost is worst-case detection moving from one tick to two --
         # intended, and not symmetrical with the error it prevents: a false
@@ -1664,8 +1678,15 @@ class GPasteWatcher:
         # positive costs one more interval on a machine that is already not
         # syncing. Every change is still REPORTED throughout either way; only
         # the interval the safety net polls at is at stake.
-        confirmed = diverged and self._diverged_last_tick
-        self._diverged_last_tick = diverged
+        if not read_ok or not still_silent:
+            confirmed = False
+            self._armed = False
+        elif self._armed:
+            confirmed = True
+            self._armed = False   # the run is spent, whatever is done with it
+        else:
+            confirmed = False
+            self._armed = previous != current
         if confirmed and not self._degraded:
             self._degraded = True
             log("GPaste is not reporting clipboard changes (is the gnome-shell "

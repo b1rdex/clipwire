@@ -845,6 +845,44 @@ class SignallingClipboard:
         return self.last
 
 
+class ArmThenSignalClipboard:
+    """Drives the exact interleaving the two-tick verdict exists to absorb: the
+    content changes, the tick that sees it arms the verdict, and only THEN is
+    the Update signal for that very change counted -- before the tick that
+    would confirm. A healthy source whose signal was merely in flight looks
+    precisely like this, and it is reachable now that the poll loop no longer
+    spends a wl-paste round trip inside on_change.
+
+    The counter is moved from inside the read belonging to the confirming tick,
+    on the poll thread itself, so it is provably in place before that tick's
+    comparison -- the same deterministic-side-effect-inside-read() trick
+    SignallingClipboard uses above, rather than racing two real threads and
+    hoping. It is bumped directly rather than through a real gdbus line because
+    WHICH reader moved the counter is irrelevant to the rule under test, and a
+    real line would have to beat the confirming tick through the pump thread to
+    count."""
+
+    def __init__(self, before, after):
+        self.watcher = None       # set by start_watcher, before anything reads
+        self.calls = 0
+        self.last = None
+        self._before = before
+        self._after = after
+
+    def take(self):
+        return self.last
+
+    def read(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.last = self._before   # the poll loop's own baseline
+        elif self.calls == 2:
+            self.last = self._after    # the change: this tick arms the verdict
+        elif self.calls == 3:
+            self.watcher._signals += 1
+        return self.last
+
+
 class TestGPasteSafetyNet(unittest.TestCase):
     """GPasteWatcher.available() probes the bus NAME, but GPaste tracks the
     clipboard through a gnome-shell extension: a GNOME upgrade can leave the
@@ -891,6 +929,11 @@ class TestGPasteSafetyNet(unittest.TestCase):
             degraded=degraded,
             on_degrade=on_degrade,
         )
+        # Same reason as `process` above, and the same instant: a clipboard
+        # that drives the SIGNAL COUNTER from inside its own read() must hold
+        # the watcher before the baseline read.
+        if hasattr(clipboard, "watcher"):
+            clipboard.watcher = watcher
         # Stopped in cleanup as well as in the tests themselves, so a failing
         # assertion cannot leave a poll thread running against a torn-down
         # fixture.
@@ -933,54 +976,28 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "change; got: %r" % self.log_lines,
         )
 
-    def test_one_diverging_tick_does_not_degrade(self):
-        """The hysteresis, stated as the thing that must NOT happen.
+    def test_the_verdict_lands_on_the_tick_after_the_arming_one(self):
+        """The rule, pinned by WHICH tick fires it rather than by "it degrades
+        eventually" -- which passes against every version of this rule the
+        project has had and pins nothing.
 
-        v2 degraded from a SINGLE tick, and that ruling was safe only because
-        the poll loop called the handler synchronously: _local_change always
-        forks wl-paste, so milliseconds always passed between the content read
-        and the verdict -- enough for a signal already in flight to be counted.
-        Decoupling the loop from the handler deleted that grace period, so one
-        diverging tick is no longer evidence: a copy landing in the last few
-        milliseconds before the read gets judged missed while its Update is
-        still in flight, and a healthy machine is degraded to 1-second polling
-        for the rest of the connection. That is the very defect this release
-        exists to fix.
-
-        The script changes exactly once and then repeats, so there can never be
-        a second consecutive divergence. Against a one-tick verdict this goes
-        red on the assertion below."""
-        clipboard = ScriptedReadClipboard([b"a", b"b"])
-        watcher, _ = self.start_watcher(clipboard)
-
-        # The baseline read, the diverging tick, and three settled ticks after
-        # it -- far past the point a one-tick verdict would have fired.
-        self.wait_until(lambda: clipboard.calls >= 5)
-        self.quiesce(watcher)
-
-        self.assertGreaterEqual(
-            clipboard.calls, 5,
-            "the poll must have run well past the divergence, or this test "
-            "proves nothing",
-        )
-        self.assertEqual(
-            self.switch_log_lines(), [],
-            "one diverging tick must ARM the verdict, not fire it; got: %r"
-            % self.log_lines,
-        )
-
-    def test_the_verdict_lands_on_the_second_consecutive_diverging_tick(self):
-        """Not merely "it degrades eventually" -- that passes against a
-        one-tick verdict too and would pin nothing. This pins WHICH tick fires
-        it.
+        One diverging tick ARMS: content changed while the counter stood still.
+        The next tick CONFIRMS if the counter is STILL unmoved, and whether the
+        content moved again is irrelevant, because the armed state is a claim
+        about the EVENT SOURCE, not about the clipboard -- only evidence about
+        the source may clear it. The script below changes exactly once and then
+        settles, so a rule that cleared the arm on a settled tick never fires
+        at all: a dead source on any machine whose copies fall more than one
+        tick apart would go undiagnosed forever, which is the defect this
+        version corrects.
 
         on_degrade runs synchronously inside _observe_tick, on the poll thread,
-        and clipboard.calls is incremented only by that same thread, so the
-        read count at the moment of the verdict is exact with no sleep and no
-        waiting: one baseline read plus two ticks. A one-tick verdict records
-        2."""
+        and clipboard.calls is incremented only by that same thread, so the read
+        count at the moment of the verdict is exact with no sleep and no
+        waiting: one baseline read plus two ticks. A one-tick verdict records 2;
+        a settling-resets rule records nothing at all."""
         reads_at_verdict = []
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
         watcher, _ = self.start_watcher(
             clipboard, on_degrade=lambda: reads_at_verdict.append(clipboard.calls))
 
@@ -989,8 +1006,69 @@ class TestGPasteSafetyNet(unittest.TestCase):
 
         self.assertEqual(
             reads_at_verdict, [3],
-            "the verdict must land on the SECOND consecutive diverging tick -- "
-            "one baseline read plus two ticks",
+            "the verdict must land on the tick AFTER the arming one -- one "
+            "baseline read plus two ticks -- and must land even though the "
+            "content settled",
+        )
+
+    def test_a_signal_arriving_after_the_arming_tick_clears_the_run(self):
+        """Why one diverging tick is not a verdict, and the whole reason this
+        rule is two ticks long.
+
+        The poll loop stopped calling the handler, so the milliseconds that
+        call used to spend forking wl-paste -- the grace an in-flight Update
+        had to be counted in -- are gone. A copy landing just before a tick's
+        read is therefore SEEN before its signal is counted, on a perfectly
+        healthy source. That tick arms; the signal lands; the next tick must
+        find the counter moved and clear the run rather than confirm it.
+
+        Deterministic by construction: the counter moves from inside the read
+        belonging to the confirming tick, on the poll thread itself, so it is
+        provably in place before that tick's comparison."""
+        clipboard = ArmThenSignalClipboard(before=b"a", after=b"b")
+        watcher, _ = self.start_watcher(clipboard, on_change=lambda: None)
+
+        # The baseline, the arming tick, the tick that must clear the run, and
+        # two more after it.
+        self.wait_until(lambda: clipboard.calls >= 5)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 5,
+            "the poll must have run past the tick that would have confirmed",
+        )
+        self.assertEqual(
+            watcher._signals, 1, "the in-flight signal must have been counted"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a signal arriving after the arming tick must clear the run, not "
+            "leave it to be confirmed; got: %r" % self.log_lines,
+        )
+
+    def test_a_failed_read_clears_an_armed_run(self):
+        """The third reset condition. A read that failed is not evidence about
+        the event source either way -- WaylandClipboard.read() returns None for
+        a timed-out wl-paste and for a genuinely empty selection alike -- so it
+        cannot serve as the second half of a verdict. Without that, one flaky
+        wl-paste landing on the tick after a change would confirm a verdict on
+        a healthy machine, which is the same false positive by another route.
+
+        The script arms on b, then fails, so the tick that would otherwise
+        confirm has nothing to confirm with."""
+        clipboard = ScriptedReadClipboard([b"a", b"b", None, b"b"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: clipboard.calls >= 6)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 6, "the poll must have run past the recovery"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a failed read must clear an armed run, not confirm it; got: %r"
+            % self.log_lines,
         )
 
     def test_a_healthy_signal_source_plus_a_content_change_does_not_log_the_switch(self):
@@ -1086,9 +1164,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
     def test_the_switch_polls_at_the_degraded_interval_not_the_detection_budget(self):
         """The same ruling as a live transition rather than a default: the
         interval changes, the mechanism does not."""
-        # Three values, not two: the verdict now needs two CONSECUTIVE
-        # diverging ticks, so a dead source must be given two changes to miss.
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=0.01, degraded_interval_seconds=0.05)
 
@@ -1113,10 +1189,9 @@ class TestGPasteSafetyNet(unittest.TestCase):
         the budget cannot deliver even one, since Event.wait does not return
         early."""
         budget, degraded, window = 0.03, 0.002, 0.02
-        # Three values: two consecutive diverging ticks are needed to switch.
-        # Deliberately NOT paced -- this counts ticks in a 20ms window and a
+        # Deliberately NOT paced: this counts ticks in a 20ms window and a
         # blocking read would starve the count.
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=budget,
             degraded_interval_seconds=degraded)
@@ -1146,11 +1221,10 @@ class TestGPasteSafetyNet(unittest.TestCase):
         that child down mid-connection is the SIGPIPE class of bug that already
         killed this project's Mac agent once, at exactly the moment the PC
         rebooted."""
-        # Three values for the two consecutive diverging ticks the verdict
-        # now needs, and paced so both are observed before the count below is
-        # taken -- otherwise a poll-driven change still in flight could satisfy
-        # the assertion that only the emitted SIGNAL is supposed to.
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"], paced=True)
+        # Paced so the poll's own change is observed before the count below
+        # is taken -- otherwise a poll-driven change still in flight could
+        # satisfy the assertion that only the emitted SIGNAL is supposed to.
+        clipboard = ScriptedReadClipboard([b"a", b"b"], paced=True)
         watcher, fake_process = self.start_watcher(clipboard)
 
         self.wait_until(lambda: self.switch_log_lines())
@@ -1161,11 +1235,11 @@ class TestGPasteSafetyNet(unittest.TestCase):
         )
 
         # The script is exhausted and repeats its last value forever, so the
-        # poll cannot add a change here: only the emitted signal can. Both of
-        # its changes must have been OBSERVED first, or the count below could
-        # be satisfied by one of them landing late.
-        self.wait_until(lambda: len(self.changes) >= 2)
-        self.assertEqual(len(self.changes), 2, "both poll-driven changes must be in")
+        # poll cannot add a change here: only the emitted signal can. Its one
+        # change must have been OBSERVED first, or the count below could be
+        # satisfied by that landing late.
+        self.wait_until(lambda: len(self.changes) >= 1)
+        self.assertEqual(len(self.changes), 1, "the poll-driven change must be in")
         reported = len(self.changes)
         fake_process.emit(GPASTE_UPDATE_LINE)
         self.wait_until(lambda: len(self.changes) > reported)
