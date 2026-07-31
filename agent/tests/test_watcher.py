@@ -1127,6 +1127,67 @@ class TestIncomingClipState(unittest.TestCase):
             "_local_change's own send path already does",
         )
 
+    def test_winning_clip_state_prefers_a_just_applied_clip_over_a_racy_reread(self):
+        """The same class of bug clipboard_became_ready's announce step was
+        fixed for, one door over: a TYPE_CLIP frame applied via _write_clip
+        (the immediate _on_clip path, once READY) followed closely by a
+        TYPE_CLIP_STATE frame that wins the reconciliation -- both
+        plausible on the same connection, e.g. the Mac's watcher pushing a
+        fresh local change around the time of its own one-time clip-state
+        announcement. _write_clip already wrote to and correctly persisted
+        state for that applied clip; if _on_clip_state instead re-reads the
+        clipboard fresh to find the TEXT to send, that read can race
+        wl-copy's asynchronous, detached write (see _write_clip's own
+        comment) and see stale content -- sending WRONG text stamped with
+        the CORRECT mine[1] timestamp, which looks like a valid, fresh
+        reconciliation response to the peer.
+
+        _last_seen already holds the applied clip's exact text (_write_clip
+        sets it before spawning wl-copy) -- and it is verified against
+        mine's hash before being trusted, so a stale/unrelated _last_seen
+        (e.g. clipboard_became_ready's own connect-time seed) still falls
+        back to a live read exactly as before.
+
+        QueueClipboard is the right double here, unmodified: its write()
+        already never affects what a subsequently-queued read() returns --
+        precisely the "write and read are decoupled in time" shape of the
+        real asynchronous wl-copy, achieved here simply by not queuing the
+        applied text as a read value."""
+        applied_text = b"the peer's own recently applied clip"
+        applied_ts = 555.0
+        clipboard = QueueClipboard(ready=True)
+        agent = self.build(clipboard=clipboard)
+
+        # Get into READY phase first (an empty queue -> the connect-time
+        # seed and the initial announce both read None, which is fine and
+        # irrelevant to what this test actually checks).
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
+            agent.clipboard_became_ready()
+
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(applied_ts, applied_text))
+        self.assertEqual(
+            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts),
+            "test setup must actually apply and persist the clip, or this test proves nothing",
+        )
+
+        # Queued for _on_clip_state's OWN read, if it takes the (buggy)
+        # fresh-read path -- stale content that predates the clip just
+        # applied above, modeling wl-copy not yet having taken over.
+        clipboard.queue_read(b"stale content predating this connection")
+
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty -> sendMine
+
+        self.assertEqual(len(sent), 1)
+        ts, text = decode_clip_payload(sent[0][1])
+        self.assertEqual(ts, applied_ts)
+        self.assertEqual(
+            text, applied_text,
+            "must send the just-applied clip's own known text, not a stale "
+            "clipboard.read() racing wl-copy's asynchronous write",
+        )
+
     def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
         """Unlike _local_change's own send path, this branch reads the live
         clipboard independently and, without this bound, winning a

@@ -326,7 +326,29 @@ class Agent:
             # that is fresher means we wait. Conflating either with SEND_MINE
             # reintroduces a clobber or a ping-pong.
             return
-        text = self.clipboard.read()
+        with self._echo_lock:
+            last_seen = self._last_seen
+        # Prefer what we already know over a fresh clipboard read, exactly
+        # as clipboard_became_ready's own announce step does for a just-
+        # applied pending clip -- the same race, one door over. If a clip
+        # was recently applied (_on_clip's immediate path, or
+        # clipboard_became_ready's pending-clip path), _last_seen already
+        # holds its exact text; verifying its hash against mine confirms it
+        # is still the SAME content mine describes, not a stale or
+        # unrelated value (e.g. clipboard_became_ready's own connect-time
+        # seed, which has no such relationship to the store). A fresh
+        # clipboard.read() here would risk WaylandClipboard.write()'s
+        # asynchronous, detached wl-copy spawn: it returns as soon as its
+        # own stdin pipe closes, long before wl-copy necessarily registers
+        # as the Wayland selection owner, so a read issued shortly after
+        # could see stale content while mine (from the store) already
+        # correctly reflects the new content -- sending stale text stamped
+        # with a timestamp that looks like a valid, fresh reconciliation
+        # response.
+        if last_seen and sha256_hex(last_seen) == mine[0]:
+            text = last_seen
+        else:
+            text = self.clipboard.read()
         if not text:
             return
         # The size bound matches _local_change's own send-side guard: this
@@ -504,6 +526,24 @@ class Agent:
         # _echo_lock across the read would block _write_clip() for the
         # whole round trip, so it is released before the read and
         # re-acquired only to compare afterward.
+        #
+        # This method is NOT vulnerable to the wl-copy async-write race that
+        # clipboard_became_ready's announce step and _on_clip_state's
+        # SEND_MINE branch were fixed for (see both), even though it also
+        # reads the clipboard shortly after a _write_clip call can occur:
+        # this method is only ever invoked BY a watcher observing a signal,
+        # and both watchers' signals causally follow the underlying
+        # Wayland-level change they are reporting. GPasteWatcher's pump only
+        # calls this in reaction to GPaste's own DBus Update signal, which
+        # GPaste cannot emit before it has itself observed the new content
+        # -- so by the time this method's own read runs, the change has
+        # already stabilized. PollingWatcher's coarse interval (on the
+        # order of a second, far longer than a subprocess spawn) means a
+        # tick that races _write_clip's wl-copy and sees stale content
+        # simply finds nothing changed (not a false "revert") and fires on
+        # a LATER tick once wl-copy has settled -- self-healing rather than
+        # sending anything wrong. Neither path needs the _last_seen-hash
+        # preference the other two call sites use.
         with self._echo_lock:
             expected = self._last_written
             gen = self._write_gen
