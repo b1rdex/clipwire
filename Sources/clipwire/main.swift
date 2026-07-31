@@ -358,7 +358,34 @@ func announceClipState(
     log: Log,
     now: Double
 ) {
-    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: clipStateStore.load(), now: now)
+    let stored = clipStateStore.load()
+    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now)
+    // The line the design spec mandates by name for exactly this branch --
+    // startup reconciliation finding that the content no longer matches what
+    // was last recorded, so only `now` is honest about its age. Two things
+    // rest on it: the acceptance checklist requires a divergence to be
+    // visible in the log, and the design's one accepted trade-off (with both
+    // clipboards changed while apart, the side whose agent was born more
+    // recently wins) is justified on the grounds of being "visible in the log
+    // rather than mysterious" -- which is only true if this line exists.
+    //
+    // Exactly the negation of `resolveStartupState`'s "the stored timestamp
+    // is authoritative" condition, nothing-ever-stored included: content that
+    // APPEARED while nothing was watching is the same judgement as content
+    // that changed. A nil hash is deliberately silent -- an empty or
+    // unreadable pasteboard never reaches a timestamp comparison at all, so
+    // there is no reconciliation judgement to report.
+    //
+    // Logged here rather than inside `resolveCurrentClipState`, which the
+    // `.clipState` case's own store-failure fallback also calls with
+    // `stored: nil`: that call would then claim "changed while apart" on
+    // every clip-state frame arriving while the store is unreadable, when
+    // nothing changed at all. The spec ties this line to startup
+    // reconciliation, which is this function. Byte-identical to
+    // `announce_clip_state`'s own line on the PC side.
+    if let hash = resolved.sha256, stored?.sha256 != hash {
+        log.line("clipboard changed while apart")
+    }
     persistClipState(resolved, to: clipStateStore, log: log)
     guard let payload = try? resolved.encodePayload() else { return }
     send(Frame(type: .clipState, payload: payload))
@@ -463,7 +490,23 @@ func handleFrame(
         // bug through the fallback path instead of the main one.
         let mine = clipStateStore.load()
             ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
-        switch resolveFreshness(mine: mine, peer: peerState) {
+        let decision = resolveFreshness(mine: mine, peer: peerState)
+        // Every reconciliation outcome is reported, not only the interesting
+        // ones. Acceptance item 2 requires the conflict to appear in the log,
+        // and the design's accepted trade-off -- with both clipboards changed
+        // while apart, the more recently born agent wins -- is only tolerable
+        // because it is visible here rather than mysterious.
+        //
+        // The decision word is the shared vocabulary: `FreshnessDecision`'s
+        // raw values are the same three strings the PC agent's SEND_MINE /
+        // WAIT_FOR_PEER / DO_NOTHING constants hold, so the two sides' lines
+        // are byte-identical with no formatting bridge -- the convention the
+        // frame-cap and skew lines already follow, which has caught drift
+        // twice. In production both sides' lines land in the SAME file:
+        // `Channel.attempt` pipes the agent's stderr into this log with a
+        // `remote: ` prefix, so one file shows the conflict and its winner.
+        log.line("reconciled with the peer: \(decision.rawValue)")
+        switch decision {
         case .sendMine:
             guard let data = pasteboard.readText(), !data.isEmpty else { return }
             // The size bound matches PasteboardWatcher's own send-side guard

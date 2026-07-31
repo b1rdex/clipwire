@@ -810,6 +810,114 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(sent.count, 1, "a local disk failure must not prevent the announcement from going out")
     }
 
+    // MARK: - Final wave: the reconciliation decisions are logged, on both sides
+
+    /// The design doc mandates this line by name for the branch where
+    /// startup reconciliation finds the content no longer matches what was
+    /// last recorded. It existed in neither implementation. Two things rest
+    /// on it: acceptance item 2 requires a divergence to APPEAR IN THE LOG,
+    /// and the design's one accepted trade-off -- with both clipboards
+    /// changed while apart, the side whose agent was born more recently wins
+    /// -- is justified on the grounds of being "visible in the log rather
+    /// than mysterious", which is only true once this line exists.
+    func testAnnounceClipStateLogsWhenTheClipboardChangedWhileApart() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashB, ts: 111))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("new content".utf8)
+
+        announceClipState(send: { _ in }, pasteboard: pasteboard, clipStateStore: store,
+                          log: log, now: 999_999)
+
+        log.flush()
+        XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed while apart"),
+                      "got: \(loggedMessages(at: path))")
+    }
+
+    /// "Nothing on disk" is the same branch: the content appeared while
+    /// nothing was watching, and only `now` is honest about its age.
+    func testAnnounceClipStateLogsWhenNothingWasEverStored() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("first ever content".utf8)
+
+        announceClipState(send: { _ in }, pasteboard: pasteboard,
+                          clipStateStore: tempClipStateStore(), log: log, now: 42)
+
+        log.flush()
+        XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed while apart"))
+    }
+
+    /// The complement, and what keeps the line worth reading: the stored
+    /// hash still matches, so nothing changed while apart. A line on every
+    /// reconnect would teach everyone to ignore it.
+    func testAnnounceClipStateIsSilentWhenTheStoredStateIsStillAuthoritative() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let text = Data("unchanged".utf8)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(text), ts: 555))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = text
+
+        announceClipState(send: { _ in }, pasteboard: pasteboard, clipStateStore: store,
+                          log: log, now: 999_999)
+
+        log.flush()
+        XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed while apart"))
+    }
+
+    /// A nil hash never reaches a timestamp comparison at all --
+    /// `resolveFreshness` refuses to compare timestamps when either side's
+    /// hash is nil -- so there is no reconciliation judgement to report.
+    func testAnnounceClipStateIsSilentForAnEmptyPasteboard() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        announceClipState(send: { _ in }, pasteboard: RecordingPasteboard(),
+                          clipStateStore: tempClipStateStore(), log: log, now: 42)
+
+        log.flush()
+        XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed while apart"))
+    }
+
+    /// No reconciliation outcome was logged at all before this. The decision
+    /// word is the shared vocabulary -- `FreshnessDecision`'s raw values are
+    /// the same three strings the PC agent's SEND_MINE / WAIT_FOR_PEER /
+    /// DO_NOTHING constants hold -- so both sides' lines are byte-identical
+    /// for free, the convention the frame-cap and skew lines already follow.
+    /// In production they even land in the same file: `Channel.attempt`
+    /// pipes the agent's stderr into this log with a `remote: ` prefix, so
+    /// one file shows the conflict and which side won it.
+    func testEveryReconciliationOutcomeIsLogged() throws {
+        let cases: [(storedTs: Double, peer: ClipState, expected: String)] = [
+            (5, ClipState(sha256: Self.hashB, ts: 9), "waitForPeer"),
+            (5, ClipState(sha256: Self.hashA, ts: 999), "doNothing"),
+            (777, ClipState(sha256: nil, ts: 0), "sendMine"),
+        ]
+        for c in cases {
+            let path = tempLogPath()
+            let log = Log(path: path)
+            let store = tempClipStateStore()
+            try store.save(ClipState(sha256: Self.hashA, ts: c.storedTs))
+            let pasteboard = RecordingPasteboard()
+            pasteboard.textToRead = Data("whatever we hold".utf8)
+
+            handleFrame(Frame(type: .clipState, payload: try c.peer.encodePayload()),
+                        send: { _ in }, noteWrittenLocally: { _ in },
+                        pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                        log: log, clipStateStore: store,
+                        clipStateAnnouncement: ClipStateAnnouncement())
+
+            log.flush()
+            XCTAssertTrue(loggedMessages(at: path).contains("reconciled with the peer: \(c.expected)"),
+                          "expected \(c.expected); got: \(loggedMessages(at: path))")
+        }
+    }
+
     // MARK: - Final wave: a failed save is logged, on all three Swift sites
 
     /// A plain file occupying the name where the store needs a directory,

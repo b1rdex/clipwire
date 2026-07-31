@@ -17,6 +17,11 @@ from agent_under_test import (
     sha256_hex,
 )
 
+# agent_under_test registers the loaded module under this name in
+# sys.modules; grabbed here to swap the module-level log() for a list
+# appender, the same way test_frame.py and test_watcher.py already do.
+import clipwire_agent
+
 JOIN_TIMEOUT = 2  # generous relative to the millisecond-scale waits below
 
 # 64 lowercase hex characters: the only shape decode_clip_state accepts,
@@ -344,6 +349,66 @@ class TestAnnounceClipState(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.path = os.path.join(self._tmp.name, "clip-state.json")
+
+    def capture_log(self):
+        """Everything log() was asked to write during this test. Same
+        module-attribute swap the rest of the suite uses."""
+        original = clipwire_agent.log
+        lines = []
+        clipwire_agent.log = lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original)
+        return lines
+
+    def test_logs_when_the_clipboard_changed_while_apart(self):
+        """The design doc mandates this line by name where startup
+        reconciliation takes the ts = now branch, and nothing implemented it
+        on either side. Two things depend on it: acceptance item 2 requires
+        the conflict to APPEAR IN THE LOG, and the design's one accepted
+        trade-off -- the side whose agent was born more recently wins -- is
+        justified on the grounds of being "visible in the log rather than
+        mysterious". Without this line, that mitigation does not exist."""
+        save_clip_state(HASH_B, 111, path=self.path)
+        lines = self.capture_log()
+
+        announce_clip_state(lambda t, p: None, FixedReadClipboard(b"new content"),
+                            now=999999, path=self.path)
+
+        self.assertIn("clipboard changed while apart", lines)
+
+    def test_logs_when_nothing_was_ever_stored(self):
+        """"Nothing on disk" is the same branch: the content appeared while
+        nothing was watching, and only now is honest about its age."""
+        lines = self.capture_log()
+
+        announce_clip_state(lambda t, p: None, FixedReadClipboard(b"first ever content"),
+                            now=42, path=self.path)
+
+        self.assertIn("clipboard changed while apart", lines)
+
+    def test_does_not_log_when_the_stored_state_is_still_authoritative(self):
+        """The complement, and the one that keeps the line meaningful: the
+        stored hash still matches, so nothing changed while apart and the
+        stored timestamp is authoritative. A line here on every reconnect
+        would teach everyone to ignore it."""
+        text = b"unchanged"
+        save_clip_state(sha256_hex(text), 555, path=self.path)
+        lines = self.capture_log()
+
+        announce_clip_state(lambda t, p: None, FixedReadClipboard(text),
+                            now=999999, path=self.path)
+
+        self.assertNotIn("clipboard changed while apart", lines)
+
+    def test_does_not_log_for_an_empty_clipboard(self):
+        """A null hash never reaches a timestamp comparison at all --
+        resolve_freshness refuses to compare timestamps when either side's
+        hash is None -- so there is no reconciliation judgement to report."""
+        lines = self.capture_log()
+
+        announce_clip_state(lambda t, p: None, FixedReadClipboard(None),
+                            now=42, path=self.path)
+
+        self.assertNotIn("clipboard changed while apart", lines)
 
     def test_keeps_stored_timestamp_when_content_is_unchanged(self):
         text = b"same"

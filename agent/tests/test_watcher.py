@@ -2017,6 +2017,45 @@ class TestIncomingClipState(unittest.TestCase):
         )
         self.assertEqual(decode_clip_payload(clip_frames[0][1])[1], b"B")
 
+    def test_every_reconciliation_outcome_is_logged(self):
+        """No reconciliation decision was logged at all, on either side.
+        Acceptance item 2 -- "the PC's copy must win, and the conflict must
+        appear in the log" -- is unpassable without this, and the design's
+        one accepted trade-off ("the side whose agent was born more recently
+        wins") is justified on the grounds of being visible in the log
+        rather than mysterious, which was never implemented.
+
+        The decision word itself is the shared vocabulary: SEND_MINE /
+        WAIT_FOR_PEER / DO_NOTHING are the exact strings Swift's
+        FreshnessDecision raw values use, so the two sides' lines are
+        byte-identical for free -- the same convention the frame-cap and
+        skew lines already follow. Both sides' lines land in the SAME file
+        in production: Channel.attempt pipes this agent's stderr into the
+        Mac's log with a `remote: ` prefix."""
+        cases = [
+            # (stored ts, peer state, expected decision)
+            (5, (HASH_B, 9), "waitForPeer"),   # peer fresher
+            (5, (HASH_A, 999), "doNothing"),   # same hash
+            (777, (None, 0), "sendMine"),      # peer has nothing
+        ]
+        for stored_ts, peer, expected in cases:
+            with self.subTest(expected):
+                save_clip_state(HASH_A, stored_ts, path=self.clip_state_path)
+                clipboard = QueueClipboard(ready=True)
+                clipboard.queue_read(b"whatever we hold")
+                agent = self.build(clipboard=clipboard)
+                agent.send = lambda t, p: None
+
+                original_log = clipwire_agent.log
+                log_lines = []
+                clipwire_agent.log = log_lines.append
+                try:
+                    agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(*peer))
+                finally:
+                    clipwire_agent.log = original_log
+
+                self.assertIn("reconciled with the peer: %s" % expected, log_lines)
+
     def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
         """The reboot flow (acceptance item 5), where the stash is stale by
         construction. The Mac announces its clip-state, then copies again

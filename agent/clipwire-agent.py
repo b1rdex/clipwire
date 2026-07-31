@@ -503,7 +503,23 @@ class Agent:
             # and silently lose the clip, reintroducing v1's bug through the
             # fallback path instead of the main one.
             mine = resolve_current_clip_state(self.clipboard, None, time.time())
-        if resolve_freshness(mine, peer) != SEND_MINE:
+        decision = resolve_freshness(mine, peer)
+        # Every reconciliation outcome is reported, not only the interesting
+        # ones. Acceptance item 2 requires the conflict to appear in the log,
+        # and the design's accepted trade-off -- with both clipboards changed
+        # while apart, the more recently born agent wins -- is only tolerable
+        # because it is visible here rather than mysterious.
+        #
+        # The decision word is the shared vocabulary: SEND_MINE /
+        # WAIT_FOR_PEER / DO_NOTHING are the same three strings Swift's
+        # FreshnessDecision uses as raw values, so the two sides' lines are
+        # byte-identical without a formatting bridge -- the convention the
+        # frame-cap and skew lines already follow, which has caught drift
+        # twice. In production both sides' lines even land in the same file:
+        # Channel.attempt pipes this agent's stderr into the Mac's log,
+        # prefixed with `remote: `.
+        log("reconciled with the peer: %s" % decision)
+        if decision != SEND_MINE:
             # Hashes equal means we agree -- not a signal to resend. A peer
             # that is fresher means we wait. Conflating either with SEND_MINE
             # reintroduces a clobber or a ping-pong.
@@ -1145,7 +1161,32 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     """
     if now is None:
         now = time.time()
-    resolved = resolve_current_clip_state(clipboard, load_clip_state(path=path), now)
+    stored = load_clip_state(path=path)
+    resolved = resolve_current_clip_state(clipboard, stored, now)
+    # The line the design doc mandates by name for exactly this branch --
+    # startup reconciliation finding that the content no longer matches what
+    # was last recorded, so only `now` is honest about its age. Two things
+    # rest on it: the acceptance checklist requires a divergence to be
+    # visible in the log, and the design's one accepted trade-off (with both
+    # clipboards changed while apart, the side whose agent was born more
+    # recently wins) is justified on the grounds of being "visible in the log
+    # rather than mysterious" -- which is only true if this line exists.
+    #
+    # Exactly the negation of resolve_startup_state's "the stored timestamp
+    # is authoritative" condition, including the nothing-ever-stored case:
+    # content that appeared while nothing was watching is the same judgement
+    # as content that changed. A null hash is deliberately silent -- an empty
+    # or unreadable clipboard never reaches a timestamp comparison at all, so
+    # there is no reconciliation judgement to report.
+    #
+    # Logged HERE rather than inside resolve_current_clip_state, which
+    # _resolve_clip_state's own store-failure fallback also calls with
+    # stored=None: that call would then report "changed while apart" on every
+    # clip-state frame arriving while the store is unreadable, when nothing
+    # changed at all. The doc ties this line to startup reconciliation, which
+    # is this function.
+    if resolved[0] is not None and (stored is None or stored[0] != resolved[0]):
+        log("clipboard changed while apart")
     try:
         save_clip_state(*resolved, path=path)
     except (OSError, ClipStateError) as error:
