@@ -1,0 +1,13 @@
+{
+  "comment": "Freshness resolution table, shared by both implementations. Hashes are abbreviated but compared as strings, exactly as the real hex hashes are.",
+  "cases": [
+    {"name": "equal-hashes",        "mine": {"sha256": "aa", "ts": 5},    "peer": {"sha256": "aa", "ts": 9},    "expect": "doNothing"},
+    {"name": "mine-null",           "mine": {"sha256": null, "ts": 0},    "peer": {"sha256": "bb", "ts": 1},    "expect": "waitForPeer"},
+    {"name": "peer-null",           "mine": {"sha256": "aa", "ts": 1},    "peer": {"sha256": null, "ts": 9},    "expect": "sendMine"},
+    {"name": "both-null",           "mine": {"sha256": null, "ts": 0},    "peer": {"sha256": null, "ts": 0},    "expect": "doNothing"},
+    {"name": "mine-fresher",        "mine": {"sha256": "aa", "ts": 10},   "peer": {"sha256": "bb", "ts": 9},    "expect": "sendMine"},
+    {"name": "peer-fresher",        "mine": {"sha256": "aa", "ts": 8},    "peer": {"sha256": "bb", "ts": 9},    "expect": "waitForPeer"},
+    {"name": "tie-mine-greater",    "mine": {"sha256": "bb", "ts": 7},    "peer": {"sha256": "aa", "ts": 7},    "expect": "sendMine"},
+    {"name": "tie-peer-greater",    "mine": {"sha256": "aa", "ts": 7},    "peer": {"sha256": "bb", "ts": 7},    "expect": "waitForPeer"}
+  ]
+}
