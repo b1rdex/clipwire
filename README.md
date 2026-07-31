@@ -112,13 +112,14 @@ on the session bus, so every liveness check that probes the bus still passes —
 The agent notices on its own and keeps working: its safety-net poll compares the clipboard
 every 30 seconds, and once it sees content change with no signal to account for it, it
 falls back to polling every second for the rest of the connection. It says so in the Mac's
-log (`~/.local/state/clipwire/clipwire.log`):
+log (`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than
+guessing why:
 
 ```
-remote: GPaste is not reporting clipboard changes (is the gnome-shell extension enabled?), polling every 1.0s for the rest of this connection
+remote: GPaste reported no clipboard change while the content changed (signals=0 signals_at_last_tick=0 pump_alive=True worker_alive=True); the gnome-shell extension being disabled is one possible cause. Polling every 1s for the rest of this connection.
 ```
 
-The command above is how you answer that question. It prints nothing when the extension is
+The command above is how you check that possible cause. It prints nothing when the extension is
 off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`.
 
 Re-enabling it is the actual fix, and reconnecting is not. The fallback never stops
