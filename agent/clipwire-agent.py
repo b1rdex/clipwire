@@ -1449,6 +1449,12 @@ def _pdeathsig_preexec():
         os._exit(0)
 
 
+# For the observer thread's non-fatal guard below. A handler exception with no
+# traceback is nearly undebuggable from the PC, where a log line is all anyone
+# gets.
+import traceback
+
+
 class GPasteWatcher:
     """Event-driven. Python has no stdlib DBus binding, so this shells out to
     gdbus monitor and parses its output line by line.
@@ -1471,6 +1477,12 @@ class GPasteWatcher:
         self.clipboard = clipboard
         self._process = None
         self._thread = None
+        # The observer thread and the only thing that wakes it. The pump sets
+        # the event; the worker below runs on_change. They are separate so the
+        # pump can neither block on Agent._observe_lock nor die of an exception
+        # the handler raised -- see start().
+        self._worker = None
+        self._event = threading.Event()
         self._stop = threading.Event()
         # Accepted Update lines. Written ONLY by the gdbus pump thread and read
         # only by the safety net's poll thread, so `+= 1` has a single writer
@@ -1572,21 +1584,73 @@ class GPasteWatcher:
         )
 
         def pump():
+            # Two statements per accepted line, deliberately. This thread must
+            # never block and never raise: it is the only thing that keeps
+            # _signals honest, and _signals is what the safety net uses to tell
+            # a dead event source from a live one. Calling the handler here --
+            # as this did until v3 -- made it able to block on
+            # Agent._observe_lock and able to die of any exception the handler
+            # raised, silently and for the rest of the connection, while the
+            # gdbus child stayed alive and went on printing lines nobody
+            # counted. Both were candidate causes of a production false
+            # positive in which a healthy event source was declared dead;
+            # neither was ever proven, and this shape removes both without
+            # needing to know which it was.
+            #
+            # Counting still happens BEFORE the dispatch, and now cannot be
+            # delayed by anything the handler does: on_change is
+            # Agent._local_change, whose wl-paste round trip can take up to
+            # SUBPROCESS_TIMEOUT=3s, and a safety-net tick landing inside that
+            # window must not see an unmoved counter on a live source.
             for line in self._process.stdout:
                 if self._stop.is_set():
                     return
                 if parse_gpaste_line(line):
-                    # Counted BEFORE dispatching, deliberately: on_change is
-                    # Agent._local_change, whose wl-paste round trip can take
-                    # up to SUBPROCESS_TIMEOUT=3s. Counting afterwards would
-                    # let a safety-net tick landing inside that window see an
-                    # unmoved counter and declare a perfectly healthy source
-                    # dead.
                     self._signals += 1
+                    self._event.set()
+
+        def observe():
+            # Coalescing falls out of the Event, and there is deliberately no
+            # queue: signals arriving while on_change is running collapse into
+            # one set() and produce a single re-read afterwards. That is the
+            # right semantics for a clipboard -- the handler reads current
+            # STATE, not the contents of any particular event, and GPaste's
+            # Update payload carries nothing this agent uses -- so a queue
+            # would hold nothing and only add a way to fall behind.
+            while not self._stop.is_set():
+                self._event.wait()
+                if self._stop.is_set():
+                    return
+                # Cleared BEFORE the handler runs, so a signal arriving DURING
+                # it re-arms the event and earns its own re-read afterwards.
+                # Clearing afterwards would drop exactly the change that landed
+                # while we were busy looking at the previous one.
+                self._event.clear()
+                try:
                     on_change()
+                except (BrokenPipeError, ValueError) as error:
+                    # Fatal: the channel is gone. ValueError is what a CLOSED
+                    # stdout raises on write, and Agent.send writes straight to
+                    # it. Mirrors run()'s rule for stdin EOF -- this agent is
+                    # one process per connection, and exiting IS how it reports
+                    # a dead channel. Logging and carrying on would leave a
+                    # process syncing into a pipe nobody reads.
+                    log("observer stopping, the channel is gone: %r" % error)
+                    os._exit(0)
+                except Exception:
+                    # Non-fatal: one observation is disposable, because the
+                    # next one re-reads the clipboard anyway rather than
+                    # replaying anything. Logged with its traceback rather than
+                    # swallowed -- a thread that dies quietly here is the exact
+                    # defect this split exists to remove, and a thread that
+                    # swallows quietly is the same defect one debugging session
+                    # later.
+                    log("observer error: %s" % traceback.format_exc())
 
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
+        self._worker = threading.Thread(target=observe, daemon=True)
+        self._worker.start()
         # The SAME on_change object the signal path just got -- in production
         # Agent._local_change -- so a change only the safety net catches goes
         # through one observation, one one-shot echo suppression and one
@@ -1599,6 +1663,12 @@ class GPasteWatcher:
         # (30 seconds with the production default).
         self._safety_net.start(on_change)
 
+    def worker_alive(self):
+        """For the safety net's verdict line. A live pump with a dead worker is
+        silent failure: the counter keeps climbing, so every observer concludes
+        the event source is healthy while nothing is being synced at all."""
+        return self._worker is not None and self._worker.is_alive()
+
     def stop(self):
         """Session teardown (Agent.clipboard_lost), NOT the degrade path.
 
@@ -1607,6 +1677,15 @@ class GPasteWatcher:
         switch, where the subscription is left alive to recover on its own.
         """
         self._stop.set()
+        # The flag alone does not reach a worker parked in _event.wait(): only
+        # a signal that will never come would wake it, and Agent.clipboard_lost
+        # drops its reference to this watcher the moment stop() returns, so a
+        # thread left parked here can never be reached again and every Wayland
+        # flap leaks another one. Deliberately not JOINED, though: stop() runs
+        # on the main protocol loop, and waiting on a worker that is inside
+        # _local_change's wl-paste round trip would stall it for up to
+        # SUBPROCESS_TIMEOUT.
+        self._event.set()
         self._safety_net.stop()
         if self._process:
             self._process.terminate()
