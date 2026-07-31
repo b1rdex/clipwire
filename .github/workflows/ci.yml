@@ -22,13 +22,16 @@ jobs:
       # (or the reverse), which one broke IS the finding.
       fail-fast: false
       matrix:
-        # 3.13 is what the PC actually runs, so it is the version under
-        # test. 3.11 is the floor the design doc promises and nothing
-        # verified before this: a bare `python3` here tested only whatever
-        # ubuntu-latest happened to ship, which is neither. Quoted, because
-        # unquoted YAML reads these as floats and a future "3.10" would
-        # become 3.1.
-        python-version: ["3.11", "3.13"]
+        # 3.14 is what the PC actually runs -- measured, not assumed: the
+        # first real deployment's `clipwire install` self-test reported
+        # "ok python 3.14.4" on a box the plan had recorded as 3.13. 3.11 is
+        # the floor the design doc promises and nothing verified before this;
+        # 3.13 stays because the two of them bracket the range the agent is
+        # claimed to run on. A bare `python3` here tested only whatever
+        # ubuntu-latest happened to ship, which was none of the three. Quoted,
+        # because unquoted YAML reads these as floats and a future "3.10"
+        # would become 3.1.
+        python-version: ["3.11", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

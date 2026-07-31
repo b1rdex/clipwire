@@ -126,3 +126,25 @@ listening for signals — it only speeds the safety-net poll up from 30 seconds 
 that faster interval is scoped to one connection, so the next connection starts back at 30
 seconds whether or not anything was repaired. With the extension still disabled, the agent
 just spends another detection budget before reaching the same conclusion again.
+
+## GPaste trims whitespace, and that is not clipwire
+
+Copy a block of text ending in a newline on the PC, paste it on the Mac, and the trailing
+newline is gone. The same text copied on the Mac arrives on the PC without it too. This
+looks exactly like a fidelity bug in the sync and it is not: GPaste ships with
+
+```sh
+gsettings get org.gnome.GPaste trim-items    # true
+```
+
+which strips leading and trailing whitespace from every item it records. The PC's clipboard
+never holds the newline in the first place, so there is nothing for clipwire to carry. Both
+sides were verified byte-exact against what the clipboard actually held — Cyrillic, emoji,
+a composed character in NFD, embedded newlines and a CRLF fragment all survive unchanged in
+both directions.
+
+Set it to `false` if you would rather keep the whitespace:
+
+```sh
+gsettings set org.gnome.GPaste trim-items false
+```
