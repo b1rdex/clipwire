@@ -446,11 +446,12 @@ class Agent:
 
         decode_clip_state is called bare, not wrapped in a local try/except
         -- one deliberate divergence from Sources/clipwire/main.swift's
-        handleFrame .clipState case, which swallows via `try?`. That is
-        correct THERE because Channel exposes no way to force-close the ssh
-        process from that side -- but this agent, spawned fresh per SSH
-        connection by sshd, both CAN and already DOES close the connection
-        on a malformed/mismatched hello (_on_hello's own bare `raise
+        handleFrame .clipState case, which logs the error and drops the
+        frame rather than closing the channel. That is correct THERE
+        because Channel exposes no way to force-close the ssh process from
+        that side -- but this agent, spawned fresh per SSH connection by
+        sshd, both CAN and already DOES close the connection on a
+        malformed/mismatched hello (_on_hello's own bare `raise
         FrameError(...)`, unchanged by this task). A malformed clip-state is
         the same class of peer violation, so it is handled the same way:
         propagate ClipStateError (a FrameError) up through main()'s `except

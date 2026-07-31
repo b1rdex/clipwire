@@ -930,6 +930,46 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertNotEqual(status.snapshot().state, .up)
     }
 
+    // MARK: - An undecodable clip-state is logged too, never dropped in silence
+
+    /// The twin of `testAnUndecodableClipIsLogged` for the other frame type,
+    /// and the last silent decode failure left in `handleFrame`. The drop is
+    /// correct -- there is nothing valid to reconcile against -- but it also
+    /// skips `recordPeerClipboardReady()`, so this side sits at
+    /// `clipboard-pending` for the whole rest of the connection. In the
+    /// mirror-image case the PC agent raises `ClipStateError` (a
+    /// `FrameError`) and tears the channel down WITH a line -- its
+    /// `_on_clip_state` calls `decode_clip_state` bare on purpose, and that
+    /// divergence stays. Without this line a real codec desync reads as
+    /// "the PC hangs up loudly, the Mac says nothing at all".
+    ///
+    /// Driven with well-formed JSON whose `sha256` is simply not 64
+    /// lowercase hex, rather than the `Data("not json".utf8)` that
+    /// `testAMalformedClipStateDoesNotReportUp` above already drives: this
+    /// reaches `ClipState.decodePayload`'s own shape check instead of
+    /// stopping inside `JSONDecoder`, so the line is known to carry the
+    /// REASON rather than a fixed string that happens to match one input --
+    /// the same distinction `testAClipWithANonFiniteTimestampIsLogged`
+    /// draws for the `.clip` line.
+    func testAnUndecodableClipStateIsLogged() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let wellFormedJSONWithABadHash = Data(#"{"sha256":"not-a-sha256","ts":1}"#.utf8)
+
+        handleFrame(Frame(type: .clipState, payload: wellFormedJSONWithABadHash),
+                    send: { _ in XCTFail("a rejected clip-state must not produce any frame") },
+                    noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path),
+                       ["could not decode a clip state from the peer: malformedSHA256"],
+                       "the drop is right; doing it invisibly is what leaves this side stuck at " +
+                       "clipboard-pending with nothing anywhere to explain it")
+    }
+
     // MARK: - Final wave: the reconciliation decisions are logged, on both sides
 
     /// The design doc mandates this line by name for the branch where

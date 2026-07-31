@@ -544,7 +544,28 @@ func handleFrame(
             }
         }
     case .clipState:
-        guard let peerState = try? ClipState.decodePayload(frame.payload) else { return }
+        // Logged rather than dropped in silence, exactly as the `.clip`
+        // case below now does. The DROP itself stays, and so does the
+        // divergence it embodies: `Channel` exposes no way to force-close
+        // the ssh process from here, which is why the PC agent's
+        // `_on_clip_state` deliberately raises instead and lets the
+        // connection go (its own docstring in `agent/clipwire-agent.py`
+        // spells that out). What must not stay is the silence. A frame
+        // whose `sha256` is well-formed JSON but not 64 lowercase hex is
+        // rejected here, which also skips `recordPeerClipboardReady()`
+        // below -- so on a real codec desync the PC tears the channel down
+        // WITH a line while this side sits at `clipboard-pending` for the
+        // rest of the connection having written nothing anywhere. Same
+        // "failures are visible" principle the `.clip` line rests on; the
+        // wording follows `could not decode a clip from the peer` and
+        // `could not persist clip state`, its two nearest siblings.
+        let peerState: ClipState
+        do {
+            peerState = try ClipState.decodePayload(frame.payload)
+        } catch {
+            log.line("could not decode a clip state from the peer: \(error)")
+            return
+        }
         // After the decode guard, not before it: a frame we cannot read
         // proves nothing about the peer's clipboard. This is the only frame
         // that proves the channel can actually sync -- see
