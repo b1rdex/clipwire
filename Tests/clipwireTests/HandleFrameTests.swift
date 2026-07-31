@@ -867,6 +867,87 @@ final class HandleFrameTests: XCTestCase {
                        "and clobbers a peer that should have won")
     }
 
+    // MARK: - The other half of that precedence: a readable store outranks what we announced
+
+    /// The Mac keeps `clipStateStore.load()` AHEAD of
+    /// `clipStateAnnouncement.announced`, while the PC agent passes its
+    /// just-computed pair into `_resolve_clip_state(peer, mine=announced)`
+    /// outright. That asymmetry is deliberate, and nothing pinned this half
+    /// of it -- so a refactor "restoring consistency" between the two sides
+    /// could reorder these two and silently reintroduce a clobber.
+    ///
+    /// What makes it right HERE and not there is a window that exists on
+    /// exactly one of the two machines. On this side `watcher.onChange`
+    /// calls `persistClipState` from `PasteboardWatcher`'s timer thread,
+    /// while the `.clipState` case runs on the channel thread arbitrarily
+    /// later than the `.hello` that announced -- so a genuine local copy can
+    /// land in between. Resolving against `announced` in that window is the
+    /// clobber: a peer that beats a stale `announced` wins, and its clip
+    /// overwrites a NEWER local change that the peer is itself about to
+    /// receive and apply. `load()` first turns that into a harmless
+    /// duplicate instead. On the PC the window does not exist by
+    /// construction: `_resolve_clip_state` runs inside
+    /// `clipboard_became_ready`'s own call frame, a few lines after
+    /// `announce_clip_state`, and `self._watcher` is still None until later
+    /// in that same method -- there is no observer thread yet to race.
+    ///
+    /// Driven as two `handleFrame` calls with a store write in between,
+    /// which reproduces that ordering deterministically -- no thread, no
+    /// timer, no sleep. The peer's `ts` sits deliberately BETWEEN the two:
+    /// fresher than what we announced (2000 > 1000), staler than what we
+    /// now hold (2000 < 3000), so the two precedence orders disagree about
+    /// WHO WINS rather than merely about a timestamp's value. The asserted
+    /// `ts` on the sent clip pins the third order too: going straight to a
+    /// re-derivation would send under `now` (4000) instead.
+    func testALocalChangeAfterOurAnnouncementOutranksWhatWeAnnounced() throws {
+        let store = tempClipStateStore()
+        let announcement = ClipStateAnnouncement()
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("what we held at announce time".utf8)
+        var sent: [Frame] = []
+
+        // The hello, and this connection's one-shot announcement: ts 1000.
+        handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 1000)
+
+        let announced = sent.filter { $0.type == .clipState }
+        XCTAssertEqual(announced.count, 1, "the hello must have produced an announcement")
+        XCTAssertEqual(try ClipState.decodePayload(announced[0].payload).ts, 1000,
+                       "the announced pair is what a wrong precedence order would resolve against")
+        sent.removeAll()
+
+        // The watcher thread observing a local copy, and persisting it --
+        // `wireAgent`'s `watcher.onChange` does exactly this save, off the
+        // channel thread, so it can land at any point before the frame below.
+        let copied = "copied while the peer's frame was still in flight"
+        pasteboard.textToRead = Data(copied.utf8)
+        try store.save(ClipState(sha256: sha256Hex(Data(copied.utf8)), ts: 3000))
+        XCTAssertEqual(store.load()?.ts, 3000,
+                       "the local change must really have replaced the announced value on disk, " +
+                       "or this test proves nothing")
+
+        let peer = ClipState(sha256: Self.hashB, ts: 2000)
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 4000)
+
+        let clips = sent.filter { $0.type == .clip }
+        XCTAssertEqual(clips.count, 1,
+                       "we hold something newer than the peer announced, so we send -- resolving " +
+                       "against the stale announced pair would make us wait while the peer " +
+                       "clobbers a local change it has never seen")
+        guard let clip = clips.first else { return }
+        let decoded = try ClipPayload.decode(clip.payload)
+        XCTAssertEqual(decoded.ts, 3000,
+                       "the local change's own recorded age, not the announced 1000 and not `now`")
+        XCTAssertEqual(decoded.text, copied)
+    }
+
     // MARK: - Final wave: status reports `up` only once the peer can actually sync
 
     /// The window this closes is the ordinary post-reboot one: the PC agent
