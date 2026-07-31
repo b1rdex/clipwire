@@ -34,19 +34,38 @@ protocol PasteboardWriting {
 /// running app, so a test that exercised `SystemPasteboard` against it would
 /// both depend on and destroy whatever the user had copied.
 ///
-/// Five members, all of them calls `SystemPasteboard` provably makes — the
+/// Six members, all of them calls `SystemPasteboard` provably makes — the
 /// smaller this is, the less of AppKit a fake has to imitate convincingly.
 /// `NSPasteboard` satisfies every one of them with its own existing
 /// signatures, so the conformance below is empty and there is no adapter
 /// layer that could itself be wrong.
 ///
 /// `string(forType:)` earns its place next to `data(forType:)` rather than
-/// being folded into it: it is what guarantees the text branch returns
-/// valid UTF-8. `NSPasteboard` returns `nil` (not replacement characters)
-/// for bytes that do not decode, whereas a raw `data(forType:)` read would
-/// hand `handleFrame`'s `String(decoding:as:UTF8.self)` bytes it would
-/// silently substitute U+FFFD into — while `EchoGuard` had hashed the
-/// originals, so every applied clip would echo back to the peer.
+/// being folded into it: it is what keeps bytes that are NOT valid UTF-8
+/// from ever entering the text path. `NSPasteboard` returns `nil` for such
+/// bytes (verified directly: `setData(Data([0xFF, 0xFE]), forType: .string)`
+/// then `string(forType: .string)` is nil while `data(forType: .string)`
+/// hands back `fffe`), so this read refuses them and `read()` reports
+/// nothing — nothing is synced, which is the correct outcome for content
+/// this protocol cannot carry.
+///
+/// A raw `data(forType: .string)` read would instead sync them WRONG, and
+/// permanently. The bytes would be hashed as-is by `sha256Hex` for the
+/// clip-state we store and announce, while the clip that actually goes out
+/// is built by `String(decoding:as:UTF8.self)` (main.swift, in both
+/// `wireAgent`'s `onChange` and `handleFrame`'s `.sendMine` branch), which
+/// substitutes U+FFFD. The peer would then store the hash of the SUBSTITUTED
+/// text, the two stores would disagree about the same clip forever, and
+/// every subsequent reconnect would resolve `sendMine` and re-send it — an
+/// unbounded loop, not a one-off drop.
+///
+/// Note what this is NOT: it is not what keeps an applied remote clip from
+/// echoing back. That path is byte-identical under either implementation —
+/// `handleFrame` arms `EchoGuard` with `Data(decoded.text.utf8)` and writes
+/// those same bytes, so a subsequent read returns them whichever call
+/// fetches them, and the digests match either way. The hazard here is
+/// LOCAL content that was never valid UTF-8 to begin with. Pinned by
+/// `testInvalidUTF8UnderTheStringTypeReadsAsNothing`.
 protocol PasteboardBackend: AnyObject {
     var changeCount: Int { get }
     var types: [NSPasteboard.PasteboardType]? { get }
@@ -75,11 +94,22 @@ extension NSPasteboard: PasteboardBackend {}
 /// cosmetic — the two sides' sets of USABLE image types genuinely differ:
 /// the PC considers only `image/png`, because GPaste re-offers whatever it
 /// holds as PNG among a long list of types (verified on the live machine
-/// down to a JPEG reading back as valid PNG), while this side must also
-/// accept `public.tiff`, because a macOS screenshot lands on the pasteboard
-/// as TIFF and nothing else. A translation at this boundary could not
-/// express that without mapping one side's types onto the other's and lying
+/// down to a JPEG reading back as valid PNG), while this side also accepts
+/// `public.tiff` as a FALLBACK, for sources that offer TIFF without PNG.
+/// Those are real: AppKit's own `NSImage` pasteboard writing
+/// (`writeObjects([NSImage])`, what an app copying an image typically does)
+/// offers exactly `public.tiff` and its legacy NeXT alias, with no PNG at
+/// all — verified directly on this machine, on a private named pasteboard.
+/// A translation at this boundary could not express a per-side difference
+/// like that without mapping one side's types onto the other's and lying
 /// about one of them.
+///
+/// Screenshots are NOT such a source, contrary to what an earlier version of
+/// this comment (and the task brief) claimed: `screencapture -x -c` puts
+/// `public.png` on the pasteboard FIRST, ahead of TIFF and six other
+/// formats — verified on a real Mac. So the common case takes `readPNG()`'s
+/// direct path and is never re-encoded, which is the outcome to preserve;
+/// the TIFF branch is there for the `NSImage` writers, not for screenshots.
 ///
 /// The text branch matches only `NSPasteboard.PasteboardType.string`
 /// (`public.utf8-plain-text`) rather than any text-ish UTI, deliberately:
@@ -134,11 +164,21 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
     /// PNG as offered, otherwise a TIFF converted to PNG.
     ///
     /// The wire format is PNG (`ImagePayload` carries PNG bytes, and the PC
-    /// hands `wl-copy --type image/png`), and macOS screenshots land on the
-    /// pasteboard as TIFF, so this side owns the conversion. PNG already on
-    /// the board is taken byte-for-byte rather than round-tripped: both
-    /// sides reconcile by comparing hashes, and re-encoding identical
-    /// content would change its hash.
+    /// hands `wl-copy --type image/png`), so a board offering only TIFF has
+    /// to be converted here or not synced at all. PNG already on the board
+    /// is taken byte-for-byte rather than round-tripped: both sides
+    /// reconcile by comparing hashes, and re-encoding identical content
+    /// would change its hash.
+    ///
+    /// Which order matters more than it looks. Screenshots offer PNG first
+    /// (verified: `screencapture -x -c` puts `public.png` ahead of TIFF and
+    /// six other formats), so the commonest image on this pasteboard takes
+    /// the direct path and is never decoded and re-encoded — a Retina
+    /// screenshot is tens of megabytes, and this read runs inside
+    /// `PasteboardWatcher`'s lock. The TIFF branch is the fallback for
+    /// sources that genuinely offer no PNG, of which AppKit's own
+    /// `NSImage`/`writeObjects` is one (verified: `public.tiff` and its
+    /// legacy NeXT alias, nothing else).
     ///
     /// A failed conversion is `nil` — never the unconverted TIFF, never a
     /// placeholder, both of which would put bytes on the wire that claim to

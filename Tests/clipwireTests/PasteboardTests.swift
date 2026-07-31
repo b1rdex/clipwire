@@ -556,7 +556,7 @@ final class PasteboardGenerationTests: XCTestCase {
 /// so without this the TIFF-to-PNG conversion could only be exercised by
 /// writing to the user's real clipboard, which the test suite must never do.
 ///
-/// `PasteboardBackend` is deliberately narrow (five members) rather than a
+/// `PasteboardBackend` is deliberately narrow (six members) rather than a
 /// mirror of `NSPasteboard`: the smaller it is, the less of AppKit a fake has
 /// to imitate convincingly, and every member here is one the production code
 /// provably calls.
@@ -643,11 +643,22 @@ final class CanonicalReadTests: XCTestCase {
     /// not cosmetic. The two sides' sets of USABLE image types genuinely
     /// differ -- the PC considers only `image/png` (GPaste re-offers PNG for
     /// whatever it holds, verified on the live machine), while this side
-    /// must also accept `public.tiff`, because a macOS screenshot lands on
-    /// the pasteboard as TIFF and nothing else. A single-vocabulary table
-    /// with a translation at this boundary could not express that without
+    /// also accepts `public.tiff` as a fallback, for sources that offer TIFF
+    /// without PNG (AppKit's own `NSImage`/`writeObjects` is one; verified
+    /// directly -- it offers `public.tiff` and its legacy NeXT alias and no
+    /// PNG at all). Screenshots are NOT such a source: `screencapture -x -c`
+    /// offers `public.png` first, so the common case never reaches the
+    /// conversion. A single-vocabulary table with a translation at this
+    /// boundary could not express a per-side difference like that without
     /// mapping one side's types onto the other's and lying about one of
     /// them.
+    ///
+    /// The row named "image, each side's own usable format only" is the one
+    /// that actually EXERCISES that divergence rather than merely being
+    /// compatible with it: one user situation (an image and nothing else),
+    /// `image/png` in the Wayland column, `public.tiff` in the UTI column,
+    /// and one shared verdict. Every other image row lists a type both sides
+    /// accept, so the split would be untested without it.
     func testTheKindMatchesTheSharedFixture() throws {
         for row in try loadClipKindFixture() {
             XCTAssertEqual(chooseKind(offeredTypes: row.uti), row.expect, row.name)
@@ -683,12 +694,21 @@ final class CanonicalReadTests: XCTestCase {
 
     private static let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
-    /// macOS screenshots reach the pasteboard as TIFF and nothing else, so
-    /// this side owns the conversion: the wire format is PNG (`ImagePayload`
-    /// carries PNG bytes, and the PC's `wl-copy` is handed
-    /// `--type image/png`), and a peer handed TIFF bytes under that contract
-    /// would store an unopenable image.
-    func testAScreenshotIsConvertedToPNG() throws {
+    /// A board offering TIFF and no PNG must still sync, as PNG: the wire
+    /// format is PNG (`ImagePayload` carries PNG bytes, and the PC's
+    /// `wl-copy` is handed `--type image/png`), so a peer handed TIFF bytes
+    /// under that contract would store an unopenable image.
+    ///
+    /// Renamed from `testAScreenshotIsConvertedToPNG` (the task brief's
+    /// name) because that premise turned out to be false: a real screenshot
+    /// offers `public.png` FIRST -- verified with `screencapture -x -c` --
+    /// and so takes `readPNG()`'s direct path, never this one. The genuine
+    /// TIFF-only source is an app writing an image through AppKit's
+    /// `NSImage`/`writeObjects`, which offers `public.tiff` and its legacy
+    /// NeXT alias and nothing else (verified on a private named pasteboard).
+    /// The test is unchanged and still load-bearing; only the claim about
+    /// which real-world source reaches it was wrong.
+    func testATIFFOnlyBoardIsConvertedToPNG() throws {
         let tiff = try XCTUnwrap(makeOnePixelTIFF())
         let board = FakePasteboardBackend(types: [.tiff], data: [.tiff: tiff])
         let read = try XCTUnwrap(SystemPasteboard(board).read())
@@ -758,6 +778,40 @@ final class CanonicalReadTests: XCTestCase {
         let jpeg = NSPasteboard.PasteboardType("public.jpeg")
         let board = FakePasteboardBackend(types: [jpeg], data: [jpeg: Data([0xFF, 0xD8, 0xFF])])
         XCTAssertNil(SystemPasteboard(board).read())
+    }
+
+    /// *** The reason `string(forType:)` is in `PasteboardBackend` at all. ***
+    ///
+    /// Bytes that are not valid UTF-8, offered under `public.utf8-plain-text`:
+    /// `chooseKind` selects `.text` (the type IS on offer), and the body read
+    /// then refuses them, so nothing is synced. That is the correct outcome
+    /// for content this protocol cannot carry.
+    ///
+    /// Swapping the read back to `data(forType: .string)` -- trimming the
+    /// protocol toward the task brief's shape -- would not drop this content;
+    /// it would sync it WRONG, and permanently. The raw bytes get hashed for
+    /// the clip-state we store and announce, while the clip that actually
+    /// goes out is built with `String(decoding:as:UTF8.self)` and carries
+    /// U+FFFD substitutions. The peer stores the hash of the substituted
+    /// text, the two stores disagree about that clip forever, and every
+    /// reconnect resolves `sendMine` and re-sends it. This test is what makes
+    /// that swap fail instead of passing green.
+    ///
+    /// Real `NSPasteboard` behaves exactly as the double does here, verified
+    /// directly rather than assumed: `setData(Data([0xFF, 0xFE]),
+    /// forType: .string)` then `string(forType: .string)` is nil, while
+    /// `data(forType: .string)` returns `fffe`.
+    ///
+    /// (This is NOT what stops an applied remote clip echoing back -- that
+    /// path is byte-identical either way, since `handleFrame` arms and writes
+    /// the same `Data(decoded.text.utf8)`. See `PasteboardBackend`'s own doc
+    /// comment.)
+    func testInvalidUTF8UnderTheStringTypeReadsAsNothing() {
+        let board = FakePasteboardBackend(types: [.string], data: [.string: Data([0xFF, 0xFE])])
+        XCTAssertNil(SystemPasteboard(board).read(),
+                     "bytes that are not valid UTF-8 must not enter the text path -- " +
+                     "hashing them raw while sending them substituted makes the two " +
+                     "stores disagree permanently")
     }
 
     /// An empty body is nothing to sync, matching `WaylandClipboard.read()`,
