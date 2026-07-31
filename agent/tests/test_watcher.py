@@ -600,8 +600,135 @@ class ScriptedReadClipboard:
 
 
 class TestPollingWatcher(unittest.TestCase):
+    """A standalone poller -- what make_watcher returns when GPaste is
+    unavailable -- owns the event AND the worker, so the same "no handler call
+    on a reader thread" rule holds with nothing composed above it."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+
     def test_available_is_always_true(self):
         self.assertTrue(PollingWatcher(clipboard=None, interval_seconds=1).available())
+
+    def test_a_slow_handler_does_not_stop_the_poll_loop_reading(self):
+        """The poll loop is a reader thread like the gdbus pump, and it carries
+        more: it is the only caller of _observe_tick, so a loop parked inside
+        Agent._local_change is a safety net that has stopped judging anything.
+        _local_change blocks on _observe_lock and its own wl-paste round trip
+        can take up to SUBPROCESS_TIMEOUT=3s."""
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+
+        def slow_handler():
+            entered.set()
+            released.wait(JOIN_TIMEOUT)
+
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.002)
+        self.addCleanup(watcher.stop)
+        watcher.start(slow_handler)
+
+        self.assertTrue(
+            entered.wait(JOIN_TIMEOUT),
+            "the handler must actually be in flight, or this test proves nothing",
+        )
+        at_entry = clipboard.calls
+        self.wait_until(lambda: clipboard.calls >= at_entry + 3)
+        observed = clipboard.calls - at_entry
+
+        released.set()
+        watcher.stop()
+        self.assertGreaterEqual(
+            observed, 3,
+            "the poll must keep reading while the handler is busy; got %d more "
+            "reads" % observed,
+        )
+
+    def test_a_raising_handler_does_not_kill_the_poll_loop(self):
+        """One bad observation is disposable. A poll loop that dies with the
+        handler takes the ONLY remaining clipboard observer with it -- for a
+        standalone poller there is no signal path left to fall back to."""
+        seen = []
+        lock = threading.Lock()
+
+        def handler():
+            with lock:
+                seen.append(1)
+                first = len(seen) == 1
+            if first:
+                raise RuntimeError("first observation explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c", b"d"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        watcher.start(handler)
+
+        self.wait_until(lambda: len(seen) >= 2)
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertGreaterEqual(
+            len(seen), 2, "the poller must survive a raising handler"
+        )
+        self.assertTrue(
+            any("observer error" in line for line in self.log_lines),
+            "the disposable error must be logged: %r" % self.log_lines,
+        )
+
+    def test_a_raising_on_tick_does_not_kill_the_poll_loop(self):
+        """The other half, and the one with no second chance: on_tick is
+        GPasteWatcher._observe_tick, the safety net's whole judgement. An
+        exception there killed the loop and left NOTHING watching -- neither
+        syncing nor able to diagnose that it had stopped."""
+        ticks = []
+
+        def on_tick(previous, current):
+            ticks.append((previous, current))
+            if len(ticks) == 1:
+                raise RuntimeError("the first verdict explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005, on_tick=on_tick)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertGreaterEqual(
+            len(ticks), 3, "the poll loop must keep ticking after a bad verdict"
+        )
+
+    def test_stop_wakes_a_standalone_pollers_own_worker(self):
+        """Same leak as GPasteWatcher's: Agent.clipboard_lost drops its
+        reference the moment stop() returns, so a worker parked in
+        _event.wait() can never be reached again. Bounded rather than hanging:
+        the join times out and the assertion fails."""
+        clipboard = ScriptedReadClipboard([b"a"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+        self.assertIsNotNone(
+            watcher._worker, "a standalone poller must own a worker of its own"
+        )
+
+        watcher.stop()
+        watcher._worker.join(timeout=JOIN_TIMEOUT)
+
+        self.assertFalse(
+            watcher._worker.is_alive(),
+            "stop() must wake a worker parked in _event.wait(), not only set a flag",
+        )
 
     def test_fires_only_on_an_actual_change(self):
         clipboard = ScriptedReadClipboard([b"a", b"a", b"a", b"b", b"b", b"c"])
@@ -934,22 +1061,109 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "a recovered signal must still reach the same on_change after the switch",
         )
 
-    def test_the_safety_net_reports_through_the_very_callback_the_signal_path_got(self):
-        """Not a wrapper around it: the safety net hands the observation to
-        Agent._local_change itself, so exactly one place decides what a local
-        change means -- one observation, one one-shot echo suppression, one
-        _last_seen. A second copy of that decision is the shape of the echo bug
-        this project has already fixed two races in."""
+    def test_the_safety_net_signals_the_same_event_instead_of_calling_the_handler(self):
+        """One observation path, now structural rather than argued.
+
+        This used to assert that PollingWatcher.start received the very
+        callback object the signal path got -- true, and the strongest
+        statement available while the safety net still CALLED it. It no longer
+        does: the composed poller signals this watcher's own event, so the
+        handler is called from exactly one place in the process, by exactly one
+        thread. Exactly one place still decides what a local change means --
+        one observation, one one-shot echo suppression, one _last_seen -- and a
+        second copy of that decision remains the shape of the echo bug this
+        project has already fixed two races in.
+
+        The composed poller owning a worker of its own would be that second
+        copy, and would also put two threads back inside _local_change."""
         clipboard = ScriptedReadClipboard([b"a"])
+        watcher, _ = self.start_watcher(
+            clipboard, safety_net_interval_seconds=JOIN_TIMEOUT * 100)
 
-        def callback():
-            pass
+        self.assertIs(
+            watcher._safety_net._event, watcher._event,
+            "the safety net must signal the watcher's own event, not one of its own",
+        )
+        self.assertIsNone(
+            watcher._safety_net._worker,
+            "exactly one worker per watcher tree: the composed poller must not "
+            "start a second one",
+        )
+        self.assertIsNotNone(watcher._worker, "the watcher owns the only worker")
 
-        with mock.patch.object(PollingWatcher, "start") as safety_net_start:
-            self.start_watcher(clipboard, on_change=callback,
-                               safety_net_interval_seconds=JOIN_TIMEOUT * 100)
+    def test_the_verdict_still_arrives_after_the_handler_has_raised(self):
+        """The behaviour the wiring exists for, and the one a future refactor
+        will break while preserving the wiring.
 
-        safety_net_start.assert_called_once_with(callback)
+        The poll loop is the only caller of _observe_tick. While it called
+        on_change itself, one exception from Agent._local_change killed it --
+        and with it the only thing that can ever diagnose a dead event source
+        or switch to the degraded interval. Silent failure of the detector of
+        silent failure: the watcher would report itself healthy forever."""
+        calls = []
+        lock = threading.Lock()
+
+        def on_change():
+            with lock:
+                calls.append(1)
+                first = len(calls) == 1
+            if first:
+                raise RuntimeError("first observation explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher, _ = self.start_watcher(clipboard, on_change=on_change)
+
+        # BOTH facts, not just the verdict: the two now happen on different
+        # threads and in no fixed order. _on_tick runs on the poll thread
+        # immediately after the signal, so the verdict can be logged before the
+        # worker has been scheduled at all -- waiting on the verdict alone
+        # quiesces a watcher whose handler has not run yet, and the premise
+        # below then fails on a correct implementation.
+        self.wait_until(lambda: calls and self.switch_log_lines())
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            len(calls), 1, "the handler must actually have raised, or this "
+            "test proves nothing",
+        )
+        self.assertEqual(
+            len(self.switch_log_lines()), 1,
+            "the safety net must still reach its verdict after the handler "
+            "blew up; got: %r" % self.log_lines,
+        )
+
+    def test_a_slow_handler_does_not_stop_the_safety_net_ticking(self):
+        """The other hazard the split removes from this thread. A poll loop
+        parked inside _local_change -- which blocks on _observe_lock and can
+        spend SUBPROCESS_TIMEOUT=3s in one wl-paste -- is a safety net that has
+        stopped observing for as long as the handler runs."""
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+
+        def slow_handler():
+            entered.set()
+            released.wait(JOIN_TIMEOUT)
+
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, on_change=slow_handler, safety_net_interval_seconds=0.002)
+
+        self.assertTrue(
+            entered.wait(JOIN_TIMEOUT),
+            "the handler must actually be in flight, or this test proves nothing",
+        )
+        at_entry = clipboard.calls
+        self.wait_until(lambda: clipboard.calls >= at_entry + 3)
+        observed = clipboard.calls - at_entry
+
+        released.set()
+        self.quiesce(watcher)
+        self.assertGreaterEqual(
+            observed, 3,
+            "the safety net must keep polling while the handler is busy; got "
+            "%d more reads" % observed,
+        )
 
     def test_a_watcher_built_already_degraded_polls_fast_and_stays_quiet(self):
         """One half of the flap fix: `clipboard_lost` discards the watcher and
@@ -2527,6 +2741,8 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "_LIBC = _load_libc()",
             "def _pdeathsig_preexec",
             "import traceback",
+            "def _handle_observer_error",
+            "def _start_observer",
             "class GPasteWatcher",
             "class PollingWatcher",
             "def parse_gpaste_line",

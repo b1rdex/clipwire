@@ -1449,10 +1449,73 @@ def _pdeathsig_preexec():
         os._exit(0)
 
 
-# For the observer thread's non-fatal guard below. A handler exception with no
-# traceback is nearly undebuggable from the PC, where a log line is all anyone
-# gets.
+# For the guards below. A handler exception with no traceback is nearly
+# undebuggable from the PC, where a log line is all anyone gets.
 import traceback
+
+
+def _handle_observer_error(error, what):
+    """The one place a watcher thread decides whether an exception is worth
+    dying for. Shared by every such thread so the rule cannot drift between
+    them -- two copies of this decision is how one of them quietly becomes the
+    lenient one.
+
+    Fatal: the channel is gone. ValueError is what a CLOSED stdout raises on
+    write, and Agent.send writes straight to it; log() writes to stderr, which
+    dies with the same channel. Mirrors run()'s rule for stdin EOF -- this
+    agent is one process per connection, and exiting IS how it reports a dead
+    channel. Carrying on would leave a process syncing into a pipe nobody
+    reads.
+
+    Everything else is disposable: the next observation re-reads the clipboard
+    anyway rather than replaying anything. Logged with its traceback rather
+    than swallowed -- a thread that dies quietly is the defect this whole split
+    exists to remove, and a thread that swallows quietly is the same defect one
+    debugging session later.
+    """
+    if isinstance(error, (BrokenPipeError, ValueError)):
+        log("%s stopping, the channel is gone: %r" % (what, error))
+        os._exit(0)
+    log("%s error: %s" % (what, traceback.format_exc()))
+
+
+def _start_observer(event, stop, on_change):
+    """Start the ONE thread allowed to call the clipboard handler.
+
+    Every other thread in a watcher is a reader -- the gdbus pump, the poll
+    loop -- and readers only ever set `event`. A reader that called the handler
+    could block on Agent._observe_lock and could die of anything the handler
+    raised, silently and for the rest of the connection; that is the production
+    defect this shape removes by construction. There is exactly one of these
+    per watcher tree, which is also what keeps "one observation path" true: one
+    place decides what a local change means, and only one thread is ever inside
+    it.
+
+    No queue, deliberately. The handler reads clipboard STATE, not the contents
+    of any event -- GPaste's Update payload carries nothing this agent uses and
+    the poll loop's own payload is the clipboard itself -- so signals arriving
+    while it runs collapse into one set() and one re-read afterwards. That is
+    the semantics a clipboard wants; a queue would hold nothing and only add a
+    way to fall behind.
+    """
+    def observe():
+        while not stop.is_set():
+            event.wait()
+            if stop.is_set():
+                return
+            # Cleared BEFORE the handler runs, so a signal arriving DURING it
+            # re-arms the event and earns its own re-read afterwards. Clearing
+            # afterwards would drop exactly the change that landed while we
+            # were busy looking at the previous one.
+            event.clear()
+            try:
+                on_change()
+            except Exception as error:
+                _handle_observer_error(error, "observer")
+
+    worker = threading.Thread(target=observe, daemon=True)
+    worker.start()
+    return worker
 
 
 class GPasteWatcher:
@@ -1477,10 +1540,11 @@ class GPasteWatcher:
         self.clipboard = clipboard
         self._process = None
         self._thread = None
-        # The observer thread and the only thing that wakes it. The pump sets
-        # the event; the worker below runs on_change. They are separate so the
-        # pump can neither block on Agent._observe_lock nor die of an exception
-        # the handler raised -- see start().
+        # The observer thread and the only thing that wakes it. Both readers --
+        # the gdbus pump and the safety-net poll below -- set this event and
+        # neither calls the handler, so the pump can neither block on
+        # Agent._observe_lock nor die of an exception the handler raised, and
+        # the poll cannot either. See _start_observer.
         self._worker = None
         self._event = threading.Event()
         self._stop = threading.Event()
@@ -1513,17 +1577,23 @@ class GPasteWatcher:
         # Already-degraded watchers start ON the degraded interval: coming up
         # on the detection budget would leave PC->Mac 30 seconds behind for
         # another full cycle on an installation already diagnosed.
+        #
+        # Handed THIS watcher's event, so the composed poller signals the same
+        # worker the gdbus pump does and starts none of its own. That is what
+        # keeps "one observation path" true now that neither reader calls the
+        # handler: one place decides what a local change means, and only one
+        # thread is ever inside it.
         self._safety_net = PollingWatcher(
             clipboard,
             degraded_interval_seconds if degraded else safety_net_interval_seconds,
-            on_tick=self._observe_tick)
+            on_tick=self._observe_tick, event=self._event)
 
     def _observe_tick(self, previous, current):
         """Judge the event source from one safety-net tick.
 
-        Runs on the safety net's own poll thread, after it has already reported
-        any change through on_change -- see PollingWatcher.start for why that
-        ordering is load-bearing.
+        Runs on the safety net's own poll thread, after it has already
+        SIGNALLED any change -- see PollingWatcher.start, and read the grace
+        period note there before trusting `signals` to be current.
         """
         signals = self._signals
         # A content difference ALONE does not prove the signal path missed it.
@@ -1609,59 +1679,21 @@ class GPasteWatcher:
                     self._signals += 1
                     self._event.set()
 
-        def observe():
-            # Coalescing falls out of the Event, and there is deliberately no
-            # queue: signals arriving while on_change is running collapse into
-            # one set() and produce a single re-read afterwards. That is the
-            # right semantics for a clipboard -- the handler reads current
-            # STATE, not the contents of any particular event, and GPaste's
-            # Update payload carries nothing this agent uses -- so a queue
-            # would hold nothing and only add a way to fall behind.
-            while not self._stop.is_set():
-                self._event.wait()
-                if self._stop.is_set():
-                    return
-                # Cleared BEFORE the handler runs, so a signal arriving DURING
-                # it re-arms the event and earns its own re-read afterwards.
-                # Clearing afterwards would drop exactly the change that landed
-                # while we were busy looking at the previous one.
-                self._event.clear()
-                try:
-                    on_change()
-                except (BrokenPipeError, ValueError) as error:
-                    # Fatal: the channel is gone. ValueError is what a CLOSED
-                    # stdout raises on write, and Agent.send writes straight to
-                    # it. Mirrors run()'s rule for stdin EOF -- this agent is
-                    # one process per connection, and exiting IS how it reports
-                    # a dead channel. Logging and carrying on would leave a
-                    # process syncing into a pipe nobody reads.
-                    log("observer stopping, the channel is gone: %r" % error)
-                    os._exit(0)
-                except Exception:
-                    # Non-fatal: one observation is disposable, because the
-                    # next one re-reads the clipboard anyway rather than
-                    # replaying anything. Logged with its traceback rather than
-                    # swallowed -- a thread that dies quietly here is the exact
-                    # defect this split exists to remove, and a thread that
-                    # swallows quietly is the same defect one debugging session
-                    # later.
-                    log("observer error: %s" % traceback.format_exc())
-
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
-        self._worker = threading.Thread(target=observe, daemon=True)
-        self._worker.start()
-        # The SAME on_change object the signal path just got -- in production
-        # Agent._local_change -- so a change only the safety net catches goes
-        # through one observation, one one-shot echo suppression and one
-        # _last_seen. A parallel path here would be a second copy of echo
-        # logic this project has already fixed two races in.
+        # The ONE thread allowed to call on_change -- in production
+        # Agent._local_change. The safety net below signals the same event
+        # rather than being given the handler, so a change only IT catches
+        # still goes through one observation, one one-shot echo suppression
+        # and one _last_seen. A parallel path there would be a second copy of
+        # echo logic this project has already fixed two races in.
         #
         # Its cost, deliberately accepted: _local_change stamps the clip at
         # the moment IT observes the change, so a clip caught only by the
         # safety net carries a timestamp up to one safety-net interval late
         # (30 seconds with the production default).
-        self._safety_net.start(on_change)
+        self._worker = _start_observer(self._event, self._stop, on_change)
+        self._safety_net.start()
 
     def worker_alive(self):
         """For the safety net's verdict line. A live pump with a dead worker is
@@ -1705,47 +1737,105 @@ class PollingWatcher:
     content-comparison-and-notify loop, with a single owner of `previous`: the
     safety net judges the event source from these observations rather than
     running a second comparison of its own.
+
+    `event` is how this loop reports a change, and it is the whole reason a
+    poll loop and a gdbus pump can share one handler. Composed as
+    GPasteWatcher's safety net it is handed THAT watcher's event, so both
+    readers wake the same single worker; standalone -- what make_watcher
+    returns when GPaste is unavailable -- it makes its own and starts its own
+    worker, and then `on_change` is required rather than optional.
     """
 
-    def __init__(self, clipboard, interval_seconds, on_tick=None):
+    def __init__(self, clipboard, interval_seconds, on_tick=None, event=None):
         self.clipboard = clipboard
         self.interval = interval_seconds
         self._on_tick = on_tick
         self._stop = threading.Event()
         self._thread = None
+        # Exactly one worker per watcher tree: whoever owns the event owns the
+        # worker. A composed poller starting a second one would put two threads
+        # back inside Agent._local_change and give the file two places that
+        # decide what a local change means.
+        self._event = threading.Event() if event is None else event
+        self._owns_the_worker = event is None
+        self._worker = None
 
     def available(self):
         return True
 
-    def start(self, on_change):
+    def start(self, on_change=None):
+        """`on_change` is required standalone and ignored when this poller was
+        handed someone else's event -- that owner's worker calls the handler,
+        and this loop only ever signals."""
+        if self._owns_the_worker:
+            self._worker = _start_observer(self._event, self._stop, on_change)
+
         def pump():
-            previous = self.clipboard.read()
+            # Guarded from its first statement: this thread is the only caller
+            # of _on_tick, so an exception anywhere in it does not merely cost
+            # an observation -- it takes the safety net's whole judgement with
+            # it, and the watcher then reports itself healthy forever. That is
+            # silent failure of the thing that detects silent failure. The
+            # baseline read is inside a guard for the same reason: uncaught, it
+            # killed the thread before the loop even existed.
+            previous = None
+            try:
+                previous = self.clipboard.read()
+            except Exception as error:
+                _handle_observer_error(error, "poll")
             while not self._stop.wait(self.interval):
-                current = self.clipboard.read()
-                before = previous
-                if current != previous:
-                    previous = current
-                    on_change()
-                # AFTER on_change, and load-bearing rather than tidy:
-                # on_change is Agent._local_change, whose own clipboard round
-                # trip (up to SUBPROCESS_TIMEOUT=3s) and send are the grace
-                # period the event source gets to deliver the signal for this
-                # very change before an observer judges it missing. Hoisting
-                # this above on_change looks like a harmless cleanup and
-                # silently reopens that window.
-                #
-                # `before` is passed rather than a bare `changed` flag so the
-                # observer can tell a real change from a failed read and its
-                # recovery -- both are `!=` here, and neither involves a
-                # selection change at all.
-                if self._on_tick is not None:
-                    self._on_tick(before, current)
+                try:
+                    current = self.clipboard.read()
+                    before = previous
+                    if current != previous:
+                        previous = current
+                        # Signalled, never called: a reader thread that ran the
+                        # handler could block on Agent._observe_lock and could
+                        # die of anything it raised -- see _start_observer.
+                        self._event.set()
+                    # AFTER the signal, which used to be load-bearing and is
+                    # now merely conventional -- say so rather than leave the
+                    # old claim standing. While this loop CALLED on_change,
+                    # that call (a wl-paste round trip of up to
+                    # SUBPROCESS_TIMEOUT=3s, plus the send) was the grace
+                    # period the event source got to deliver the signal for
+                    # this very change before _observe_tick judged it missing.
+                    # set() takes microseconds, so that grace is gone and the
+                    # window is open: a copy landing in the last few
+                    # milliseconds before this tick's read can be judged
+                    # "missed" while its Update signal is still in flight.
+                    #
+                    # What still holds: the pump increments _signals BEFORE it
+                    # dispatches, so a signal already read from gdbus cannot be
+                    # missed by a slow handler. What no longer holds: this
+                    # thread waiting for anything at all. Compensating belongs
+                    # in the verdict, not here -- confirming `missed` across
+                    # two consecutive ticks would restore a grace of one full
+                    # interval with no thread coupling, at the cost of doubling
+                    # the worst-case detection budget. Reintroducing a wait on
+                    # this thread would re-couple the safety net to the handler
+                    # and hand a wedged worker the power to stop the poll.
+                    #
+                    # `before` is passed rather than a bare `changed` flag so
+                    # the observer can tell a real change from a failed read
+                    # and its recovery -- both are `!=` here, and neither
+                    # involves a selection change at all.
+                    if self._on_tick is not None:
+                        self._on_tick(before, current)
+                except Exception as error:
+                    _handle_observer_error(error, "poll")
 
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
 
     def stop(self):
         self._stop.set()
+        if self._owns_the_worker:
+            # A worker parked in _event.wait() has nothing else to wake it, and
+            # nothing can reach the thread once the caller drops this watcher.
+            # Guarded on ownership: a composed poller's stop() must not wake
+            # the shared worker, whose owner stops it with its own flag.
+            self._event.set()
 
 
 def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
