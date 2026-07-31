@@ -15,6 +15,16 @@ protocol, and the constraints that shaped both. The Swift and Python test suites
 in CI; the acceptance test — copy on one machine, paste on the other, survive a PC reboot
 with no manual action — is manual, per the design doc's Testing section.
 
+**Passwords land in GPaste's history on the PC and stay there.** Anything copied on the
+Mac is written to the PC's clipboard, and GPaste records it in its on-disk history. A
+password copied out of 1Password is no exception. 1Password clears the Mac's clipboard
+after about ninety seconds, but a cleared clipboard is empty and empty clips are never
+synced, so the clearing does not replicate. Remove it on the PC with:
+
+```sh
+gpaste-client delete-history
+```
+
 ## Installing
 
 Everything below runs on the Mac, from inside a clone of this repository. `clipwire init`
@@ -82,3 +92,29 @@ be run from the repo root.
    ```sh
    ~/.local/bin/clipwire status
    ```
+
+## After a GNOME upgrade
+
+Check that the GPaste shell extension is still enabled:
+
+```sh
+gnome-extensions list --enabled | grep -i gpaste
+```
+
+GPaste tracks the clipboard through that extension, and an upgrade can leave it disabled.
+Nothing looks broken when it happens: the GPaste daemon keeps running and keeps answering
+on the session bus, so every liveness check that probes the bus still passes — but the
+`Update` signal the agent watches for never fires again.
+
+The agent notices on its own and keeps working: its safety-net poll compares the clipboard
+every 30 seconds, and once it sees content change with no signal to account for it, it
+falls back to polling every second for the rest of the connection. It says so in the Mac's
+log (`~/.local/state/clipwire/clipwire.log`):
+
+```
+remote: GPaste is not reporting clipboard changes (is the gnome-shell extension enabled?), polling every 1.0s for the rest of this connection
+```
+
+The command above is how you answer that question. It prints nothing when the extension is
+off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`. The fallback
+is scoped to one connection, so event-driven watching resumes on the next reconnect.
