@@ -222,6 +222,16 @@ class Agent:
         # connection" and "once per process" are the same thing -- there is
         # no reconnect-within-the-same-process to re-arm for.
         self._clip_state_sent = False
+        # A peer clip-state announcement received before OUR OWN side has
+        # reconciled and sent its own (i.e. before clipboard_became_ready
+        # has run at least once this connection) -- resolved immediately
+        # after that reconciliation instead, in clipboard_became_ready
+        # itself. Keep only the newest, exactly like pending_clip, for the
+        # same reason: a well-behaved peer only ever announces once per
+        # connection, so this is a rare, one-shot handoff, not a queue.
+        # See _on_clip_state's own doc comment for why resolving against
+        # the store before it has been reconciled is unsafe.
+        self._pending_peer_clip_state = None
         # Persistent memory of what was last synced between the two
         # machines -- set in _write_clip (content arriving FROM the peer)
         # and after a successful send in _local_change (content sent TO
@@ -293,22 +303,57 @@ class Agent:
         self._write_clip(payload)
 
     def _on_clip_state(self, payload):
-        """Resolves an incoming clip-state announcement against what we
-        hold, and sends only when we win. Mirrors
-        Sources/clipwire/main.swift's handleFrame .clipState case, with one
-        deliberate divergence: decode_clip_state is called bare here, not
-        wrapped in a local try/except. Swift's `try?` swallow is correct
-        THERE because Channel exposes no way to force-close the ssh process
-        from that side -- but this agent, spawned fresh per SSH connection
-        by sshd, both CAN and already DOES close the connection on a
-        malformed/mismatched hello (_on_hello's own bare `raise
+        """Decodes an incoming clip-state announcement, then either
+        resolves it immediately or stashes it for clipboard_became_ready to
+        resolve once our own side has reconciled.
+
+        decode_clip_state is called bare, not wrapped in a local try/except
+        -- one deliberate divergence from Sources/clipwire/main.swift's
+        handleFrame .clipState case, which swallows via `try?`. That is
+        correct THERE because Channel exposes no way to force-close the ssh
+        process from that side -- but this agent, spawned fresh per SSH
+        connection by sshd, both CAN and already DOES close the connection
+        on a malformed/mismatched hello (_on_hello's own bare `raise
         FrameError(...)`, unchanged by this task). A malformed clip-state is
         the same class of peer violation, so it is handled the same way:
         propagate ClipStateError (a FrameError) up through main()'s `except
         FrameError`, which is exactly what closing the OverflowError hole
         in decode_clip_state makes safe to do.
+
+        Fix round 1, Finding 1: run()'s real loop dispatches every complete
+        frame on stdin BEFORE it ever checks clipboard.ready() in that same
+        iteration (see run()'s own comment) -- so this can be called while
+        still PHASE_PENDING, before clipboard_became_ready has EVER run
+        this connection. Unlike Swift, where announceClipState reconciles
+        and persists the store SYNCHRONOUSLY inside the same matched-hello
+        handler that then answers a peer's own announcement -- guaranteed
+        by hello arriving first on an ordered stream -- this agent's own
+        reconciliation is bound to a LATER, independent event (Wayland
+        session readiness). Resolving against load_clip_state() before that
+        reconciliation has run risks exactly the store being stale: content
+        predates this process (the ordinary case this whole design exists
+        for -- ANY reconnect, not only a reboot), and nothing has yet
+        compared it against what the clipboard actually holds right now.
+        A peer's announcement that happens to still match that stale value
+        would resolve doNothing and never be reconsidered -- v1's silent
+        loss, reintroduced through an event-ordering race instead of the
+        multi-process one this design was built to close. Stashing here and
+        resolving in clipboard_became_ready, once the store is known-fresh,
+        mirrors pending_clip's identical pattern for the identical class of
+        ordering problem.
         """
         peer = decode_clip_state(payload)
+        if not self._clip_state_sent:
+            self._pending_peer_clip_state = peer
+            return
+        self._resolve_clip_state(peer)
+
+    def _resolve_clip_state(self, peer):
+        """The resolution logic _on_clip_state defers until our own side
+        has reconciled -- see its own doc comment for why. Called either
+        directly (a clip-state arriving after clipboard_became_ready has
+        already run once this connection) or from clipboard_became_ready
+        itself (a clip-state that arrived before it and was stashed)."""
         mine = load_clip_state(path=self._clip_state_path)
         if mine is None:
             # load_clip_state should already reflect our own current state --
@@ -443,6 +488,20 @@ class Agent:
                 self.send(TYPE_CLIP_STATE, encode_clip_state(*applied_pending))
             else:
                 announce_clip_state(self.send, self.clipboard, path=self._clip_state_path)
+            if self._pending_peer_clip_state is not None:
+                # Fix round 1, Finding 1: a peer clip-state that arrived
+                # (via _on_clip_state) before we ever reached this point
+                # this connection was stashed rather than resolved, because
+                # load_clip_state() could still have been stale then --
+                # unreconciled against what the clipboard actually holds
+                # right now. The two announce branches just above (either
+                # one) have now brought the store up to date, so it is safe
+                # to resolve it here, immediately -- exactly mirroring how
+                # pending_clip is applied above before anything else in
+                # this method depends on the store being current.
+                peer = self._pending_peer_clip_state
+                self._pending_peer_clip_state = None
+                self._resolve_clip_state(peer)
         if self._watcher is None:
             self._watcher = make_watcher(self.clipboard)
             self._watcher.start(self._local_change)

@@ -1029,19 +1029,41 @@ class TestIncomingClipState(unittest.TestCase):
     """Agent._on_clip_state: resolves an incoming TYPE_CLIP_STATE frame
     against what we hold, per resolve_freshness, and sends only when we
     win. Mirrors HandleFrameTests.swift's "Contract 5" section
-    (resolving a peer's clip-state announcement)."""
+    (resolving a peer's clip-state announcement).
+
+    Fix round 1, Finding 1: _on_clip_state only resolves a peer's
+    announcement immediately when _clip_state_sent is already True (our own
+    side has reconciled and announced at least once this connection) --
+    otherwise it stashes the peer state for clipboard_became_ready to
+    resolve once that reconciliation has happened, since the store can
+    still be stale before it. build() below defaults to simulating that
+    precondition directly (already_reconciled=True) so the tests in this
+    class, which are about resolve_freshness's OUTCOMES once resolution
+    actually happens, are not all forced to drive a full
+    clipboard_became_ready() just to reach that state. The stash itself,
+    and clipboard_became_ready resolving it, are pinned separately below
+    (test_a_clip_state_arriving_before_our_own_reconciliation_is_stashed_not_resolved_immediately
+    and
+    test_clipboard_became_ready_resolves_a_stashed_peer_clip_state_after_reconciling);
+    the full real-dispatch-ordering reproduction lives in
+    test_mainloop.py::TestClipStateOrderingAcrossRealDispatch, since only
+    driving the REAL run() loop can prove the ordering bug this precondition
+    exists to close (calling handlers by hand in a chosen order is exactly
+    what let it through undetected the first time)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
 
-    def build(self, clipboard=None):
-        return Agent(
+    def build(self, clipboard=None, already_reconciled=True):
+        agent = Agent(
             stdin=io.BytesIO(), stdout=io.BytesIO(),
             clipboard=clipboard if clipboard is not None else QueueClipboard(ready=True),
             clip_state_path=self.clip_state_path,
         )
+        agent._clip_state_sent = already_reconciled
+        return agent
 
     def test_losing_clip_state_with_peer_fresher_produces_no_send(self):
         """resolve_freshness's waitForPeer outcome: the peer is fresher, so
@@ -1152,11 +1174,19 @@ class TestIncomingClipState(unittest.TestCase):
         already never affects what a subsequently-queued read() returns --
         precisely the "write and read are decoupled in time" shape of the
         real asynchronous wl-copy, achieved here simply by not queuing the
-        applied text as a read value."""
+        applied text as a read value.
+
+        already_reconciled=False, unlike every other test in this class:
+        this is the one test that drives the REAL clipboard_became_ready()
+        transition (not a simulated shortcut) before the clip-state frame
+        arrives -- it is the "clip-state after readiness" half of the
+        ordering space, deliberately kept distinct from
+        TestClipStateOrderingAcrossRealDispatch's "clip-state BEFORE
+        readiness" reproduction in test_mainloop.py."""
         applied_text = b"the peer's own recently applied clip"
         applied_ts = 555.0
         clipboard = QueueClipboard(ready=True)
-        agent = self.build(clipboard=clipboard)
+        agent = self.build(clipboard=clipboard, already_reconciled=False)
 
         # Get into READY phase first (an empty queue -> the connect-time
         # seed and the initial announce both read None, which is fine and
@@ -1282,6 +1312,83 @@ class TestIncomingClipState(unittest.TestCase):
 
         with self.assertRaises(ClipStateError):
             agent.on_frame(TYPE_CLIP_STATE, oversized)
+
+    # MARK: - Fix round 1, Finding 1: stash-before-reconciliation
+    #
+    # Fast, direct pins of the stash mechanism itself, complementing
+    # test_mainloop.py::TestClipStateOrderingAcrossRealDispatch's slower but
+    # higher-fidelity end-to-end reproduction (which drives the REAL run()
+    # loop, per Finding 3 -- calling handlers by hand in a chosen order,
+    # as these two tests do, is exactly the blind spot that let the bug
+    # through the first time, so it cannot be the ONLY coverage).
+
+    def test_a_clip_state_arriving_before_our_own_reconciliation_is_stashed_not_resolved_immediately(self):
+        """not self._clip_state_sent -- our own side has not yet reconciled
+        and announced this connection -- must stash the peer's state rather
+        than resolve it against a store that can still be stale (content
+        predating this process, the ordinary case: ANY reconnect, not only
+        a reboot). Resolving here anyway is exactly how a peer's
+        announcement that happens to still match the stale value would be
+        judged doNothing and never reconsidered -- v1's silent loss.
+
+        Our own local store's content ("aa", 5) is deliberately irrelevant
+        here and never even loaded: this pins that the STASHED value is the
+        peer's own decoded announcement ("bb", 42) -- not our local state,
+        and not silently dropped -- which is a distinct assertion from
+        "nothing was sent"."""
+        save_clip_state("aa", 5, path=self.clip_state_path)
+        agent = self.build(already_reconciled=False)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("bb", 42))
+
+        self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
+        self.assertEqual(
+            agent._pending_peer_clip_state, ("bb", 42.0),
+            "the peer's own decoded state must be stashed, not silently dropped",
+        )
+
+    def test_clipboard_became_ready_resolves_a_stashed_peer_clip_state_after_reconciling(self):
+        """The other half: once clipboard_became_ready has reconciled (and
+        announced) our own side, a clip-state stashed before that point
+        must actually be resolved -- against the NOW-current store, not a
+        stale one. This is the direct-call twin of
+        TestClipStateOrderingAcrossRealDispatch's full run()-loop
+        reproduction in test_mainloop.py; both exist because neither alone
+        is enough evidence (see this class's own docstring)."""
+        clipboard = QueueClipboard(ready=True)
+        # Two reads happen inside clipboard_became_ready(): the connect-time
+        # seed, and a second read from announce_clip_state's own
+        # resolve_current_clip_state call -- see
+        # TestEchoBookkeeping.test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send
+        # for the same double-read shape.
+        clipboard.queue_read(b"B")  # the seed read
+        clipboard.queue_read(b"B")  # the announce step's own read
+        agent = self.build(clipboard=clipboard, already_reconciled=False)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        # Stale on disk: both sides last synced on "A" a long time ago.
+        save_clip_state(sha256_hex(b"A"), 100.0, path=self.clip_state_path)
+        # The peer's own announcement, also still describing "A" -- it
+        # has not changed either.
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"A"), 100.0))
+        self.assertEqual(sent, [], "must not resolve yet -- stashed")
+
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
+            agent.clipboard_became_ready()
+
+        self.assertIsNone(
+            agent._pending_peer_clip_state, "the stash must be cleared once resolved"
+        )
+        clip_frames = [f for f in sent if f[0] == TYPE_CLIP]
+        self.assertEqual(
+            len(clip_frames), 1,
+            "the reconciled store now says B, fresher than the peer's stale "
+            "A announcement -- B must be sent, not silently dropped",
+        )
+        self.assertEqual(decode_clip_payload(clip_frames[0][1])[1], b"B")
 
 
 class TestModuleDefinitionOrder(unittest.TestCase):
