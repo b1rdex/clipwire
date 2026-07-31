@@ -2,6 +2,7 @@
 import io
 import os
 import pathlib
+import signal
 import subprocess
 import tempfile
 import threading
@@ -244,6 +245,58 @@ class TestGPasteWatcherLifecycle(unittest.TestCase):
             watcher._thread.is_alive(),
             "a daemon thread that keeps reading a dead pipe is a leak",
         )
+
+    def test_the_gdbus_child_is_spawned_with_the_pdeathsig_preexec(self):
+        fake_process = FakeGPasteProcess()
+        self.addCleanup(fake_process.close)
+        with mock.patch.object(clipwire_agent.subprocess, "Popen") as popen:
+            popen.return_value = fake_process
+            watcher = clipwire_agent.GPasteWatcher(clipboard=ScriptedReadClipboard([b"a"]))
+            watcher.start(lambda: None)
+        self.addCleanup(watcher.stop)
+        self.assertIs(
+            popen.call_args.kwargs.get("preexec_fn"), clipwire_agent._pdeathsig_preexec
+        )
+
+
+class TestPdeathsigPreexec(unittest.TestCase):
+    def test_it_requests_sigterm_when_the_parent_dies(self):
+        calls = []
+
+        class FakeLibc:
+            def prctl(self, option, sig, *rest):
+                calls.append((option, sig))
+                return 0
+
+        with mock.patch.object(clipwire_agent, "_load_libc", return_value=FakeLibc()), \
+             mock.patch.object(clipwire_agent.os, "getppid", return_value=42):
+            clipwire_agent._pdeathsig_preexec()
+
+        self.assertEqual(calls, [(clipwire_agent.PR_SET_PDEATHSIG, signal.SIGTERM)])
+
+    def test_it_exits_when_the_parent_already_died(self):
+        """The fork/prctl window: if the parent died in between, the signal
+        never arrives, so the child must notice and leave on its own.
+
+        os._exit is mocked rather than expected to raise: it does NOT raise
+        SystemExit, it ends the process immediately -- which is correct inside
+        a preexec_fn, where an exception would be re-raised in the PARENT and
+        take the agent down instead of the child. An assertRaises here would
+        kill the test runner.
+        """
+        class FakeLibc:
+            def prctl(self, option, sig, *rest):
+                return 0
+
+        with mock.patch.object(clipwire_agent, "_load_libc", return_value=FakeLibc()), \
+             mock.patch.object(clipwire_agent.os, "getppid", return_value=1), \
+             mock.patch.object(clipwire_agent.os, "_exit") as exit_call:
+            clipwire_agent._pdeathsig_preexec()
+        exit_call.assert_called_once_with(0)
+
+    def test_it_is_a_no_op_where_prctl_is_unavailable(self):
+        with mock.patch.object(clipwire_agent, "_load_libc", return_value=None):
+            clipwire_agent._pdeathsig_preexec()   # must not raise
 
 
 class ScriptedReadClipboard:
@@ -2186,6 +2239,10 @@ class TestModuleDefinitionOrder(unittest.TestCase):
         guard_index = source.index('if __name__ == "__main__"')
         for needle in (
             "def make_watcher",
+            "import signal",
+            "PR_SET_PDEATHSIG = 1",
+            "def _load_libc",
+            "def _pdeathsig_preexec",
             "class GPasteWatcher",
             "class PollingWatcher",
             "def parse_gpaste_line",

@@ -1393,6 +1393,46 @@ def parse_gpaste_line(line):
     return "Update" in line and GPASTE_OBJECT_PATH in line
 
 
+import signal
+
+PR_SET_PDEATHSIG = 1
+
+
+def _load_libc():
+    """libc for prctl, or None where it is unavailable.
+
+    ctypes is standard library, so this costs no dependency. Returns None on
+    macOS and anywhere else without a usable libc: the agent only ever runs on
+    the PC, but the test suite runs on both, and an import-time failure would
+    take the whole module down.
+    """
+    try:
+        import ctypes
+        return ctypes.CDLL("libc.so.6", use_errno=True)
+    except (ImportError, OSError):
+        return None
+
+
+def _pdeathsig_preexec():
+    """Ask the kernel to SIGTERM this child when its parent dies.
+
+    Runs between fork and exec. This is what actually reaps the gdbus child:
+    stop() cannot be relied on, because sshd kills the agent outright when the
+    channel drops and no cleanup path runs. terminate() is also not enough on
+    its own -- glib installs SIG_IGN for SIGPIPE, so the orphan survives its
+    stdout closing and lingers until the session ends.
+    """
+    libc = _load_libc()
+    if libc is None:
+        return
+    libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    # The parent can die between the fork above and the prctl call just made,
+    # in which case the signal we just asked for will never be delivered and
+    # this child would outlive it anyway. getppid() == 1 means exactly that.
+    if os.getppid() == 1:
+        os._exit(0)
+
+
 class GPasteWatcher:
     """Event-driven. Python has no stdlib DBus binding, so this shells out to
     gdbus monitor and parses its output line by line.
@@ -1512,7 +1552,7 @@ class GPasteWatcher:
             ["gdbus", "monitor", "--session", "--dest", GPASTE_BUS_NAME,
              "--object-path", GPASTE_OBJECT_PATH],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, env=clipboard_env(),
+            text=True, env=clipboard_env(), preexec_fn=_pdeathsig_preexec,
         )
 
         def pump():
