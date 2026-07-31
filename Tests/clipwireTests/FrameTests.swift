@@ -56,14 +56,16 @@ final class FrameTests: XCTestCase {
     }
 
     func testMaxPayloadBoundaryIncomplete() throws {
-        // Frame declaring exactly MAX_PAYLOAD_BYTES (4_194_304) is incomplete, not oversized
-        var buffer = Data([0x00, 0x40, 0x00, 0x00, 0x00])
+        // Frame declaring exactly maxPayloadBytes (8_388_608, this task's new
+        // frame cap -- see testTheFrameCapIsLargerThanEitherContentLimit) is
+        // incomplete, not oversized
+        var buffer = Data([0x00, 0x80, 0x00, 0x00, 0x00])
         XCTAssertNil(try Frame.decode(from: &buffer))
     }
 
     func testMaxPayloadBoundaryExceeded() {
-        // Frame declaring MAX_PAYLOAD_BYTES + 1 (4_194_305) is oversized
-        var buffer = Data([0x00, 0x40, 0x00, 0x01, 0x00])
+        // Frame declaring maxPayloadBytes + 1 (8_388_609) is oversized
+        var buffer = Data([0x00, 0x80, 0x00, 0x01, 0x00])
         XCTAssertThrowsError(try Frame.decode(from: &buffer)) { error in
             guard case FrameError.oversized = error else {
                 return XCTFail("expected .oversized, got \(error)")
@@ -79,8 +81,10 @@ final class FrameTests: XCTestCase {
         // wire-format assignment explicitly here instead.
         XCTAssertEqual(FrameType.hello.rawValue, 0x00, "hello must be wire type 0x00")
         XCTAssertEqual(FrameType.clip.rawValue, 0x01, "clip must be wire type 0x01")
-        // Same gap, same fix, for the type this task registers.
+        // Same gap, same fix, for the type Task 3 registered.
         XCTAssertEqual(FrameType.clipState.rawValue, 0x02, "clipState must be wire type 0x02")
+        // Same gap, same fix, for the type this task registers.
+        XCTAssertEqual(FrameType.imageClip.rawValue, 0x03, "imageClip must be wire type 0x03")
     }
 
     func testClipStateRoundTrip() throws {
@@ -96,11 +100,11 @@ final class FrameTests: XCTestCase {
         XCTAssertTrue(buffer.isEmpty, "decode must consume exactly one frame")
     }
 
-    func testProtocolVersionIsBumpedToV2() {
+    func testProtocolVersionIsBumpedToV3() {
         // ProtocolConstants lives in main.swift, not this file -- but
         // @testable import gives this test target access regardless, and
         // this is the file the task brief designates for the assertion.
-        XCTAssertEqual(ProtocolConstants.version, 2)
+        XCTAssertEqual(ProtocolConstants.version, 3)
     }
 
     func testHelloPayloadContainsSentAtAsANumber() throws {
@@ -110,5 +114,34 @@ final class FrameTests: XCTestCase {
         let json = try JSONSerialization.jsonObject(with: ProtocolConstants.helloPayload) as? [String: Any]
         XCTAssertNotNil(json?["sent_at"] as? Double,
                          "hello payload must carry sent_at as a JSON number, not a string")
+    }
+
+    // MARK: - Task 4: three caps, one new frame type, protocol 3
+
+    func testTheFrameCapIsLargerThanEitherContentLimit() {
+        XCTAssertEqual(FrameConstants.maxPayloadBytes, 8_388_608)
+        XCTAssertEqual(FrameConstants.maxTextBytes, 4_194_304)
+        XCTAssertEqual(FrameConstants.maxImageBytes, 4_194_304)
+        // The brief's own sample spells this as `FrameConstants.timestampBytes`,
+        // but no such member exists: the 8-byte timestamp prefix belongs to
+        // the CLIP PAYLOAD's own encoding (ClipPayload.swift), not to the
+        // frame envelope, which carries no timestamp semantics at all.
+        // FrameConstants already owns `maxPayloadBytes`/`maxTextBytes`/
+        // `maxImageBytes`/`headerBytes` -- adding a second, frame-scoped
+        // `timestampBytes` alongside `ClipPayloadConstants.timestampBytes`
+        // would just be two sources of truth for the same 8. Using the real
+        // symbol here instead.
+        XCTAssertGreaterThan(FrameConstants.maxPayloadBytes,
+                             FrameConstants.maxImageBytes + ClipPayloadConstants.timestampBytes,
+                             "a maximum-size image plus its ts must fit in a frame")
+    }
+
+    func testTheImageClipTypeIsKnown() {
+        XCTAssertEqual(FrameType.imageClip.rawValue, 0x03)
+        XCTAssertEqual(FrameType(rawValue: 0x03), .imageClip)
+    }
+
+    func testTheProtocolVersionIsThree() {
+        XCTAssertEqual(ProtocolConstants.version, 3)
     }
 }

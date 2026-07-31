@@ -16,7 +16,7 @@ from agent_under_test import (
     DEGRADED_POLL_SECONDS,
     GPASTE_BUS_NAME,
     GPasteWatcher,
-    MAX_PAYLOAD_BYTES,
+    MAX_TEXT_BYTES,
     PollingWatcher,
     SAFETY_NET_POLL_SECONDS,
     TIMESTAMP_BYTES,
@@ -1836,28 +1836,32 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_oversized_local_change_is_skipped_not_sent(self):
         agent = self.build(ready=True)
-        agent.clipboard.queue_read(b"x" * (MAX_PAYLOAD_BYTES + 1))
+        agent.clipboard.queue_read(b"x" * (MAX_TEXT_BYTES + 1))
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
         self.assertEqual(sent, [])
 
     def test_text_at_exactly_the_cap_is_skipped_because_the_encoded_frame_would_exceed_it(self):
-        """Since this task, _local_change wraps the observed text in
-        encode_clip_payload before it reaches the wire, adding an 8-byte
-        timestamp prefix -- so text at exactly MAX_PAYLOAD_BYTES would
-        encode to a frame 8 bytes OVER the cap. The pre-existing guard
-        (len(text) > MAX_PAYLOAD_BYTES) cannot see this boundary: it only
-        rejects text already over the cap, one byte too late for content
-        exactly AT it. Mirrors
+        """_local_change wraps the observed text in encode_clip_payload
+        before it reaches the wire, adding an 8-byte timestamp prefix -- so
+        text at exactly MAX_TEXT_BYTES would encode to a payload 8 bytes
+        over the TEXT limit. The pre-existing guard (len(text) >
+        MAX_TEXT_BYTES) cannot see this boundary: it only rejects text
+        already over the cap, one byte too late for content exactly AT it.
+        Since Task 4, MAX_TEXT_BYTES (this guard) and MAX_PAYLOAD_BYTES (the
+        wire's frame cap, enforced only by decode_frame) are separate
+        constants -- text here is checked against the text-content limit,
+        not the larger frame cap that exists to leave room for images.
+        Mirrors
         PasteboardTests.testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt
         on the Swift side."""
         agent = self.build(ready=True)
-        agent.clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        agent.clipboard.queue_read(b"x" * MAX_TEXT_BYTES)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
-        self.assertEqual(sent, [], "text at exactly the cap would encode to a frame 8 bytes over it")
+        self.assertEqual(sent, [], "text at exactly the cap would encode to a payload 8 bytes over it")
 
     def test_text_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
         """The other half of the boundary: content that leaves exact room
@@ -1865,7 +1869,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         over-trimmed fix would silently refuse to sync content the wire
         format actually supports."""
         agent = self.build(ready=True)
-        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        text = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
         agent.clipboard.queue_read(text)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -2615,23 +2619,25 @@ class TestIncomingClipState(unittest.TestCase):
     def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
         """Unlike _local_change's own send path, this branch reads the live
         clipboard independently and, without this bound, winning a
-        reconciliation over content at or beyond the cap would build a
-        frame that exceeds MAX_PAYLOAD_BYTES once wrapped -- the peer's
-        decode_frame rejects that as oversized and drops the whole channel."""
+        reconciliation over content at or beyond the TEXT limit would build
+        a payload that exceeds MAX_TEXT_BYTES once wrapped in its 8-byte
+        timestamp -- refused here on content-limit grounds, independently of
+        whether the resulting frame would also exceed the (larger)
+        MAX_PAYLOAD_BYTES wire cap."""
         save_clip_state(HASH_A, 777, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
-        clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        clipboard.queue_read(b"x" * MAX_TEXT_BYTES)
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
         agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
 
-        self.assertEqual(sent, [], "content of exactly the cap would encode to a frame 8 bytes over it")
+        self.assertEqual(sent, [], "content of exactly the cap would encode to a payload 8 bytes over it")
 
     def test_winning_clip_state_with_content_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
         save_clip_state(HASH_A, 777, path=self.clip_state_path)
-        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        text = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(text)
         agent = self.build(clipboard=clipboard)
@@ -2649,7 +2655,7 @@ class TestIncomingClipState(unittest.TestCase):
         "skipping a clip of N bytes: over the frame cap" line used for
         _local_change's own cap."""
         save_clip_state(HASH_A, 777, path=self.clip_state_path)
-        oversized = MAX_PAYLOAD_BYTES
+        oversized = MAX_TEXT_BYTES
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * oversized)
         agent = self.build(clipboard=clipboard)
@@ -2951,6 +2957,11 @@ class TestModuleDefinitionOrder(unittest.TestCase):
         source = AGENT.read_text()
         guard_index = source.index('if __name__ == "__main__"')
         for needle in (
+            # Task 4: the three-way cap split and the new image-clip type,
+            # all defined at the top of the file alongside MAX_PAYLOAD_BYTES.
+            "MAX_TEXT_BYTES = 4194304",
+            "MAX_IMAGE_BYTES = 4194304",
+            "TYPE_IMAGE_CLIP = 0x03",
             "def make_watcher",
             "import ctypes",
             "import signal",

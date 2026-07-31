@@ -5,13 +5,21 @@ Only frames go to stdout. Everything else goes to stderr — a stray print()
 on stdout desynchronises the protocol.
 """
 
-MAX_PAYLOAD_BYTES = 4194304
+# Three separate bounds, and they must stay separate even while two of them
+# hold the same number. The frame cap is what the decoder enforces; the two
+# content limits are what the senders enforce BEFORE wrapping a body in its
+# 8-byte timestamp. v2 used one constant for all of it, which made a
+# maximum-size image unsendable while looking like it was within the limit.
+MAX_PAYLOAD_BYTES = 8388608
+MAX_TEXT_BYTES = 4194304
+MAX_IMAGE_BYTES = 4194304
 HEADER_BYTES = 5
 TYPE_HELLO = 0x00
 TYPE_CLIP = 0x01
 TYPE_CLIP_STATE = 0x02
-PROTOCOL_VERSION = 2
-_KNOWN_TYPES = (TYPE_HELLO, TYPE_CLIP, TYPE_CLIP_STATE)
+TYPE_IMAGE_CLIP = 0x03
+PROTOCOL_VERSION = 3
+_KNOWN_TYPES = (TYPE_HELLO, TYPE_CLIP, TYPE_CLIP_STATE, TYPE_IMAGE_CLIP)
 
 
 class FrameError(Exception):
@@ -569,12 +577,15 @@ class Agent:
             return
         # The size bound matches _local_change's own send-side guard: this
         # branch reads the live clipboard independently, and without it,
-        # winning a reconciliation over content at or beyond the cap would
-        # build a frame that exceeds MAX_PAYLOAD_BYTES once wrapped in its
-        # 8-byte timestamp prefix -- the peer's decode_frame rejects that as
-        # oversized and drops the whole channel over a single large clip.
-        if len(text) + TIMESTAMP_BYTES > MAX_PAYLOAD_BYTES:
-            log("skipping a clip of %d bytes: over the frame cap" % len(text))
+        # winning a reconciliation over content at or beyond the TEXT limit
+        # would build a payload that exceeds MAX_TEXT_BYTES once wrapped in
+        # its 8-byte timestamp prefix. This is the text-content limit, not
+        # the (larger) MAX_PAYLOAD_BYTES wire cap decode_frame enforces --
+        # since Task 4 the two are separate, and a send this size would
+        # still fit inside the frame cap; it is refused here purely as a
+        # matter of the policy text clips are held to.
+        if len(text) + TIMESTAMP_BYTES > MAX_TEXT_BYTES:
+            log("skipping a clip of %d bytes: over the text limit" % len(text))
             return
         # mine[1] (our stored ts), not now: the content has not changed, only
         # been re-announced, so its recorded age must be preserved. Sending
@@ -893,14 +904,16 @@ class Agent:
         # exactly the non-change signals the one-shot value cannot.
         if text == last_seen:
             return
-        # Since this task wraps the observed text in encode_clip_payload
-        # before it reaches the wire, the cap must account for the 8-byte
-        # timestamp prefix -- text at exactly MAX_PAYLOAD_BYTES would
-        # otherwise encode to a frame 8 bytes over it, which the peer's
-        # decode_frame rejects as oversized, dropping the whole channel over
-        # a single large-but-not-overlong clip.
-        if len(text) + TIMESTAMP_BYTES > MAX_PAYLOAD_BYTES:
-            log("skipping a clip of %d bytes: over the frame cap" % len(text))
+        # This text is wrapped in encode_clip_payload before it reaches the
+        # wire, so the cap must account for the 8-byte timestamp prefix --
+        # text at exactly MAX_TEXT_BYTES would otherwise encode to a payload
+        # 8 bytes over the text-content limit. MAX_TEXT_BYTES, not the
+        # (larger) MAX_PAYLOAD_BYTES the decoder enforces: since Task 4 the
+        # two are separate constants, and content between the two would
+        # still fit inside a frame -- this guard is the text-specific
+        # policy limit, not a wire-safety necessity.
+        if len(text) + TIMESTAMP_BYTES > MAX_TEXT_BYTES:
+            log("skipping a clip of %d bytes: over the text limit" % len(text))
             return
         # Persisted before the send, unconditional on the send's outcome:
         # what we hold and how old it is changed the instant it was

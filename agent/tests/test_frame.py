@@ -5,13 +5,19 @@ import unittest
 
 from agent_under_test import (
     Agent,
+    MAX_IMAGE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    MAX_TEXT_BYTES,
     OversizedFrame,
     PROTOCOL_VERSION,
     SKEW_WARN_SECONDS,
+    TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
     TYPE_HELLO,
+    TYPE_IMAGE_CLIP,
     UnknownFrameType,
+    _KNOWN_TYPES,
     decode_frame,
     encode_clip_payload,
     encode_frame,
@@ -60,13 +66,14 @@ class TestFrame(unittest.TestCase):
         self.assertEqual(decode_frame(buffer), (TYPE_CLIP, b""))
 
     def test_max_payload_boundary_incomplete(self):
-        # Frame declaring exactly MAX_PAYLOAD_BYTES (4194304) is incomplete, not oversized
-        buffer = bytearray(b"\x00\x40\x00\x00\x00")
+        # Frame declaring exactly MAX_PAYLOAD_BYTES (8388608, this task's new
+        # frame cap -- see TestV3Constants) is incomplete, not oversized
+        buffer = bytearray(b"\x00\x80\x00\x00\x00")
         self.assertIsNone(decode_frame(buffer))
 
     def test_max_payload_boundary_exceeded(self):
-        # Frame declaring MAX_PAYLOAD_BYTES + 1 (4194305) is oversized
-        buffer = bytearray(b"\x00\x40\x00\x01\x00")
+        # Frame declaring MAX_PAYLOAD_BYTES + 1 (8388609) is oversized
+        buffer = bytearray(b"\x00\x80\x00\x01\x00")
         with self.assertRaises(OversizedFrame):
             decode_frame(buffer)
 
@@ -89,8 +96,8 @@ class TestFrame(unittest.TestCase):
         self.assertEqual(decode_frame(buffer), (TYPE_CLIP_STATE, b"state"))
         self.assertEqual(len(buffer), 0)
 
-    def test_protocol_version_is_bumped_to_v2(self):
-        self.assertEqual(PROTOCOL_VERSION, 2)
+    def test_protocol_version_is_bumped_to_v3(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
 
     def test_hello_payload_contains_sent_at_as_a_number(self):
         # Checks only what we SEND: parse the built payload directly rather
@@ -100,6 +107,32 @@ class TestFrame(unittest.TestCase):
         payload = json.loads(agent.hello_payload().decode())
         self.assertIsInstance(payload["sent_at"], float,
                                "sent_at must be a JSON number, not a string")
+
+
+class TestV3Constants(unittest.TestCase):
+    """Task 4: the frame cap and the two content limits are three separate
+    numbers that happen to share two values today (see the comment on the
+    constants themselves in clipwire-agent.py). Bare names here, not an
+    `agent.` prefix -- unlike test_watcher.py (which binds the local name
+    `agent` to `Agent(...)` instances at a dozen call sites), this file
+    imports individual names from agent_under_test and uses them bare, and
+    there is no module-level `agent` alias here to hang a dotted lookup off.
+    """
+
+    def test_the_frame_cap_is_larger_than_either_content_limit(self):
+        self.assertEqual(MAX_PAYLOAD_BYTES, 8388608)
+        self.assertEqual(MAX_TEXT_BYTES, 4194304)
+        self.assertEqual(MAX_IMAGE_BYTES, 4194304)
+        self.assertGreater(MAX_PAYLOAD_BYTES,
+                           MAX_IMAGE_BYTES + TIMESTAMP_BYTES,
+                           "a maximum-size image plus its ts must fit in a frame")
+
+    def test_the_image_clip_type_is_known(self):
+        self.assertEqual(TYPE_IMAGE_CLIP, 0x03)
+        self.assertIn(TYPE_IMAGE_CLIP, _KNOWN_TYPES)
+
+    def test_the_protocol_version_is_three(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
 
 
 class TestSkewLogLine(unittest.TestCase):

@@ -16,7 +16,7 @@ enum AgentPaths {
 }
 
 enum ProtocolConstants {
-    static let version = 2
+    static let version = 3
     static let agentVersion = "0.1.0"
 
     static var helloPayload: Data {
@@ -645,15 +645,19 @@ func handleFrame(
             // The size bound matches PasteboardWatcher's own send-side guard
             // (Pasteboard.swift): this branch reads the live pasteboard
             // independently, and without it, winning a reconciliation over
-            // content at or beyond the cap would build a `ClipPayload` whose
-            // encoded frame exceeds `FrameConstants.maxPayloadBytes` -- the
-            // peer's `Frame.decode` rejects that as oversized and drops the
-            // whole channel. Logged (unlike a merely-empty pasteboard, which
-            // is not a skip at all) so a user whose large paste never syncs
-            // has something to look at, matching the Python agent's
-            // existing "skipping a clip of N bytes" line for the same cap.
-            guard data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
-                log.line("skipping a clip of \(data.count) bytes: over the frame cap")
+            // content at or beyond the TEXT limit would build a `ClipPayload`
+            // whose encoded frame exceeds `FrameConstants.maxTextBytes`. This
+            // is the text-content limit, not the (larger)
+            // `FrameConstants.maxPayloadBytes` wire cap `Frame.decode`
+            // enforces -- since Task 4 the two are separate, and a send this
+            // size would still fit inside the frame cap; it is refused here
+            // purely as a matter of the policy text clips are held to.
+            // Logged (unlike a merely-empty pasteboard, which is not a skip
+            // at all) so a user whose large paste never syncs has something
+            // to look at, matching the Python agent's existing "skipping a
+            // clip of N bytes" line for the same limit.
+            guard data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
+                log.line("skipping a clip of \(data.count) bytes: over the text limit")
                 return
             }
             let text = String(decoding: data, as: UTF8.self)
@@ -712,6 +716,18 @@ func handleFrame(
         persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts),
                          to: clipStateStore, log: log)
         status.recordReceived()
+    case .imageClip:
+        // Task 4 adds this case to `FrameType`, which makes this switch
+        // non-exhaustive without a branch for it -- a compiler requirement,
+        // not a feature request. Image sync itself is out of scope here
+        // (Task 5+ wires real handling); this is deliberately the smallest
+        // legal body. A silent no-op would break with this file's own
+        // convention (stated above, at `.clip`): not-yet-handled input is
+        // logged, never swallowed invisibly. `default:` would satisfy the
+        // compiler too, but would also hide the NEXT unhandled case the
+        // same way -- an explicit case here means adding a fifth frame type
+        // later fails to compile again instead of silently falling through.
+        log.line("received an image clip — image sync is not implemented yet")
     }
 }
 

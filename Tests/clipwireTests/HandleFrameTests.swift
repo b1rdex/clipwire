@@ -354,7 +354,13 @@ final class HandleFrameTests: XCTestCase {
     func testAMatchedHelloLogsTheSkewAgainstTheInjectedNow() {
         let path = tempLogPath()
         let log = Log(path: path)
-        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.0}"#.utf8)
+        // Built from ProtocolConstants.version rather than a hardcoded
+        // literal -- matches test_mainloop.py's own comment on the Python
+        // side's equivalent hello builder. A literal "2" here was exactly
+        // what this task's version bump to 3 broke: this hello must MATCH
+        // to reach the skew-logging code this test is actually pinning, and
+        // a stale literal silently turns it into a mismatch instead.
+        let hello = Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0","sent_at":1000.0}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: hello),
                     send: { _ in }, noteWrittenLocally: { _ in },
@@ -370,7 +376,9 @@ final class HandleFrameTests: XCTestCase {
     func testABadlySkewedPeerWarns() {
         let path = tempLogPath()
         let log = Log(path: path)
-        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.0}"#.utf8)
+        // See testAMatchedHelloLogsTheSkewAgainstTheInjectedNow: must match
+        // ProtocolConstants.version, not repeat a hardcoded literal.
+        let hello = Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0","sent_at":1000.0}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: hello),
                     send: { _ in }, noteWrittenLocally: { _ in },
@@ -391,7 +399,10 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: path)
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
-        handleFrame(Frame(type: .hello, payload: Data(#"{"protocol":2,"agent":"0.1.0"}"#.utf8)),
+        // Must match ProtocolConstants.version -- see
+        // testAMatchedHelloLogsTheSkewAgainstTheInjectedNow.
+        handleFrame(Frame(type: .hello,
+                          payload: Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0"}"#.utf8)),
                     send: { _ in }, noteWrittenLocally: { _ in },
                     pasteboard: RecordingPasteboard(), status: status,
                     log: log, clipStateStore: tempClipStateStore(),
@@ -430,7 +441,9 @@ final class HandleFrameTests: XCTestCase {
         let path = tempLogPath()
         let log = Log(path: path)
         let now: Double = 1_000_000
-        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000000.0}"#.utf8)
+        // Must match ProtocolConstants.version -- see
+        // testAMatchedHelloLogsTheSkewAgainstTheInjectedNow.
+        let hello = Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0","sent_at":1000000.0}"#.utf8)
         let store = tempClipStateStore()
 
         handleFrame(Frame(type: .hello, payload: hello),
@@ -607,16 +620,18 @@ final class HandleFrameTests: XCTestCase {
     /// Unlike the watcher's own local-change path, this branch reads the
     /// live pasteboard independently and, before this fix, applied no size
     /// bound at all: winning a reconciliation over content at or beyond the
-    /// cap would build a `ClipPayload` whose encoded frame exceeds
-    /// `FrameConstants.maxPayloadBytes`, and the peer's `Frame.decode`
-    /// would reject it as oversized and drop the whole channel -- the same
+    /// TEXT limit would build a `ClipPayload` whose encoded frame exceeds
+    /// `FrameConstants.maxTextBytes` -- the same
     /// boundary `PasteboardTests.testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt`
-    /// pins for the watcher's send path.
+    /// pins for the watcher's send path. Since Task 4, `maxTextBytes` (this
+    /// guard) and `maxPayloadBytes` (the wire's frame cap, enforced only by
+    /// `Frame.decode`) are separate constants that happen to still share
+    /// this number.
     func testWinningClipStateWithContentAtExactlyTheCapProducesNoSend() throws {
         let store = tempClipStateStore()
         try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
-        pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxPayloadBytes)
+        pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxTextBytes)
         var sent: [Frame] = []
         let peerState = ClipState(sha256: nil, ts: 0)
 
@@ -638,7 +653,7 @@ final class HandleFrameTests: XCTestCase {
         try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
         let text = String(repeating: "a",
-                          count: FrameConstants.maxPayloadBytes - ClipPayloadConstants.timestampBytes)
+                          count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
         pasteboard.textToRead = Data(text.utf8)
         var sent: [Frame] = []
         let peerState = ClipState(sha256: nil, ts: 0)
@@ -661,7 +676,7 @@ final class HandleFrameTests: XCTestCase {
         let store = tempClipStateStore()
         try store.save(ClipState(sha256: Self.hashA, ts: 777))
         let pasteboard = RecordingPasteboard()
-        let oversized = FrameConstants.maxPayloadBytes
+        let oversized = FrameConstants.maxTextBytes
         pasteboard.textToRead = Data(repeating: 0x61, count: oversized)
         let peerState = ClipState(sha256: nil, ts: 0)
         let logPath = FileManager.default.temporaryDirectory
@@ -1213,5 +1228,32 @@ final class HandleFrameTests: XCTestCase {
         log.flush()
         XCTAssertEqual(persistFailures(at: path).count, 1,
                        "an applied clip whose state cannot be persisted must not be silent")
+    }
+
+    // MARK: - Task 4: FrameType.imageClip is a compiler-forced case, not a feature
+
+    /// Adding `.imageClip` to `FrameType` (Task 4) makes this function's
+    /// switch over `frame.type` non-exhaustive unless a case is added for
+    /// it -- a compiler requirement, not a feature request. Image sync
+    /// itself is Task 5+'s job. This pins only the minimal legal body
+    /// added here: the frame is received and logged, and produces no other
+    /// effect -- no reply, no echo-suppression arm, no pasteboard write.
+    func testImageClipFrameIsReceivedAndLoggedButNotYetHandled() {
+        let pasteboard = RecordingPasteboard()
+        var sent: [Frame] = []
+        let logPath = tempLogPath()
+        let log = Log(path: logPath)
+
+        handleFrame(Frame(type: .imageClip, payload: Data("not yet a real image".utf8)),
+                    send: { sent.append($0) },
+                    noteWrittenLocally: { _ in XCTFail("must not arm echo suppression for an unhandled type") },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()), log: log,
+                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty, "must not reply to or forward an image clip yet")
+        XCTAssertTrue(pasteboard.writtenTexts.isEmpty, "must not write anything to the pasteboard yet")
+        XCTAssertTrue(loggedMessages(at: logPath).contains { $0.contains("image clip") },
+                     "expected the receipt to be logged; got: \(loggedMessages(at: logPath))")
     }
 }

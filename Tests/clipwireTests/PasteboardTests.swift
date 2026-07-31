@@ -122,7 +122,7 @@ final class PasteboardTests: XCTestCase {
         var seen: [Data] = []
         watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
-        pasteboard.set(String(repeating: "x", count: FrameConstants.maxPayloadBytes + 1))
+        pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes + 1))
         watcher.poll()
         XCTAssertTrue(seen.isEmpty)
     }
@@ -131,21 +131,23 @@ final class PasteboardTests: XCTestCase {
     /// directly, which was exact back when that text WAS the frame payload.
     /// Since Task 9, `wireAgent` wraps this text in `ClipPayload(ts:text:)`
     /// before it reaches the wire, adding an 8-byte prefix -- so text at
-    /// exactly the cap would encode to a frame 8 bytes OVER it, and the
-    /// peer's `Frame.decode` would reject it as oversized and drop the whole
-    /// channel over a single large-but-not-overlong clip.
+    /// exactly the cap would encode to a payload 8 bytes OVER the TEXT
+    /// limit, and the peer's `Frame.decode` would reject the resulting
+    /// frame as oversized if it also exceeded the (larger) frame cap.
     /// `testOversizedClipIsSkipped` above (`max + 1`) cannot see this: it is
     /// oversized under either the old or the new guard, so it sails past
-    /// the boundary this test targets. Matches the plan's own global
-    /// constraint: "Max payload stays 4 MiB, now including the 8-byte
-    /// timestamp prefix."
+    /// the boundary this test targets.
+    /// Since Task 4, `FrameConstants.maxTextBytes` (this guard) and
+    /// `FrameConstants.maxPayloadBytes` (the wire's frame cap, enforced only
+    /// by `Frame.decode`) are separate constants that happen to still share
+    /// this number -- this test targets the text-content limit specifically.
     func testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
         watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
-        pasteboard.set(String(repeating: "x", count: FrameConstants.maxPayloadBytes))
+        pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes))
         watcher.poll()
         XCTAssertTrue(seen.isEmpty,
                       "text of exactly the cap would encode to a ClipPayload 8 bytes over it")
@@ -163,12 +165,12 @@ final class PasteboardTests: XCTestCase {
         watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
         let text = String(repeating: "x",
-                          count: FrameConstants.maxPayloadBytes - ClipPayloadConstants.timestampBytes)
+                          count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
         pasteboard.set(text)
         watcher.poll()
         XCTAssertEqual(seen, [Data(text.utf8)],
                        "must still be emitted -- the encoded ClipPayload is exactly at the cap, not over it")
-        XCTAssertEqual(ClipPayload(ts: 1, text: text).encode().count, FrameConstants.maxPayloadBytes,
+        XCTAssertEqual(ClipPayload(ts: 1, text: text).encode().count, FrameConstants.maxTextBytes,
                        "sanity check on the boundary itself")
     }
 
@@ -185,7 +187,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4, log: log)
         watcher.poll()
-        let oversized = FrameConstants.maxPayloadBytes
+        let oversized = FrameConstants.maxTextBytes
         pasteboard.set(String(repeating: "x", count: oversized))
         watcher.poll()
         log.flush()

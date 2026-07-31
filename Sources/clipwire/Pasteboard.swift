@@ -158,14 +158,17 @@ final class PasteboardWatcher {
         // ever reaches the wire, adding an 8-byte prefix -- so the bound
         // here must leave room for it. Checking `text.count` alone (exact
         // before Task 9, when this text WAS the frame payload) would let
-        // text at exactly the cap encode to a frame 8 bytes over it, which
-        // the peer's `Frame.decode` rejects as oversized, dropping the
-        // whole channel over a single large-but-not-overlong clip.
-        guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+        // text at exactly the cap encode to a payload 8 bytes over the
+        // TEXT limit. `maxTextBytes`, not the (larger) `maxPayloadBytes`
+        // the decoder enforces: since Task 4 the two are separate
+        // constants, and content between the two would still fit inside a
+        // frame -- this guard is the text-specific policy limit, not a
+        // wire-safety necessity.
+        guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
             // Logged so a user whose large local copy never reaches the
             // peer has something to look at, matching the Python agent's
-            // existing "skipping a clip of N bytes" line for the same cap.
-            log?.line("skipping a clip of \(text.count) bytes: over the frame cap")
+            // existing "skipping a clip of N bytes" line for the same limit.
+            log?.line("skipping a clip of \(text.count) bytes: over the text limit")
             return nil
         }
         guard echo.shouldSend(text) else { return nil }
