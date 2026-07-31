@@ -1,13 +1,18 @@
 # agent/tests/test_clip_state_store.py
+import hashlib
 import os
 import tempfile
 import unittest
 
 from agent_under_test import (
+    announce_clip_state,
     clip_state_path,
+    decode_clip_state,
     load_clip_state,
+    resolve_current_clip_state,
     resolve_startup_state,
     save_clip_state,
+    sha256_hex,
 )
 
 
@@ -164,6 +169,143 @@ class TestResolveStartupState(unittest.TestCase):
     def test_current_hash_none_and_nothing_stored_returns_none_hash(self):
         result = resolve_startup_state(None, None, 999)
         self.assertIsNone(result[0])
+
+
+class FixedReadClipboard:
+    """A clipboard double whose read() always returns the same fixed value
+    -- unlike test_watcher.py's QueueClipboard, which pops a scripted
+    sequence. resolve_current_clip_state reads the clipboard exactly once
+    per call, so either double would work here; this one is used so a test
+    that calls it more than once (never needed today, but cheap to keep
+    true) still sees the SAME clipboard content each time, matching how a
+    real clipboard behaves between two reads with nothing in between."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def read(self):
+        return self._value
+
+
+class TestResolveCurrentClipState(unittest.TestCase):
+    """Mirrors Sources/clipwire/ClipStateStore.swift's
+    resolveCurrentClipState / ClipStateStoreTests.swift coverage of it:
+    reconciles what the clipboard holds RIGHT NOW against what was last
+    persisted. A None or empty clipboard must never be hashed -- it must
+    resolve exactly like resolve_startup_state's own None-hash case,
+    matching the wire contract that sha256 is null for exactly that
+    clipboard state."""
+
+    def test_empty_clipboard_resolves_to_a_none_hash(self):
+        clipboard = FixedReadClipboard(None)
+        result = resolve_current_clip_state(clipboard, stored=("aa", 100), now=999)
+        self.assertIsNone(result[0])
+        self.assertEqual(result[1], 999)
+
+    def test_blank_but_non_none_clipboard_also_resolves_to_a_none_hash(self):
+        """b"" is falsy but not None -- resolve_current_clip_state must
+        treat it the same as a totally empty clipboard, not hash zero
+        bytes and treat that as real content."""
+        clipboard = FixedReadClipboard(b"")
+        result = resolve_current_clip_state(clipboard, stored=None, now=999)
+        self.assertIsNone(result[0])
+
+    def test_content_matching_the_store_keeps_the_stored_timestamp(self):
+        """The load-bearing case: unchanged content must keep its true
+        recorded age, not look freshly copied just because a new process
+        is asking. now (999) and the stored ts (100) are deliberately
+        different, so a bug that returns `now` instead cannot pass by
+        coincidence."""
+        text = b"unchanged clip"
+        clipboard = FixedReadClipboard(text)
+        stored = (hashlib.sha256(text).hexdigest(), 100)
+        result = resolve_current_clip_state(clipboard, stored, now=999)
+        self.assertEqual(result, (stored[0], 100))
+
+    def test_content_differing_from_the_store_uses_now(self):
+        clipboard = FixedReadClipboard(b"brand new content")
+        stored = ("some-other-hash-entirely", 100)
+        result = resolve_current_clip_state(clipboard, stored, now=999)
+        self.assertEqual(
+            result,
+            (hashlib.sha256(b"brand new content").hexdigest(), 999),
+        )
+
+    def test_nothing_stored_uses_now(self):
+        clipboard = FixedReadClipboard(b"first time seeing this")
+        result = resolve_current_clip_state(clipboard, stored=None, now=999)
+        self.assertEqual(
+            result,
+            (hashlib.sha256(b"first time seeing this").hexdigest(), 999),
+        )
+
+
+class TestAnnounceClipState(unittest.TestCase):
+    """announce_clip_state, tested directly against the free function rather
+    than through Agent.clipboard_became_ready -- mirrors
+    HandleFrameTests.swift's "announceClipState: the outgoing announcement,
+    tested directly" section, for the same reason: the load-bearing cases
+    need control over `now` that going through the full phase machine would
+    obscure."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "clip-state.json")
+
+    def test_keeps_stored_timestamp_when_content_is_unchanged(self):
+        text = b"same"
+        save_clip_state(sha256_hex(text), 555, path=self.path)
+        sent = []
+
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(text),
+                            now=999999, path=self.path)
+
+        self.assertEqual(len(sent), 1)
+        decoded = decode_clip_state(sent[0][1])
+        self.assertEqual(decoded[1], 555, "content unchanged since last recorded must keep its real age")
+
+    def test_uses_now_when_content_changed_while_apart(self):
+        save_clip_state("some-other-hash-entirely", 111, path=self.path)
+        sent = []
+
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"new content"),
+                            now=999999, path=self.path)
+
+        decoded = decode_clip_state(sent[0][1])
+        self.assertEqual(decoded[1], 999999, "content changed while apart -- only now is honest")
+
+    def test_persists_the_resolved_value(self):
+        """So a later .clipState comparison (or a crash immediately
+        afterward) sees the reconciled value, not whatever was on disk
+        before this connection began."""
+        sent = []
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"fresh content"),
+                            now=42, path=self.path)
+
+        self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0))
+
+    def test_still_sends_when_the_store_cannot_be_saved(self):
+        """A local disk failure is not the peer's fault, and must not
+        silently disable reconciliation for this connection. Forces a real
+        save failure (a plain file occupying the path where the store needs
+        to create a directory) rather than asserting this from reading the
+        implementation, mirroring
+        HandleFrameTests.testAnnounceClipStateStillSendsWhenTheStoreCannotBeSaved."""
+        blocker = os.path.join(self._tmp.name, "blocker")
+        with open(blocker, "wb") as handle:
+            handle.write(b"occupying this name")
+        unsaveable_path = os.path.join(blocker, "clip-state.json")
+        # Confirm the setup actually forces a failure, or this test proves nothing.
+        with self.assertRaises(OSError):
+            save_clip_state("aa", 1, path=unsaveable_path)
+
+        sent = []
+        announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard(b"still send this"),
+                            now=1, path=unsaveable_path)
+
+        self.assertEqual(len(sent), 1,
+                         "a local disk failure must not prevent the announcement from going out")
 
 
 if __name__ == "__main__":

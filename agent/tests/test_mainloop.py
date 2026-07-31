@@ -9,7 +9,14 @@ import time
 import unittest
 import pathlib
 
-from agent_under_test import Agent, PROTOCOL_VERSION, TYPE_HELLO, decode_frame, encode_frame
+from agent_under_test import (
+    Agent,
+    PROTOCOL_VERSION,
+    TYPE_CLIP_STATE,
+    TYPE_HELLO,
+    decode_frame,
+    encode_frame,
+)
 
 # agent_under_test registers the loaded module under this name in
 # sys.modules; grabbed here only to reach a module-level tuning constant
@@ -127,6 +134,40 @@ class TestMainLoop(unittest.TestCase):
                     "a non-object hello payload must fail via FrameError (exit 2), "
                     "not an uncaught AttributeError",
                 )
+
+    def test_agent_exits_cleanly_on_an_oversized_integer_timestamp_in_a_clip_state_frame(self):
+        """The real deployed agent's twin of test_freshness.py's
+        test_decode_rejects_an_oversized_integer_timestamp and
+        test_watcher.py's TestIncomingClipState.
+        test_a_malformed_clip_state_raises_a_clip_state_error_not_a_crash.
+
+        json.loads parses a 400-digit integer ts as arbitrary-precision
+        int; math.isfinite's int-to-float conversion then raises a bare
+        OverflowError, which (before this task's fix) is not a FrameError
+        and so is not caught by main()'s `except FrameError` -- an
+        uncaught exception exits 1 with a raw traceback on stderr. Exit
+        code 2 is the discriminator, exactly as
+        test_agent_exits_cleanly_on_non_object_hello_payload's own comment
+        explains: it is only reachable through main()'s `except
+        FrameError`, so it proves decode_clip_state raised the intended
+        ClipStateError rather than crashing."""
+        env = dict(os.environ, CLIPWIRE_FAKE_CLIPBOARD="never-ready")
+        process = subprocess.Popen(
+            [sys.executable, str(AGENT)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
+        oversized_ts_payload = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+        process.stdin.write(encode_frame(TYPE_CLIP_STATE, oversized_ts_payload))
+        process.stdin.flush()
+        self.assertEqual(
+            process.wait(timeout=10), 2,
+            "an oversized-integer ts in a clip-state frame must fail via "
+            "ClipStateError/FrameError (exit 2), not an uncaught OverflowError",
+        )
 
     def test_partial_hello_frame_split_across_two_writes_is_reassembled(self):
         """A frame split across two stdin reads (a slow or chunked SSH

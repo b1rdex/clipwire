@@ -140,6 +140,33 @@ class TestClipStateCodec(unittest.TestCase):
         with self.assertRaises(ClipStateError):
             decode_clip_state(b"not json")
 
+    def test_decode_rejects_an_oversized_integer_timestamp(self):
+        """The wire-path twin of test_clip_state_store.py's
+        test_oversized_integer_timestamp_loads_as_none. json.loads parses an
+        integer literal as arbitrary-precision int, unlike a float literal
+        (1e400 already becomes inf, caught by the ordinary isfinite check).
+        A 400-digit integer ts instead passes decode_clip_state's own
+        isinstance(ts, (int, float)) check and only fails inside
+        math.isfinite's int-to-float conversion, raising a bare
+        OverflowError -- not a ClipStateError, and therefore not a
+        FrameError, so main()'s `except FrameError` would not catch it.
+
+        Until this task there was no call site for decode_clip_state whose
+        input is peer-controlled: load_clip_state (test_clip_state_store.py)
+        already guards its own call site by catching OverflowError there,
+        because that input is this agent's own prior write to its own
+        disk. The new wire call site (Agent._on_clip_state, added by this
+        task) has no such local guard and none is added -- it deliberately
+        mirrors _on_hello's existing bare `raise FrameError(...)`, so a
+        malformed clip-state closes the connection exactly like a malformed
+        hello does, via main()'s `except FrameError`. That symmetry only
+        holds if decode_clip_state itself never raises anything outside the
+        FrameError family -- which is what this test pins, at the source,
+        rather than only at one caller."""
+        oversized = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+        with self.assertRaises(ClipStateError):
+            decode_clip_state(oversized)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,19 +3,29 @@ import io
 import os
 import pathlib
 import subprocess
+import tempfile
 import time
 import unittest
 from unittest import mock
 
 from agent_under_test import (
     Agent,
+    ClipStateError,
     GPASTE_BUS_NAME,
     GPasteWatcher,
     MAX_PAYLOAD_BYTES,
     PollingWatcher,
+    TIMESTAMP_BYTES,
     TYPE_CLIP,
+    TYPE_CLIP_STATE,
+    decode_clip_payload,
+    encode_clip_payload,
+    encode_clip_state,
+    load_clip_state,
     make_watcher,
     parse_gpaste_line,
+    save_clip_state,
+    sha256_hex,
 )
 
 # agent_under_test registers the loaded module under this name in
@@ -318,9 +328,18 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
     make_watcher is patched throughout so these tests never touch a real
     subprocess or thread."""
 
+    def setUp(self):
+        # clipboard_became_ready()'s new announce step persists through
+        # save_clip_state/load_clip_state, which touch the real production
+        # path when clip_state_path is None -- see TestEchoBookkeeping.setUp.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
     def build(self, ready=False):
         return Agent(
-            stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=ready)
+            stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=ready),
+            clip_state_path=self.clip_state_path,
         )
 
     def test_watcher_is_created_and_started_when_the_clipboard_becomes_ready(self):
@@ -365,9 +384,21 @@ class TestEchoBookkeeping(unittest.TestCase):
     Task 8's tests only exercise the immediate write path -- several of
     these cover the pending-clip path too, which is easy to forget."""
 
+    def setUp(self):
+        # _write_clip, _local_change and clipboard_became_ready's new
+        # announce step all persist through save_clip_state/load_clip_state,
+        # which default to the real production path
+        # (~/.local/state/clipwire/clip-state.json) when clip_state_path is
+        # None. Every Agent built in this class gets its own temp path so no
+        # test in this file ever touches that real location.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
     def build(self, ready=False):
         return Agent(
-            stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=ready)
+            stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=ready),
+            clip_state_path=self.clip_state_path,
         )
 
     def become_ready_without_a_real_watcher(self, agent):
@@ -376,14 +407,14 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_write_clip_writes_and_arms_the_suppression(self):
         agent = self.build(ready=True)
-        agent._write_clip(b"hello")
+        agent._write_clip(encode_clip_payload(1.0, b"hello"))
         self.assertEqual(agent.clipboard.written, [b"hello"])
         self.assertEqual(agent._last_written, b"hello")
 
     def test_immediate_clip_delivery_arms_the_suppression(self):
         agent = self.build(ready=True)
         self.become_ready_without_a_real_watcher(agent)
-        agent.on_frame(TYPE_CLIP, b"now")
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"now"))
         self.assertEqual(agent.clipboard.written, [b"now"])
         self.assertEqual(agent._last_written, b"now")
 
@@ -393,7 +424,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         the very next poll tick would bounce our own delivered clip back to
         the peer as if the user had copied it."""
         agent = self.build(ready=False)
-        agent.on_frame(TYPE_CLIP, b"queued while pending")
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"queued while pending"))
         agent.clipboard._ready = True
         self.become_ready_without_a_real_watcher(agent)
         self.assertEqual(agent.clipboard.written, [b"queued while pending"])
@@ -401,7 +432,7 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_matching_echo_is_suppressed_and_consumed(self):
         agent = self.build(ready=True)
-        agent._write_clip(b"hello")
+        agent._write_clip(encode_clip_payload(1.0, b"hello"))
         agent.clipboard.queue_read(b"hello")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -421,12 +452,13 @@ class TestEchoBookkeeping(unittest.TestCase):
         original text. The suppression must be consumed by the first
         observed change, whatever it is, not only by a matching one."""
         agent = self.build(ready=True)
-        agent._write_clip(b"hello")
+        agent._write_clip(encode_clip_payload(1.0, b"hello"))
         agent.clipboard.queue_read(b"something else")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
-        agent._local_change()
-        self.assertEqual(sent, [(TYPE_CLIP, b"something else")])
+        with mock.patch("time.time", return_value=1234.5):
+            agent._local_change()
+        self.assertEqual(sent, [(TYPE_CLIP, encode_clip_payload(1234.5, b"something else"))])
         self.assertIsNone(
             agent._last_written,
             "the suppression must be consumed on a mismatch too, not only on a match",
@@ -437,8 +469,9 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.clipboard.queue_read(b"typed by the user")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
-        agent._local_change()
-        self.assertEqual(sent, [(TYPE_CLIP, b"typed by the user")])
+        with mock.patch("time.time", return_value=1234.5):
+            agent._local_change()
+        self.assertEqual(sent, [(TYPE_CLIP, encode_clip_payload(1234.5, b"typed by the user"))])
 
     def test_deliberate_recopy_still_syncs_after_a_missed_echo(self):
         """Mirrors EchoGuardTests.testDeliberateRecopyStillSyncsAfterAMissedEcho
@@ -449,16 +482,19 @@ class TestEchoBookkeeping(unittest.TestCase):
         our_write = b"our own write"
         something_else = b"a different clip the user made"
 
-        agent._write_clip(our_write)
+        agent._write_clip(encode_clip_payload(1.0, our_write))
         agent.clipboard.queue_read(something_else)
-        agent._local_change()  # the poll missed our echo, saw the user's clip instead
+        with mock.patch("time.time", return_value=10.0):
+            agent._local_change()  # the poll missed our echo, saw the user's clip instead
 
         agent.clipboard.queue_read(our_write)
-        agent._local_change()  # a deliberate re-copy of our own text, later
+        with mock.patch("time.time", return_value=20.0):
+            agent._local_change()  # a deliberate re-copy of our own text, later
 
         self.assertEqual(
             sent,
-            [(TYPE_CLIP, something_else), (TYPE_CLIP, our_write)],
+            [(TYPE_CLIP, encode_clip_payload(10.0, something_else)),
+             (TYPE_CLIP, encode_clip_payload(20.0, our_write))],
             "a later deliberate re-copy of our own text must still sync",
         )
 
@@ -468,7 +504,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         exercised."""
         agent = self.build(ready=False)
         delivered = b"queued while pending"
-        agent.on_frame(TYPE_CLIP, delivered)
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, delivered))
         agent.clipboard._ready = True
         self.become_ready_without_a_real_watcher(agent)
 
@@ -477,16 +513,22 @@ class TestEchoBookkeeping(unittest.TestCase):
         something_else = b"a different clip the user made"
 
         agent.clipboard.queue_read(something_else)
-        agent._local_change()
+        with mock.patch("time.time", return_value=10.0):
+            agent._local_change()
 
         agent.clipboard.queue_read(delivered)
-        agent._local_change()
+        with mock.patch("time.time", return_value=20.0):
+            agent._local_change()
 
-        self.assertEqual(sent, [(TYPE_CLIP, something_else), (TYPE_CLIP, delivered)])
+        self.assertEqual(
+            sent,
+            [(TYPE_CLIP, encode_clip_payload(10.0, something_else)),
+             (TYPE_CLIP, encode_clip_payload(20.0, delivered))],
+        )
 
     def test_empty_read_does_not_consume_an_armed_suppression(self):
         agent = self.build(ready=True)
-        agent._write_clip(b"hello")
+        agent._write_clip(encode_clip_payload(1.0, b"hello"))
         agent.clipboard.queue_read(None)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -504,6 +546,112 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
         self.assertEqual(sent, [])
+
+    def test_text_at_exactly_the_cap_is_skipped_because_the_encoded_frame_would_exceed_it(self):
+        """Since this task, _local_change wraps the observed text in
+        encode_clip_payload before it reaches the wire, adding an 8-byte
+        timestamp prefix -- so text at exactly MAX_PAYLOAD_BYTES would
+        encode to a frame 8 bytes OVER the cap. The pre-existing guard
+        (len(text) > MAX_PAYLOAD_BYTES) cannot see this boundary: it only
+        rejects text already over the cap, one byte too late for content
+        exactly AT it. Mirrors
+        PasteboardTests.testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt
+        on the Swift side."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(sent, [], "text at exactly the cap would encode to a frame 8 bytes over it")
+
+    def test_text_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
+        """The other half of the boundary: content that leaves exact room
+        for the 8-byte timestamp prefix must still be sent -- an
+        over-trimmed fix would silently refuse to sync content the wire
+        format actually supports."""
+        agent = self.build(ready=True)
+        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        agent.clipboard.queue_read(text)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        with mock.patch("time.time", return_value=1.0):
+            agent._local_change()
+        self.assertEqual(sent, [(TYPE_CLIP, encode_clip_payload(1.0, text))])
+
+    def test_local_change_stamps_the_send_with_the_moment_of_observation(self):
+        """The timestamp half of the new send path: the frame must carry
+        the moment _local_change observed the change, not some later
+        moment. Mirrors
+        AgentWiringTests.testAGenuineLocalChangeStoresItsHashAndObservationTimestamp
+        on the Swift side, but pins it against the SENT FRAME here rather
+        than the store (a separate test below pins the store)."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"typed by the user")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        before = time.time()
+        agent._local_change()
+        after = time.time()
+        self.assertEqual(len(sent), 1)
+        ts, text = decode_clip_payload(sent[0][1])
+        self.assertEqual(text, b"typed by the user")
+        self.assertTrue(before <= ts <= after, "expected %r to fall within [%r, %r]" % (ts, before, after))
+
+    def test_local_change_persists_the_observed_hash_and_timestamp(self):
+        """Mirrors AgentWiringTests.testAGenuineLocalChangeStoresItsHashAndObservationTimestamp:
+        a genuine local change must hash the new content and persist it
+        alongside the moment it was OBSERVED, so resolve_startup_state has
+        something accurate to compare against on the next connection."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"typed by the user")
+        agent.send = lambda t, p: None
+        before = time.time()
+        agent._local_change()
+        after = time.time()
+
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(stored[0], sha256_hex(b"typed by the user"))
+        self.assertTrue(before <= stored[1] <= after,
+                        "expected %r to fall within [%r, %r]" % (stored[1], before, after))
+
+    def test_local_change_stores_the_literal_known_hash_for_a_pinned_vector(self):
+        """The outgoing-path twin of
+        TestWriteClipDecodesTheWirePayload.test_stores_the_literal_known_hash_for_a_pinned_vector --
+        the same call-site-hashing bug could hide on either side of the
+        wire independently."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"hi")
+        agent.send = lambda t, p: None
+        agent._local_change()
+
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(
+            stored[0],
+            "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4",
+        )
+
+    def test_local_change_survives_a_real_disk_failure_when_persisting_clip_state(self):
+        """A local disk failure must not prevent the genuine local change
+        from being sent to the peer -- the peer did nothing wrong. Forces a
+        real save failure rather than mocking it, mirroring
+        TestWriteClipDecodesTheWirePayload's own version of this test."""
+        blocker = os.path.join(self._tmp.name, "blocker")
+        with open(blocker, "wb") as handle:
+            handle.write(b"occupying this name")
+        unsaveable_path = os.path.join(blocker, "clip-state.json")
+        with self.assertRaises(OSError):
+            save_clip_state("aa", 1, path=unsaveable_path)
+
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=True),
+                      clip_state_path=unsaveable_path)
+        agent.clipboard.queue_read(b"typed by the user")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent._local_change()
+
+        self.assertEqual(len(sent), 1, "a local disk failure must not prevent the send")
+        self.assertEqual(decode_clip_payload(sent[0][1])[1], b"typed by the user")
 
     # MARK: - _last_seen: persistent memory of what was last synced
     #
@@ -527,7 +675,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         reading "A". _last_written is already spent, so only _last_seen
         can recognize this as not a genuine change."""
         agent = self.build(ready=True)
-        agent._write_clip(b"A")  # "A" arrived from the Mac
+        agent._write_clip(encode_clip_payload(1.0, b"A"))  # "A" arrived from the Mac
         agent.clipboard.queue_read(b"A")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -554,13 +702,14 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.clipboard.queue_read(b"A")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
-        agent._local_change()  # a genuine first sync of "A"
-        self.assertEqual(sent, [(TYPE_CLIP, b"A")])
+        with mock.patch("time.time", return_value=1.0):
+            agent._local_change()  # a genuine first sync of "A"
+        self.assertEqual(sent, [(TYPE_CLIP, encode_clip_payload(1.0, b"A"))])
 
         agent.clipboard.queue_read(b"A")  # unchanged content, spurious signal
         agent._local_change()
         self.assertEqual(
-            sent, [(TYPE_CLIP, b"A")],
+            sent, [(TYPE_CLIP, encode_clip_payload(1.0, b"A"))],
             "a non-change signal must not resend content already known to be in sync",
         )
 
@@ -576,8 +725,9 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.clipboard.queue_read(b"A")
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
-        agent._local_change()  # "A" is now the known-synced value
-        self.assertEqual(sent, [(TYPE_CLIP, b"A")])
+        with mock.patch("time.time", return_value=1.0):
+            agent._local_change()  # "A" is now the known-synced value
+        self.assertEqual(sent, [(TYPE_CLIP, encode_clip_payload(1.0, b"A"))])
 
         # PollingWatcher's read() returned None on a transient timeout, so it
         # treats this tick's previous(A)->current(None) transition as a
@@ -590,7 +740,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent._local_change()
 
         self.assertEqual(
-            sent, [(TYPE_CLIP, b"A")],
+            sent, [(TYPE_CLIP, encode_clip_payload(1.0, b"A"))],
             "a transient read() glitch that recovers to the same content must not resend it",
         )
 
@@ -607,7 +757,15 @@ class TestEchoBookkeeping(unittest.TestCase):
         channel was down. clipboard_became_ready() must seed _last_seen
         from the clipboard before the watcher can observe anything."""
         agent = self.build(ready=True)
+        # Two reads happen inside clipboard_became_ready() now: the seed
+        # read below, and a second read from the new announce-clip-state
+        # step's own resolve_current_clip_state call. QueueClipboard.read()
+        # pops one value per call, so both must be queued or the second
+        # (the announce's) would see an empty queue and read as None --
+        # not a bug in the code under test, just this queue-based double
+        # needing to reflect the extra call.
         agent.clipboard.queue_read(b"already on the pc")  # the seed read
+        agent.clipboard.queue_read(b"already on the pc")  # the announce step's own read
         self.become_ready_without_a_real_watcher(agent)
         self.assertEqual(agent._last_seen, b"already on the pc")
 
@@ -620,6 +778,174 @@ class TestEchoBookkeeping(unittest.TestCase):
             "a spurious signal right after connect must not resend content the PC "
             "already held before anything synced",
         )
+
+
+class OrderRecordingClipboard:
+    """write() snapshots agent._last_written at the exact moment it is
+    called, so a test can pin the ORDER of arm-then-write, not merely that
+    both happened. A version of _write_clip that armed the suppression
+    AFTER writing would still make an occurrence-only assertion
+    (clipboard.written == [...] and agent._last_written == ...) pass, since
+    both would still be true by the time the test looks -- only checking
+    what was armed AT WRITE TIME can tell the two orderings apart. Mirrors
+    HandleFrameTests.swift's RecordingPasteboard.onWrite callback."""
+
+    def __init__(self):
+        self.agent = None  # set after construction, once the real agent exists
+        self.written = []
+        self.armed_at_write_time = []
+
+    def ready(self):
+        return True
+
+    def read(self):
+        return None
+
+    def write(self, data):
+        self.written.append(data)
+        self.armed_at_write_time.append(self.agent._last_written if self.agent else None)
+
+
+class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
+    """_write_clip's contract changed with this task: its argument is now
+    the wire-format [ts][text] payload encode_clip_payload produces, not
+    bare text -- so it must decode before touching the clipboard, arm the
+    suppression with the TEXT (not the ts-prefixed payload -- Contract 2 in
+    HandleFrameTests.swift), and persist the PEER's timestamp, never now."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
+    def test_arms_suppression_strictly_before_writing_to_the_clipboard(self):
+        """The ordering contract, pinned as a SEQUENCE: reversed, the
+        watcher's next poll would observe the new content before the
+        suppression exists and bounce our own applied clip back out."""
+        clipboard = OrderRecordingClipboard()
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=self.clip_state_path)
+        clipboard.agent = agent
+
+        agent._write_clip(encode_clip_payload(1.0, b"hello"))
+
+        self.assertEqual(clipboard.written, [b"hello"])
+        self.assertEqual(
+            clipboard.armed_at_write_time, [b"hello"],
+            "the suppression must already be armed with the decoded text at "
+            "the moment write() runs -- arm-after-write would leave this None",
+        )
+
+    def test_arms_suppression_with_plain_text_not_the_timestamp_prefixed_payload(self):
+        """Distinct from the ordering test above: this pins WHAT is armed.
+        _local_change's own clipboard.read() returns plain text, never a
+        timestamp prefix -- arming with the raw wire payload instead would
+        make the suppression never match a later poll's read, silently
+        disabling echo suppression entirely."""
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(),
+                      clip_state_path=self.clip_state_path)
+        wire_payload = encode_clip_payload(1.0, b"hello")
+
+        agent._write_clip(wire_payload)
+
+        self.assertEqual(agent._last_written, b"hello")
+        self.assertNotEqual(agent._last_written, wire_payload)
+
+    def test_stores_the_peers_timestamp_not_now(self):
+        """The assertion the persistent store's whole design exists to make
+        possible: stamping applied content with `now` instead of the peer's
+        ts would make it look freshly copied here and win the next
+        reconciliation against the machine it actually came from. 424242.0
+        is picked far from wall-clock time specifically so "came from the
+        frame" and "came from now" cannot be confused by coincidence."""
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(),
+                      clip_state_path=self.clip_state_path)
+        peers_ts = 424242.0
+
+        agent._write_clip(encode_clip_payload(peers_ts, b"peer's clip"))
+
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts),
+                         "must store the PEER's ts, never now")
+
+    def test_stores_the_literal_known_hash_for_a_pinned_vector(self):
+        """Closes a gap a self-referential assertion cannot: comparing the
+        stored hash against sha256_hex(b"hi") itself would still pass even
+        if _write_clip hashed the wrong bytes (the ts-prefixed wire
+        payload, or a str re-decoded/re-encoded differently), as long as it
+        did so consistently with sha256_hex's own behavior. This pins the
+        LITERAL, independently-verified digest instead -- see
+        fixtures/hashes.json, read by both suites."""
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(),
+                      clip_state_path=self.clip_state_path)
+
+        agent._write_clip(encode_clip_payload(1.0, b"hi"))
+
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(
+            stored,
+            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0),
+        )
+
+    def test_a_malformed_too_short_payload_touches_neither_suppression_nor_the_clipboard(self):
+        """Mirrors Sources/clipwire/main.swift's handleFrame .clip case:
+        `guard let decoded = try? ClipPayload.decode(...) else { return }`.
+        A payload shorter than the 8-byte timestamp prefix cannot decode at
+        all; _write_clip must swallow that quietly, exactly as an
+        undecodable or empty clip frame already did before this task."""
+        clipboard = OrderRecordingClipboard()
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=self.clip_state_path)
+        clipboard.agent = agent
+
+        agent._write_clip(b"\x00\x01\x02")  # 3 bytes: shorter than TIMESTAMP_BYTES
+
+        self.assertEqual(clipboard.written, [])
+        self.assertIsNone(agent._last_written)
+        self.assertIsNone(load_clip_state(path=self.clip_state_path),
+                          "a payload that never decoded must not be persisted")
+
+    def test_a_decodable_but_empty_text_payload_touches_neither_suppression_nor_the_clipboard(self):
+        """Distinct failure mode from the too-short case above: this payload
+        DECODES fine (a valid 8-byte ts prefix, no text) but carries empty
+        text. Mirrors
+        HandleFrameTests.testDecodableButEmptyTextClipTouchesNeitherSuppressionNorThePasteboard."""
+        clipboard = OrderRecordingClipboard()
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=self.clip_state_path)
+        clipboard.agent = agent
+
+        agent._write_clip(encode_clip_payload(5.0, b""))
+
+        self.assertEqual(clipboard.written, [])
+        self.assertIsNone(agent._last_written)
+
+    def test_survives_a_real_disk_failure_when_persisting_clip_state(self):
+        """Self-review: a local disk failure is not the peer's fault, and
+        must not silently disable applying the clip. Forces a REAL save
+        failure (a plain file occupying the directory the store needs to
+        create), not a mock -- a mock would only prove a try/except exists
+        syntactically, not that the clipboard write survives an actual
+        failure. Mirrors HandleFrameTests.testAnnounceClipStateStillSendsWhenTheStoreCannotBeSaved."""
+        blocker = os.path.join(self._tmp.name, "blocker")
+        with open(blocker, "wb") as handle:
+            handle.write(b"occupying this name")
+        unsaveable_path = os.path.join(blocker, "clip-state.json")
+        # Confirm the setup actually forces a failure, or this test proves nothing.
+        with self.assertRaises(OSError):
+            save_clip_state("aa", 1, path=unsaveable_path)
+
+        clipboard = OrderRecordingClipboard()
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=unsaveable_path)
+        clipboard.agent = agent
+
+        agent._write_clip(encode_clip_payload(1.0, b"still write this"))
+
+        self.assertEqual(clipboard.written, [b"still write this"],
+                         "a local disk failure must not prevent the clipboard write")
+        self.assertEqual(agent._last_written, b"still write this",
+                         "the suppression must still be armed despite the disk failure")
 
 
 class RacyClipboard:
@@ -655,6 +981,14 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
     the main thread at any point during that window, not just cleanly
     before or after it."""
 
+    def setUp(self):
+        # _write_clip persists through save_clip_state, which touches the
+        # real production path when clip_state_path is None -- see
+        # TestEchoBookkeeping.setUp.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
     def test_a_write_that_lands_during_the_read_is_not_echoed(self):
         """Sequence pinned here:
         1. Mac sends clip A -> _write_clip(A) arms the suppression for A.
@@ -671,12 +1005,14 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
         -- our own echo. It must send nothing, and must leave B's
         suppression armed so B's own echo (or a later genuine change) is
         still judged correctly."""
-        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard())
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(),
+                      clip_state_path=self.clip_state_path)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent._write_clip(b"A")
-        agent.clipboard = RacyClipboard(agent, value_read=b"A", interleaved_write=b"B")
+        agent._write_clip(encode_clip_payload(1.0, b"A"))
+        agent.clipboard = RacyClipboard(
+            agent, value_read=b"A", interleaved_write=encode_clip_payload(2.0, b"B"))
 
         agent._local_change()
 
@@ -687,6 +1023,168 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
             agent._last_written, b"B",
             "the newer write's suppression must stay armed for its own echo",
         )
+
+
+class TestIncomingClipState(unittest.TestCase):
+    """Agent._on_clip_state: resolves an incoming TYPE_CLIP_STATE frame
+    against what we hold, per resolve_freshness, and sends only when we
+    win. Mirrors HandleFrameTests.swift's "Contract 5" section
+    (resolving a peer's clip-state announcement)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
+    def build(self, clipboard=None):
+        return Agent(
+            stdin=io.BytesIO(), stdout=io.BytesIO(),
+            clipboard=clipboard if clipboard is not None else QueueClipboard(ready=True),
+            clip_state_path=self.clip_state_path,
+        )
+
+    def test_losing_clip_state_with_peer_fresher_produces_no_send(self):
+        """resolve_freshness's waitForPeer outcome: the peer is fresher, so
+        we wait. Conflating this with doNothing would be harmless here, but
+        the point of a resend would be to CLOBBER a fresher peer -- exactly
+        the defect this whole design exists to prevent."""
+        save_clip_state("aa", 5, path=self.clip_state_path)
+        agent = self.build()
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("bb", 9))  # peer fresher
+
+        self.assertEqual(sent, [], "the peer is fresher -- we wait, we do not resend")
+
+    def test_agreeing_clip_state_with_equal_hashes_produces_no_send(self):
+        """resolve_freshness's doNothing outcome via equal hashes: "hashes
+        equal" must mean "we agree", not "resend" -- conflating it with
+        sendMine would ping-pong the same content back and forth forever."""
+        save_clip_state("aa", 5, path=self.clip_state_path)
+        agent = self.build()
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state("aa", 999))  # same hash
+
+        self.assertEqual(sent, [], "hashes equal means we agree, not resend")
+
+    def test_winning_clip_state_sends_exactly_one_clip_frame_carrying_our_stored_timestamp(self):
+        """resolve_freshness's sendMine outcome: a peer with no clipboard at
+        all (also the fix for v1's documented loss of Mac copies made while
+        the PC was off). The resulting clip must carry OUR stored ts, not
+        now -- resending with now would perpetually refresh its age and let
+        it win every future reconciliation regardless of what happens next."""
+        save_clip_state("aa", 777, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"current clip text")
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], TYPE_CLIP)
+        ts, text = decode_clip_payload(sent[0][1])
+        self.assertEqual(ts, 777, "must carry OUR stored ts, not now")
+        self.assertEqual(text, b"current clip text")
+
+    def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
+        """Unlike _local_change's own send path, this branch reads the live
+        clipboard independently and, without this bound, winning a
+        reconciliation over content at or beyond the cap would build a
+        frame that exceeds MAX_PAYLOAD_BYTES once wrapped -- the peer's
+        decode_frame rejects that as oversized and drops the whole channel."""
+        save_clip_state("aa", 777, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+
+        self.assertEqual(sent, [], "content of exactly the cap would encode to a frame 8 bytes over it")
+
+    def test_winning_clip_state_with_content_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
+        save_clip_state("aa", 777, path=self.clip_state_path)
+        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(text)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(decode_clip_payload(sent[0][1])[1], text)
+
+    def test_winning_clip_state_with_oversized_content_is_logged_with_its_size(self):
+        """A user whose large paste wins a reconciliation but can't actually
+        be sent has nothing to look at otherwise -- matches the existing
+        "skipping a clip of N bytes: over the frame cap" line used for
+        _local_change's own cap."""
+        save_clip_state("aa", 777, path=self.clip_state_path)
+        oversized = MAX_PAYLOAD_BYTES
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"x" * oversized)
+        agent = self.build(clipboard=clipboard)
+        agent.send = lambda t, p: None
+
+        original_log = clipwire_agent.log
+        log_lines = []
+        clipwire_agent.log = log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+
+        self.assertTrue(
+            any("skipping a clip of %d bytes" % oversized in line for line in log_lines),
+            "expected the skip to be logged with its size; got: %r" % log_lines,
+        )
+
+    def test_clip_state_fallback_when_store_is_empty_still_resolves_from_the_live_clipboard(self):
+        """If the store's own load returns nothing (a disk failure on an
+        earlier save, never expected in ordinary operation), _on_clip_state
+        must still resolve a real state from the live clipboard rather than
+        a bare None-hash placeholder. A bare None there would make BOTH
+        sides resolve waitForPeer against each other's (correctly
+        announced) state and silently lose the clip -- exactly v1's bug,
+        reintroduced through the fallback path instead of the main one."""
+        # self.clip_state_path is never written to -- load_clip_state() returns None.
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"what we actually hold")  # the fallback resolution's own read
+        clipboard.queue_read(b"what we actually hold")  # the sendMine branch's own read
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer also empty
+
+        self.assertEqual(len(sent), 1,
+                         "an empty store must not silently resolve to waitForPeer against a "
+                         "peer that also holds nothing to compare against -- that is a silent loss")
+        self.assertEqual(decode_clip_payload(sent[0][1])[1], b"what we actually hold")
+
+    def test_a_malformed_clip_state_raises_a_clip_state_error_not_a_crash(self):
+        """The agent-level twin of test_freshness.py's
+        test_decode_rejects_an_oversized_integer_timestamp: _on_clip_state
+        must not locally swallow a decode failure. It mirrors _on_hello's
+        existing bare `raise FrameError(...)` for a malformed/mismatched
+        hello -- so a malformed clip-state closes the connection via
+        main()'s `except FrameError`, exactly like a malformed hello does,
+        rather than silently continuing (Swift's peer cannot self-close
+        and so swallows this; this agent, as the child process sshd spawns,
+        can and already does for hello) or crashing with an uncaught
+        OverflowError."""
+        agent = self.build()
+        oversized = b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}"
+
+        with self.assertRaises(ClipStateError):
+            agent.on_frame(TYPE_CLIP_STATE, oversized)
 
 
 class TestModuleDefinitionOrder(unittest.TestCase):
@@ -730,6 +1228,9 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def load_clip_state",
             "def save_clip_state",
             "def resolve_startup_state",
+            "def sha256_hex",
+            "def resolve_current_clip_state",
+            "def announce_clip_state",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

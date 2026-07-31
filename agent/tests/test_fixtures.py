@@ -2,9 +2,16 @@ import json
 import pathlib
 import unittest
 
-from agent_under_test import TYPE_CLIP_STATE, decode_clip_payload, decode_frame, encode_frame
+from agent_under_test import (
+    TYPE_CLIP_STATE,
+    decode_clip_payload,
+    decode_frame,
+    encode_frame,
+    sha256_hex,
+)
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "frames.json"
+HASH_FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "hashes.json"
 
 
 class TestFixtures(unittest.TestCase):
@@ -67,6 +74,29 @@ class TestFixtures(unittest.TestCase):
         parsed = json.loads(payload.decode())
         self.assertIsNone(parsed["sha256"], "sha256 must parse to null")
         self.assertEqual(parsed["ts"], 1.0)
+
+
+class TestHashFixtures(unittest.TestCase):
+    """Shared with Swift's FixtureTests.testSha256HexMatchesSharedVectors --
+    the same file, the same vectors, so neither implementation can drift
+    from the other's idea of what sha256_hex/sha256Hex should produce.
+
+    This alone does not catch a call site that hashes the WRONG bytes (a
+    ts-prefixed wire payload, or a re-encoded str) -- it only pins
+    sha256_hex in isolation. test_watcher.py's
+    TestWriteClipDecodesTheWirePayload.test_stores_the_literal_known_hash_for_a_pinned_vector
+    and its _local_change twin close that gap, by pinning a literal digest
+    at the actual call site rather than re-deriving it from this same
+    function."""
+
+    def setUp(self):
+        self.cases = json.loads(HASH_FIXTURES.read_text())["cases"]
+        self.assertTrue(self.cases, "fixtures/hashes.json must not be empty")
+
+    def test_sha256_hex_matches_shared_vectors(self):
+        for c in self.cases:
+            with self.subTest(c["name"]):
+                self.assertEqual(sha256_hex(bytes.fromhex(c["input_hex"])), c["sha256"])
 
 
 if __name__ == "__main__":

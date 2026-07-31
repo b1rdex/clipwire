@@ -1,0 +1,9 @@
+{
+  "comment": "Shared sha256-hex vectors, read by both suites, so a hash implementation that hashes the wrong bytes (a timestamp-prefixed wire payload, or a decoded string re-encoded differently) cannot pass in one language while failing in the other. Every input is plain bytes, exactly what a clipboard holds -- never the [ts][text] wire payload. sha256 is lowercase hex, no separators: hashlib.sha256(data).hexdigest()'s native format, which Swift's sha256Hex must match byte for byte. Each value was verified independently via `python3 -c \"import hashlib; print(hashlib.sha256(data).hexdigest())\"` before being committed here -- this file is not derived from either implementation under test.",
+  "cases": [
+    {"name": "hi",    "input_hex": "6869",                                 "sha256": "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4"},
+    {"name": "empty", "input_hex": "",                                     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+    {"name": "utf8",  "input_hex": "d0bfd180d0b8d0b2d0b5d18220f09f94a5",   "sha256": "d2f34f7740712283c337f31a6e52420a2234a454ec14aeed53751c5bc9725455"},
+    {"name": "nul",   "input_hex": "610062",                               "sha256": "59b271ae1bbcb1d31d41929817f4b16fb439eb4f31520b5ad1d5ce98920a7138"}
+  ]
+}

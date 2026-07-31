@@ -124,7 +124,27 @@ def decode_clip_state(payload):
     ts = parsed.get("ts")
     if not isinstance(ts, (int, float)):
         raise ClipStateError("malformed clip-state payload: ts must be a number")
-    if not math.isfinite(ts):
+    try:
+        finite = math.isfinite(ts)
+    except OverflowError:
+        # json.loads parses an integer literal as arbitrary-precision int,
+        # unlike a float literal (1e400 already becomes inf, caught by the
+        # ordinary isfinite check below). A 400-digit integer ts instead
+        # passes the isinstance check above and only fails inside
+        # math.isfinite's int-to-float conversion, raising a bare
+        # OverflowError -- not a ClipStateError, and therefore not a
+        # FrameError, so main()'s `except FrameError` would not catch it.
+        #
+        # Before this fix there was no call site where that mattered: the
+        # one existing caller, load_clip_state, already swallows
+        # OverflowError at ITS OWN call site, because that input is this
+        # agent's own prior write to its own disk. Agent._on_clip_state
+        # (added by this task) decodes a peer-controlled wire payload with
+        # no such local guard, deliberately mirroring _on_hello's existing
+        # bare `raise FrameError(...)` -- so the fix belongs here, at the
+        # source both callers share, rather than duplicated at each site.
+        raise ClipStateError("malformed clip-state payload: ts out of range, got %r" % ts)
+    if not finite:
         raise ClipStateError("malformed clip-state payload: ts must be finite, got %r" % ts)
     return sha256, float(ts)
 
@@ -180,7 +200,7 @@ def log(message):
 
 
 class Agent:
-    def __init__(self, stdin, stdout, clipboard):
+    def __init__(self, stdin, stdout, clipboard, clip_state_path=None):
         self.stdin = stdin
         self.stdout = stdout
         self.clipboard = clipboard
@@ -190,6 +210,18 @@ class Agent:
         self._watcher = None
         self._last_written = None
         self._write_gen = 0
+        # None in production: load_clip_state/save_clip_state then fall
+        # back to the real XDG state path (clip_state_path()) on their own.
+        # Tests inject a temp path here so no test run ever touches that
+        # real location.
+        self._clip_state_path = clip_state_path
+        # Whether THIS process's one-shot clip-state announcement has
+        # already gone out. Unlike the Mac side's ClipStateAnnouncement,
+        # there is no reset() here: this agent lives exactly one connection
+        # (sshd spawns a fresh process per SSH connection), so "once per
+        # connection" and "once per process" are the same thing -- there is
+        # no reconnect-within-the-same-process to re-arm for.
+        self._clip_state_sent = False
         # Persistent memory of what was last synced between the two
         # machines -- set in _write_clip (content arriving FROM the peer)
         # and after a successful send in _local_change (content sent TO
@@ -234,6 +266,8 @@ class Agent:
             self._on_hello(payload)
         elif frame_type == TYPE_CLIP:
             self._on_clip(payload)
+        elif frame_type == TYPE_CLIP_STATE:
+            self._on_clip_state(payload)
 
     def _on_hello(self, payload):
         try:
@@ -257,6 +291,58 @@ class Agent:
             self.pending_clip = payload
             return
         self._write_clip(payload)
+
+    def _on_clip_state(self, payload):
+        """Resolves an incoming clip-state announcement against what we
+        hold, and sends only when we win. Mirrors
+        Sources/clipwire/main.swift's handleFrame .clipState case, with one
+        deliberate divergence: decode_clip_state is called bare here, not
+        wrapped in a local try/except. Swift's `try?` swallow is correct
+        THERE because Channel exposes no way to force-close the ssh process
+        from that side -- but this agent, spawned fresh per SSH connection
+        by sshd, both CAN and already DOES close the connection on a
+        malformed/mismatched hello (_on_hello's own bare `raise
+        FrameError(...)`, unchanged by this task). A malformed clip-state is
+        the same class of peer violation, so it is handled the same way:
+        propagate ClipStateError (a FrameError) up through main()'s `except
+        FrameError`, which is exactly what closing the OverflowError hole
+        in decode_clip_state makes safe to do.
+        """
+        peer = decode_clip_state(payload)
+        mine = load_clip_state(path=self._clip_state_path)
+        if mine is None:
+            # load_clip_state should already reflect our own current state --
+            # from this connection's own announcement, or an ordinary
+            # local-change/applied-clip save since -- so this fallback only
+            # matters if an earlier save failed. It must still resolve a REAL
+            # state from the live clipboard rather than a bare None-hash
+            # placeholder: a wrong None here would make both sides resolve
+            # waitForPeer against each other's (correctly announced) state
+            # and silently lose the clip, reintroducing v1's bug through the
+            # fallback path instead of the main one.
+            mine = resolve_current_clip_state(self.clipboard, None, time.time())
+        if resolve_freshness(mine, peer) != SEND_MINE:
+            # Hashes equal means we agree -- not a signal to resend. A peer
+            # that is fresher means we wait. Conflating either with SEND_MINE
+            # reintroduces a clobber or a ping-pong.
+            return
+        text = self.clipboard.read()
+        if not text:
+            return
+        # The size bound matches _local_change's own send-side guard: this
+        # branch reads the live clipboard independently, and without it,
+        # winning a reconciliation over content at or beyond the cap would
+        # build a frame that exceeds MAX_PAYLOAD_BYTES once wrapped in its
+        # 8-byte timestamp prefix -- the peer's decode_frame rejects that as
+        # oversized and drops the whole channel over a single large clip.
+        if len(text) + TIMESTAMP_BYTES > MAX_PAYLOAD_BYTES:
+            log("skipping a clip of %d bytes: over the frame cap" % len(text))
+            return
+        # mine[1] (our stored ts), not now: the content has not changed, only
+        # been re-announced, so its recorded age must be preserved. Sending
+        # with now would perpetually refresh it and let it win every future
+        # reconciliation regardless of what happens next.
+        self.send(TYPE_CLIP, encode_clip_payload(mine[1], text))
 
     # --- phase transitions ----------------------------------------------
 
@@ -293,6 +379,17 @@ class Agent:
             # clipboard held a moment earlier.
             self._write_clip(self.pending_clip)
             self.pending_clip = None
+        if not self._clip_state_sent:
+            # Sent exactly once per connection (== once per process here --
+            # see __init__), after the store has been consulted, and after
+            # any queued pending_clip above has already been applied: if one
+            # was just applied, _write_clip already persisted ITS (peer's)
+            # state, so announcing after it reflects what we actually hold
+            # now rather than the stale, about-to-be-overwritten content
+            # from before this connection. Per the design spec, this is not
+            # gated on the store save succeeding -- see announce_clip_state.
+            self._clip_state_sent = True
+            announce_clip_state(self.send, self.clipboard, path=self._clip_state_path)
         if self._watcher is None:
             self._watcher = make_watcher(self.clipboard)
             self._watcher.start(self._local_change)
@@ -307,15 +404,46 @@ class Agent:
         """Single place where we touch the local clipboard, so echo
         bookkeeping cannot be forgotten on one of the paths.
 
+        `payload` is the wire-format [ts][text] encoding encode_clip_payload
+        produces -- not bare text -- since v2's clip frame carries its own
+        timestamp; both call sites (_on_clip's immediate-apply path and
+        clipboard_became_ready's pending_clip-apply path) pass the raw frame
+        payload through unchanged, so it is decoded here, once.
+
+        A payload that fails to decode, or decodes with empty text, touches
+        neither the suppression nor the clipboard -- swallowed quietly,
+        mirroring Sources/clipwire/main.swift's handleFrame .clip case
+        (`try? ... !decoded.text.isEmpty`). This is a deliberate asymmetry
+        with _on_clip_state, which lets a malformed clip-state propagate and
+        close the connection: Swift's OWN .clip case swallows too, and
+        nothing in this task asks for a clip payload's malformed-content
+        behaviour to change.
+
         Runs on the main thread. _local_change() (below) runs on the
         watcher's background thread and reads this same bookkeeping, so the
         two fields are only ever touched under _echo_lock.
         """
+        try:
+            ts, text = decode_clip_payload(payload)
+        except ClipPayloadError:
+            return
+        if not text:
+            return
         with self._echo_lock:
-            self._last_written = payload
+            self._last_written = text
             self._write_gen += 1
-            self._last_seen = payload
-        self.clipboard.write(payload)
+            self._last_seen = text
+        self.clipboard.write(text)
+        # The peer's timestamp, never now: this is the entire reason it
+        # travels in the frame. Stamping it with now would make applied
+        # content look freshly copied here and win the next reconciliation
+        # against the machine it actually came from. A local disk failure
+        # here is not the peer's fault and must not undo the write above or
+        # propagate as a FrameError and tear down the channel.
+        try:
+            save_clip_state(sha256_hex(text), ts, path=self._clip_state_path)
+        except (OSError, ClipStateError) as error:
+            log("could not persist clip state: %r" % error)
 
     def _local_change(self):
         # Snapshot what we expect and the generation it belongs to BEFORE
@@ -331,6 +459,10 @@ class Agent:
             last_seen = self._last_seen
 
         text = self.clipboard.read()
+        # The moment of OBSERVATION -- as close to the read as possible --
+        # not whenever the rest of this method happens to run afterward.
+        # Persisted and sent below, once we know this is a genuine change.
+        observed_at = time.time()
         if not text:
             return
 
@@ -367,10 +499,25 @@ class Agent:
         # exactly the non-change signals the one-shot value cannot.
         if text == last_seen:
             return
-        if len(text) > MAX_PAYLOAD_BYTES:
+        # Since this task wraps the observed text in encode_clip_payload
+        # before it reaches the wire, the cap must account for the 8-byte
+        # timestamp prefix -- text at exactly MAX_PAYLOAD_BYTES would
+        # otherwise encode to a frame 8 bytes over it, which the peer's
+        # decode_frame rejects as oversized, dropping the whole channel over
+        # a single large-but-not-overlong clip.
+        if len(text) + TIMESTAMP_BYTES > MAX_PAYLOAD_BYTES:
             log("skipping a clip of %d bytes: over the frame cap" % len(text))
             return
-        self.send(TYPE_CLIP, text)
+        # Persisted before the send, unconditional on the send's outcome:
+        # what we hold and how old it is changed the instant it was
+        # observed, regardless of whether the peer ever receives it. A local
+        # disk failure here is not the peer's fault and must not prevent the
+        # send below.
+        try:
+            save_clip_state(sha256_hex(text), observed_at, path=self._clip_state_path)
+        except (OSError, ClipStateError) as error:
+            log("could not persist clip state: %r" % error)
+        self.send(TYPE_CLIP, encode_clip_payload(observed_at, text))
         # Only after a successful send: if send() ever raises (e.g. a dead
         # channel), _last_seen must not advance to content the peer never
         # actually received.
@@ -558,6 +705,68 @@ def resolve_startup_state(current_hash, stored, now):
     if stored is not None and stored[0] == current_hash:
         return current_hash, stored[1]
     return current_hash, now
+
+
+import hashlib
+
+
+def sha256_hex(data):
+    """Lowercase hex, no separators -- hashlib.sha256(...).hexdigest()'s
+    native format already, and the exact shape every sha256 on the wire
+    must match byte for byte against Swift's own sha256Hex.
+
+    The risk this task exists to close is not the hex FORMAT -- Python's
+    hexdigest() gives that for free -- it is what gets hashed. `data` must
+    always be the clipboard's exact bytes: never the timestamp-prefixed
+    [ts][text] wire payload (encode_clip_payload's output), and never a
+    str re-encoded independently. Hashing either of those instead would
+    leave this function itself passing its own tests while every call
+    site that got it wrong took the "hashes differ" branch on every
+    reconciliation -- the systematic clobber resolve_startup_state exists
+    to prevent. See fixtures/hashes.json, read by both this suite
+    (test_fixtures.py) and Swift's (FixtureTests.swift), so neither side
+    can drift from the other's idea of what this function should produce;
+    and test_watcher.py's TestWriteClipDecodesTheWirePayload /
+    TestEchoBookkeeping literal-hash tests, which pin a known digest at
+    the actual call sites rather than re-deriving it from this function.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def resolve_current_clip_state(clipboard, stored, now):
+    """Reconciles what the clipboard holds RIGHT NOW against what was last
+    persisted. Mirrors Sources/clipwire/ClipStateStore.swift's
+    resolveCurrentClipState: `clipboard.read()` returning None or empty is
+    never hashed, matching the wire contract that sha256 is null for
+    exactly that clipboard state -- see resolve_startup_state for the rule
+    this applies once a current hash is in hand.
+    """
+    text = clipboard.read()
+    current_hash = sha256_hex(text) if text else None
+    return resolve_startup_state(current_hash, stored, now)
+
+
+def announce_clip_state(send, clipboard, now=None, path=None):
+    """Builds and sends this side's one-shot clip-state announcement:
+    reconciles whatever the clipboard currently holds against the
+    persistent store (so unchanged content keeps its true recorded age
+    instead of looking freshly copied -- see resolve_startup_state),
+    persists the reconciled value, and sends it.
+
+    The send is unconditional on the save's success -- a local disk
+    failure is not the peer's fault, and must not silently disable
+    reconciliation for this connection the way gating the send behind the
+    save's result would. Mirrors Sources/clipwire/main.swift's
+    announceClipState.
+    """
+    if now is None:
+        now = time.time()
+    resolved = resolve_current_clip_state(clipboard, load_clip_state(path=path), now)
+    try:
+        save_clip_state(*resolved, path=path)
+    except (OSError, ClipStateError) as error:
+        log("could not persist clip state: %r" % error)
+    send(TYPE_CLIP_STATE, encode_clip_state(*resolved))
 
 
 def wayland_socket_path(env=None):

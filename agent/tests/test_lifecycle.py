@@ -1,5 +1,7 @@
 # agent/tests/test_lifecycle.py
 import io
+import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -7,8 +9,12 @@ from agent_under_test import (
     Agent,
     PROTOCOL_VERSION,
     TYPE_CLIP,
+    TYPE_CLIP_STATE,
     TYPE_HELLO,
+    decode_clip_state,
     decode_frame,
+    encode_clip_payload,
+    load_clip_state,
 )
 
 # agent_under_test registers the loaded module under this name in
@@ -53,10 +59,25 @@ class FakeClipboard:
 
 
 class TestLifecycle(unittest.TestCase):
+    def setUp(self):
+        # clipboard_became_ready()'s new announce-clip-state step persists
+        # through save_clip_state/load_clip_state, which touch the real
+        # production path (~/.local/state/clipwire/clip-state.json) when
+        # clip_state_path is None. Every Agent built in this class gets its
+        # own temp path so no test here ever touches that real location.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+
     def build(self, ready=False):
         clipboard = FakeClipboard(ready=ready)
         out = io.BytesIO()
-        return Agent(stdin=io.BytesIO(), stdout=out, clipboard=clipboard), clipboard, out
+        return (
+            Agent(stdin=io.BytesIO(), stdout=out, clipboard=clipboard,
+                  clip_state_path=self.clip_state_path),
+            clipboard,
+            out,
+        )
 
     def test_hello_is_sent_before_clipboard_is_ready(self):
         agent, _, out = self.build(ready=False)
@@ -72,15 +93,17 @@ class TestLifecycle(unittest.TestCase):
 
     def test_clip_arriving_while_pending_is_not_written(self):
         agent, clipboard, _ = self.build(ready=False)
-        agent.on_frame(TYPE_CLIP, b"early")
+        wire_payload = encode_clip_payload(1.0, b"early")
+        agent.on_frame(TYPE_CLIP, wire_payload)
         self.assertEqual(clipboard.written, [])
-        self.assertEqual(agent.pending_clip, b"early")
+        self.assertEqual(agent.pending_clip, wire_payload,
+                         "pending_clip holds the raw wire payload, not yet decoded")
 
     def test_only_the_newest_pending_clip_survives(self):
         agent, clipboard, _ = self.build(ready=False)
-        agent.on_frame(TYPE_CLIP, b"first")
-        agent.on_frame(TYPE_CLIP, b"second")
-        agent.on_frame(TYPE_CLIP, b"third")
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"first"))
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(2.0, b"second"))
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(3.0, b"third"))
         clipboard.become_ready()
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
@@ -98,7 +121,7 @@ class TestLifecycle(unittest.TestCase):
         agent, clipboard, _ = self.build(ready=True)
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
-        agent.on_frame(TYPE_CLIP, b"now")
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"now"))
         self.assertEqual(clipboard.written, [b"now"])
         self.assertIsNone(agent.pending_clip)
 
@@ -109,14 +132,92 @@ class TestLifecycle(unittest.TestCase):
         agent.on_frame(TYPE_CLIP, b"")
         self.assertEqual(clipboard.written, [])
 
+    def test_decodable_but_empty_text_clip_is_never_written(self):
+        """Distinct failure mode from the totally-empty payload above: this
+        payload DECODES fine (a valid 8-byte ts prefix, no text) but
+        carries empty text. decode_clip_payload cannot reject this on its
+        own -- an empty bytes object is a valid decode -- so _write_clip
+        must still refuse to apply it. Mirrors
+        HandleFrameTests.testDecodableButEmptyTextClipTouchesNeitherSuppressionNorThePasteboard."""
+        agent, clipboard, _ = self.build(ready=True)
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(5.0, b""))
+        self.assertEqual(clipboard.written, [])
+
     def test_losing_the_clipboard_returns_to_pending(self):
         agent, clipboard, _ = self.build(ready=True)
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
         agent.clipboard_lost()
         self.assertEqual(agent.phase, "clipboard-pending")
-        agent.on_frame(TYPE_CLIP, b"during outage")
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"during outage"))
         self.assertEqual(clipboard.written, [], "must not write while the session is gone")
+
+    # --- clip-state announcement: sent once, inside clipboard_became_ready ---
+    #
+    # Per the design spec: clip-state is sent exactly once per connection,
+    # inside clipboard_became_ready, after the store has been consulted --
+    # not on every frame. This agent process IS one connection (sshd spawns
+    # a fresh process per SSH connection), so "once per connection" here
+    # means once per process: unlike the Mac side's ClipStateAnnouncement,
+    # there is no reconnect-within-the-same-process to re-arm for, so the
+    # gate below is never reset.
+
+    def _sent_frame_types(self, out):
+        buffer = bytearray(out.getvalue())
+        types = []
+        while True:
+            frame = decode_frame(buffer)
+            if frame is None:
+                return types
+            types.append(frame)
+
+    def test_clipboard_became_ready_sends_clip_state_exactly_once(self):
+        agent, clipboard, out = self.build(ready=True)
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()
+
+        frames = self._sent_frame_types(out)
+        clip_state_frames = [f for f in frames if f[0] == TYPE_CLIP_STATE]
+        self.assertEqual(len(clip_state_frames), 1,
+                         "clipboard_became_ready must announce our clip-state exactly once")
+        # Proves the wiring reaches all the way to a well-formed wire frame,
+        # not merely that some bytes typed TYPE_CLIP_STATE were written.
+        decode_clip_state(clip_state_frames[0][1])
+
+    def test_a_second_clipboard_became_ready_in_the_same_process_does_not_announce_again(self):
+        """The strongest form of "sent once, not again": clipboard_became_ready
+        runs twice on the SAME agent (the Wayland session flapping while the
+        SSH connection itself stays up) -- the ordinary protocol never does
+        this, but the gate, not that assumption, is what must prevent a
+        second announcement. Mirrors
+        HandleFrameTests.testASecondMatchedHelloInTheSameConnectionDoesNotAnnounceAgain."""
+        agent, clipboard, out = self.build(ready=True)
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()
+            agent.clipboard_lost()
+            agent.clipboard_became_ready()
+
+        frames = self._sent_frame_types(out)
+        clip_state_frames = [f for f in frames if f[0] == TYPE_CLIP_STATE]
+        self.assertEqual(len(clip_state_frames), 1,
+                         "a second clipboard_became_ready in the same process must not announce again")
+
+    def test_clipboard_became_ready_persists_the_resolved_clip_state(self):
+        """"after the store has been consulted" has a second half: the
+        reconciled value must also be PERSISTED, so a later .clipState
+        comparison (or a crash immediately afterward) sees it, not whatever
+        was on disk before this connection began."""
+        agent, clipboard, out = self.build(ready=True)
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()
+
+        # FakeClipboard.read() always returns None -> resolve_startup_state's
+        # None-hash branch -> (None, now).
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertIsNotNone(stored, "the resolved clip-state must be persisted, not only sent")
+        self.assertIsNone(stored[0])
 
 
 def json_of(payload):
