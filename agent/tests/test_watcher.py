@@ -297,10 +297,15 @@ class SignallingClipboard:
     down this file, instead of racing two real threads and hoping.
 
     Deliberately waits on the CALLBACK having run rather than on the watcher's
-    private signal counter, so the test is evidence about behaviour and stays
-    red against an implementation that counts a signal only after dispatching
-    it (which would let a tick landing inside a slow _local_change see an
-    unmoved counter and declare a healthy source dead)."""
+    private signal counter, so the test is evidence about observable behaviour
+    rather than about an attribute.
+
+    What it does NOT prove: that the pump counts a signal BEFORE dispatching
+    it. In a count-after-dispatch variant the increment and the dispatch are
+    adjacent bytecodes on the pump thread while the released poll thread still
+    has to be rescheduled, so this test would normally pass anyway. That
+    ordering is argued in the pump's own comment and is deliberately left
+    untested rather than pinned by a test that would pass most of the time."""
 
     def __init__(self, before, after):
         self.process = None       # set by start_watcher, before anything reads
@@ -532,7 +537,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
         at the degraded rate three of them need ~15ms, while a loop still on
         the budget cannot deliver even one, since Event.wait does not return
         early."""
-        budget, degraded, window = 0.05, 0.002, 0.04
+        budget, degraded, window = 0.03, 0.002, 0.02
         clipboard = ScriptedReadClipboard([b"a", b"b"])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=budget,
