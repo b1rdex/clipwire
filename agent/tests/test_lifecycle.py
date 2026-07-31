@@ -146,6 +146,43 @@ class TestLifecycle(unittest.TestCase):
             agent.clipboard_became_ready()
         self.assertEqual(clipboard.written, [b"third"])
 
+    def test_a_non_finite_timestamp_in_a_pending_clip_does_not_tear_down_the_channel(self):
+        """Fix round 1, Finding 2: struct.unpack(">d", ...) inside
+        decode_clip_payload used to accept ANY 8-byte pattern, including the
+        bit patterns for inf/-inf/nan. Before that was fixed, a clip with a
+        non-finite ts queued while pending would get WRITTEN to the
+        clipboard by _write_clip (decode succeeded), the persistence
+        attempt inside _write_clip would fail and be logged (caught there),
+        but clipboard_became_ready's own follow-up
+        encode_clip_state(*applied_pending) call -- reusing that same
+        non-finite ts to build the announcement frame -- had no local
+        try/except, so ClipStateError escaped uncaught and (in the real
+        agent) exited main() via `except FrameError`, tearing down the
+        whole connection over a clip that had ALREADY been applied.
+
+        A malformed clip payload is deliberately swallowed everywhere else
+        (test_watcher.py's TestWriteClipDecodesTheWirePayload) -- the fix
+        makes a non-finite ts join that same family at the source
+        (decode_clip_payload itself), so this is the same "swallowed
+        quietly" outcome: nothing is written, nothing is announced, and
+        crucially no exception of any kind reaches this call."""
+        agent, clipboard, out = self.build(ready=False)
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(float("inf"), b"B"))
+        clipboard.become_ready()
+
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()  # must not raise
+
+        self.assertEqual(
+            clipboard.written, [],
+            "a non-finite ts must be rejected before ever reaching the clipboard write",
+        )
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertTrue(
+            stored is None or stored[0] is None,
+            "nothing about the rejected clip may be persisted",
+        )
+
     def test_becoming_ready_without_a_pending_clip_writes_nothing(self):
         agent, clipboard, _ = self.build(ready=False)
         clipboard.become_ready()

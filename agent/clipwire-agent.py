@@ -69,6 +69,24 @@ def decode_clip_payload(payload):
     if len(payload) < TIMESTAMP_BYTES:
         raise ClipPayloadError("clip payload shorter than its timestamp: %d bytes" % len(payload))
     (ts,) = struct.unpack(">d", payload[:TIMESTAMP_BYTES])
+    # Fix round 1, Finding 2: struct.unpack(">d", ...) decodes ANY 8-byte
+    # pattern into a valid IEEE-754 double, including inf/-inf/nan -- there
+    # is no bit pattern it rejects, unlike an out-of-range integer literal
+    # in JSON (decode_clip_state's own hazard). Guarding it here, at the
+    # one place both callers share, follows the same precedent as that
+    # earlier fix: _write_clip already swallows ClipPayloadError for a
+    # too-short or empty-text payload, so folding a non-finite ts into the
+    # SAME exception type here means it is swallowed the same quiet way,
+    # with no new call-site-specific handling needed. Left unguarded, a
+    # clip queued while pending with e.g. ts=inf would decode fine here,
+    # get WRITTEN to the clipboard by _write_clip (its own persistence
+    # attempt would fail and be logged, caught there) -- but
+    # clipboard_became_ready's own follow-up
+    # encode_clip_state(*applied_pending) call reuses that same ts with no
+    # local try/except, so ClipStateError would escape uncaught and tear
+    # down the whole connection over a clip that had ALREADY been applied.
+    if not math.isfinite(ts):
+        raise ClipPayloadError("clip payload ts must be finite, got %r" % ts)
     return ts, bytes(payload[TIMESTAMP_BYTES:])
 
 
