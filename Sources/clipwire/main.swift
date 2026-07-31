@@ -41,6 +41,21 @@ private struct HelloPayload: Codable {
     // degrading to "malformed hello" the moment a v1 peer's payload lacks a
     // key v2 introduced. `skewLogLine` reads it back out and treats a
     // missing value as "not measurable", never as an error.
+    //
+    // That tolerance is narrower than "Optional" suggests, and it is the one
+    // place the two sides deliberately disagree -- written down here because
+    // it reads as a bug to anyone who finds it from one side only. An absent
+    // key and an explicit `null` are the ONLY two shapes both sides accept.
+    // Every other shape fails the WHOLE payload here, so the Mac logs
+    // "malformed hello from peer" and records a mismatch: a string or a bool
+    // as `typeMismatch`, and `NaN`, `Infinity`, `1e309` and an integer too
+    // large for a Double as `dataCorrupted` (probed against this exact
+    // struct). `agent/clipwire-agent.py`'s `skew_log_line` ignores all of
+    // them in silence and syncs on. Left as is deliberately: making this
+    // field lenient means a custom `init(from:)`, which changes what counts
+    // as a decodable hello -- and the `NaN` case already had this outcome
+    // before skew measurement existed, so this is the blessed shape rather
+    // than a new divergence.
     let sentAt: Double?
 
     enum CodingKeys: String, CodingKey {
@@ -94,7 +109,9 @@ enum SkewConstants {
 /// logs `peer clock skew nan` and silently never warns. Foundation's
 /// `JSONDecoder` rejects those tokens outright, so on this side such a payload
 /// never gets past `decodeHello` -- the guard costs one clause and keeps the
-/// two functions readable as one formula.
+/// two functions readable as one formula. `HelloPayload.sentAt`'s own comment
+/// lists every shape where that rejection makes the two sides diverge; it is
+/// wider than the non-finite literals alone.
 func skewLogLine(peerSentAt: Double?, now: Double) -> String? {
     guard let sentAt = peerSentAt, sentAt.isFinite else { return nil }
     let skew = abs(now - sentAt)
