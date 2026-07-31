@@ -797,7 +797,16 @@ func printStatus() -> Int32 {
         if let received = status.lastReceivedAt { print("last received: \(received)") }
         return 0
     case .unhealthy(let status, let reason):
-        print("\(status.state.rawValue) — \(reason)")
+        // `Status.read` falls back to the state's own name when the agent
+        // recorded no specific reason, which would print it twice. That was
+        // unreachable until `clipboard-pending` became a state the agent
+        // actually reports -- it is now the normal state for the whole window
+        // between a PC reboot and someone logging in to GNOME.
+        if reason == status.state.rawValue {
+            print(status.state.rawValue)
+        } else {
+            print("\(status.state.rawValue) — \(reason)")
+        }
         return 1
     case .agentDead(let why):
         print("agent dead — \(why)")

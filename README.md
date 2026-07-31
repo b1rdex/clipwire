@@ -9,11 +9,14 @@ encryption come from SSH, so there is no state that a reboot can invalidate.
 Built for a specific pair of machines — macOS Sequoia and Ubuntu 25.10 on GNOME/Wayland,
 where `wl-paste --watch` does not work because Mutter has no wlroots data-control protocol.
 
-**Status:** implemented. See
-[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md) for architecture,
-protocol, and the constraints that shaped both. The Swift and Python test suites both run
-in CI; the acceptance test — copy on one machine, paste on the other, survive a PC reboot
-with no manual action — is manual, per the design doc's Testing section.
+**Status:** implemented. For architecture and the constraints that shaped it, read
+[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md) and then
+[the protocol v2 amendment](docs/superpowers/specs/2026-07-31-protocol-v2-freshness-design.md),
+which supersedes it on the wire format and on what happens at connect time: the two sides
+now exchange what each holds and how old it is, and the fresher one sends. The Swift and
+Python test suites both run in CI. The acceptance test is manual and lives in the
+amendment; the two halves of the program have never been exercised against each other by
+any automated test, because each suite drives one side against scripted pipes.
 
 **Passwords land in GPaste's history on the PC and stay there.** Anything copied on the
 Mac is written to the PC's clipboard, and GPaste records it in its on-disk history. A
