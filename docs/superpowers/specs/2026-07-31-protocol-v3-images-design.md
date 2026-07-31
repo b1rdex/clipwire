@@ -111,6 +111,53 @@ is the same defect one layer down. The rule:
   v1's rule for stdin EOF. The agent is one process per connection by design; exiting is how
   it reports a dead channel.
 
+### The verdict now needs two consecutive ticks — and why the one-tick rule died
+
+v2 ruled that the safety net declares the event source dead from **one** tick: content
+changed while the signal counter stood still. That ruling was valid, and it is now reversed.
+The reason matters more than the fact.
+
+The one-tick verdict was only ever safe because the poll loop called the handler
+**synchronously**. `_local_change` always forks `wl-paste`, so several milliseconds always
+elapsed between the content read and the verdict — enough for a signal already in flight to
+be counted. v2's review accepted the residual race on exactly that basis.
+
+**Decoupling the loop from the handler deletes that grace period.** It was an accidental
+side effect of the synchronous call, nobody named it as load-bearing, and the change that
+removed it was correct for its own reasons. The result: a copy landing in the last few
+milliseconds before a tick's read can be judged missed while its `Update` is still in
+flight — a false "source is dead", degrading a healthy installation to 1-second polling for
+the rest of the connection. That is the very defect this release exists to fix.
+
+**The rule: a divergence must survive two consecutive ticks before the verdict fires.** The
+discriminator compares two asynchronous observation streams — content and counter — with no
+happens-before between them, and any single-point check of such a pair has a window. It
+closes by synchronisation or by hysteresis. Synchronisation was rejected: an acknowledgement
+from the worker re-couples the poll thread to it and restores the wedge path the decoupling
+exists to remove. So: hysteresis. The divergence must outlive a whole 30-second tick, three
+orders of magnitude longer than any signal lag, and a false verdict would need two
+independent millisecond-window hits on consecutive ticks.
+
+The cost is worst-case detection moving from 30 to 60 seconds. It is the right trade because
+the two errors are not symmetric: a false positive permanently degrades a **healthy**
+machine, while a late true positive costs thirty extra seconds on one that is already not
+syncing.
+
+**Do not restore the one-tick verdict without restoring the synchronous call.** A future
+reader will see two ticks where one would do. This is the project's signature defect —
+correctness living between two individually correct changes — caught before production for
+the first time. The general lesson is worth as much as the specific rule: **a ruling is
+attached to its premise; delete the premise and the ruling must be re-examined.**
+
+Order within a tick is load-bearing and free: read the content first, snapshot the counter
+after. The `wl-paste` fork at the start of the tick hands the first strike back a
+millisecond of grace, and the second tick covers the tail.
+
+**Backlog, explicitly out of scope here:** degradation is one-way — once the safety net
+switches to polling it stays there for the connection. Re-probing the event path every few
+minutes and returning to it when signals resume would soften both a false verdict and a real
+but temporary failure, such as the extension being re-enabled without a reboot.
+
 **Diagnosis stays permanently**, as insurance against a mechanism nobody has named yet:
 
 - The safety net's verdict line gains `signals`, `signals_at_last_tick`, `pump_alive` and
