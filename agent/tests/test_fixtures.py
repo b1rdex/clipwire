@@ -6,6 +6,7 @@ from agent_under_test import (
     TYPE_CLIP_STATE,
     decode_clip_payload,
     decode_frame,
+    decode_image_payload,
     encode_frame,
     sha256_hex,
 )
@@ -74,6 +75,27 @@ class TestFixtures(unittest.TestCase):
         parsed = json.loads(payload.decode())
         self.assertIsNone(parsed["sha256"], "sha256 must parse to null")
         self.assertEqual(parsed["ts"], 1.0)
+
+    def test_image_payload_decodes_golden(self):
+        """Pins the fixtures' type-3 payload against the image payload codec
+        too, not just the frame envelope. Filtered and asserted against the
+        literal 3, not TYPE_IMAGE_CLIP: a vector that routed the type byte
+        through the constant and back could not catch that constant being
+        relabelled, which was a real defect in v1 (see task-5-brief.md)."""
+        image_cases = [c for c in self.cases if c["type"] == 3]
+        self.assertEqual(len(image_cases), 1, "expected exactly 1 type-3 fixture case")
+        c = image_cases[0]
+
+        buffer = bytearray(bytes.fromhex(c["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, 3, "image-clip fixture must decode as type 3")
+        self.assertEqual(len(buffer), 0)
+
+        ts, png = decode_image_payload(payload)
+        self.assertEqual(ts, 1785400000.5)
+        # An independent, hardcoded pin -- not derived from payload_hex by
+        # slicing, so it cannot pass merely by symmetry with the encoder.
+        self.assertEqual(png, bytes.fromhex("89504e470d0a1a0a0000000d49484452"))
 
 
 class TestHashFixtures(unittest.TestCase):

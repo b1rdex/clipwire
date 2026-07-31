@@ -93,6 +93,33 @@ final class FixtureTests: XCTestCase {
         XCTAssertEqual(json["ts"] as? Double, 1.0)
     }
 
+    /// Pins the fixtures' type-3 payload against the *image* payload codec
+    /// too, not just the frame envelope. Filtered and asserted against the
+    /// literal `3`, not `FrameType.imageClip.rawValue`: a vector that routed
+    /// the type byte through the enum and back could not catch that enum
+    /// being relabelled, which was a real defect in v1 (see
+    /// task-5-brief.md's Step 5).
+    func testImagePayloadDecodesGolden() throws {
+        let cases = try loadFixtures().filter { $0.type == 3 }
+        XCTAssertEqual(cases.count, 1, "expected exactly 1 type-3 fixture case")
+        guard let c = cases.first else { return }
+
+        var buffer = hex(c.frame_hex)
+        let frame = try Frame.decode(from: &buffer)
+        XCTAssertEqual(frame?.type.rawValue, 3, "image-clip fixture must decode as type 3")
+        XCTAssertTrue(buffer.isEmpty, "leftover bytes for \(c.name)")
+
+        guard let payload = frame?.payload else {
+            return XCTFail("image-clip fixture must decode to a frame")
+        }
+        let decoded = try ImagePayload.decode(payload)
+        XCTAssertEqual(decoded.ts, 1785400000.5, "ts mismatch for \(c.name)")
+        // An independent, hardcoded pin -- not derived from payload_hex by
+        // slicing, so it cannot pass merely by symmetry with the encoder.
+        XCTAssertEqual(decoded.png, hex("89504e470d0a1a0a0000000d49484452"),
+                       "png bytes mismatch for \(c.name)")
+    }
+
     // MARK: - shared hash vectors (fixtures/hashes.json)
 
     struct HashCase: Decodable { let name: String; let input_hex: String; let sha256: String }

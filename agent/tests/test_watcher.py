@@ -2981,6 +2981,10 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "class ClipPayloadError",
             "def encode_clip_payload",
             "def decode_clip_payload",
+            # Task 5: the image-clip codec, defined immediately after the
+            # text one it mirrors.
+            "def encode_image_payload",
+            "def decode_image_payload",
             "TYPE_CLIP_STATE = 0x02",
             "class ClipStateError",
             "def encode_clip_state",

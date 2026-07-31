@@ -98,6 +98,44 @@ def decode_clip_payload(payload):
     return ts, bytes(payload[TIMESTAMP_BYTES:])
 
 
+def encode_image_payload(ts, png):
+    """type-0x03 payload: [f64 BE ts][PNG bytes].
+
+    Same shape as the text clip and for the same reason -- the receiver has to
+    record the PEER's timestamp for content it applies, and it cannot record
+    what the wire never carried. The body is opaque here: PNG validity is the
+    business of whoever read it off a clipboard, not of the codec.
+
+    Unlike encode_clip_payload, this rejects a non-finite ts on ENCODE too,
+    not just decode: encode_clip_payload's two existing callers only ever
+    pass a ts that has already been validated finite by an earlier decode or
+    a fresh time.time() reading, but this function has no callers yet to
+    lean on that same invariant -- whatever a later task wires up to call it
+    should not have to re-derive this guarantee, so it is enforced here,
+    at the source, matching what the tests below require.
+    """
+    if not math.isfinite(ts):
+        raise ClipPayloadError("refusing to encode a non-finite ts: %r" % ts)
+    return struct.pack(">d", ts) + png
+
+
+def decode_image_payload(payload):
+    """Inverse of encode_image_payload. Checks are ordered the same as
+    decode_clip_payload's: length, then ts finiteness, both before the body
+    is even looked at -- only the last check differs, since an empty image
+    body is never representable (unlike an empty clip TEXT, which
+    test_empty_text_is_representable above pins as legal)."""
+    if len(payload) < TIMESTAMP_BYTES:
+        raise ClipPayloadError("image payload shorter than its timestamp")
+    (ts,) = struct.unpack(">d", payload[:TIMESTAMP_BYTES])
+    if not math.isfinite(ts):
+        raise ClipPayloadError("refusing a non-finite ts: %r" % ts)
+    body = payload[TIMESTAMP_BYTES:]
+    if not body:
+        raise ClipPayloadError("image payload carries no image")
+    return ts, bytes(body)
+
+
 import json
 import math
 
