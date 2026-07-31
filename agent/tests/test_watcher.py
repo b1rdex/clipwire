@@ -668,12 +668,31 @@ class TestGPasteSafetyNet(unittest.TestCase):
 class TestMakeWatcher(unittest.TestCase):
     def test_uses_gpaste_when_available(self):
         clipboard = object()
+        on_degrade = object()
         with mock.patch.object(GPasteWatcher, "available", return_value=True):
-            watcher = make_watcher(clipboard=clipboard)
+            watcher = make_watcher(clipboard=clipboard, on_degrade=on_degrade)
         self.assertIsInstance(watcher, GPasteWatcher)
         self.assertIs(
             watcher.clipboard, clipboard,
             "the clipboard must reach the watcher, or its safety net polls nothing",
+        )
+        # The other half of the same forwarding contract, and the one this
+        # class never checked: `degraded` (the verdict handed IN) is pinned
+        # by the two tests below, but `on_degrade` -- the callback that
+        # carries the verdict back OUT to Agent._note_event_source_degraded
+        # -- was not asserted anywhere. It is the single production link
+        # that makes the degraded latch connection-scoped rather than
+        # watcher-scoped: without it, clipboard_lost/clipboard_became_ready
+        # discards the watcher that reached the verdict, the rebuilt one
+        # starts undiagnosed, and a mid-connection Wayland flap puts
+        # PC-to-Mac sync back on the 30-second detection budget on an
+        # installation already known to be broken. Verified by mutation:
+        # hardcoding `on_degrade=None` at the forwarding site below left the
+        # entire suite green before this assertion existed.
+        self.assertIs(
+            watcher._on_degrade, on_degrade,
+            "the degraded verdict must be able to travel back out to the Agent, "
+            "or the latch dies with the watcher that reached it",
         )
 
     def test_falls_back_to_polling_when_gpaste_unavailable(self):
