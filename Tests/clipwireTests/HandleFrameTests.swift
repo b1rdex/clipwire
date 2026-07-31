@@ -393,6 +393,54 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(decoded.text, "current clip text")
     }
 
+    /// Unlike the watcher's own local-change path, this branch reads the
+    /// live pasteboard independently and, before this fix, applied no size
+    /// bound at all: winning a reconciliation over content at or beyond the
+    /// cap would build a `ClipPayload` whose encoded frame exceeds
+    /// `FrameConstants.maxPayloadBytes`, and the peer's `Frame.decode`
+    /// would reject it as oversized and drop the whole channel -- the same
+    /// boundary `PasteboardTests.testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt`
+    /// pins for the watcher's send path.
+    func testWinningClipStateWithContentAtExactlyTheCapProducesNoSend() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: "aa", ts: 777))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxPayloadBytes)
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: nil, ts: 0)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertTrue(sent.isEmpty,
+                      "content of exactly the cap would encode to a frame 8 bytes over it")
+    }
+
+    /// The other half of the boundary: content that leaves exact room for
+    /// the timestamp prefix must still be sent -- an over-trimmed fix would
+    /// silently refuse to reconcile a win over content the wire format
+    /// actually supports.
+    func testWinningClipStateWithContentLeavingExactRoomForTheTimestampPrefixStillSends() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: "aa", ts: 777))
+        let pasteboard = RecordingPasteboard()
+        let text = String(repeating: "a",
+                          count: FrameConstants.maxPayloadBytes - ClipPayloadConstants.timestampBytes)
+        pasteboard.textToRead = Data(text.utf8)
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: nil, ts: 0)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(try ClipPayload.decode(sent[0].payload).text, text)
+    }
+
     /// If the store's own load somehow returns nothing (the fallback path
     /// for a disk failure on an earlier save, never expected in ordinary
     /// operation), `handleFrame` must still resolve a real state from the

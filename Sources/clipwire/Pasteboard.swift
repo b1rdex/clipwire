@@ -146,7 +146,16 @@ final class PasteboardWatcher {
         lastChangeCount = current
 
         guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
-        guard text.count <= FrameConstants.maxPayloadBytes else { return nil }
+        // `wireAgent` wraps this text in `ClipPayload(ts:text:)` before it
+        // ever reaches the wire, adding an 8-byte prefix -- so the bound
+        // here must leave room for it. Checking `text.count` alone (exact
+        // before Task 9, when this text WAS the frame payload) would let
+        // text at exactly the cap encode to a frame 8 bytes over it, which
+        // the peer's `Frame.decode` rejects as oversized, dropping the
+        // whole channel over a single large-but-not-overlong clip.
+        guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+            return nil
+        }
         guard echo.shouldSend(text) else { return nil }
         return (text, Date().timeIntervalSince1970)
     }
