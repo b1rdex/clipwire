@@ -1689,9 +1689,29 @@ class GPasteWatcher:
             self._armed = previous != current
         if confirmed and not self._degraded:
             self._degraded = True
-            log("GPaste is not reporting clipboard changes (is the gnome-shell "
-                "extension enabled?), polling every %.1fs for the rest of this "
-                "connection" % self._degraded_interval)
+            # Report what was observed, not a diagnosis this thread cannot
+            # make. A production line once read "GPaste is not reporting
+            # clipboard changes (is the gnome-shell extension enabled?)" on a
+            # machine where the extension WAS enabled and active, the bus name
+            # was owned, and a direct probe caught three Update signals for
+            # three copies -- the line asserted a cause it could not know and
+            # carried no evidence, so the real mechanism was never found. The
+            # fields below are exactly what this tick knows: the accepted-
+            # signal count, its value one tick ago, and whether each thread on
+            # the observation path is still alive. worker_alive is a dead/not-
+            # dead bit ONLY -- see its own docstring for what it cannot prove.
+            #
+            # %g, not %.1f: this is exercised with millisecond-scale intervals
+            # in tests, where %.1f renders "0.0s" and the line would misstate
+            # what the code actually did.
+            log("GPaste reported no clipboard change while the content changed "
+                "(signals=%d signals_at_last_tick=%d pump_alive=%s worker_alive=%s); "
+                "the gnome-shell extension being disabled is one possible cause. "
+                "Polling every %gs for the rest of this connection."
+                % (signals, self._signals_at_last_tick,
+                   self._thread.is_alive() if self._thread else False,
+                   self.worker_alive(),  # dead, not wedged -- see worker_alive()
+                   self._degraded_interval))
             self._safety_net.interval = self._degraded_interval
             if self._on_degrade is not None:
                 # Last, so this watcher's own state is fully consistent before
@@ -1763,7 +1783,16 @@ class GPasteWatcher:
     def worker_alive(self):
         """For the safety net's verdict line. A live pump with a dead worker is
         silent failure: the counter keeps climbing, so every observer concludes
-        the event source is healthy while nothing is being synced at all."""
+        the event source is healthy while nothing is being synced at all.
+
+        Detects a DEAD worker, not a WEDGED one, and that gap is now the
+        likely case rather than a corner one: _start_observer wraps the
+        handler call in `except Exception`, so the worker thread surviving is
+        the normal outcome and outright death is nearly unreachable. A worker
+        blocked inside Agent._local_change (a hung wl-paste, say) is still
+        `is_alive()` -- busy is not the same as working. So `worker_alive=True`
+        in a verdict line rules out "the thread exited"; it proves nothing
+        about whether the thread is still doing anything useful."""
         return self._worker is not None and self._worker.is_alive()
 
     def stop(self):

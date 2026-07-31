@@ -896,7 +896,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
     parameters so these tests run at millisecond scale instead of the
     production 30 seconds."""
 
-    SWITCH_MARKER = "not reporting clipboard changes"
+    SWITCH_MARKER = "reported no clipboard change"
 
     def setUp(self):
         original_log = clipwire_agent.log
@@ -974,6 +974,35 @@ class TestGPasteSafetyNet(unittest.TestCase):
             len(self.switch_log_lines()), 1,
             "the switch must be logged exactly once, not once per missed "
             "change; got: %r" % self.log_lines,
+        )
+
+    def test_the_verdict_reports_evidence_and_does_not_assert_a_cause(self):
+        """The production incident this task exists for: the line said `GPaste
+        is not reporting clipboard changes (is the gnome-shell extension
+        enabled?)` on a machine where the extension was enabled and active,
+        the bus name was owned, and a direct probe caught three Update signals
+        for three copies. The line asserted a cause it could not know and
+        carried no evidence, which is why the mechanism was never established.
+
+        No emitted gdbus line ever reaches this watcher, so `_signals` and
+        `_signals_at_last_tick` are pinned at 0 by construction, and neither
+        thread is ever stopped before the verdict fires -- so the values are
+        exact, not just present."""
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: self.switch_log_lines())
+        self.quiesce(watcher)
+
+        self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
+        line = self.switch_log_lines()[0]
+        self.assertIn("signals=0", line)
+        self.assertIn("signals_at_last_tick=0", line)
+        self.assertIn("pump_alive=True", line)
+        self.assertIn("worker_alive=True", line)
+        self.assertNotIn(
+            "is the gnome-shell extension enabled?", line,
+            "the verdict must not assert a cause it cannot know",
         )
 
     def test_the_verdict_lands_on_the_tick_after_the_arming_one(self):
