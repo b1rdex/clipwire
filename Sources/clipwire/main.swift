@@ -339,8 +339,28 @@ func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, 
 final class ClipStateAnnouncement {
     private(set) var sent = false
 
+    /// What THIS connection actually put on the wire. Kept because the store
+    /// is not a reliable way to read it back: `announceClipState`'s save is
+    /// best-effort and, like all three save sites, its failure is only
+    /// logged. See the `.clipState` case for what depends on it.
+    ///
+    /// Cleared by `reset()` along with `sent`, so a value announced on one
+    /// connection can never be resolved against on the next -- by then it
+    /// describes an older reading of the pasteboard than the reconciliation
+    /// that connection is about to perform for itself.
+    private(set) var announced: ClipState?
+
     func reset() {
         sent = false
+        announced = nil
+    }
+
+    /// Records what `announceClipState` resolved and sent. Separate from
+    /// `markSent()` because that call has to happen BEFORE the announcement
+    /// is built (it is what claims the one-shot), and the value only exists
+    /// afterwards.
+    func record(announced state: ClipState) {
+        announced = state
     }
 
     /// Marks it sent and returns whether THIS call is the one that did so --
@@ -390,13 +410,14 @@ func persistClipState(_ state: ClipState, to store: ClipStateStore, log: Log) {
 /// Pulled out of `wireAgent` for the same reason `handleFrame` was pulled out of
 /// `runAgent()`: a `send` spy can verify the exact frame this produces without a
 /// live channel. See `Tests/clipwireTests/HandleFrameTests.swift`.
+@discardableResult
 func announceClipState(
     send: (Frame) -> Void,
     pasteboard: PasteboardReading,
     clipStateStore: ClipStateStore,
     log: Log,
     now: Double
-) {
+) -> ClipState? {
     let stored = clipStateStore.load()
     let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now)
     // The line the design spec mandates by name for exactly this branch --
@@ -426,8 +447,12 @@ func announceClipState(
         log.line("clipboard changed while apart")
     }
     persistClipState(resolved, to: clipStateStore, log: log)
-    guard let payload = try? resolved.encodePayload() else { return }
+    // Returns what actually reached the wire, and only that: a payload that
+    // failed to encode was never announced, so there is nothing for a later
+    // reconciliation to be consistent WITH.
+    guard let payload = try? resolved.encodePayload() else { return nil }
     send(Frame(type: .clipState, payload: payload))
+    return resolved
 }
 
 /// Handles one decoded frame. Pulled out of `runAgent()`'s inline closure
@@ -513,8 +538,10 @@ func handleFrame(
         // ever arrives once: `wireAgent` resets it on the next
         // `.clipboardPending`, so it re-arms on every reconnect.
         if clipStateAnnouncement.markSent() {
-            announceClipState(send: send, pasteboard: pasteboard, clipStateStore: clipStateStore,
-                              log: log, now: now)
+            if let announced = announceClipState(send: send, pasteboard: pasteboard,
+                                                 clipStateStore: clipStateStore, log: log, now: now) {
+                clipStateAnnouncement.record(announced: announced)
+            }
         }
     case .clipState:
         guard let peerState = try? ClipState.decodePayload(frame.payload) else { return }
@@ -534,7 +561,46 @@ func handleFrame(
         // both sides resolve waitForPeer against each other's (correctly
         // announced) state and silently lose the clip, reintroducing v1's
         // bug through the fallback path instead of the main one.
+        // `load()` first, then what THIS connection announced, and only
+        // then a fresh re-derivation.
+        //
+        // The store should already be current -- from this connection's own
+        // announcement, or an ordinary local-change/applied-clip save since --
+        // so the rest only matters once a save has failed, which every one of
+        // the three sites merely logs. The old code went straight to the
+        // re-derivation there, and that is a clobber, not a fallback: it
+        // stamps `now` on content whose age this connection already ANNOUNCED
+        // to this same peer, so a peer that is genuinely fresher than what we
+        // put on the wire still loses to a number nobody was told about. The
+        // announced pair is the only value consistent with the announcement
+        // the peer is answering.
+        //
+        // `load()` still outranks it, unlike the PC agent, which prefers its
+        // just-computed pair outright -- and the asymmetry is deliberate, not
+        // drift. There, `_resolve_clip_state` is called from
+        // `clipboard_became_ready`'s own call frame, one line after computing
+        // the pair, so nothing can have happened in between. Here the
+        // `.clipState` frame arrives arbitrarily later than the `.hello` that
+        // announced, and a local change may legitimately have moved the store
+        // on since; the freshest readable value wins.
+        //
+        // The re-derivation survives as the last resort for the case neither
+        // covers: a clip-state arriving before we ever announced (this side
+        // does not stash, unlike the PC). A nil-hash placeholder there would
+        // make both sides resolve waitForPeer against each other's correctly
+        // announced state and silently lose the clip -- v1's bug through the
+        // fallback path.
+        //
+        // Accepted trade-off, stated rather than left to be discovered: if a
+        // local change ALSO failed to save after the announcement, the
+        // announced pair now describes older content than the pasteboard
+        // holds, and a `.sendMine` below would send the current text under the
+        // announced `ts` -- underselling its age. That needs two independent
+        // save failures plus a concurrent announcement, where the previous
+        // behaviour needed only one, and the local change in question was
+        // already sent to the peer by the watcher's own path.
         let mine = clipStateStore.load()
+            ?? clipStateAnnouncement.announced
             ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
         let decision = resolveFreshness(mine: mine, peer: peerState)
         // Every reconciliation outcome is reported, not only the interesting

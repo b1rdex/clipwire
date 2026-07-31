@@ -38,6 +38,35 @@ final class ClipStateStoreTests: XCTestCase {
         XCTAssertEqual(store.load(), ClipState(sha256: "bb", ts: 2))
     }
 
+    /// The deliberate asymmetry the final wave introduced, pinned so it is a
+    /// decision rather than an oversight. `ClipState.decodePayload` rejects a
+    /// `sha256` that is not 64 lowercase hex; `load()` decodes directly and
+    /// does not, unlike the PC agent's `load_clip_state`, which shares its
+    /// decoder with the wire path and so validates its store file too.
+    ///
+    /// Harmless in both directions, and this test says why: the store only
+    /// ever holds `sha256Hex` output, so a malformed hash means corruption --
+    /// and a corrupt one simply fails to match the current clipboard, taking
+    /// `resolveStartupState`'s "content changed while apart" branch (`ts =
+    /// now`, and now a log line saying so). That is the same outcome as the
+    /// `nil` `load()` already returns for a torn file, so validating here
+    /// would buy nothing while adding a fourth failure reason to `load()`'s
+    /// documented contract. It also never reaches the wire: what gets
+    /// announced is the LOCALLY computed hash, never the stored one.
+    func testLoadDoesNotValidateTheStoredHashTheWayTheWireDecoderDoes() throws {
+        let malformed = ClipState(sha256: "not a hex digest at all", ts: 100)
+        try store.save(malformed)
+        XCTAssertEqual(store.load(), malformed, "the store is deliberately lenient")
+
+        XCTAssertThrowsError(try ClipState.decodePayload(malformed.encodePayload()),
+                             "the same value must NOT be accepted off the wire")
+        XCTAssertEqual(
+            resolveStartupState(currentHash: sha256Hex(Data("current".utf8)),
+                                stored: malformed, now: 999),
+            ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999),
+            "a corrupt stored hash resolves to `now`, exactly as nothing-stored does")
+    }
+
     func testNilHashRoundTrips() throws {
         let state = ClipState(sha256: nil, ts: 0)
         try store.save(state)

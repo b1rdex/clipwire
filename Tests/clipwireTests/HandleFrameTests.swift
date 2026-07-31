@@ -816,6 +816,57 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(sent.count, 1, "a local disk failure must not prevent the announcement from going out")
     }
 
+    // MARK: - Final wave: reconcile against what we announced, not a re-derivation
+
+    /// The `.clipState` case re-derived `mine` from the live pasteboard
+    /// whenever `clipStateStore.load()` came back nil, stamping `now` on it.
+    /// Since all three save sites swallow their failure, an unwritable state
+    /// directory reaches that path silently -- and the re-derived value is
+    /// not the one this connection ANNOUNCED to this same peer moments
+    /// earlier. It is strictly newer, because `now` has moved on, so a peer
+    /// that is genuinely fresher than what we announced still loses, and we
+    /// clobber it with older content under an invented age.
+    ///
+    /// Driven end to end through `handleFrame` with one shared
+    /// `ClipStateAnnouncement`, exactly as a real connection does it: a
+    /// matched hello announces, then the peer's own clip-state arrives. The
+    /// peer's `ts` sits deliberately BETWEEN the announced `ts` and the `now`
+    /// the re-derivation would use, so the two implementations disagree about
+    /// who wins rather than merely about a timestamp's value.
+    func testAPeersClipStateResolvesAgainstWhatWeAnnouncedWhenTheStoreIsUnreadable() throws {
+        let store = try unsaveableStore()
+        let announcement = ClipStateAnnouncement()
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("what we hold".utf8)
+        var sent: [Frame] = []
+
+        handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 1000)
+
+        let announced = sent.filter { $0.type == .clipState }
+        XCTAssertEqual(announced.count, 1, "the hello must have produced an announcement")
+        XCTAssertEqual(try ClipState.decodePayload(announced[0].payload).ts, 1000)
+        XCTAssertNil(store.load(), "the store must really be unreadable, or this proves nothing")
+        sent.removeAll()
+
+        // The peer is fresher than what we announced (2000 > 1000) but older
+        // than the clock a re-derivation would stamp (2000 < 3000).
+        let peer = ClipState(sha256: Self.hashB, ts: 2000)
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 3000)
+
+        XCTAssertEqual(sent.filter { $0.type == .clip }, [],
+                       "the peer is fresher than the state we put on the wire, so it wins -- " +
+                       "re-deriving our own from `now` invents an age nobody was told about " +
+                       "and clobbers a peer that should have won")
+    }
+
     // MARK: - Final wave: status reports `up` only once the peer can actually sync
 
     /// The window this closes is the ordinary post-reboot one: the PC agent

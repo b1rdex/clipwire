@@ -187,11 +187,19 @@ final class AgentWiringTests: XCTestCase {
         channel.onFrame?(Frame(type: .hello, payload: ProtocolConstants.helloPayload))
         XCTAssertTrue(announcement.sent, "a matched hello on the first connection must claim the gate")
 
+        XCTAssertNotNil(announcement.announced,
+                        "the announced pair must be recorded, or the .clipState case has nothing " +
+                        "to reconcile against when the store cannot be read back")
+
         channel.onStateChange?(.clipboardPending, nil)
         XCTAssertFalse(announcement.sent,
                        "a NEW connection (the ordinary sleep/wake reconnect) must re-arm the gate -- " +
                        "otherwise the announcement fires on the process's first connection ever and " +
                        "never again, which defeats the entire feature")
+        XCTAssertNil(announcement.announced,
+                     "and it must forget what the PREVIOUS connection announced: by now that pair " +
+                     "describes an older reading of the pasteboard than the reconciliation this " +
+                     "connection is about to perform for itself")
     }
 
     /// The third of the three Swift `clipStateStore.save` sites, and the
