@@ -431,9 +431,125 @@ import subprocess
 SUBPROCESS_TIMEOUT = 3
 
 
-def runtime_dir(env=None):
+def _xdg_dir(var_name, default, env=None):
+    """`$<var_name>` when the caller's environment sets it, else `default`
+    (already resolved to an absolute path by the caller). This is the
+    env-var-with-fallback shape runtime_dir() below needs for
+    XDG_RUNTIME_DIR -- shared here, rather than typed out a second time
+    with different literals, so clip_state_path()'s own fallback can never
+    drift from it independently.
+    """
     env = os.environ if env is None else env
-    return env.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return env.get(var_name) or default
+
+
+def runtime_dir(env=None):
+    return _xdg_dir("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid(), env)
+
+
+def clip_state_path(env=None):
+    """`$XDG_STATE_HOME/clipwire/clip-state.json`, falling back to
+    `~/.local/state` -- the directory XDG itself specifies as the default
+    for XDG_STATE_HOME when unset -- through the same _xdg_dir helper
+    runtime_dir() above uses for XDG_RUNTIME_DIR.
+
+    Deliberately independent of /run, unlike runtime_dir()'s own fallback
+    just above: XDG_RUNTIME_DIR's default (/run/user/<uid>) is commonly
+    tmpfs, cleared on reboot -- fine for a Wayland socket that only needs
+    to outlive one login session. This file has to outlive far more: sshd
+    spawns a brand-new agent process on every SSH connection, and the
+    channel drops on every Mac sleep/wake cycle, so the entire reason this
+    store exists is to answer "how old is what I hold" for content that
+    predates the process asking, which is the ordinary case here, not an
+    edge one. A store that itself lived under /run would forget
+    everything on the one occasion -- a real reboot -- it would matter
+    most.
+    """
+    base = _xdg_dir("XDG_STATE_HOME", os.path.expanduser("~/.local/state"), env)
+    return os.path.join(base, "clipwire", "clip-state.json")
+
+
+def load_clip_state(path=None):
+    """(sha256, ts) last persisted by save_clip_state, or None.
+
+    None covers three distinct failure reasons identically, on purpose: no
+    file has ever been written, the file exists but cannot be opened as a
+    regular file (permissions, or -- as this module's own tests cover
+    directly -- a directory sitting where the file should be), and the
+    file opens fine but does not decode as a valid clip state (a write
+    torn by a mid-rename crash, or anything else malformed). Every one of
+    those collapses to the same "nothing stored" branch in
+    resolve_startup_state below, so no caller would ever treat them
+    differently -- and raising here instead would turn every fresh install
+    (no file yet) into a crash. Reuses decode_clip_state's existing
+    malformed-payload checks rather than a second, file-specific copy of
+    the same JSON shape.
+    """
+    target = clip_state_path() if path is None else path
+    try:
+        with open(target, "rb") as handle:
+            payload = handle.read()
+    except OSError:
+        return None
+    try:
+        return decode_clip_state(payload)
+    except ClipStateError:
+        return None
+
+
+def save_clip_state(sha256, ts, path=None):
+    """Persists (sha256, ts) atomically: encode, write to a `.tmp`
+    sibling, then os.replace it over the real path. os.replace is an
+    atomic rename on POSIX, so load_clip_state above -- quite possibly
+    running in an entirely different process, since the PC agent is a new
+    process every connection -- can never observe a half-written file.
+    Reuses encode_clip_state rather than a second JSON encoding, so its
+    non-finite-ts guard protects this path too, and the on-disk format can
+    never drift from the wire format of the same shape.
+    """
+    target = clip_state_path() if path is None else path
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    payload = encode_clip_state(sha256, ts)
+    tmp = target + ".tmp"
+    with open(tmp, "wb") as handle:
+        handle.write(payload)
+    os.replace(tmp, target)
+
+
+def resolve_startup_state(current_hash, stored, now):
+    """The judgement that makes the wake flow work. `current_hash` is the
+    clipboard's hash *right now*, at startup; `stored` is whatever
+    load_clip_state() last returned (a (sha256, ts) pair, or None); `now`
+    is the caller's clock.
+
+    A timestamp can come from three places, in precedence order: a local
+    change this process watched happen, a clip received from the peer
+    (carrying the peer's own timestamp, stored unchanged), and -- the case
+    this function exists for -- content that predates this process
+    entirely. sshd spawns this agent fresh on every connection, and the
+    Mac's channel drops on every sleep/wake cycle, so "predates this
+    process" is not an edge case here; it is the ordinary shape of a clip
+    copied on one side while the other slept or was disconnected.
+
+    If the hash on disk matches what the clipboard holds now, the content
+    has not changed since it was last recorded, so the *stored* timestamp
+    is the real age of that content and is returned unchanged. Returning
+    `now` here instead would make every such clip look freshly copied,
+    winning it every reconciliation and clobbering the peer systematically
+    on every reconnect. If the hashes differ, or nothing was ever stored,
+    the content changed (or first appeared) while nothing was watching,
+    and only `now` is honest.
+
+    A None current_hash (clipboard empty or unreadable right now) always
+    wins over whatever is on disk, regardless of what was previously
+    stored: resolve_freshness never compares timestamps when either side's
+    hash is None, so the timestamp returned here is never actually read.
+    """
+    if current_hash is None:
+        return None, now
+    if stored is not None and stored[0] == current_hash:
+        return current_hash, stored[1]
+    return current_hash, now
 
 
 def wayland_socket_path(env=None):

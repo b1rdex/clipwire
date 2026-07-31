@@ -725,6 +725,11 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             'SEND_MINE = "sendMine"',
             'WAIT_FOR_PEER = "waitForPeer"',
             'DO_NOTHING = "doNothing"',
+            "def _xdg_dir",
+            "def clip_state_path",
+            "def load_clip_state",
+            "def save_clip_state",
+            "def resolve_startup_state",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(
