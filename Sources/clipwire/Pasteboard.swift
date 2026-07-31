@@ -217,14 +217,28 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// same lock as the rest closes this: whatever generation `poll()` records
 /// is provably the one it just read text and consulted `echo` for, because
 /// nothing else can touch `echo` in between. Unlike the PC side, none of
-/// this needs a generation counter: `SystemPasteboard.read()` is an
-/// in-process NSPasteboard call, not a forked `wl-paste` that can take up to
-/// 3 seconds, so there is no slow operation whose lock-holding cost a
-/// counter would be needed to dodge — and a counter keyed off `echo`'s own
-/// arm count would not even catch this specific gap, since the arm that
-/// matters here can complete before `poll()` starts, leaving the counter
-/// unchanged across the whole call. A single lock around the full sequence
-/// is both sufficient and cheap.
+/// this needs a generation counter — but NOT, since Task 8, because the read
+/// is always cheap. `SystemPasteboard.read()` is an in-process NSPasteboard
+/// call rather than a forked `wl-paste`, and for text it is as fast as it
+/// ever was; for an IMAGE it now also runs `NSBitmapImageRep` decode plus PNG
+/// re-encode, which on a Retina screenshot is genuinely slow — comparable to
+/// the wl-paste call the PC side had to dodge — and `pollLocked()` runs it
+/// inside `stateLock`, so `noteWrittenLocally` can block for that long.
+/// That cost is bounded and accepted rather than overlooked: the
+/// `changeCount` guard returns BEFORE the read on an unchanged board, so a
+/// conversion happens at most once per clipboard change, never once per tick,
+/// however long an image sits there. And a generation counter would not help
+/// anyway — the reason it is unnecessary is a correctness argument, not a
+/// latency one: a counter keyed off `echo`'s own arm count would not catch
+/// this specific gap at all, since the arm that matters here can complete
+/// before `poll()` starts, leaving the counter unchanged across the whole
+/// call. A single lock around the full sequence is sufficient; if the
+/// image-read latency ever becomes a problem, the fix is to read outside the
+/// lock and re-validate, not to reach for a counter.
+///
+/// (The converted PNG is then discarded, because `pollLocked()` keeps text
+/// only — see its own comment. That waste ends with Task 11, which is what
+/// makes an image observation worth sending.)
 ///
 /// This lock is still not a complete contract on its own: it says nothing
 /// about the ORDER in which the future frame handler writes to the

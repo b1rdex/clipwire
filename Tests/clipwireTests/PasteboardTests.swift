@@ -277,17 +277,21 @@ final class PasteboardTests: XCTestCase {
 // discard a comparison made stale by a write racing its slow (up to 3s,
 // forked wl-paste) read.
 //
-// PasteboardWatcher has the same two actors: the timer's poll() and (in a
-// later task) the channel's frame handler, which writes an incoming clip and
-// calls noteWrittenLocally() from a different thread. Unlike wl-paste,
-// SystemPasteboard.read() is an in-process NSPasteboard call with no
-// subprocess fork, so there is no slow operation whose lock-holding cost
-// needs dodging with a generation counter — a plain lock that covers
-// poll()'s [read text -> consult echo] step and noteWrittenLocally()'s arm
-// is both necessary and sufficient, and is cheap because that whole section
-// is fast. This test proves the "necessary" half empirically: it fails
-// against an unprotected implementation and passes once the two are made
-// mutually exclusive.
+// PasteboardWatcher has the same two actors: the timer's poll() and the
+// channel's frame handler, which writes an incoming clip and calls
+// noteWrittenLocally() from a different thread. A plain lock covering
+// poll()'s [read -> consult echo] step and noteWrittenLocally()'s arm is
+// both necessary and sufficient here, with no generation counter — and the
+// reason is a correctness argument, not a speed one. Since Task 8,
+// SystemPasteboard.read() is NOT unconditionally cheap: an image goes
+// through an NSBitmapImageRep decode and a PNG re-encode inside the lock,
+// which on a screenshot is comparable to the forked wl-paste call the PC
+// side had to dodge. It stays bounded because the changeCount guard returns
+// before the read on an unchanged board, so that conversion runs at most
+// once per clipboard change. See PasteboardWatcher's own class comment for
+// why a counter would not have caught this gap regardless. This test proves
+// the "necessary" half empirically: it fails against an unprotected
+// implementation and passes once the two are made mutually exclusive.
 
 /// A double that can pause mid-read, to let a test land a concurrent
 /// noteWrittenLocally() call while poll() is between reading the pasteboard
