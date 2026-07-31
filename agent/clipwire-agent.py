@@ -1140,10 +1140,50 @@ SUBPROCESS_TIMEOUT = 3
 # Text reads have already been observed timing out at SUBPROCESS_TIMEOUT in
 # production. An image body can be up to MAX_IMAGE_BYTES (4 MiB) flowing
 # through a pipe, not a few kilobytes of text, so it gets its own, longer
-# bound rather than inheriting the text one. Both bounds are logged against
-# in WaylandClipboard._run_wl_paste, so the next time either is wrong there
-# is evidence of how long the read actually took, not a guess.
+# bound rather than inheriting the text one. WaylandClipboard._run_wl_paste
+# logs a read's duration against whichever of these two bounds applies to
+# it -- see SLOW_READ_SECONDS/SLOW_IMAGE_READ_SECONDS just below for when.
 IMAGE_SUBPROCESS_TIMEOUT = 10
+
+# Fix round 1: the coordinator caught that logging EVERY read's duration
+# unconditionally -- this file's own first cut at "the next time this bound
+# is wrong there is evidence, not a guess" -- floods the log at production
+# scale rather than serving it. PollingWatcher's safety net (composed by
+# GPasteWatcher, or standalone when GPaste is unavailable) calls
+# clipboard.read() on EVERY tick for as long as the connection lasts,
+# whether or not anything changed; each read is up to two wl-paste
+# invocations. At DEGRADED_POLL_SECONDS=1.0 that is 86400 x 2 = 172,800
+# duration lines a day, every one of them crossing the SSH channel into the
+# Mac's log -- not instrumentation, the log being destroyed as a
+# diagnostic. Sources/clipwire/main.swift's own skewLogLine (mirrored by
+# skew_log_line above) already rejected logging the wrong quantity on
+# exactly this ground: measuring clip age instead of clock skew "would fire
+# on nearly every handshake and teach everyone to ignore the log". A
+# duration line on every poll tick fails the same test, in the one release
+# whose whole purpose is making this log worth reading.
+#
+# So a read's duration is logged only when it clears one of these two
+# thresholds -- gated, not measured differently; the file still tries every
+# wl-paste call and always KNOWS its duration, it just does not always say
+# so. Two thresholds, not one, because the two bounds above are not one
+# number either: holding an image body to the text threshold would spam on
+# every normal-sized screenshot, and holding text to the image threshold
+# would hide a genuinely slow text read for 3 extra seconds. Both sit at
+# roughly the same fraction of their own timeout (~1/3), which is the
+# reasoning that carries over from one to the other; this project has no
+# live Wayland machine to measure real read latencies against (every read
+# in this suite is a mocked, near-instant subprocess.run), so this is
+# proportional reasoning tied to SUBPROCESS_TIMEOUT/IMAGE_SUBPROCESS_TIMEOUT
+# themselves, not an empirical measurement -- said plainly rather than
+# implied.
+#
+# A threshold alone would still leave a reader with nothing to judge an
+# outlier against, so WaylandClipboard.read() also logs its OWN first call
+# unconditionally (see the _first_read_done flag below), establishing at
+# least one baseline duration in the log per connection before the gate
+# takes over.
+SLOW_READ_SECONDS = 1.0
+SLOW_IMAGE_READ_SECONDS = 3.0
 
 
 def _xdg_dir(var_name, default, env=None):
@@ -1490,6 +1530,16 @@ class WaylandClipboard:
         # tracks "wl-paste is currently hanging", not which of the two
         # calls a single read() makes is the one that hung.
         self._read_timeout_logged = False
+        # Whether this WaylandClipboard has completed a read() call yet.
+        # Checked and set once per read() (not once per wl-paste
+        # invocation), so the very FIRST read of a connection logs the
+        # duration of BOTH its wl-paste calls unconditionally -- a real
+        # baseline for both call shapes (--list-types and a body fetch),
+        # not just whichever one happens to run first. See
+        # SLOW_READ_SECONDS's own comment for why an unconditional first
+        # reading matters: a threshold alone gives a reader outliers with
+        # nothing to judge them against.
+        self._first_read_done = False
 
     def ready(self):
         return os.path.exists(wayland_socket_path())
@@ -1513,7 +1563,14 @@ class WaylandClipboard:
         the single-read behaviour this replaces: a normal state, not an
         error.
         """
-        listed = self._run_wl_paste(["--list-types"], SUBPROCESS_TIMEOUT)
+        # Captured once, at the top, and immediately consumed: whichever of
+        # the (up to two) wl-paste calls this particular read() goes on to
+        # make, ALL of them log unconditionally if this is the connection's
+        # first read() -- not just whichever call happens to run first. See
+        # _first_read_done's own comment.
+        force_log = not self._first_read_done
+        self._first_read_done = True
+        listed = self._run_wl_paste(["--list-types"], SUBPROCESS_TIMEOUT, SLOW_READ_SECONDS, force_log)
         if listed is None or listed.returncode != 0:
             return None
         kind = choose_kind(listed.stdout.decode("utf-8", "replace").splitlines())
@@ -1521,34 +1578,41 @@ class WaylandClipboard:
             return None
         if kind == KIND_TEXT:
             result = self._run_wl_paste(
-                ["-n", "--type", "text/plain;charset=utf-8"], SUBPROCESS_TIMEOUT)
+                ["-n", "--type", "text/plain;charset=utf-8"], SUBPROCESS_TIMEOUT,
+                SLOW_READ_SECONDS, force_log)
         else:
             # No -n here: verified against the wl-clipboard manual that
             # --no-newline is applied automatically for any non-text MIME
             # type, so passing it explicitly would be redundant, never
             # incorrect. Left off so this call visibly differs from the
             # text one above, rather than carrying a flag that does nothing.
-            result = self._run_wl_paste(["--type", "image/png"], IMAGE_SUBPROCESS_TIMEOUT)
+            result = self._run_wl_paste(
+                ["--type", "image/png"], IMAGE_SUBPROCESS_TIMEOUT, SLOW_IMAGE_READ_SECONDS, force_log)
         if result is None or result.returncode != 0 or not result.stdout:
             return None
         return kind, result.stdout
 
-    def _run_wl_paste(self, args, timeout):
+    def _run_wl_paste(self, args, timeout, slow_after, force_log):
         """One wl-paste invocation, shared by every call read() makes --
         `--list-types` and both body-fetch shapes -- so the failure
-        handling and the one-shot hang log live in exactly one place
+        handling and the duration-logging gate live in exactly one place
         rather than duplicated per call site.
 
-        Logs this call's own duration on every path that actually reaches
-        the subprocess: success, a timeout, or any other OSError -- "every
-        read's duration", so the next time SUBPROCESS_TIMEOUT or
-        IMAGE_SUBPROCESS_TIMEOUT turns out wrong there is evidence of how
-        long the read actually took, not a guess. Skipped only when
-        wl-paste is not installed at all, where there is no duration worth
-        reporting and it would just be noise next to the "not installed"
-        line. Deliberately worded without the literal text "wl-paste" in
-        it, unlike the hang log below -- so a log-line-counting test that
-        greps for that word keeps counting failures, not every read.
+        `slow_after` and `force_log` together decide whether this call's
+        duration gets a log line -- see SLOW_READ_SECONDS's own comment for
+        why logging every call unconditionally is not an option at
+        production scale (172,800 lines a day in degraded mode). Gated on
+        every path that actually reaches the subprocess: success, a
+        timeout, or any other OSError. Skipped entirely (not even measured
+        against the gate) only when wl-paste is not installed at all, where
+        there is no meaningful duration to report and it would just be
+        noise next to the "not installed" line.
+
+        The "wl-paste failed" line below is deliberately NOT subject to
+        this gate -- it is already deduplicated by _read_timeout_logged, a
+        different mechanism for a different purpose (an ongoing hang logs
+        once, not the rate of successful reads), so it stays unconditional
+        on the first occurrence of a hang the way it always has.
 
         Returns the CompletedProcess, or None on a missing binary, a
         timeout, or any other OSError -- all three already logged here, so
@@ -1563,14 +1627,29 @@ class WaylandClipboard:
             log("wl-paste is not installed")
             return None
         except (subprocess.TimeoutExpired, OSError) as error:
-            log("clipboard read (%s) took %.3fs" % (" ".join(args), time.monotonic() - started))
+            self._log_duration_if_notable(args, time.monotonic() - started, slow_after, force_log)
             if not self._read_timeout_logged:
                 log("wl-paste failed: %r" % error)
                 self._read_timeout_logged = True
             return None
-        log("clipboard read (%s) took %.3fs" % (" ".join(args), time.monotonic() - started))
+        self._log_duration_if_notable(args, time.monotonic() - started, slow_after, force_log)
         self._read_timeout_logged = False
         return result
+
+    def _log_duration_if_notable(self, args, duration, slow_after, force_log):
+        """The gate itself: log iff this is forced (the connection's first
+        read -- see _first_read_done) or the read actually took long enough
+        to be worth a line. A timeout always satisfies the threshold on its
+        own (duration is at least `timeout`, always chosen well above
+        `slow_after`), so the exception path above needs no special case
+        here beyond calling this the same way the success path does.
+
+        Deliberately worded without the literal text "wl-paste" in the
+        line itself, unlike the hang log above -- so a log-line-counting
+        test that greps for that word keeps counting failures, not reads.
+        """
+        if force_log or duration >= slow_after:
+            log("clipboard read (%s) took %.3fs" % (" ".join(args), duration))
 
     def write(self, kind, data):
         """wl-copy does not exit — it stays resident as the selection owner.

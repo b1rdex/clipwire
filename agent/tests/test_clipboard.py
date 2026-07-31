@@ -10,6 +10,8 @@ from agent_under_test import (
     IMAGE_SUBPROCESS_TIMEOUT,
     KIND_IMAGE,
     KIND_TEXT,
+    SLOW_IMAGE_READ_SECONDS,
+    SLOW_READ_SECONDS,
     SUBPROCESS_TIMEOUT,
     WaylandClipboard,
     choose_kind,
@@ -243,24 +245,6 @@ class TestReadSubprocessBehavior(unittest.TestCase):
             "a body-read timeout must be logged: %r" % self.log_lines,
         )
 
-    def test_every_subprocess_call_logs_its_own_duration(self):
-        """'log every read's duration' (the brief's own words), so the next
-        time a bound is wrong there is evidence, not a guess. Checked
-        against the log line's own shape -- both calls, not just one --
-        rather than the timing value itself, which a mocked call cannot
-        pin meaningfully."""
-        with mock.patch("subprocess.run", side_effect=[
-            _completed(stdout=b"text/plain;charset=utf-8\n"),
-            _completed(stdout=b"hello"),
-        ]):
-            WaylandClipboard().read()
-        duration_lines = [line for line in self.log_lines if line.startswith("clipboard read (")]
-        self.assertEqual(
-            len(duration_lines), 2,
-            "both the --list-types call and the body read must each log their "
-            "own duration: %r" % self.log_lines,
-        )
-
     def test_timeout_returns_none_and_logs(self):
         with mock.patch(
             "subprocess.run", side_effect=subprocess.TimeoutExpired("wl-paste", SUBPROCESS_TIMEOUT)
@@ -298,7 +282,9 @@ class TestReadSubprocessBehavior(unittest.TestCase):
         log for as long as the hang lasts. The per-call duration line added
         this task is deliberately worded without the substring "wl-paste"
         (see _run_wl_paste's own docstring), so this count keeps counting
-        failures only, unaffected by it."""
+        failures only, unaffected by it -- and unaffected too by Fix round
+        1's gate, which governs only whether the duration line appears, not
+        the separately-mechanised "wl-paste failed" dedup this counts."""
         clipboard = WaylandClipboard()
         with mock.patch(
             "subprocess.run",
@@ -333,6 +319,147 @@ class TestReadSubprocessBehavior(unittest.TestCase):
         self.assertEqual(
             sum(1 for line in self.log_lines if "wl-paste" in line), 2,
             "a new timeout after the condition clears must be logged again: %r" % self.log_lines,
+        )
+
+    def test_the_connections_first_read_logs_both_calls_unconditionally(self):
+        """Fix round 1: duration logging is now gated (see
+        TestDurationLoggingIsGated below for the volume this exists to
+        prevent), but the very FIRST read() a WaylandClipboard makes is the
+        one deliberate exception -- both of its wl-paste calls log
+        regardless of how fast they were, so there is always at least one
+        baseline pair in the log before the gate takes over. Checked
+        against the log line's own shape -- both calls, not just one --
+        rather than the timing value itself, which a mocked call cannot pin
+        meaningfully."""
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"),
+            _completed(stdout=b"hello"),
+        ]):
+            WaylandClipboard().read()
+        duration_lines = [line for line in self.log_lines if line.startswith("clipboard read (")]
+        self.assertEqual(
+            len(duration_lines), 2,
+            "the connection's first read must log both the --list-types call "
+            "and the body read's own duration, unconditionally: %r" % self.log_lines,
+        )
+
+
+class TestDurationLoggingIsGated(unittest.TestCase):
+    """Fix round 1. Logging every read's duration unconditionally -- built
+    exactly as the original brief specified, and exactly what
+    TestReadSubprocessBehavior's own first-read test above still pins --
+    floods the log at production scale: PollingWatcher's safety net calls
+    clipboard.read() on every tick for as long as a connection lasts,
+    whether or not anything changed, and each read is up to two wl-paste
+    invocations. At DEGRADED_POLL_SECONDS=1.0 that is 86400 x 2 = 172,800
+    duration lines a day, all of it crossing the SSH channel into the Mac's
+    log. Every case here is pinned by LINE COUNT, not by wording -- the
+    deliverable the coordinator asked for is a test that goes red if the
+    gate is ever removed, and a wording-based assertion would not notice
+    that; a count would."""
+
+    def setUp(self):
+        self.log_lines = []
+        original_log = clipwire_agent.log
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def _duration_lines(self):
+        return [line for line in self.log_lines if line.startswith("clipboard read (")]
+
+    def test_fast_reads_after_the_first_do_not_each_log_a_duration_line(self):
+        """The gate's core claim, reproduced directly: three MORE reads
+        after the connection's first, all fast (mocked subprocess.run calls
+        complete in effectively zero time, comfortably under
+        SLOW_READ_SECONDS), must not each add a duration line. If the gate
+        were ever removed -- reverting to logging every call
+        unconditionally, which is what this task's own first cut did --
+        this goes red: 4 reads x 2 calls = 8 lines, not the 2 asserted
+        here."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"one"),
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"two"),
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"three"),
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"four"),
+        ]):
+            clipboard.read()  # the connection's first read -- logs unconditionally
+            clipboard.read()
+            clipboard.read()
+            clipboard.read()
+        self.assertEqual(
+            len(self._duration_lines()), 2,
+            "only the first read's two calls should ever log here -- three more fast "
+            "reads (six more wl-paste calls) must add nothing: %r" % self.log_lines,
+        )
+
+    def test_a_slow_read_after_the_first_still_logs(self):
+        """The gate's other half, so the fix cannot be 'never log again
+        after the first read': a read past SLOW_READ_SECONDS must still
+        produce a line, on whichever read() call and whichever of the two
+        wl-paste invocations it happens on. time.monotonic is mocked
+        (rather than actually sleeping, which this suite avoids throughout)
+        to make the SECOND wl-paste call of the second read() report a
+        duration safely past the threshold with no real delay."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"fast one"),
+        ]):
+            clipboard.read()  # consumes the connection's unconditional first read
+        self.log_lines.clear()
+
+        # time.monotonic is called twice per _run_wl_paste call (started,
+        # then the duration subtraction): [start1, end1, start2, end2].
+        # The first (--list-types) is fast; the second (the text body) is
+        # pushed well past SLOW_READ_SECONDS.
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"slow one"),
+        ]), mock.patch("time.monotonic", side_effect=[0.0, 0.01, 10.0, 10.0 + SLOW_READ_SECONDS + 1]):
+            clipboard.read()
+
+        duration_lines = self._duration_lines()
+        self.assertEqual(
+            len(duration_lines), 1,
+            "a read past the threshold must still log even though it is not "
+            "the connection's first: %r" % self.log_lines,
+        )
+        self.assertIn(
+            "text/plain;charset=utf-8", duration_lines[0],
+            "the SLOW call (the body fetch) must be the one that logged, not "
+            "the fast --list-types call: %r" % duration_lines,
+        )
+
+    def test_the_image_threshold_is_higher_than_the_text_threshold_and_applied_independently(self):
+        """Holding both call shapes to the same number would either spam on
+        a normal-sized image (if set to the text threshold) or hide a
+        genuinely slow text read for extra seconds (if set to the image
+        threshold) -- pinned directly by a duration that is slow BY TEXT'S
+        standard but not by image's, on an actual image read."""
+        self.assertGreater(
+            SLOW_IMAGE_READ_SECONDS, SLOW_READ_SECONDS,
+            "an image body is up to MAX_IMAGE_BYTES through a pipe, not a few "
+            "kilobytes of text -- it needs a higher bar before its duration is "
+            "worth a line",
+        )
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"), _completed(stdout=b"fast"),
+        ]):
+            clipboard.read()  # consumes the connection's unconditional first read
+        self.log_lines.clear()
+
+        between_the_two_thresholds = (SLOW_READ_SECONDS + SLOW_IMAGE_READ_SECONDS) / 2
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"image/png\n"), _completed(stdout=b"\x89PNG-body"),
+        ]), mock.patch("time.monotonic", side_effect=[
+            0.0, 0.01, 10.0, 10.0 + between_the_two_thresholds,
+        ]):
+            clipboard.read()
+
+        self.assertEqual(
+            self._duration_lines(), [],
+            "a duration between the two thresholds is slow for text but not "
+            "for an image, and this read is an image: %r" % self.log_lines,
         )
 
 

@@ -3069,6 +3069,10 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             # WaylandClipboard.
             "IMAGE_SUBPROCESS_TIMEOUT = 10",
             "def choose_kind",
+            # Task 7, Fix round 1: the duration-logging gate's two
+            # thresholds, defined alongside IMAGE_SUBPROCESS_TIMEOUT.
+            "SLOW_READ_SECONDS = 1.0",
+            "SLOW_IMAGE_READ_SECONDS = 3.0",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(
