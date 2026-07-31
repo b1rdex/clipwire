@@ -68,10 +68,6 @@ final class HandleFrameTests: XCTestCase {
         }
     }
 
-    /// A real, temp-path-backed store -- not a live production state
-    /// directory -- mirroring `tempStatusURL()`/`tempLog()`'s existing
-    /// pattern of injecting real-but-disposable dependencies rather than
-    /// mocking file I/O.
     /// 64 lowercase hex characters: the only shape `ClipState.decodePayload`
     /// accepts, and the only shape `sha256Hex` -- hence the wire -- ever
     /// produces. Obviously fake, but well-formed, so these tests exercise the
@@ -83,6 +79,10 @@ final class HandleFrameTests: XCTestCase {
     private static let hashA = String(repeating: "aa", count: 32)
     private static let hashB = String(repeating: "bb", count: 32)
 
+    /// A real, temp-path-backed store -- not a live production state
+    /// directory -- mirroring `tempStatusURL()`/`tempLog()`'s existing
+    /// pattern of injecting real-but-disposable dependencies rather than
+    /// mocking file I/O.
     private func tempClipStateStore() -> ClipStateStore {
         ClipStateStore(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString).json").path)
@@ -279,7 +279,10 @@ final class HandleFrameTests: XCTestCase {
 
     // MARK: - Contract 3: a received hello always produces a reply
 
-    func testMatchingHelloProducesExactlyOneReplyAndReportsUp() {
+    /// The `.up` half of this became `.clipboardPending` in the final wave
+    /// -- see `testAMatchedHelloAloneDoesNotReportUp` for why. The reply
+    /// count is what this test is actually for.
+    func testMatchingHelloProducesExactlyOneReplyAndReportsClipboardPending() {
         var sent: [Frame] = []
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
@@ -291,7 +294,7 @@ final class HandleFrameTests: XCTestCase {
 
         XCTAssertEqual(sent.filter { $0.type == .hello }.count, 1)
         XCTAssertEqual(sent.first?.type, .hello)
-        XCTAssertEqual(status.snapshot().state, .up)
+        XCTAssertEqual(status.snapshot().state, .clipboardPending)
     }
 
     func testMismatchedHelloStillProducesExactlyOneReply() {
@@ -396,7 +399,10 @@ final class HandleFrameTests: XCTestCase {
 
         log.flush()
         XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") }, [])
-        XCTAssertEqual(status.snapshot().state, .up,
+        // Not `.down`, rather than specifically `.up`: what this pins is
+        // that an unmeasurable peer clock is not a protocol violation. The
+        // promotion to `.up` now waits for the peer's clip-state frame.
+        XCTAssertEqual(status.snapshot().state, .clipboardPending,
                        "a missing sent_at must not be treated as a mismatch")
     }
 
@@ -808,6 +814,69 @@ final class HandleFrameTests: XCTestCase {
                           clipStateStore: unsaveableStore, log: tempLog(), now: 1)
 
         XCTAssertEqual(sent.count, 1, "a local disk failure must not prevent the announcement from going out")
+    }
+
+    // MARK: - Final wave: status reports `up` only once the peer can actually sync
+
+    /// The window this closes is the ordinary post-reboot one: the PC agent
+    /// sends its hello the instant sshd spawns it, minutes before GNOME
+    /// login, so `Channel.attempt` marks `.clipboardPending` and then that
+    /// same frame's handler promoted straight back to `.up` microseconds
+    /// later. `clipwire status` said `up` for the entire pre-login window,
+    /// while nothing could sync at all. The peer's clip-state frame is the
+    /// first that actually proves otherwise -- the agent sends it from
+    /// inside `clipboard_became_ready`.
+    func testAMatchedHelloAloneDoesNotReportUp() {
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+
+        handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
+                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(status.snapshot().state, .clipboardPending,
+                       "a live peer whose clipboard is not readable yet cannot sync anything")
+    }
+
+    func testAPeersClipStateReportsUp() throws {
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+        let peer = ClipState(sha256: Self.hashB, ts: 9)
+
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
+                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(status.snapshot().state, .up,
+                       "the peer announced what it holds, so its clipboard is readable and sync works")
+    }
+
+    /// A null hash means the peer's clipboard is EMPTY, not unavailable --
+    /// the agent only announces from inside `clipboard_became_ready`, so the
+    /// frame's existence is the proof, not its contents. Syncing works fine
+    /// in that state.
+    func testAPeersEmptyClipStateStillReportsUp() throws {
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+
+        handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0).encodePayload()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
+                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(status.snapshot().state, .up)
+    }
+
+    /// A frame we cannot decode proves nothing about the peer's clipboard,
+    /// so it must not promote. Placed after the decode guard, not before it.
+    func testAMalformedClipStateDoesNotReportUp() {
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+
+        handleFrame(Frame(type: .clipState, payload: Data("not json".utf8)),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
+                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertNotEqual(status.snapshot().state, .up)
     }
 
     // MARK: - Final wave: the reconciliation decisions are logged, on both sides

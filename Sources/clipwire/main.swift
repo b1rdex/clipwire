@@ -200,10 +200,49 @@ final class AgentStatus: @unchecked Sendable {
         locked { status.lastReceivedAt = Date() }
     }
 
+    /// `.clipboardPending`, not `.up`. A matched hello proves only that the
+    /// peer PROCESS is alive: the PC agent sends its hello the instant sshd
+    /// spawns it, which after a reboot is minutes before GNOME login and the
+    /// Wayland session that makes its clipboard readable at all. Reporting
+    /// `.up` there overwrote -- microseconds later, from that same frame's
+    /// handler -- the `.clipboardPending` that `Channel.attempt()` had just
+    /// set, so `clipwire status` claimed a healthy channel for the whole
+    /// pre-login window while nothing could sync. `recordPeerClipboardReady`
+    /// below is what promotes now, and the spec names precisely this as the
+    /// reason clip-state is its own frame rather than fields on `hello`: it
+    /// "gives `status` its long-missing protocol basis for reporting
+    /// `clipboard-pending` durably".
+    ///
+    /// Observability only. Nothing reads `status.state` to gate a send; the
+    /// FUNCTIONAL `.clipboardPending` that re-arms the one-shot announcement
+    /// comes from `Channel`'s `onStateChange` in `wireAgent`, not from here,
+    /// so this cannot feed back into the protocol.
     func recordHelloMatched() {
         locked {
             hasHeardFromChannel = true
             protocolMismatchReason = nil
+            status.state = .clipboardPending
+            status.reason = nil
+        }
+    }
+
+    /// The peer's clip-state announcement arrived, so its clipboard is
+    /// readable and this channel can actually sync. The PC agent sends that
+    /// frame from inside `clipboard_became_ready` and nowhere else, so the
+    /// frame's mere existence is the proof -- a null hash means an EMPTY
+    /// clipboard, not an unavailable one, and syncing works fine in that
+    /// state.
+    ///
+    /// A pinned protocol mismatch outranks this, mirroring
+    /// `applyChannelState`'s existing rule. Nothing about a version mismatch
+    /// stops the peer's own frames from already being in flight, and
+    /// promoting on one would erase the specific "run `clipwire install`"
+    /// diagnosis -- reporting a healthy channel that is about to close --
+    /// which is the whole reason that reason is pinned.
+    func recordPeerClipboardReady() {
+        locked {
+            hasHeardFromChannel = true
+            guard protocolMismatchReason == nil else { return }
             status.state = .up
             status.reason = nil
         }
@@ -479,6 +518,13 @@ func handleFrame(
         }
     case .clipState:
         guard let peerState = try? ClipState.decodePayload(frame.payload) else { return }
+        // After the decode guard, not before it: a frame we cannot read
+        // proves nothing about the peer's clipboard. This is the only frame
+        // that proves the channel can actually sync -- see
+        // `recordPeerClipboardReady` -- and it is reported regardless of
+        // which way the reconciliation below then goes, since who wins says
+        // nothing about whether the channel is healthy.
+        status.recordPeerClipboardReady()
         // `clipStateStore.load()` should already reflect our own current
         // state -- either from this connection's own announcement above,
         // or from an ordinary local-change/applied-clip save since -- so

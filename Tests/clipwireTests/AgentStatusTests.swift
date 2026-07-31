@@ -38,12 +38,61 @@ final class AgentStatusTests: XCTestCase {
                         "no longer be masked by the stale mismatch")
     }
 
-    func testRecordHelloMatchedReportsUp() {
+    /// Inverted by the final wave, deliberately: this used to assert `.up`.
+    /// A matched hello proves the peer PROCESS is alive, which is not the
+    /// same as the channel being able to sync -- the PC agent sends its
+    /// hello the instant sshd spawns it, after a reboot minutes before the
+    /// Wayland session its clipboard needs. Promoting here overwrote the
+    /// `.clipboardPending` that `Channel.attempt()` had set microseconds
+    /// earlier, from that same frame. The reason must still be CLEARED,
+    /// which is unchanged and is what keeps a stale mismatch from sticking.
+    func testRecordHelloMatchedReportsClipboardPendingNotUp() {
         let status = AgentStatus(pid: 1, url: url())
         status.recordHelloMatched()
         let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .clipboardPending,
+                       "a live peer process is not yet a channel that can sync")
+        XCTAssertNil(snapshot.reason)
+    }
+
+    /// The spec's stated reason for splitting clip-state off `hello` at all:
+    /// it "gives `status` its long-missing protocol basis for reporting
+    /// `clipboard-pending` durably". A matched hello only proves the PEER
+    /// PROCESS is alive -- the PC agent sends its hello immediately, long
+    /// before the Wayland session exists -- so it cannot mean the channel can
+    /// actually sync. The peer's clip-state announcement is the first and
+    /// only frame that does prove it: the agent sends it from inside
+    /// `clipboard_became_ready`.
+    func testPeerClipboardReadyIsWhatReportsUp() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.recordHelloMatched()
+        XCTAssertEqual(status.snapshot().state, .clipboardPending,
+                       "a matched hello proves the peer process is alive, not that it can sync")
+
+        status.recordPeerClipboardReady()
+        let snapshot = status.snapshot()
         XCTAssertEqual(snapshot.state, .up)
         XCTAssertNil(snapshot.reason)
+    }
+
+    /// The non-obvious half. `recordProtocolMismatch` pins a specific
+    /// diagnosis precisely so a user running `clipwire status` is told to run
+    /// `clipwire install` instead of being shown something generic -- and a
+    /// clip-state frame can arrive after one (nothing about a version
+    /// mismatch stops the peer's own frames from being in flight). Promoting
+    /// unconditionally would erase that diagnosis and report a healthy
+    /// channel that is about to close. Mirrors `applyChannelState`'s existing
+    /// rule that a pinned mismatch outranks whatever is reported next.
+    func testPeerClipboardReadyDoesNotOverwriteAPinnedProtocolMismatch() {
+        let status = AgentStatus(pid: 1, url: url())
+        let mismatch = "protocol mismatch: peer speaks 3, we speak 2 — run `clipwire install`"
+        status.recordProtocolMismatch(mismatch)
+
+        status.recordPeerClipboardReady()
+
+        let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .down, "a mismatched peer's clipboard readiness changes nothing")
+        XCTAssertEqual(snapshot.reason, mismatch)
     }
 
     func testSentAndReceivedTimestampsAreRecorded() {
@@ -131,8 +180,11 @@ final class AgentStatusTests: XCTestCase {
         status.recordHelloMatched()
         status.tickHeartbeat(reconnects: 2)
         let snapshot = status.snapshot()
-        XCTAssertEqual(snapshot.state, .up)
-        XCTAssertNil(snapshot.reason, "an established, healthy channel must not grow a synthesized " +
+        XCTAssertEqual(snapshot.state, .clipboardPending)
+        // The reason-is-nil half is this test's actual subject: whatever
+        // the state, a channel that HAS reported must not be given a
+        // synthesized "peer unreachable" reason by the heartbeat.
+        XCTAssertNil(snapshot.reason, "an established channel must not grow a synthesized " +
                      "'unreachable' reason just because reconnects is nonzero from an earlier drop")
     }
 
