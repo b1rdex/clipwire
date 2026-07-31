@@ -270,6 +270,17 @@ class TestPdeathsigPreexec(unittest.TestCase):
         with mock.patch.object(clipwire_agent.ctypes, "CDLL", side_effect=OSError):
             self.assertIsNone(clipwire_agent._load_libc())
 
+    def test_it_does_not_resolve_libc_at_call_time(self):
+        """The whole point of _LIBC: nothing inside preexec_fn may import,
+        allocate, or take a lock, because preexec_fn runs in a forked child of
+        a threaded process. _load_libc() calling import ctypes is fine at
+        module load and would be a hazard here -- so this pins that
+        _pdeathsig_preexec never calls it, not merely that _LIBC is read."""
+        with mock.patch.object(clipwire_agent, "_load_libc") as loader, \
+             mock.patch.object(clipwire_agent, "_LIBC", None):
+            clipwire_agent._pdeathsig_preexec()
+        loader.assert_not_called()
+
     def test_it_requests_sigterm_when_the_parent_dies(self):
         calls = []
 
