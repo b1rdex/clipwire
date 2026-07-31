@@ -257,8 +257,10 @@ class TestResolveStartupState(unittest.TestCase):
         """Content that changed while apart is read fresh -- here, always
         through resolve_current_clip_state's own clipboard.read(), which is
         text-only today, so the kind of newly-observed content is KIND_TEXT.
-        (There is no image-reading call site on this path yet; Task 11 is
-        where that changes.)"""
+        (There is no image-reading call site on this path yet; Task 7 is
+        where that changes, by making clipboard.read() itself kind-aware --
+        see resolve_startup_state's own docstring for why that revisit
+        needs a human, not the test suite, to catch it.)"""
         stored = ("aa", 100, KIND_TEXT)
         result = resolve_startup_state("bb", stored, 999)
         self.assertEqual(result, ("bb", 999, KIND_TEXT))

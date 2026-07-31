@@ -1247,9 +1247,18 @@ def resolve_startup_state(current_hash, stored, now):
     than threaded through as a parameter: resolve_current_clip_state below
     is this function's only non-test caller, and it derives `current_hash`
     from clipboard.read() alone, a text/plain read -- there is no
-    independent "current kind" input to thread through yet. Task 11, which
-    wires image reconciliation, is where this stops being true; revisit
-    this hardcoding there rather than adding an unused parameter now.
+    independent "current kind" input to thread through yet. **Task 7** is
+    where that changes -- it makes clipboard.read() itself kind-aware --
+    NOT Task 11, which only wires the send branch that reads `kind` back
+    out once it is already correct. The test suite will not catch a missed
+    revisit here: this function's signature is untouched by Task 7, so no
+    call-site failure points at it. What DOES change, visibly, is
+    resolve_current_clip_state's own body one frame up -- and a mechanical
+    adaptation there (e.g. `current_hash = sha256_hex(read.data)`, the new
+    kind quietly dropped on the floor) runs clean and passes the whole
+    suite while silently fabricating KIND_TEXT for a PNG hash, right here,
+    one frame below the line that actually changed. Revisit THIS
+    hardcoding, not just the caller above it.
 
     A None current_hash (clipboard empty or unreadable right now) always
     wins over whatever is on disk, regardless of what was previously

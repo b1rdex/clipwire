@@ -110,9 +110,19 @@ struct ClipStateStore {
 /// `.text`, hardcoded rather than threaded through as a parameter:
 /// `resolveCurrentClipState` below is this function's only non-test caller,
 /// and it derives `currentHash` from `pasteboard.readText()` alone -- there
-/// is no independent "current kind" input to thread through yet. Task 11,
-/// which wires image reconciliation, is where this stops being true;
-/// revisit this hardcoding there rather than adding an unused parameter now.
+/// is no independent "current kind" input to thread through yet. **Task 8**
+/// is where that changes -- it makes the pasteboard read itself kind-aware
+/// (`readText()` becoming `read() -> (kind:, data:)?`) -- NOT Task 11,
+/// which only wires the send branch that reads `kind` back out once it is
+/// already correct. The compiler will not catch a missed revisit here:
+/// this function's signature is untouched by Task 8, so no call-site error
+/// points at it. What DOES change, visibly, is `resolveCurrentClipState`'s
+/// own body one frame up -- and a mechanical adaptation there (e.g.
+/// `currentHash = sha256Hex(read.data)`, the new `kind` quietly dropped on
+/// the floor) compiles clean and passes the whole suite while silently
+/// fabricating `.text` for a PNG hash, right here, one frame below the
+/// line the compiler actually flagged. Revisit THIS hardcoding, not just
+/// the caller above it.
 ///
 /// A `nil` currentHash (clipboard empty or unreadable right now) always
 /// wins over whatever is on disk, regardless of what was previously stored:
