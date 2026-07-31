@@ -2,7 +2,9 @@
 import hashlib
 import os
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from agent_under_test import (
     announce_clip_state,
@@ -14,6 +16,8 @@ from agent_under_test import (
     save_clip_state,
     sha256_hex,
 )
+
+JOIN_TIMEOUT = 2  # generous relative to the millisecond-scale waits below
 
 
 class TestClipStatePath(unittest.TestCase):
@@ -130,6 +134,84 @@ class TestSaveIsAtomic(_TempPathCase):
         nested = os.path.join(self._tmp.name, "nested", "clip-state.json")
         save_clip_state("aa", 1, path=nested)
         self.assertEqual(load_clip_state(path=nested), ("aa", 1.0))
+
+
+class TestSaveIsSerialized(_TempPathCase):
+    """save_clip_state has three call sites, and since the safety-net poll
+    landed they run on up to three threads: _write_clip and
+    announce_clip_state on run()'s thread, _local_change on the watcher
+    threads. All three write the SAME `target + ".tmp"` and then os.replace
+    it, so two concurrent savers truncate one another's temp file and
+    whichever replace runs second finds it already consumed.
+
+    The consequence is already on record: a half-written temp moved into
+    place makes load_clip_state return None, so the next connection stamps
+    ts=now on old content and wins a reconciliation it should lose -- a
+    silent clipboard clobber, the exact failure protocol v2 exists to
+    prevent. All three call sites swallow the exception, so nothing surfaces
+    either.
+
+    Mirrors ClipStateStore.save's NSLock on the Swift side, fixed for this in
+    an earlier task; the Python half of the same defect was never done.
+    ClipStateStoreTests.swift documents why it did NOT ship a
+    timing-threshold assertion for it (real overlap between the locked and
+    unlocked distributions). This test needs no threshold: it observes
+    whether the two critical sections OVERLAP, which is a yes/no fact, and
+    pins the resulting exception directly."""
+
+    def test_a_second_saver_cannot_enter_while_the_first_is_inside(self):
+        real_replace = os.replace
+        events = []
+        errors = []
+        first_inside = threading.Event()
+        second_done = threading.Event()
+
+        def gated_replace(src, dst):
+            if dst != self.path:
+                return real_replace(src, dst)
+            events.append("enter")
+            if len(events) == 1:
+                first_inside.set()
+                # Released the moment the second saver FINISHES, which can only
+                # happen while the first is still in here if the two are not
+                # serialized. Serialized, this is a short bounded wait and the
+                # second saver is still parked outside when it expires.
+                second_done.wait(0.02)
+            real_replace(src, dst)
+            events.append("leave")
+
+        def save(sha, ts, done=None):
+            try:
+                save_clip_state(sha, ts, path=self.path)
+            except Exception as error:  # the swallowed production failure, surfaced
+                errors.append(error)
+            if done is not None:
+                done.set()
+
+        first = threading.Thread(target=save, args=("aa", 1))
+        second = threading.Thread(target=save, args=("bb", 2),
+                                  kwargs={"done": second_done})
+        with mock.patch("os.replace", gated_replace):
+            first.start()
+            self.assertTrue(first_inside.wait(JOIN_TIMEOUT),
+                            "the first saver never reached the replace")
+            second.start()
+            first.join(timeout=JOIN_TIMEOUT)
+            second.join(timeout=JOIN_TIMEOUT)
+
+        self.assertEqual(
+            errors, [],
+            "a concurrent saver must not race the shared temp file out from "
+            "under the other; got %r" % (errors,),
+        )
+        self.assertEqual(
+            events, ["enter", "leave", "enter", "leave"],
+            "the two saves must not overlap inside the write-and-replace section",
+        )
+        self.assertIsNotNone(
+            load_clip_state(path=self.path),
+            "concurrent saves must never leave a file that fails to load",
+        )
 
 
 class TestResolveStartupState(unittest.TestCase):

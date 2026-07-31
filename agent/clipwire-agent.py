@@ -895,6 +895,31 @@ def load_clip_state(path=None):
         return None
 
 
+# Serializes the whole encode-write-replace below. save_clip_state has three
+# call sites, and they run on up to three threads: Agent._write_clip and
+# announce_clip_state on run()'s thread, Agent._local_change on the watcher
+# threads. All three derive the SAME `target + ".tmp"`, so two concurrent
+# savers truncate one another's temp file and whichever os.replace runs second
+# finds it already consumed -- observed directly as a FileNotFoundError, and in
+# the worse interleaving as a half-written file renamed into place.
+#
+# That failure is not cosmetic: a temp moved into place mid-write makes
+# load_clip_state return None, so the NEXT connection stamps ts=now on old
+# content and wins a reconciliation it should lose -- a silent clipboard
+# clobber, the exact failure protocol v2 exists to prevent. All three call
+# sites swallow the exception, so nothing would surface either.
+#
+# Module-level because these are module functions, not a store object: it is
+# the direct mirror of ClipStateStore.save's NSLock on the Swift side, which
+# was fixed for this in an earlier task while the Python half was missed.
+# load_clip_state needs no lock of its own for the same reason it does not
+# there: os.replace is an atomic rename, so once the temp file itself cannot be
+# torn, any reader sees the whole old file or the whole new one. Process-wide,
+# not machine-wide -- and it does not need to be, since sshd spawns exactly one
+# agent per connection.
+_clip_state_write_lock = threading.Lock()
+
+
 def save_clip_state(sha256, ts, path=None):
     """Persists (sha256, ts) atomically: encode, write to a `.tmp`
     sibling, then os.replace it over the real path. os.replace is an
@@ -904,14 +929,19 @@ def save_clip_state(sha256, ts, path=None):
     Reuses encode_clip_state rather than a second JSON encoding, so its
     non-finite-ts guard protects this path too, and the on-disk format can
     never drift from the wire format of the same shape.
+
+    Serialized in full under _clip_state_write_lock: the atomic rename alone
+    protects readers, not the shared temp file that concurrent WRITERS both
+    build. See that lock's own comment.
     """
     target = clip_state_path() if path is None else path
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    payload = encode_clip_state(sha256, ts)
-    tmp = target + ".tmp"
-    with open(tmp, "wb") as handle:
-        handle.write(payload)
-    os.replace(tmp, target)
+    with _clip_state_write_lock:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        payload = encode_clip_state(sha256, ts)
+        tmp = target + ".tmp"
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+        os.replace(tmp, target)
 
 
 def resolve_startup_state(current_hash, stored, now):

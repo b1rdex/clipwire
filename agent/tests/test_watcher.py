@@ -1993,6 +1993,7 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def _xdg_dir",
             "def clip_state_path",
             "def load_clip_state",
+            "_clip_state_write_lock = threading.Lock()",
             "def save_clip_state",
             "def resolve_startup_state",
             "def sha256_hex",
