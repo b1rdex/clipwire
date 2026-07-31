@@ -1,5 +1,5 @@
 {
-  "comment": "Golden frame vectors, protocol v2. Type 1 payloads are [f64 BE ts][utf-8]. Type 2 (clip-state JSON) has no vector here yet: 0x02 is not a recognized frame type until Task 4 registers it on both sides, and the one clip-state payload this task's brief supplied omitted the spec's required ts field. Do not edit by hand without recomputing.",
+  "comment": "Golden frame vectors, protocol v2. Type 1 payloads are [f64 BE ts][utf-8]. Type 2 (clip-state JSON) has no vector here yet: 0x02 is not a registered frame type on either side, and the clip-state schema requires both sha256 and ts. Do not edit by hand without recomputing.",
   "cases": [
     {"name": "empty-clip", "type": 1, "payload_hex": "3ff0000000000000",                         "frame_hex": "00000008013ff0000000000000"},
     {"name": "ascii-clip", "type": 1, "payload_hex": "3ff00000000000006869",                     "frame_hex": "0000000a013ff00000000000006869"},
