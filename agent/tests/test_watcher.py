@@ -1091,6 +1091,42 @@ class TestIncomingClipState(unittest.TestCase):
         self.assertEqual(ts, 777, "must carry OUR stored ts, not now")
         self.assertEqual(text, b"current clip text")
 
+    def test_winning_clip_state_updates_last_seen_to_what_was_just_sent(self):
+        """_local_change sets _last_seen = text after a successful send,
+        deliberately: _last_seen is "what the peer already holds, for as
+        long as neither side has genuinely changed it" (see its own doc
+        comment in _local_change). Telling the peer "I hold X" through THIS
+        path is no different -- after this send, the peer does (soon) hold
+        X too, exactly as after a _local_change send. Without this update, a
+        later spurious GPaste signal (a history deletion emits Update too,
+        not only a real change) would see clipboard.read() == X but
+        last_seen still stale or None, wrongly conclude a genuine local
+        change happened, and resend X to the peer -- wastefully at best,
+        and destructively if the Mac had meanwhile been changed to some Y:
+        the Mac's handleFrame applies ANY incoming .clip frame
+        unconditionally, so a stale resend of X arriving after the user's
+        own Y would silently clobber it.
+
+        This is the Swift reference's own .clipState case NOT doing this
+        either -- but harmlessly there, since the Mac's PasteboardWatcher is
+        changeCount-driven and never fires on a non-change. The PC's GPaste
+        watcher does fire on non-changes (that is the entire reason
+        _last_seen exists on this side at all), so the omission that is
+        inert on the Mac is a real defect here."""
+        save_clip_state("aa", 777, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"current clip text")
+        agent = self.build(clipboard=clipboard)
+        agent.send = lambda t, p: None
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty -> sendMine
+
+        self.assertEqual(
+            agent._last_seen, b"current clip text",
+            "_last_seen must advance to what was just sent, exactly as "
+            "_local_change's own send path already does",
+        )
+
     def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
         """Unlike _local_change's own send path, this branch reads the live
         clipboard independently and, without this bound, winning a

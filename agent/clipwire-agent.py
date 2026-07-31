@@ -343,6 +343,22 @@ class Agent:
         # with now would perpetually refresh it and let it win every future
         # reconciliation regardless of what happens next.
         self.send(TYPE_CLIP, encode_clip_payload(mine[1], text))
+        # Same bookkeeping _local_change's own send path does, and for the
+        # same reason: _last_seen is "what the peer already holds", and
+        # after this send the peer does (soon) hold `text` too. Sources/clipwire's
+        # own .clipState case has no EchoGuard-equivalent update here either,
+        # but harmlessly so -- the Mac's PasteboardWatcher is
+        # changeCount-driven and never fires on a non-change. The PC's
+        # GPaste watcher DOES fire on non-changes (a history deletion emits
+        # Update too) -- the entire reason _last_seen exists on this side at
+        # all -- so skipping this update would let a later spurious signal
+        # see the clipboard still reading `text`, wrongly conclude a genuine
+        # local change happened, and resend it: wasteful at best, and a
+        # silent clobber of a real Mac-side change made in the meantime at
+        # worst, since the Mac applies any incoming .clip frame
+        # unconditionally.
+        with self._echo_lock:
+            self._last_seen = text
 
     # --- phase transitions ----------------------------------------------
 
@@ -372,24 +388,39 @@ class Agent:
         seed = self.clipboard.read()
         with self._echo_lock:
             self._last_seen = seed
+        applied_pending = None
         if self.pending_clip is not None:
             # Supersedes the seed above with the more authoritative value:
             # once a queued clip from the Mac has actually been applied,
             # both sides genuinely hold ITS content, not whatever the PC's
             # clipboard held a moment earlier.
-            self._write_clip(self.pending_clip)
+            applied_pending = self._write_clip(self.pending_clip)
             self.pending_clip = None
         if not self._clip_state_sent:
             # Sent exactly once per connection (== once per process here --
             # see __init__), after the store has been consulted, and after
-            # any queued pending_clip above has already been applied: if one
-            # was just applied, _write_clip already persisted ITS (peer's)
-            # state, so announcing after it reflects what we actually hold
-            # now rather than the stale, about-to-be-overwritten content
-            # from before this connection. Per the design spec, this is not
-            # gated on the store save succeeding -- see announce_clip_state.
+            # any queued pending_clip above has already been applied.
             self._clip_state_sent = True
-            announce_clip_state(self.send, self.clipboard, path=self._clip_state_path)
+            if applied_pending is not None:
+                # _write_clip just wrote to and persisted state for a
+                # pending clip -- we know EXACTLY what we now hold and how
+                # old it is, straight from that call's own return value.
+                # Deliberately NOT calling announce_clip_state (which would
+                # re-derive this via a fresh clipboard read) here: wl-copy is
+                # spawned detached and _write_clip's own write() returns as
+                # soon as its stdin pipe is closed, long before wl-copy
+                # necessarily registers as the Wayland selection owner. A
+                # read issued immediately afterward can see stale
+                # (pre-write) content, or none at all -- and
+                # announce_clip_state would then PERSIST that wrong state
+                # OVER the correct entry _write_clip just saved, silently
+                # clobbering it and announcing the wrong age to the peer.
+                # Using the known-correct value directly sidesteps that
+                # race entirely; there is nothing left for a fresh read to
+                # tell us that _write_clip does not already know.
+                self.send(TYPE_CLIP_STATE, encode_clip_state(*applied_pending))
+            else:
+                announce_clip_state(self.send, self.clipboard, path=self._clip_state_path)
         if self._watcher is None:
             self._watcher = make_watcher(self.clipboard)
             self._watcher.start(self._local_change)
@@ -422,18 +453,37 @@ class Agent:
         Runs on the main thread. _local_change() (below) runs on the
         watcher's background thread and reads this same bookkeeping, so the
         two fields are only ever touched under _echo_lock.
+
+        Returns the (sha256, ts) pair that was applied and (best-effort)
+        persisted, or None if the payload never decoded or decoded with
+        empty text and nothing was applied. clipboard_became_ready uses
+        this to announce a just-applied pending clip's state DIRECTLY,
+        rather than re-deriving it through a fresh clipboard read -- see
+        that method's own comment for why a read immediately after this
+        call cannot be trusted to reflect it yet.
         """
         try:
             ts, text = decode_clip_payload(payload)
         except ClipPayloadError:
-            return
+            return None
         if not text:
-            return
+            return None
         with self._echo_lock:
             self._last_written = text
             self._write_gen += 1
             self._last_seen = text
         self.clipboard.write(text)
+        # WaylandClipboard.write() spawns wl-copy DETACHED (Popen(...,
+        # start_new_session=True)) and returns as soon as its own stdin pipe
+        # is closed -- a hand-off, not a confirmation that wl-copy has
+        # actually registered as the Wayland selection owner yet. The write
+        # above and this sha256_hex/save_clip_state pair are therefore not
+        # "the clipboard now reads this" -- they are "this is what we just
+        # told the clipboard to hold, and it is authoritative regardless of
+        # when (or whether) wl-copy finishes taking ownership." A caller
+        # that instead re-read the clipboard to find out what was just
+        # written would race that handoff.
+        sha256 = sha256_hex(text)
         # The peer's timestamp, never now: this is the entire reason it
         # travels in the frame. Stamping it with now would make applied
         # content look freshly copied here and win the next reconciliation
@@ -441,9 +491,10 @@ class Agent:
         # here is not the peer's fault and must not undo the write above or
         # propagate as a FrameError and tear down the channel.
         try:
-            save_clip_state(sha256_hex(text), ts, path=self._clip_state_path)
+            save_clip_state(sha256, ts, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
+        return sha256, ts
 
     def _local_change(self):
         # Snapshot what we expect and the generation it belongs to BEFORE

@@ -15,6 +15,7 @@ from agent_under_test import (
     decode_frame,
     encode_clip_payload,
     load_clip_state,
+    sha256_hex,
 )
 
 # agent_under_test registers the loaded module under this name in
@@ -53,6 +54,36 @@ class FakeClipboard:
 
     def read(self):
         return None
+
+    def write(self, data):
+        self.written.append(data)
+
+
+class AsyncWriteClipboard:
+    """Models WaylandClipboard's real write() precisely: it spawns wl-copy
+    detached (Popen(..., start_new_session=True)) and returns as soon as
+    its stdin is closed -- a hand-off, not a confirmation that wl-copy has
+    actually registered as the Wayland selection owner yet. So write()
+    does NOT change what a subsequent read() returns; the two are
+    decoupled in time, exactly like the real asynchronous pair.
+
+    FakeClipboard/QueueClipboard (used everywhere else in this file and in
+    test_watcher.py) are both synchronous: write() and read() agree
+    instantly. That is the right model for most of this suite, but it is
+    the WRONG model for clipboard_became_ready's pending-clip path, whose
+    correctness this double exists to pin.
+    """
+
+    def __init__(self, read_value, ready=True):
+        self._read_value = read_value
+        self._ready = ready
+        self.written = []
+
+    def ready(self):
+        return self._ready
+
+    def read(self):
+        return self._read_value  # never reflects write() below -- the real race
 
     def write(self, data):
         self.written.append(data)
@@ -218,6 +249,46 @@ class TestLifecycle(unittest.TestCase):
         stored = load_clip_state(path=self.clip_state_path)
         self.assertIsNotNone(stored, "the resolved clip-state must be persisted, not only sent")
         self.assertIsNone(stored[0])
+
+    def test_clipboard_became_ready_announces_the_just_applied_pending_clip_without_a_racy_reread(self):
+        """wl-copy's write() is asynchronous and detached: WaylandClipboard.write()
+        spawns it via Popen(..., start_new_session=True) and returns as soon
+        as its OWN stdin pipe is closed -- a hand-off, not a guarantee that
+        wl-copy has actually registered as the Wayland selection owner yet.
+
+        _write_clip(pending_clip) already does the right thing: it writes,
+        then persists (sha256_hex(text), ts) -- the correct, authoritative
+        entry. But if clipboard_became_ready's announce step re-reads the
+        clipboard through resolve_current_clip_state/announce_clip_state
+        immediately afterward, that read can race wl-copy and see stale
+        (pre-write) content, or none at all -- and resolve_startup_state
+        would then see a hash that does not match what was just stored,
+        take the "hashes differ" branch, and announce_clip_state would
+        PERSIST that wrong (stale-content, now-stamped) state OVER the
+        correct entry _write_clip just saved. That silent clobber is
+        exactly the defect this whole design exists to prevent, arriving
+        through the async-write door instead of the multi-process one.
+
+        AsyncWriteClipboard models this precisely: its read() always
+        returns stale content that predates this connection, regardless of
+        what write() was just called with -- the honest shape of the race,
+        which FakeClipboard/QueueClipboard (synchronous by construction)
+        cannot represent."""
+        clipboard = AsyncWriteClipboard(read_value=b"stale content predating this connection")
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=self.clip_state_path)
+        peers_ts = 424242.0
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(peers_ts, b"the peer's pending clip"))
+
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+            agent.clipboard_became_ready()
+
+        expected = (sha256_hex(b"the peer's pending clip"), peers_ts)
+        self.assertEqual(
+            load_clip_state(path=self.clip_state_path), expected,
+            "the pending clip's own correct, just-persisted state must survive "
+            "the announce step, not be overwritten by a racy re-read",
+        )
 
 
 def json_of(payload):
