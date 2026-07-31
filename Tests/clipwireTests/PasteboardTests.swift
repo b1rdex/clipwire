@@ -8,23 +8,60 @@ import XCTest
 /// object must be observable to a `PasteboardWatcher` reading the same
 /// instance, exactly as an incoming clip's write is observable to the real
 /// watcher polling `NSPasteboard.general`).
+///
+/// Since Task 8 this double holds BOTH kinds and applies the same
+/// text-wins rule `chooseKind` applies to a real board, so a test can put
+/// an image on it and see what the production code does with one. It is
+/// deliberately not a `SystemPasteboard` wrapping a fake backend: these
+/// tests are about `PasteboardWatcher` and the frame handler, which only
+/// ever see the `PasteboardReading`/`PasteboardWriting` protocols --
+/// `SystemPasteboard`'s own translation of NSPasteboard types is pinned
+/// separately, in `CanonicalReadTests` below, against a fake backend.
 final class FakePasteboard: PasteboardReading, PasteboardWriting {
     var changeCount = 0
     var text: Data?
+    var image: Data?
 
+    /// A real pasteboard write replaces everything on the board, so these
+    /// setters clear the other kind rather than accumulating both -- a
+    /// double that let stale image bytes survive a text copy would make
+    /// the text-wins rule look exercised when it never was.
     func set(_ value: String) {
         text = Data(value.utf8)
+        image = nil
+        changeCount += 1
+    }
+
+    func setImage(_ png: Data) {
+        image = png
+        text = nil
         changeCount += 1
     }
 
     func setNonText() {
         text = nil
+        image = nil
         changeCount += 1
     }
 
-    func readText() -> Data? { text }
+    /// Text wins, then image -- `chooseKind`'s rule, applied by the double
+    /// so callers of `read()` see the same precedence the real board gives
+    /// them. Empty content reads as nothing at all, matching
+    /// `SystemPasteboard.read()`, which returns nil rather than an empty
+    /// body (and `WaylandClipboard.read()` on the PC, which does the same).
+    func read() -> (kind: ClipKind, data: Data)? {
+        if let text, !text.isEmpty { return (.text, text) }
+        if let image, !image.isEmpty { return (.image, image) }
+        return nil
+    }
 
-    func writeText(_ text: String) { set(text) }
+    func write(kind: ClipKind, data: Data) {
+        switch kind {
+        case .text: text = data; image = nil
+        case .image: image = data; text = nil
+        }
+        changeCount += 1
+    }
 }
 
 final class PasteboardTests: XCTestCase {
@@ -86,6 +123,38 @@ final class PasteboardTests: XCTestCase {
         watcher.poll()
         XCTAssertEqual(seen, [Data("after the image".utf8)],
                        "the image must not have wedged the watcher")
+    }
+
+    /// The test above cannot see this one: `setNonText()` leaves the double
+    /// with nothing to read at all, so a watcher that had stopped checking
+    /// the KIND would still emit nothing there. Here the pasteboard holds a
+    /// real image, which since Task 8 reads back as a genuine
+    /// `(.image, bytes)` pair rather than nil -- so only the kind check
+    /// stands between those PNG bytes and `onChange`, whose consumer wraps
+    /// whatever it is handed in a `ClipPayload` via
+    /// `String(decoding:as:UTF8.self)` and sends it as a TEXT clip. Dropping
+    /// the check would put a mojibake transliteration of a PNG on the wire
+    /// and into both persistent stores. Syncing a local image change is
+    /// later work (Task 11); until then an image observation is skipped
+    /// exactly as it has always been, and this test is what keeps "skipped"
+    /// from quietly becoming "sent as text".
+    func testAnImageOnThePasteboardIsNotEmittedAsText() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        var seen: [Data] = []
+        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.poll()
+
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        pasteboard.setImage(png)
+        watcher.poll()
+        XCTAssertTrue(seen.isEmpty, "an image must not be emitted as a text clip")
+
+        watcher.poll()
+        pasteboard.set("after the image")
+        watcher.poll()
+        XCTAssertEqual(seen, [Data("after the image".utf8)],
+                       "and the image must not have wedged the watcher either")
     }
 
     func testEmptyClipIsNotEmitted() {
@@ -211,7 +280,7 @@ final class PasteboardTests: XCTestCase {
 // PasteboardWatcher has the same two actors: the timer's poll() and (in a
 // later task) the channel's frame handler, which writes an incoming clip and
 // calls noteWrittenLocally() from a different thread. Unlike wl-paste,
-// SystemPasteboard.readText() is an in-process NSPasteboard call with no
+// SystemPasteboard.read() is an in-process NSPasteboard call with no
 // subprocess fork, so there is no slow operation whose lock-holding cost
 // needs dodging with a generation counter — a plain lock that covers
 // poll()'s [read text -> consult echo] step and noteWrittenLocally()'s arm
@@ -235,14 +304,15 @@ final class BlockingPasteboard: PasteboardReading {
         changeCount += 1
     }
 
-    func readText() -> Data? {
+    func read() -> (kind: ClipKind, data: Data)? {
         let snapshot = text
         if blockNextRead {
             blockNextRead = false
             readingStarted.signal()
             _ = proceedWithRead.wait(timeout: .now() + 2)
         }
-        return snapshot
+        guard let snapshot, !snapshot.isEmpty else { return nil }
+        return (.text, snapshot)
     }
 }
 
@@ -285,9 +355,9 @@ final class PasteboardConcurrencyTests: XCTestCase {
             pollFinished.signal()
         }
 
-        // Wait until poll() is inside readText(), holding "A", about to return.
+        // Wait until poll() is inside read(), holding "A", about to return.
         XCTAssertEqual(pasteboard.readingStarted.wait(timeout: .now() + 2), .success,
-                       "poll() never reached readText()")
+                       "poll() never reached read()")
 
         // While that read is outstanding, clip "B" arrives on another thread:
         // written locally, suppression armed for B — the second of two
@@ -335,7 +405,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
 // Review found that the first fix left `changeCount` itself read, and
 // `lastChangeCount` written, *before* `stateLock` was acquired — a gap the
 // BlockingPasteboard test above cannot see, because it interleaves inside
-// readText(), which was already under the lock. This double interleaves in
+// read(), which was already under the lock. This double interleaves in
 // the changeCount getter instead, landing a complete second clip (arm and
 // write) in that earlier, still-unlocked gap:
 //
@@ -352,7 +422,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
 //      onChange(B) fires: our own already-suppressed clip goes out again.
 
 /// A double that pauses inside the `changeCount` getter itself (not
-/// `readText()`), to let a test land a complete second clip cycle in the gap
+/// `read()`), to let a test land a complete second clip cycle in the gap
 /// between poll() observing a changeCount and poll() acquiring the lock that
 /// guards the read-and-compare that follows.
 final class ChangeCountGapPasteboard: PasteboardReading {
@@ -377,7 +447,10 @@ final class ChangeCountGapPasteboard: PasteboardReading {
         return snapshot
     }
 
-    func readText() -> Data? { text }
+    func read() -> (kind: ClipKind, data: Data)? {
+        guard !text.isEmpty else { return nil }
+        return (.text, text)
+    }
 }
 
 final class PasteboardGenerationTests: XCTestCase {
@@ -467,5 +540,287 @@ final class PasteboardGenerationTests: XCTestCase {
                        "resent just because lastChangeCount lagged the generation " +
                        "that poll actually read and consumed")
         seenLock.unlock()
+    }
+}
+
+// MARK: - Task 8: one canonical read, kind-aware (mirrors test_clipboard.py's
+// TestCanonicalRead)
+
+/// A double for the narrow slice of `NSPasteboard` that `SystemPasteboard`
+/// actually touches. `NSPasteboard` itself is not injectable -- there is one
+/// `general` board per session, shared with every other app on the machine --
+/// so without this the TIFF-to-PNG conversion could only be exercised by
+/// writing to the user's real clipboard, which the test suite must never do.
+///
+/// `PasteboardBackend` is deliberately narrow (five members) rather than a
+/// mirror of `NSPasteboard`: the smaller it is, the less of AppKit a fake has
+/// to imitate convincingly, and every member here is one the production code
+/// provably calls.
+final class FakePasteboardBackend: PasteboardBackend {
+    var changeCount = 0
+    var types: [NSPasteboard.PasteboardType]?
+    private var bodies: [NSPasteboard.PasteboardType: Data]
+    private(set) var clearCount = 0
+    private(set) var written: [(type: NSPasteboard.PasteboardType, data: Data?)] = []
+
+    init(types: [NSPasteboard.PasteboardType], data: [NSPasteboard.PasteboardType: Data] = [:]) {
+        self.types = types
+        self.bodies = data
+    }
+
+    /// Real `NSPasteboard.string(forType:)` returns nil for bytes that are
+    /// not valid UTF-8 rather than substituting replacement characters, and
+    /// this double matches that: `SystemPasteboard.read()`'s text branch
+    /// goes through it precisely so the bytes it returns are always valid
+    /// UTF-8, and a double that lossily decoded instead would hide a
+    /// regression that swapped it for a raw `data(forType:)` read.
+    func string(forType dataType: NSPasteboard.PasteboardType) -> String? {
+        guard let data = bodies[dataType] else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func data(forType dataType: NSPasteboard.PasteboardType) -> Data? { bodies[dataType] }
+
+    @discardableResult
+    func clearContents() -> Int {
+        clearCount += 1
+        bodies = [:]
+        types = []
+        changeCount += 1
+        return changeCount
+    }
+
+    @discardableResult
+    func setData(_ data: Data?, forType dataType: NSPasteboard.PasteboardType) -> Bool {
+        written.append((dataType, data))
+        guard let data else { return true }
+        bodies[dataType] = data
+        types = (types ?? []) + [dataType]
+        return true
+    }
+}
+
+final class CanonicalReadTests: XCTestCase {
+    /// One row of `fixtures/clipkind.json`. `expect` decodes as `ClipKind?`
+    /// rather than `String?` so a typo'd value ("txt") throws here instead of
+    /// silently reading as null and turning a row into a weaker assertion
+    /// than it looks.
+    ///
+    /// `uti` is NOT optional, deliberately: adding a row to the shared table
+    /// without deciding what the Mac does with it then fails to decode, which
+    /// is the whole point of the column. `types` (the Wayland/X11 vocabulary
+    /// the PC's `choose_kind` consumes) is decoded too, unused here but named
+    /// so a reader of this file can see there are two vocabularies and one
+    /// shared verdict.
+    struct ClipKindRow: Decodable {
+        let name: String
+        let types: [String]
+        let uti: [String]
+        let expect: ClipKind?
+    }
+
+    private func loadClipKindFixture() throws -> [ClipKindRow] {
+        // Tests/clipwireTests/ -> repo root -> fixtures/clipkind.json
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(contentsOf: root.appendingPathComponent("fixtures/clipkind.json"))
+        let rows = try JSONDecoder().decode([ClipKindRow].self, from: data)
+        XCTAssertFalse(rows.isEmpty, "fixtures/clipkind.json must not be empty")
+        return rows
+    }
+
+    /// Same fixture the Python suite reads (test_clipboard.py's
+    /// `test_the_kind_matches_the_shared_fixture`). Two implementations of
+    /// one rule stay honest only if both are pinned to the same table.
+    ///
+    /// The table pins the DECISION, in a shared `expect` column, and gives
+    /// each side its own vocabulary column: `types` is what a Wayland/X11
+    /// clipboard offers, `uti` is what `NSPasteboard` offers. That split is
+    /// not cosmetic. The two sides' sets of USABLE image types genuinely
+    /// differ -- the PC considers only `image/png` (GPaste re-offers PNG for
+    /// whatever it holds, verified on the live machine), while this side
+    /// must also accept `public.tiff`, because a macOS screenshot lands on
+    /// the pasteboard as TIFF and nothing else. A single-vocabulary table
+    /// with a translation at this boundary could not express that without
+    /// mapping one side's types onto the other's and lying about one of
+    /// them.
+    func testTheKindMatchesTheSharedFixture() throws {
+        for row in try loadClipKindFixture() {
+            XCTAssertEqual(chooseKind(offeredTypes: row.uti), row.expect, row.name)
+        }
+    }
+
+    /// The row that closes the gap Task 7's review found: without it, every
+    /// remaining row passes an implementation that matched any image type at
+    /// all, so "only the image types this side can actually use are
+    /// considered" could drift with the shared table unable to notice. Named
+    /// here so deleting the row from the fixture fails loudly rather than
+    /// quietly reducing coverage.
+    func testTheSharedFixturePinsAnUnusableImage() throws {
+        let rows = try loadClipKindFixture()
+        guard let row = rows.first(where: { $0.name == "unusable image only" }) else {
+            return XCTFail("fixtures/clipkind.json must keep the unusable-image row")
+        }
+        XCTAssertNil(row.expect, "an image in a format this side cannot use must select no kind")
+        XCTAssertNil(chooseKind(offeredTypes: row.uti))
+    }
+
+    /// A one-pixel bitmap encoded as TIFF, built through `NSBitmapImageRep`
+    /// only -- no `NSImage`, no drawing context, nothing that needs a window
+    /// server -- so this runs identically under `swift test` on a headless
+    /// machine and on a desktop.
+    private func makeOnePixelTIFF() -> Data? {
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 4, bitsPerPixel: 32)
+        return rep?.representation(using: .tiff, properties: [:])
+    }
+
+    private static let pngMagic = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+    /// macOS screenshots reach the pasteboard as TIFF and nothing else, so
+    /// this side owns the conversion: the wire format is PNG (`ImagePayload`
+    /// carries PNG bytes, and the PC's `wl-copy` is handed
+    /// `--type image/png`), and a peer handed TIFF bytes under that contract
+    /// would store an unopenable image.
+    func testAScreenshotIsConvertedToPNG() throws {
+        let tiff = try XCTUnwrap(makeOnePixelTIFF())
+        let board = FakePasteboardBackend(types: [.tiff], data: [.tiff: tiff])
+        let read = try XCTUnwrap(SystemPasteboard(board).read())
+        XCTAssertEqual(read.kind, .image)
+        XCTAssertEqual(read.data.prefix(8), Self.pngMagic,
+                       "the body on the wire must be PNG, not the TIFF the pasteboard held")
+        XCTAssertNotEqual(read.data, tiff, "the TIFF must not have been passed through unconverted")
+    }
+
+    /// PNG already on the board is taken as-is: re-encoding bytes that are
+    /// already in the wire format would change the hash of identical
+    /// content, and both sides' reconciliation compares hashes.
+    func testAnOfferedPNGIsTakenWithoutReEncoding() throws {
+        let png = Self.pngMagic + Data([0x00, 0x00, 0x00, 0x0D])
+        let board = FakePasteboardBackend(types: [.png], data: [.png: png])
+        let read = try XCTUnwrap(SystemPasteboard(board).read())
+        XCTAssertEqual(read.kind, .image)
+        XCTAssertEqual(read.data, png, "PNG on the board must reach the wire byte-for-byte")
+    }
+
+    /// Spreadsheets put a bitmap of the copied cells on the pasteboard
+    /// alongside the text; preferring the image would turn every copied
+    /// range into a picture of a table -- a regression of the primary flow
+    /// in exchange for the new one. Byte-for-byte the same rule
+    /// `choose_kind` applies on the PC.
+    func testTextWinsOverAnImage() throws {
+        let board = FakePasteboardBackend(
+            types: [.string, .png],
+            data: [.string: Data("hi".utf8), .png: Data([0x89])])
+        let read = try XCTUnwrap(SystemPasteboard(board).read())
+        XCTAssertEqual(read.kind, .text)
+        XCTAssertEqual(read.data, Data("hi".utf8))
+    }
+
+    /// A failed conversion is nothing -- never the unconverted TIFF, never a
+    /// placeholder. Substituting either would put bytes on the wire that
+    /// claim to be PNG and are not.
+    ///
+    /// It is logged HERE rather than by the caller, unlike what the task
+    /// brief specified: `read()` returns a bare optional, so nil for a failed
+    /// conversion is indistinguishable at every call site from nil for an
+    /// empty pasteboard -- the ordinary, uneventful case that must stay
+    /// silent -- and `resolveCurrentClipState`, one of those call sites, has
+    /// no logger at all. The optional `log` follows `PasteboardWatcher`'s
+    /// existing idiom for exactly this: defaulted to nil so every other call
+    /// site compiles unchanged, with only `runAgent()` passing a real one.
+    func testAFailedConversionReadsAsNothingAndIsLogged() throws {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-pasteboard-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        let board = FakePasteboardBackend(types: [.tiff], data: [.tiff: Data("not a tiff".utf8)])
+
+        XCTAssertNil(SystemPasteboard(board, log: log).read(),
+                     "unconvertible image bytes must read as nothing, not be passed through")
+
+        log.flush()
+        let contents = try? String(contentsOfFile: logPath, encoding: .utf8)
+        XCTAssertEqual(contents?.contains("could not convert"), true,
+                       "a dropped image must not be silent; got: \(contents ?? "<unreadable>")")
+    }
+
+    /// The read-side half of the fixture's unusable-image row, at the
+    /// `read()` level rather than `chooseKind`'s: an image this side cannot
+    /// convert is not read at all -- no body fetch, no guess.
+    func testAnUnusableImageIsNotRead() {
+        let jpeg = NSPasteboard.PasteboardType("public.jpeg")
+        let board = FakePasteboardBackend(types: [jpeg], data: [jpeg: Data([0xFF, 0xD8, 0xFF])])
+        XCTAssertNil(SystemPasteboard(board).read())
+    }
+
+    /// An empty body is nothing to sync, matching `WaylandClipboard.read()`,
+    /// which returns None for an empty stdout.
+    func testAnEmptyTextBodyReadsAsNothing() {
+        let board = FakePasteboardBackend(types: [.string], data: [.string: Data()])
+        XCTAssertNil(SystemPasteboard(board).read())
+    }
+
+    func testAnEmptyBoardReadsAsNothing() {
+        XCTAssertNil(SystemPasteboard(FakePasteboardBackend(types: [])).read())
+    }
+
+    /// `changeCount` is what `PasteboardWatcher` polls; it has to come from
+    /// the real board rather than being invented by the wrapper, or the
+    /// watcher would never observe a change.
+    func testChangeCountComesFromTheBoard() {
+        let board = FakePasteboardBackend(types: [])
+        let pasteboard = SystemPasteboard(board)
+        XCTAssertEqual(pasteboard.changeCount, 0)
+        board.setData(Data("hi".utf8), forType: .string)
+        board.changeCount += 1
+        XCTAssertEqual(pasteboard.changeCount, board.changeCount)
+    }
+
+    /// Both write kinds land under the type a reader of that kind asks for:
+    /// text under `.string` (what `read()`'s text branch and every other app
+    /// on the machine reads), an image under `.png`.
+    ///
+    /// `clearContents()` first, and exactly once: without it the previous
+    /// item's other representations survive, so writing an incoming image
+    /// over an old text clip would leave BOTH on the board -- and text wins,
+    /// so the very next read would return the stale text instead of the
+    /// image just applied.
+    func testWriteReplacesTheBoardContentsUnderTheRightType() {
+        let board = FakePasteboardBackend(types: [.string], data: [.string: Data("old".utf8)])
+        let png = Self.pngMagic
+        SystemPasteboard(board).write(kind: .image, data: png)
+
+        XCTAssertEqual(board.clearCount, 1, "the previous item's types must be cleared exactly once")
+        XCTAssertEqual(board.written.count, 1)
+        XCTAssertEqual(board.written.first?.type, .png)
+        XCTAssertEqual(board.written.first?.data, png)
+        XCTAssertNil(board.data(forType: .string), "the stale text must be gone, or it would win the next read")
+    }
+
+    func testWritingTextLandsUnderTheStringType() {
+        let board = FakePasteboardBackend(types: [])
+        SystemPasteboard(board).write(kind: .text, data: Data("hello".utf8))
+
+        XCTAssertEqual(board.clearCount, 1)
+        XCTAssertEqual(board.written.first?.type, .string)
+        XCTAssertEqual(board.written.first?.data, Data("hello".utf8))
+    }
+
+    /// The round trip, on one object: what `write` puts on a board is what
+    /// `read` gets back from it. This is the property that lets the Mac skip
+    /// the read-back the PC side needs -- see `write(kind:data:)`'s own
+    /// comment.
+    func testWhatIsWrittenIsWhatIsReadBack() throws {
+        let board = FakePasteboardBackend(types: [])
+        let pasteboard = SystemPasteboard(board)
+        let png = Self.pngMagic + Data([0x01, 0x02])
+        pasteboard.write(kind: .image, data: png)
+
+        let read = try XCTUnwrap(pasteboard.read())
+        XCTAssertEqual(read.kind, .image)
+        XCTAssertEqual(read.data, png, "NSPasteboard returns the bytes it was given, unlike GPaste")
     }
 }

@@ -18,26 +18,42 @@ import XCTest
 @testable import clipwire
 
 final class HandleFrameTests: XCTestCase {
-    /// Records every `writeText` call and, via `onWrite`, lets a test
+    /// Records every `write` call and, via `onWrite`, lets a test
     /// observe exactly when it happens relative to other calls -- the
     /// ORDER is what these tests pin, not merely that a write occurred.
     /// A spy that only checked occurrence would pass against code that
     /// armed the suppression after writing instead of before.
     ///
-    /// Also conforms to `PasteboardReading` (`changeCount`/`readText`),
-    /// which `handleFrame`'s new clip-state paths need: announcing our own
+    /// Also conforms to `PasteboardReading` (`changeCount`/`read`),
+    /// which `handleFrame`'s clip-state paths need: announcing our own
     /// state and answering a peer's announcement both require reading
     /// whatever the pasteboard currently holds, not only writing to it.
     final class RecordingPasteboard: PasteboardReading, PasteboardWriting {
-        private(set) var writtenTexts: [String] = []
+        private(set) var writes: [(kind: ClipKind, data: Data)] = []
         var onWrite: (() -> Void)?
         var changeCount = 0
         var textToRead: Data?
+        /// Only read when `textToRead` is nil, so the double applies the
+        /// same text-wins rule the real board does -- and so a test can put
+        /// an image on the pasteboard and see what a path that only ever
+        /// expected text does with it.
+        var imageToRead: Data?
 
-        func readText() -> Data? { textToRead }
+        /// What was written as TEXT, decoded -- the shape most of this
+        /// suite asserts on. Kept as a derived view rather than a second
+        /// stored property so it cannot disagree with `writes`.
+        var writtenTexts: [String] {
+            writes.filter { $0.kind == .text }.map { String(decoding: $0.data, as: UTF8.self) }
+        }
 
-        func writeText(_ text: String) {
-            writtenTexts.append(text)
+        func read() -> (kind: ClipKind, data: Data)? {
+            if let textToRead, !textToRead.isEmpty { return (.text, textToRead) }
+            if let imageToRead, !imageToRead.isEmpty { return (.image, imageToRead) }
+            return nil
+        }
+
+        func write(kind: ClipKind, data: Data) {
+            writes.append((kind, data))
             onWrite?()
         }
     }
@@ -110,8 +126,8 @@ final class HandleFrameTests: XCTestCase {
     }
 
     /// Distinct from the ordering test above: this pins WHAT is armed, not
-    /// merely WHEN. `PasteboardWatcher.poll()` hashes whatever
-    /// `pasteboard.readText()` returns -- the plain text alone, never a
+    /// merely WHEN. `PasteboardWatcher.poll()` hashes the body
+    /// `pasteboard.read()` returns -- the plain text alone, never a
     /// timestamp prefix. Arming with `frame.payload` (the ts-prefixed clip
     /// payload) instead of the decoded text would make `EchoGuard`'s stored
     /// digest never match poll()'s later read, so `shouldSend` would always
@@ -617,6 +633,36 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(decoded.text, "current clip text")
     }
 
+    /// This branch became REACHABLE for an image only because of Task 8: an
+    /// image-only pasteboard used to read back as nothing, so it resolved a
+    /// nil hash and could never win a reconciliation; now it resolves a real
+    /// `(hash, ts, .image)` state and `sendMine` is a live outcome for it.
+    /// The branch itself still builds a `ClipPayload` -- the TEXT codec --
+    /// from whatever it reads, so without a kind check it would send PNG
+    /// bytes run through `String(decoding:as:UTF8.self)` as a text clip, and
+    /// the peer would apply that mojibake to its clipboard. Not sending is
+    /// the correct behaviour until Task 11 teaches this branch to send by
+    /// `mine`'s own kind; this connection simply does not sync the image,
+    /// exactly as it did not before. The PC agent's `_resolve_clip_state`
+    /// carries the same guard, for the same reason.
+    func testWinningClipStateWithAnImageOnThePasteboardProducesNoSend() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .image))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertTrue(sent.isEmpty,
+                      "an image must not be sent as a text clip just because we won the " +
+                      "reconciliation -- the peer would apply mojibake to its clipboard")
+    }
+
     /// Unlike the watcher's own local-change path, this branch reads the
     /// live pasteboard independently and, before this fix, applied no size
     /// bound at all: winning a reconciliation over content at or beyond the
@@ -1094,6 +1140,38 @@ final class HandleFrameTests: XCTestCase {
         log.flush()
         XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed while apart"),
                       "got: \(loggedMessages(at: path))")
+    }
+
+    /// End to end for the kind-threading fix, at the point where a wrong
+    /// kind would actually do damage: what `announceClipState` puts ON THE
+    /// WIRE and INTO THE STORE for an image-only pasteboard.
+    ///
+    /// The two unit tests on `resolveStartupState`/`resolveCurrentClipState`
+    /// pin the rule; this one pins that nothing between them and the frame
+    /// re-derives, defaults or drops the kind on the way out. `.image`
+    /// against a stored `.text` again, so a hardcoded `.text` anywhere in
+    /// that chain fails here rather than matching by coincidence. The peer's
+    /// `decode_clip_state` accepts "image" (it is in `_KNOWN_KINDS`), so a
+    /// wrong value here is not rejected on arrival -- it is believed.
+    func testAnnounceClipStateOfAnImageOnlyPasteboardPutsTheImageKindOnTheWireAndOnDisk() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x02])
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashB, ts: 111, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = png
+        var sent: [Frame] = []
+
+        announceClipState(send: { sent.append($0) }, pasteboard: pasteboard,
+                          clipStateStore: store, log: tempLog(), now: 999_999)
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.type, .clipState)
+        guard let payload = sent.first?.payload else { return }
+        let announced = try ClipState.decodePayload(payload)
+        XCTAssertEqual(announced, ClipState(sha256: sha256Hex(png), ts: 999_999, kind: .image),
+                       "an image on the pasteboard must be announced as an image")
+        XCTAssertEqual(store.load(), announced,
+                       "and the store must record exactly what was announced")
     }
 
     /// "Nothing on disk" is the same branch: the content appeared while

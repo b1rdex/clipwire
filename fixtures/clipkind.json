@@ -1,7 +1,8 @@
 [
-  {"name": "text only",        "types": ["text/plain;charset=utf-8", "TEXT"], "expect": "text"},
-  {"name": "image only",       "types": ["image/png", "image/tiff", "TARGETS"], "expect": "image"},
-  {"name": "both, text wins",  "types": ["text/plain;charset=utf-8", "image/png"], "expect": "text"},
-  {"name": "neither",          "types": ["TARGETS", "TIMESTAMP"], "expect": null},
-  {"name": "empty",            "types": [], "expect": null}
+  {"name": "text only",           "types": ["text/plain;charset=utf-8", "TEXT"],        "uti": ["public.utf8-plain-text", "public.rtf"], "expect": "text"},
+  {"name": "image only",          "types": ["image/png", "image/tiff", "TARGETS"],      "uti": ["public.png", "public.tiff"],            "expect": "image"},
+  {"name": "both, text wins",     "types": ["text/plain;charset=utf-8", "image/png"],   "uti": ["public.utf8-plain-text", "public.png"],  "expect": "text"},
+  {"name": "unusable image only", "types": ["image/jpeg", "TARGETS"],                   "uti": ["public.jpeg"],                          "expect": null},
+  {"name": "neither",             "types": ["TARGETS", "TIMESTAMP"],                    "uti": ["public.file-url", "public.url-name"],   "expect": null},
+  {"name": "empty",               "types": [],                                          "uti": [],                                       "expect": null}
 ]

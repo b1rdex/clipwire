@@ -312,14 +312,27 @@ func sha256Hex(_ data: Data) -> String {
 /// `nil` (an empty or unreadable pasteboard) is never hashed, matching the wire
 /// contract that `sha256` is `null` for exactly that case -- see `resolveStartupState`
 /// for the rule this applies once a current hash is in hand.
+///
+/// `currentKind` -- the OTHER half of `resolveStartupState`'s signature -- comes from
+/// this exact same `read()` call, never derived separately: `read()` is Task 8's one
+/// canonical read, returning `(kind:, data:)` or `nil`, so the kind of what was just
+/// hashed is sitting right there in the pair already. This is the one place in the
+/// file that turns a raw `pasteboard.read()` into a (hash, kind) pair; every caller of
+/// `resolveStartupState` goes through here rather than reading the pasteboard and
+/// deciding a kind independently, which is what keeps a hash and a kind from ever
+/// being paired up wrong. Mirrors `resolve_current_clip_state` on the PC side.
 func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double) -> ClipState {
     let currentHash: String?
-    if let data = pasteboard.readText(), !data.isEmpty {
-        currentHash = sha256Hex(data)
+    let currentKind: ClipKind?
+    if let read = pasteboard.read(), !read.data.isEmpty {
+        currentHash = sha256Hex(read.data)
+        currentKind = read.kind
     } else {
         currentHash = nil
+        currentKind = nil
     }
-    return resolveStartupState(currentHash: currentHash, stored: stored, now: now)
+    return resolveStartupState(currentHash: currentHash, currentKind: currentKind,
+                               stored: stored, now: now)
 }
 
 /// Whether THIS connection's one-shot clip-state announcement has already gone out.
@@ -641,7 +654,23 @@ func handleFrame(
         log.line("reconciled with the peer: \(decision.rawValue)")
         switch decision {
         case .sendMine:
-            guard let data = pasteboard.readText(), !data.isEmpty else { return }
+            // Text or nothing. Task 8 made this branch REACHABLE for an
+            // image for the first time: an image-only pasteboard used to
+            // read back as nothing, so it resolved a `nil` hash and could
+            // never win a reconciliation; it now resolves a real
+            // `(hash, ts, .image)` state, so `sendMine` is a live outcome
+            // for it. The branch itself still builds a `ClipPayload` -- the
+            // TEXT codec -- so sending those bytes would put a mojibake
+            // transliteration of a PNG on the wire, which is a worse outcome
+            // than not sending at all. A non-text read is therefore treated
+            // exactly like no read: this connection silently does not sync
+            // the image, precisely as it silently does not today. Task 11 is
+            // where this starts reading by `mine`'s OWN kind and sending an
+            // `.imageClip` frame instead. The PC agent's
+            // `_resolve_clip_state` carries the same guard, for the same
+            // reason and with the same scope boundary.
+            guard let read = pasteboard.read(), read.kind == .text, !read.data.isEmpty else { return }
+            let data = read.data
             // The size bound matches PasteboardWatcher's own send-side guard
             // (Pasteboard.swift): this branch reads the live pasteboard
             // independently, and without it, winning a reconciliation over
@@ -699,7 +728,7 @@ func handleFrame(
         // Arm suppression BEFORE writing to the pasteboard, with the
         // PLAIN TEXT bytes -- not `frame.payload`, which carries the
         // 8-byte timestamp prefix. PasteboardWatcher's own poll() hashes
-        // whatever `pasteboard.readText()` returns, which is this text
+        // the body `pasteboard.read()` returns, which is this text
         // alone; arming with the ts-prefixed payload would make
         // EchoGuard's digest never match, `shouldSend` would always
         // return true, and every applied remote clip would bounce
@@ -707,8 +736,13 @@ func handleFrame(
         // lock keeps its own bookkeeping consistent, but it does not own
         // this write, so only this ordering keeps the watcher from
         // observing our write before the suppression exists.
+        //
+        // `.text`, and the same bytes that were armed: this case decoded a
+        // `.clip` (type 0x01) payload, the text-clip codec, so there is
+        // nothing else it could be. An image applied from the peer arrives
+        // as `.imageClip` and does not reach this branch.
         noteWrittenLocally(textData)
-        pasteboard.writeText(decoded.text)
+        pasteboard.write(kind: .text, data: textData)
         // The peer's timestamp, never `now`: this is the entire reason it
         // travels in the frame. Stamping it with `now` would make applied
         // content look freshly copied here and win the next
@@ -808,7 +842,11 @@ func runAgent() -> Int32 {
     status.writeInitial()
 
     let channel = Channel(config: config, log: log)
-    let systemPasteboard = SystemPasteboard()
+    // The log is what makes a dropped image visible: a TIFF that fails to
+    // convert reads back as nothing, which is indistinguishable at every
+    // call site from an empty pasteboard. This is the only construction site
+    // that passes one; every test constructs a `SystemPasteboard` without.
+    let systemPasteboard = SystemPasteboard(log: log)
     let watcher = PasteboardWatcher(
         pasteboard: systemPasteboard,
         pollInterval: Double(config.macPollIntervalMs) / 1000.0,

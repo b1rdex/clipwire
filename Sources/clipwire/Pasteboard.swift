@@ -4,7 +4,16 @@ import Foundation
 
 protocol PasteboardReading {
     var changeCount: Int { get }
-    func readText() -> Data?
+
+    /// The one canonical read: `(kind, bytes)` for whatever the pasteboard
+    /// currently holds, or `nil` when it holds nothing this agent syncs.
+    /// Every caller — the watcher's poll, the startup reconciliation
+    /// (`resolveCurrentClipState`) and the reconciliation send branch — goes
+    /// through this single call, so which content wins when more than one
+    /// kind is on offer is decided in exactly one place (`chooseKind`)
+    /// rather than reimplemented per call site. Mirrors
+    /// `WaylandClipboard.read()` on the PC.
+    func read() -> (kind: ClipKind, data: Data)?
 }
 
 /// The one write operation an incoming clip needs. Kept separate from
@@ -13,23 +22,167 @@ protocol PasteboardReading {
 /// ever reads, and the frame handler that applies an incoming clip
 /// (`handleFrame` in main.swift) only ever writes. Splitting them means a
 /// test can substitute a recording spy for the write side alone, without
-/// needing to fake `changeCount`/`readText` too — see `HandleFrameTests.swift`.
+/// needing to fake `changeCount`/`read` too — see `HandleFrameTests.swift`.
 protocol PasteboardWriting {
-    func writeText(_ text: String)
+    func write(kind: ClipKind, data: Data)
+}
+
+/// The narrow slice of `NSPasteboard` this file actually uses, so the
+/// TIFF→PNG path and the type-selection rule are testable without touching
+/// the machine's real clipboard. `NSPasteboard` is not injectable as-is:
+/// there is one `general` board per login session, shared with every other
+/// running app, so a test that exercised `SystemPasteboard` against it would
+/// both depend on and destroy whatever the user had copied.
+///
+/// Five members, all of them calls `SystemPasteboard` provably makes — the
+/// smaller this is, the less of AppKit a fake has to imitate convincingly.
+/// `NSPasteboard` satisfies every one of them with its own existing
+/// signatures, so the conformance below is empty and there is no adapter
+/// layer that could itself be wrong.
+///
+/// `string(forType:)` earns its place next to `data(forType:)` rather than
+/// being folded into it: it is what guarantees the text branch returns
+/// valid UTF-8. `NSPasteboard` returns `nil` (not replacement characters)
+/// for bytes that do not decode, whereas a raw `data(forType:)` read would
+/// hand `handleFrame`'s `String(decoding:as:UTF8.self)` bytes it would
+/// silently substitute U+FFFD into — while `EchoGuard` had hashed the
+/// originals, so every applied clip would echo back to the peer.
+protocol PasteboardBackend: AnyObject {
+    var changeCount: Int { get }
+    var types: [NSPasteboard.PasteboardType]? { get }
+    func string(forType dataType: NSPasteboard.PasteboardType) -> String?
+    func data(forType dataType: NSPasteboard.PasteboardType) -> Data?
+    @discardableResult func clearContents() -> Int
+    @discardableResult func setData(_ data: Data?, forType dataType: NSPasteboard.PasteboardType) -> Bool
+}
+
+extension NSPasteboard: PasteboardBackend {}
+
+/// Which kind to sync, given the types the pasteboard is offering.
+///
+/// Text wins. Spreadsheets put a bitmap of the copied cells alongside the
+/// text, so preferring the image would turn every copied range into a
+/// picture of a table — a regression of the primary flow in exchange for the
+/// new one. Screenshots and "Copy Image" carry no plain text, so they still
+/// arrive as images.
+///
+/// Pinned against `fixtures/clipkind.json`, the same file the PC agent's
+/// `choose_kind` is pinned against, so the two implementations of this one
+/// rule cannot drift. That table carries a shared `expect` column (the
+/// decision) and one vocabulary column per side: `types` for the
+/// Wayland/X11 MIME strings `wl-paste --list-types` prints, `uti` for the
+/// Uniform Type Identifiers `NSPasteboard` speaks. The split is not merely
+/// cosmetic — the two sides' sets of USABLE image types genuinely differ:
+/// the PC considers only `image/png`, because GPaste re-offers whatever it
+/// holds as PNG among a long list of types (verified on the live machine
+/// down to a JPEG reading back as valid PNG), while this side must also
+/// accept `public.tiff`, because a macOS screenshot lands on the pasteboard
+/// as TIFF and nothing else. A translation at this boundary could not
+/// express that without mapping one side's types onto the other's and lying
+/// about one of them.
+///
+/// The text branch matches only `NSPasteboard.PasteboardType.string`
+/// (`public.utf8-plain-text`) rather than any text-ish UTI, deliberately:
+/// that is the exact type `SystemPasteboard.read()` then asks for, so
+/// choosing `.text` here means a body read that can actually succeed.
+/// Accepting `public.plain-text` or `public.rtf` too would only manufacture
+/// a state where this function says "text" and the read that follows finds
+/// nothing — AppKit already maps the legacy `NSStringPboardType` onto
+/// `public.utf8-plain-text` before it ever reaches `types`.
+func chooseKind(offeredTypes: [String]) -> ClipKind? {
+    if offeredTypes.contains(NSPasteboard.PasteboardType.string.rawValue) { return .text }
+    if offeredTypes.contains(NSPasteboard.PasteboardType.png.rawValue)
+        || offeredTypes.contains(NSPasteboard.PasteboardType.tiff.rawValue) {
+        return .image
+    }
+    return nil
 }
 
 final class SystemPasteboard: PasteboardReading, PasteboardWriting {
-    private let pasteboard = NSPasteboard.general
-    var changeCount: Int { pasteboard.changeCount }
+    private let board: PasteboardBackend
+    /// Optional and defaulted to `nil` so every test that constructs a
+    /// `SystemPasteboard` for its read/write behaviour compiles unchanged;
+    /// only `runAgent()` passes a real one. The same idiom
+    /// `PasteboardWatcher` below already uses, for the same reason.
+    private let log: Log?
 
-    func readText() -> Data? {
-        guard let string = pasteboard.string(forType: .string) else { return nil }
-        return Data(string.utf8)
+    /// Defaults to the real board, so `runAgent()` reads as it always did
+    /// and the injection point exists only for tests.
+    init(_ board: PasteboardBackend = NSPasteboard.general, log: Log? = nil) {
+        self.board = board
+        self.log = log
     }
 
-    func writeText(_ text: String) {
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+    var changeCount: Int { board.changeCount }
+
+    func read() -> (kind: ClipKind, data: Data)? {
+        guard let kind = chooseKind(offeredTypes: (board.types ?? []).map(\.rawValue)) else {
+            return nil
+        }
+        switch kind {
+        case .text:
+            // Empty is nothing to sync, not an empty clip — the same answer
+            // `WaylandClipboard.read()` gives for an empty stdout.
+            guard let string = board.string(forType: .string), !string.isEmpty else { return nil }
+            return (.text, Data(string.utf8))
+        case .image:
+            guard let png = readPNG() else { return nil }
+            return (.image, png)
+        }
+    }
+
+    /// PNG as offered, otherwise a TIFF converted to PNG.
+    ///
+    /// The wire format is PNG (`ImagePayload` carries PNG bytes, and the PC
+    /// hands `wl-copy --type image/png`), and macOS screenshots land on the
+    /// pasteboard as TIFF, so this side owns the conversion. PNG already on
+    /// the board is taken byte-for-byte rather than round-tripped: both
+    /// sides reconcile by comparing hashes, and re-encoding identical
+    /// content would change its hash.
+    ///
+    /// A failed conversion is `nil` — never the unconverted TIFF, never a
+    /// placeholder, both of which would put bytes on the wire that claim to
+    /// be PNG and are not. It is logged here rather than by the caller (as
+    /// the task brief specified) because `read()` returns a bare optional:
+    /// at every call site, `nil` from a failed conversion is
+    /// indistinguishable from `nil` for an empty pasteboard — the ordinary,
+    /// uneventful case that must stay silent — and `resolveCurrentClipState`,
+    /// one of those call sites, has no logger at all. Logging where the
+    /// distinction still exists is the only place it can be made.
+    private func readPNG() -> Data? {
+        if let png = board.data(forType: .png), !png.isEmpty { return png }
+        guard let tiff = board.data(forType: .tiff), !tiff.isEmpty else { return nil }
+        guard let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]),
+              !png.isEmpty else {
+            log?.line("could not convert the pasteboard image to PNG: dropping it")
+            return nil
+        }
+        return png
+    }
+
+    /// `clearContents()` first, always: without it the previous item's other
+    /// representations survive, so writing an incoming image over an old
+    /// text clip would leave BOTH on the board — and text wins, so the very
+    /// next read would return the stale text instead of the image just
+    /// applied.
+    ///
+    /// No read-back afterwards, and deliberately not: `NSPasteboard` returns
+    /// the bytes it was given, and nothing else takes ownership of the
+    /// selection here. The PC side's `_write_clip` does re-read after
+    /// writing, but that exists for a Wayland-side fact — GPaste takes over
+    /// the selection and RE-ENCODES images, so the bytes it serves back are
+    /// not the bytes `wl-copy` was handed, and its hash has to be recomputed
+    /// from what the clipboard actually ended up holding. Nothing on this
+    /// side re-encodes anything, so a symmetric read-back here would add a
+    /// race (the watcher polls the same board) in exchange for no
+    /// information. Do not add one for symmetry.
+    func write(kind: ClipKind, data: Data) {
+        board.clearContents()
+        // `setData` rather than `setString` for text: the two are equivalent
+        // for `public.utf8-plain-text` (both write the UTF-8 bytes), and one
+        // call covers both kinds, which keeps `PasteboardBackend` a member
+        // smaller.
+        board.setData(data, forType: kind == .text ? .string : .png)
     }
 }
 
@@ -64,7 +217,7 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// same lock as the rest closes this: whatever generation `poll()` records
 /// is provably the one it just read text and consulted `echo` for, because
 /// nothing else can touch `echo` in between. Unlike the PC side, none of
-/// this needs a generation counter: `SystemPasteboard.readText()` is an
+/// this needs a generation counter: `SystemPasteboard.read()` is an
 /// in-process NSPasteboard call, not a forked `wl-paste` that can take up to
 /// 3 seconds, so there is no slow operation whose lock-holding cost a
 /// counter would be needed to dodge — and a counter keyed off `echo`'s own
@@ -153,7 +306,22 @@ final class PasteboardWatcher {
         // observed earlier and now stale.
         lastChangeCount = current
 
-        guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
+        // Text or nothing. Since Task 8 made the read kind-aware, an image
+        // on the pasteboard comes back as a real `(.image, bytes)` pair
+        // instead of nil, and `onChange`'s consumer (`wireAgent`) wraps
+        // whatever it is handed in a `ClipPayload` — the TEXT codec — via
+        // `String(decoding:as:UTF8.self)`. Emitting an image here would
+        // therefore put a mojibake transliteration of a PNG on the wire and
+        // into both persistent stores. Keeping this text-only is a scope
+        // boundary, not an oversight: syncing a local image change is later
+        // work (Task 11), which needs the image send, apply and announce
+        // wiring together rather than one call site at a time. Until then an
+        // image observation is skipped exactly as it always was — the
+        // difference is that it is now skipped on purpose, pinned by
+        // `testAnImageOnThePasteboardIsNotEmittedAsText`. The PC agent's
+        // `_local_change` carries the same guard for the same reason.
+        guard let read = pasteboard.read(), read.kind == .text, !read.data.isEmpty else { return nil }
+        let text = read.data
         // `wireAgent` wraps this text in `ClipPayload(ts:text:)` before it
         // ever reaches the wire, adding an 8-byte prefix -- so the bound
         // here must leave room for it. Checking `text.count` alone (exact

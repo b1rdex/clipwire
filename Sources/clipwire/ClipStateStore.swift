@@ -86,9 +86,11 @@ struct ClipStateStore {
     }
 }
 
-/// The judgement that makes the wake flow work. `currentHash` is the
-/// clipboard's hash *right now*, at startup; `stored` is whatever
-/// `ClipStateStore.load()` last returned; `now` is the caller's clock.
+/// The judgement that makes the wake flow work. `currentHash` and
+/// `currentKind` are the pasteboard's hash and kind *right now*, at
+/// startup -- both produced by the same `pasteboard.read()` call, never
+/// derived independently; `stored` is whatever `ClipStateStore.load()`
+/// last returned; `now` is the caller's clock.
 ///
 /// A timestamp can come from three places, in precedence order: a local
 /// change this process watched happen, a clip received from the peer
@@ -100,42 +102,55 @@ struct ClipStateStore {
 /// on one side while the other slept or was disconnected.
 ///
 /// If the hash on disk matches what the clipboard holds now, the content
-/// has not changed since it was last recorded, so the *stored* timestamp --
-/// and, by the same reasoning, its *stored* kind -- is the real age (and
-/// kind) of that content and is returned unchanged. Returning `now` here
-/// instead would make every such clip look freshly copied, winning it every
-/// reconciliation and clobbering the peer systematically. If the hashes
-/// differ, or nothing was ever stored, the content changed (or appeared)
-/// while nothing was watching, and only `now` is honest -- and its kind is
-/// `.text`, hardcoded rather than threaded through as a parameter:
-/// `resolveCurrentClipState` below is this function's only non-test caller,
-/// and it derives `currentHash` from `pasteboard.readText()` alone -- there
-/// is no independent "current kind" input to thread through yet. **Task 8**
-/// is where that changes -- it makes the pasteboard read itself kind-aware
-/// (`readText()` becoming `read() -> (kind:, data:)?`) -- NOT Task 11,
-/// which only wires the send branch that reads `kind` back out once it is
-/// already correct. The compiler will not catch a missed revisit here:
-/// this function's signature is untouched by Task 8, so no call-site error
-/// points at it. What DOES change, visibly, is `resolveCurrentClipState`'s
-/// own body one frame up -- and a mechanical adaptation there (e.g.
-/// `currentHash = sha256Hex(read.data)`, the new `kind` quietly dropped on
-/// the floor) compiles clean and passes the whole suite while silently
-/// fabricating `.text` for a PNG hash, right here, one frame below the
-/// line the compiler actually flagged. Revisit THIS hardcoding, not just
-/// the caller above it.
+/// has not changed since it was last recorded, so the *stored* timestamp
+/// and the *stored* kind -- not `currentKind` -- are the real age and kind
+/// of that content, and are returned unchanged: unchanged content did not
+/// change what kind of content it is either, and the stored value is the
+/// one this side already announced to a peer, possibly on an earlier
+/// connection. Returning `now` here instead would make every such clip look
+/// freshly copied, winning it every reconciliation and clobbering the peer
+/// systematically. If the hashes differ, or nothing was ever stored, the
+/// content changed (or appeared) while nothing was watching, and only `now`
+/// is honest about its age -- `currentKind` is equally honest about what it
+/// is, since it came from that exact same read, and is returned as-is
+/// rather than guessed.
+///
+/// Before Task 8 made `pasteboard.read()` kind-aware, this parameter did
+/// not exist and this branch hardcoded `.text`: `resolveCurrentClipState`
+/// (main.swift), this function's only non-test caller, could only ever
+/// derive `currentHash` from a text read, so there was no independent
+/// "current kind" to thread through yet. Task 6's own note on this function
+/// named the exact failure a purely mechanical fix to the CALLER (not to
+/// this signature) would have left behind: once the read returned a
+/// `(kind:, data:)` pair, a caller that computed `currentHash =
+/// sha256Hex(read.data)` while quietly dropping the kind would compile
+/// clean and pass the whole suite, silently fabricating `.text` for a PNG
+/// hash right here -- one frame below the line that actually changed, with
+/// no call-site error to point at it, since a same-arity caller changing
+/// its body is invisible to every test that only checks THIS function's
+/// behaviour. Fixed by threading the kind through as a real parameter
+/// instead of leaving it something only the caller could derive: dropping
+/// it is now a compile error at every call site, everywhere it is tested,
+/// rather than a wrong answer only the one production call site would ever
+/// produce. See `resolveCurrentClipState`'s own doc comment for the other
+/// half -- it is what derives `currentKind` from the read's pair.
 ///
 /// A `nil` currentHash (clipboard empty or unreadable right now) always
 /// wins over whatever is on disk, regardless of what was previously stored:
 /// `resolveFreshness` never compares timestamps when either side's hash is
 /// `nil`, so the timestamp attached here is never actually read. Its kind is
-/// `nil` too, matching the nil-iff-nil rule `ClipState.init(from:)` enforces
-/// on the wire.
-func resolveStartupState(currentHash: String?, stored: ClipState?, now: Double) -> ClipState {
+/// a literal `nil` too -- not `currentKind` -- matching the nil-iff-nil rule
+/// `ClipState.init(from:)` enforces on the wire: a caller reporting a `nil`
+/// hash has no real kind to go with it either, and `ClipState`'s memberwise
+/// initializer does not enforce that rule, so a leak here would reach the
+/// wire and be rejected by the peer's decoder rather than by anything local.
+func resolveStartupState(currentHash: String?, currentKind: ClipKind?,
+                         stored: ClipState?, now: Double) -> ClipState {
     guard let currentHash else {
         return ClipState(sha256: nil, ts: now, kind: nil)
     }
     if let stored, stored.sha256 == currentHash {
         return ClipState(sha256: currentHash, ts: stored.ts, kind: stored.kind)
     }
-    return ClipState(sha256: currentHash, ts: now, kind: .text)
+    return ClipState(sha256: currentHash, ts: now, kind: currentKind)
 }

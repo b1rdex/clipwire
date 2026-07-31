@@ -63,7 +63,7 @@ final class ClipStateStoreTests: XCTestCase {
         XCTAssertThrowsError(try ClipState.decodePayload(malformed.encodePayload()),
                              "the same value must NOT be accepted off the wire")
         XCTAssertEqual(
-            resolveStartupState(currentHash: sha256Hex(Data("current".utf8)),
+            resolveStartupState(currentHash: sha256Hex(Data("current".utf8)), currentKind: .text,
                                 stored: malformed, now: 999),
             ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999, kind: .text),
             "a corrupt stored hash resolves to `now`, exactly as nothing-stored does")
@@ -184,29 +184,51 @@ final class ClipStateStoreTests: XCTestCase {
     /// copied, winning it every reconciliation and clobbering the peer
     /// systematically in the other direction.
     /// Content that has not changed since it was last recorded must keep
-    /// its real recorded kind too, not just its timestamp: `stored` here is
-    /// deliberately `.image`, the "wrong" guess a bug hardcoding `.text`
-    /// onto this branch would produce, so such a bug cannot pass by
-    /// coincidence.
+    /// its real recorded kind too, not just its timestamp -- and the STORED
+    /// kind, not the one just read. `currentKind` here is deliberately the
+    /// opposite of `stored`'s, so returning either one is distinguishable:
+    /// unchanged content did not change what kind of content it is, and the
+    /// stored value is the one this side already announced to the peer,
+    /// possibly on an earlier connection.
     func testStoredHashMatchesCurrentReturnsStoredTimestampNotNow() {
         let stored = ClipState(sha256: "aa", ts: 100, kind: .image)
-        let result = resolveStartupState(currentHash: "aa", stored: stored, now: 999)
+        let result = resolveStartupState(currentHash: "aa", currentKind: .text,
+                                         stored: stored, now: 999)
         XCTAssertEqual(result, ClipState(sha256: "aa", ts: 100, kind: .image))
     }
 
-    /// New content observed here is always `.text`, hardcoded --
-    /// `resolveCurrentClipState`'s only production caller derives
-    /// `currentHash` from `pasteboard.readText()` alone; see
-    /// `resolveStartupState`'s own doc comment.
-    func testStoredHashDiffersReturnsNow() {
+    /// *** The kind-threading deliverable. *** Content that changed while
+    /// nothing was watching gets `now` for its age AND the kind of the read
+    /// that just observed it -- never a hardcoded guess.
+    ///
+    /// `currentKind: .image` against a stored `.text` is what makes the
+    /// three possible implementations distinguishable, and passing `.text`
+    /// would prove none of it: `.image` is returned only by threading the
+    /// parameter through, `.text` would mean either the old hardcoding or a
+    /// value copied from `stored`. Before Task 8 this branch hardcoded
+    /// `.text`, which was harmless only because the pasteboard read could
+    /// not report an image at all; the moment it could, that hardcoding
+    /// would have labelled a PNG's hash `.text` in the persistent store and
+    /// on the wire, with no compiler error anywhere to point at it (this
+    /// function's signature was unchanged) -- so the fix is the parameter
+    /// itself, which makes dropping the kind a compile error at every call
+    /// site rather than a silent wrong answer at one.
+    func testStoredHashDiffersReturnsNowAndTheKindThatWasActuallyRead() {
         let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
-        let result = resolveStartupState(currentHash: "bb", stored: stored, now: 999)
-        XCTAssertEqual(result, ClipState(sha256: "bb", ts: 999, kind: .text))
+        let result = resolveStartupState(currentHash: "bb", currentKind: .image,
+                                         stored: stored, now: 999)
+        XCTAssertEqual(result, ClipState(sha256: "bb", ts: 999, kind: .image),
+                       "the changed-content branch must report the kind it was given, " +
+                       "not the stored kind and not a hardcoded .text")
     }
 
-    func testNothingStoredReturnsNow() {
-        let result = resolveStartupState(currentHash: "aa", stored: nil, now: 999)
-        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 999, kind: .text))
+    /// Same branch, reached the other way: nothing was ever stored, so the
+    /// content appeared while nothing was watching. `.image` again, for the
+    /// same reason -- a hardcoding here would be invisible against `.text`.
+    func testNothingStoredReturnsNowAndTheKindThatWasActuallyRead() {
+        let result = resolveStartupState(currentHash: "aa", currentKind: .image,
+                                         stored: nil, now: 999)
+        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 999, kind: .image))
     }
 
     /// A `nil` current hash always wins over whatever is on disk, and it
@@ -214,17 +236,69 @@ final class ClipStateStoreTests: XCTestCase {
     /// never compares timestamps when either side's hash is `nil`, so `ts`
     /// is unread downstream here -- this pins current behaviour (`now`)
     /// rather than asserting a hard requirement on its exact value.
+    ///
+    /// `currentKind` is `.image` and must NOT survive: a hash-less state
+    /// carrying a kind violates the nil-iff-nil rule `ClipState.init(from:)`
+    /// enforces on the wire, and `ClipState`'s memberwise initializer does
+    /// not enforce it, so nothing downstream would catch a leak here before
+    /// the peer's decoder rejected the frame.
     func testCurrentHashNilReturnsNilHashRegardlessOfStored() {
         let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
-        let result = resolveStartupState(currentHash: nil, stored: stored, now: 999)
+        let result = resolveStartupState(currentHash: nil, currentKind: .image,
+                                         stored: stored, now: 999)
         XCTAssertNil(result.sha256)
         XCTAssertEqual(result.ts, 999)
-        XCTAssertNil(result.kind, "a nil hash must carry a nil kind")
+        XCTAssertNil(result.kind, "a nil hash must carry a nil kind, whatever the read reported")
     }
 
     func testCurrentHashNilAndNothingStoredReturnsNilHash() {
-        let result = resolveStartupState(currentHash: nil, stored: nil, now: 999)
+        let result = resolveStartupState(currentHash: nil, currentKind: nil, stored: nil, now: 999)
         XCTAssertNil(result.sha256)
+    }
+
+    // MARK: - resolveCurrentClipState — the hash and the kind come from ONE read
+
+    /// The other half of the deliverable, and the frame the compiler does
+    /// NOT protect: `resolveStartupState`'s new parameter can be satisfied
+    /// by anything of the right type, including a fresh guess. What makes it
+    /// honest is that this function destructures a single
+    /// `pasteboard.read()` pair and derives both values from it, so a hash
+    /// and a kind can never be paired up from two different readings of the
+    /// clipboard.
+    ///
+    /// An image-only pasteboard against a STORED `.text` state with a
+    /// different hash: `.image` can only come from the read, `.text` would
+    /// mean the kind was dropped somewhere between the read and the result.
+    func testResolveCurrentClipStateReportsTheKindOfTheBytesItHashed() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01])
+        let pasteboard = FakePasteboard()
+        pasteboard.setImage(png)
+        let stored = ClipState(sha256: String(repeating: "ab", count: 32), ts: 100, kind: .text)
+
+        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: 999)
+
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(png), ts: 999, kind: .image),
+                       "the hash and the kind must both come from the one read that produced them")
+    }
+
+    /// The same function on the text path, so the test above cannot pass by
+    /// simply always reporting `.image`.
+    func testResolveCurrentClipStateReportsTextForATextPasteboard() {
+        let pasteboard = FakePasteboard()
+        pasteboard.set("hello")
+
+        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999)
+
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(Data("hello".utf8)), ts: 999, kind: .text))
+    }
+
+    /// An unreadable pasteboard is hashless and kindless -- never hashed,
+    /// matching the wire contract that `sha256` is null for exactly this
+    /// clipboard state.
+    func testResolveCurrentClipStateReportsNothingForAnEmptyPasteboard() {
+        let result = resolveCurrentClipState(pasteboard: FakePasteboard(), stored: nil, now: 999)
+        XCTAssertNil(result.sha256)
+        XCTAssertNil(result.kind)
     }
 
     // MARK: - Task 6: a v2 store on disk must be rejected, not loaded as kindless
