@@ -2027,6 +2027,8 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def sha256_hex",
             "def resolve_current_clip_state",
             "def announce_clip_state",
+            "SKEW_WARN_SECONDS = 5.0",
+            "def skew_log_line",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

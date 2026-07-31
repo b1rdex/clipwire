@@ -217,6 +217,58 @@ def log(message):
     print(message, file=sys.stderr, flush=True)
 
 
+# Above this, the two clocks disagree by enough that a freshness comparison
+# between them can pick the wrong side. Compared with `>`: five seconds
+# exactly is the boundary, not a warning. Written into the message below as
+# a literal rather than interpolated, so the Swift twin of that line does not
+# have to reproduce a second float-formatting bridge byte for byte; the tests
+# pin the literal against this constant.
+SKEW_WARN_SECONDS = 5.0
+
+
+def skew_log_line(peer_sent_at, now):
+    """The peer's clock offset from ours, as a log line -- or None when it
+    cannot be measured.
+
+    Measures abs(now - sent_at) from the HELLO, never the age of a clip: a
+    clip legitimately copied this morning is hours old, so warning on that
+    would fire on nearly every handshake and teach everyone to ignore the log.
+
+    Missing, null, non-numeric and non-finite sent_at all mean the same
+    thing -- skew is not measurable -- and all return None. An unmeasurable
+    peer clock is not a protocol violation, so this neither warns nor raises;
+    raising would tear down the connection over a field nothing depends on.
+
+    Mirrors Sources/clipwire/main.swift's skewLogLine one branch at a time,
+    including the exact text of both outcomes, the way the two "over the
+    frame cap" lines already match.
+
+    The finiteness guard is load-bearing and is this file's third instance of
+    the same cross-language codec asymmetry (see decode_clip_state and
+    encode_clip_state above): json.loads, unlike Swift's JSONDecoder, accepts
+    the bare literals NaN/Infinity/-Infinity, and abs(now - nan) > 5.0 is
+    False -- so without it a broken peer would log `peer clock skew nan` and
+    silently never warn. OverflowError is caught for the same reason
+    decode_clip_state catches it: json.loads parses a 400-digit integer
+    literal as an arbitrary-precision int, which passes the isinstance check
+    and then cannot be converted to a float at all -- by math.isfinite here,
+    and by the subtraction immediately below it, which is the one that would
+    otherwise crash the agent on a peer-controlled value.
+    """
+    if isinstance(peer_sent_at, bool) or not isinstance(peer_sent_at, (int, float)):
+        return None
+    try:
+        if not math.isfinite(peer_sent_at):
+            return None
+        skew = abs(now - peer_sent_at)
+    except OverflowError:
+        return None
+    if skew > SKEW_WARN_SECONDS:
+        return ("peer clock skew %.1fs — over 5s, check the clock on both machines"
+                % skew)
+    return "peer clock skew %.1fs" % skew
+
+
 class Agent:
     def __init__(self, stdin, stdout, clipboard, clip_state_path=None):
         self.stdin = stdin
@@ -297,10 +349,11 @@ class Agent:
     # --- outbound -------------------------------------------------------
 
     def hello_payload(self):
-        # sent_at is this side's clock at the moment of sending, used later
-        # for skew measurement -- nothing reads it back out yet. Read fresh
-        # on every call (not cached at import time) since "the moment of
-        # sending" is exactly when this method runs.
+        # sent_at is this side's clock at the moment of sending; the peer
+        # measures its own clock against it (our own twin of that is
+        # _on_hello below). Read fresh on every call (not cached at import
+        # time) since "the moment of sending" is exactly when this method
+        # runs.
         return json.dumps(
             {"protocol": PROTOCOL_VERSION, "agent": AGENT_VERSION, "sent_at": time.time()}
         ).encode()
@@ -326,7 +379,12 @@ class Agent:
         elif frame_type == TYPE_CLIP_STATE:
             self._on_clip_state(payload)
 
-    def _on_hello(self, payload):
+    def _on_hello(self, payload, now=None):
+        """`now` is injectable for the same reason handleFrame's is on the
+        Mac side: skew is a comparison against this side's clock, and a test
+        that read the real one could only assert vaguely, or sleep."""
+        if now is None:
+            now = time.time()
         try:
             peer = json.loads(payload.decode())
         except (UnicodeDecodeError, ValueError):
@@ -338,6 +396,11 @@ class Agent:
                 "protocol mismatch: peer speaks %r, this agent speaks %d — "
                 "run `clipwire install`" % (peer.get("protocol"), PROTOCOL_VERSION)
             )
+        # Matched peers only: a clock reading from one we are about to hang
+        # up on is noise next to the mismatch itself.
+        line = skew_log_line(peer.get("sent_at"), now)
+        if line is not None:
+            log(line)
 
     def _on_clip(self, payload):
         if not payload:

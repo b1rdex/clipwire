@@ -47,10 +47,25 @@ final class HandleFrameTests: XCTestCase {
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString).json")
     }
 
-    private func tempLog() -> Log {
-        Log(path: FileManager.default.temporaryDirectory
+    private func tempLogPath() -> String {
+        FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString)")
-            .appendingPathComponent("test.log").path)
+            .appendingPathComponent("test.log").path
+    }
+
+    private func tempLog() -> Log {
+        Log(path: tempLogPath())
+    }
+
+    /// Everything `Log` wrote to `path`, with its own ISO8601 stamp prefix
+    /// (one token, then a single space) stripped, so a test can assert the
+    /// exact message `handleFrame` asked for. Call `log.flush()` first --
+    /// `line(_:)` only enqueues the write; `LogTests` pins that contract.
+    private func loggedMessages(at path: String) -> [String] {
+        let contents = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        return contents.split(separator: "\n").map {
+            String($0.drop(while: { $0 != " " }).dropFirst())
+        }
     }
 
     /// A real, temp-path-backed store -- not a live production state
@@ -247,6 +262,109 @@ final class HandleFrameTests: XCTestCase {
             return XCTFail("expected a decodable hello reply")
         }
         XCTAssertEqual(decoded.version, ProtocolConstants.version)
+    }
+
+    // MARK: - Contract 5 (new in Task 12): skew is measured from the hello, and only there
+
+    /// `now` is injected rather than read from the wall clock: skew is a
+    /// comparison against this side's clock, so a test using the real one
+    /// could only assert vaguely, and a sleep would make it slower without
+    /// making it deterministic.
+    func testAMatchedHelloLogsTheSkewAgainstTheInjectedNow() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.0}"#.utf8)
+
+        handleFrame(Frame(type: .hello, payload: hello),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 1000.5)
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") },
+                       ["peer clock skew 0.5s"])
+    }
+
+    func testABadlySkewedPeerWarns() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.0}"#.utf8)
+
+        handleFrame(Frame(type: .hello, payload: hello),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 1060.0)
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") },
+                       ["peer clock skew 60.0s — over 5s, check the clock on both machines"])
+    }
+
+    /// A v1 peer, or any hand-built payload. Unmeasurable is not a protocol
+    /// violation: nothing about skew is logged, and the hello is otherwise
+    /// processed exactly as any other matched one.
+    func testAHelloWithoutSentAtIsAcceptedInSilence() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+
+        handleFrame(Frame(type: .hello, payload: Data(#"{"protocol":2,"agent":"0.1.0"}"#.utf8)),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: status,
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 1000.0)
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") }, [])
+        XCTAssertEqual(status.snapshot().state, .up,
+                       "a missing sent_at must not be treated as a mismatch")
+    }
+
+    func testAMismatchedHelloDoesNotReportSkew() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let hello = Data(#"{"protocol":999,"agent":"9.9.9","sent_at":1000.0}"#.utf8)
+
+        handleFrame(Frame(type: .hello, payload: hello),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 1060.0)
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") }, [],
+                       "a clock reading from a peer we cannot talk to is noise next to the mismatch")
+    }
+
+    /// The anti-requirement, and the whole reason skew is measured from the
+    /// hello's `sent_at` rather than the clip's own timestamp: a clip
+    /// legitimately copied yesterday is a day old, and warning on THAT would
+    /// fire on nearly every handshake and teach everyone to ignore the log.
+    func testAnOldClipAfterACurrentHelloDoesNotWarn() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let now: Double = 1_000_000
+        let hello = Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000000.0}"#.utf8)
+        let store = tempClipStateStore()
+
+        handleFrame(Frame(type: .hello, payload: hello),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: now)
+        handleFrame(Frame(type: .clip,
+                          payload: ClipPayload(ts: now - 86400, text: "copied yesterday").encode()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: now)
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path).filter { $0.contains("skew") },
+                       ["peer clock skew 0.0s"],
+                       "the clip's age must not be measured as clock skew")
     }
 
     // MARK: - Contract 4 (new in Task 9): clip-state is announced once, only on a matched hello

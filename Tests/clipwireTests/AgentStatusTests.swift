@@ -175,4 +175,68 @@ final class AgentStatusTests: XCTestCase {
         XCTAssertNil(decodeHello(Data(#"{"agent":"0.1.0"}"#.utf8)),
                       "no protocol field means the version cannot be confirmed compatible")
     }
+
+    func testDecodeHelloExposesTheSentAtItDecodes() {
+        let peer = decodeHello(Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.5}"#.utf8))
+        XCTAssertEqual(peer?.sentAt, 1000.5)
+    }
+
+    func testDecodeHelloToleratesAMissingSentAt() {
+        // Same tolerance as the agent field, for the same reason: a peer
+        // that omits it must still report its real version, not degrade to
+        // "malformed hello".
+        let peer = decodeHello(Data(#"{"protocol":1}"#.utf8))
+        XCTAssertEqual(peer?.version, 1)
+        XCTAssertNil(peer?.sentAt ?? nil)
+    }
+
+    // MARK: - skewLogLine
+    //
+    // The twin of agent/clipwire-agent.py's skew_log_line, asserted against
+    // the same strings: both sides are meant to log the same quantity in the
+    // same shape, the way the two "over the frame cap" lines already do.
+    // agent/tests/test_frame.py's TestSkewLogLine is the mirror of this
+    // section, case for case.
+
+    func testSkewLogLineReportsASmallDifferenceWithoutAWarning() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1000.5), "peer clock skew 0.5s")
+    }
+
+    func testSkewLogLineMeasuresAnAbsoluteDifferenceSoDirectionDoesNotMatter() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.5, now: 1000.0),
+                       skewLogLine(peerSentAt: 1000.0, now: 1000.5))
+    }
+
+    func testSkewLogLineWarnsAboveTheThreshold() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1006.0),
+                       "peer clock skew 6.0s — over 5s, check the clock on both machines")
+    }
+
+    func testSkewLogLineDoesNotWarnExactlyAtTheThreshold() {
+        // "Warn ABOVE five seconds": the boundary itself is not a warning.
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1005.0), "peer clock skew 5.0s")
+    }
+
+    func testTheSkewWarningTextQuotesTheThresholdConstant() {
+        // The threshold is a literal inside the message (no second
+        // float-formatting bridge to keep byte-identical with Python), so
+        // pin the literal against the constant here instead.
+        XCTAssertEqual(SkewConstants.warnSeconds, 5)
+        XCTAssertEqual(
+            skewLogLine(peerSentAt: 0, now: 1000)?.contains("over \(Int(SkewConstants.warnSeconds))s"),
+            true)
+    }
+
+    func testSkewLogLineSaysNothingWhenItCannotBeMeasured() {
+        // A peer that omits sent_at, and the non-finite values a peer could
+        // in principle hand us. Not measurable is not a violation: no line,
+        // no warning. (Foundation's JSONDecoder rejects the bare NaN and
+        // Infinity JSON literals outright, so on THIS side those never even
+        // reach here through decodeHello -- the guard mirrors the Python
+        // side, where json.loads does accept them.)
+        XCTAssertNil(skewLogLine(peerSentAt: nil, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: .nan, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: .infinity, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: -.infinity, now: 1000))
+    }
 }
