@@ -74,10 +74,29 @@ final class FreshnessTests: XCTestCase {
 
     func testClipStatePayloadRoundTrips() throws {
         let withHash = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5)
-        XCTAssertEqual(try ClipState.decodePayload(withHash.encodePayload()), withHash)
+        XCTAssertEqual(try ClipState.decodePayload(try withHash.encodePayload()), withHash)
 
         let empty = ClipState(sha256: nil, ts: 0)
-        XCTAssertEqual(try ClipState.decodePayload(empty.encodePayload()), empty)
+        XCTAssertEqual(try ClipState.decodePayload(try empty.encodePayload()), empty)
+    }
+
+    /// `JSONEncoder` rejects a non-finite `Double` (`.nan`, `.infinity`,
+    /// `-.infinity`) with `EncodingError.invalidValue` by default. The
+    /// previous `encodePayload` caught exactly that error with `try?` and
+    /// substituted `Data("{}".utf8)` -- valid-looking JSON that silently
+    /// discarded the failure. That payload still decodes on the Python
+    /// side, so `decode_clip_state` reported "ts must be a number": one hop
+    /// from the real cause (a non-finite ts on the Swift side) and on the
+    /// wrong side of the wire. Python's `encode_clip_state`/
+    /// `decode_clip_state` already raise `ClipStateError` on a non-finite ts
+    /// in both directions (test_freshness.py); this pins the matching
+    /// behaviour on the Swift encode side, at the point of the actual
+    /// cause, before anything reaches the wire.
+    func testEncodePayloadThrowsOnNonFiniteTimestamp() {
+        for badTs in [Double.nan, .infinity, -.infinity] {
+            XCTAssertThrowsError(try ClipState(sha256: "aa", ts: badTs).encodePayload(),
+                                  "ts=\(badTs) must not silently encode as {}")
+        }
     }
 
     /// Pins `ClipState.decodePayload` against the *existing* `clip-state`

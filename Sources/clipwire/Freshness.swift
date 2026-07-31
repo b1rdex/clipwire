@@ -5,10 +5,34 @@ struct ClipState: Codable, Equatable {
     let sha256: String?
     let ts: Double
 
-    func encodePayload() -> Data {
-        (try? JSONEncoder().encode(self)) ?? Data("{}".utf8)
+    /// Throws rather than substituting a fallback payload. `JSONEncoder`
+    /// already rejects a non-finite `ts` (`.nan`, `.infinity`, `-.infinity`)
+    /// with `EncodingError.invalidValue` -- the previous `(try? ...) ??
+    /// Data("{}".utf8)` caught exactly that and sent the two bytes `{}`
+    /// instead. `{}` is valid JSON, so it decoded fine on the Python side,
+    /// where `decode_clip_state` reported "ts must be a number": one hop
+    /// from the real cause (a non-finite ts produced here) and on the wrong
+    /// side of the wire. Python's `encode_clip_state`/`decode_clip_state`
+    /// already raise `ClipStateError` on a non-finite ts in both
+    /// directions; letting `JSONEncoder`'s own error propagate makes Swift
+    /// fail the same way on encode, at the point of the actual cause,
+    /// before anything reaches the wire. No dedicated error type: the
+    /// resulting `EncodingError.invalidValue` already names the offending
+    /// value and explains why, same as `decodePayload` below already just
+    /// lets `JSONDecoder`'s error speak for itself.
+    func encodePayload() throws -> Data {
+        try JSONEncoder().encode(self)
     }
 
+    /// Symmetric with Python's decode-side non-finite check, though for a
+    /// different reason: a bare `NaN`/`Infinity` token is not valid JSON
+    /// syntax, so `JSONDecoder` rejects it as malformed input outright
+    /// rather than parsing it (unlike Python's `json.loads`, which accepts
+    /// it as an extension). Verified empirically, not assumed: an
+    /// in-syntax numeral that overflows `Double` (e.g. `1e400`) is also
+    /// rejected by Foundation's JSON parser as undecodable rather than
+    /// silently rounding to `.infinity`. So no extra `isFinite` guard is
+    /// needed here to match Python's explicit one.
     static func decodePayload(_ data: Data) throws -> ClipState {
         try JSONDecoder().decode(ClipState.self, from: data)
     }
