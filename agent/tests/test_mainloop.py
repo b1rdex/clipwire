@@ -260,6 +260,16 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             setattr, clipwire_agent, "CLIPBOARD_RECHECK_SECONDS", original_interval
         )
 
+        # This test's script drives the clipboard into READY, which now
+        # (since the clip-state wiring landed) runs clipboard_became_ready's
+        # announce step -- save_clip_state/load_clip_state touch the real
+        # production path (~/.local/state/clipwire/clip-state.json) when
+        # clip_state_path is None. Missed when that wiring first landed;
+        # caught here while touching this same file for a related fix.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        clip_state_path = os.path.join(tmp.name, "clip-state.json")
+
         # run() calls the module-level log() by its bare name, resolved from
         # clipwire_agent's globals at call time -- so replacing the module
         # attribute captures every call, in whichever thread makes it,
@@ -280,7 +290,8 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             [False, False, True, True, True, False, False], write_fd
         )
         self.addCleanup(clipboard.close_write_end)
-        agent = Agent(stdin=stdin, stdout=io.BytesIO(), clipboard=clipboard)
+        agent = Agent(stdin=stdin, stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=clip_state_path)
 
         # This calls run() directly, not through a subprocess -- nothing
         # external bounds it the way process.wait(timeout=...) bounds every
