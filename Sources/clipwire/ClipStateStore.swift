@@ -18,6 +18,37 @@ enum ClipStateStoreConstants {
 struct ClipStateStore {
     let url: URL
 
+    // Guards `save()`'s write-then-replace sequence. Task 9 added this
+    // type's first two concurrent callers -- the pasteboard watcher's timer
+    // thread (a local change) and the channel's decode thread (an applied
+    // remote clip) -- so two `save()` calls can now genuinely overlap. Both
+    // write the SAME fixed temp path (`url.appendingPathExtension("tmp")`)
+    // with a plain, non-atomic `Data.write(to:)`; if one thread's write
+    // interleaves with another's, whichever `replaceItemAt` runs next moves
+    // a corrupt file into place, `load()` then reads it as "nothing stored"
+    // (its documented, and otherwise correct, response to a torn file), and
+    // the NEXT connection's `announceClipState` resolves `stored: nil` and
+    // stamps `now` on content that is actually old -- inflating its age and
+    // winning a reconciliation it should have lost. The exact clobber this
+    // design exists to prevent, arriving by a different door.
+    //
+    // A lock (rather than a unique temp path per write) keeps every
+    // existing caller unchanged and preserves the fixed name's self-cleaning
+    // property: a process that crashes mid-write leaves at most one stray
+    // `.tmp` file, always overwritten by the next save, rather than a
+    // per-write name that would need its own cleanup if ever abandoned.
+    // `NSLock` (a class, hence `Sendable`) as a stored `let` on this struct
+    // means every copy of a given `ClipStateStore` instance shares the SAME
+    // lock -- exactly what's needed here, since `wireAgent` constructs one
+    // instance and both concurrent call sites capture copies of it.
+    //
+    // `load()` needs no lock of its own: `replaceItemAt`'s rename is atomic
+    // at the OS level, so once this lock has kept the temp file itself from
+    // being torn, any reader of `url` sees either the complete old file or
+    // the complete new one, never a mix -- the entire point of the
+    // temp-file-and-replace pattern in the first place.
+    private let lock = NSLock()
+
     init(path: String) {
         url = URL(fileURLWithPath: expandTilde(path))
     }
@@ -45,6 +76,8 @@ struct ClipStateStore {
     /// `replaceItemAt` is atomic, so `load()` above -- possibly running in
     /// a different process -- can never observe a half-written file.
     func save(_ state: ClipState) throws {
+        lock.lock()
+        defer { lock.unlock() }
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let tmp = url.appendingPathExtension("tmp")

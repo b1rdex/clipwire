@@ -94,15 +94,23 @@ final class PasteboardWatcher {
     private var lastChangeCount: Int
     private var echo = EchoGuard()
     private var timer: DispatchSourceTimer?
+    // Optional, and defaulted to nil, so every existing call site (this
+    // class predates any need to log) keeps compiling unchanged; only
+    // `runAgent()` passes a real one. `Log` is `Sendable` and `line(_:)`
+    // only enqueues onto its own serial queue, so calling it from inside
+    // `pollLocked()`'s critical section below is safe and does not hold
+    // `stateLock` for any meaningful extra time.
+    private let log: Log?
 
     // Guards `echo` and `lastChangeCount` together — see the class doc
     // comment for why both, not just `echo`, need to be under this lock.
     private let stateLock = NSLock()
 
-    init(pasteboard: PasteboardReading, pollInterval: TimeInterval) {
+    init(pasteboard: PasteboardReading, pollInterval: TimeInterval, log: Log? = nil) {
         self.pasteboard = pasteboard
         self.pollInterval = pollInterval
         self.lastChangeCount = pasteboard.changeCount
+        self.log = log
     }
 
     func noteWrittenLocally(_ payload: Data) {
@@ -154,6 +162,10 @@ final class PasteboardWatcher {
         // the peer's `Frame.decode` rejects as oversized, dropping the
         // whole channel over a single large-but-not-overlong clip.
         guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+            // Logged so a user whose large local copy never reaches the
+            // peer has something to look at, matching the Python agent's
+            // existing "skipping a clip of N bytes" line for the same cap.
+            log?.line("skipping a clip of \(text.count) bytes: over the frame cap")
             return nil
         }
         guard echo.shouldSend(text) else { return nil }

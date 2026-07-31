@@ -171,6 +171,29 @@ final class PasteboardTests: XCTestCase {
         XCTAssertEqual(ClipPayload(ts: 1, text: text).encode().count, FrameConstants.maxPayloadBytes,
                        "sanity check on the boundary itself")
     }
+
+    /// A user whose large local copy silently never reaches the peer has
+    /// nothing to look at otherwise -- the Python agent already logs its
+    /// analogous skip ("skipping a clip of N bytes: over the frame cap").
+    /// `log` is optional and defaulted to `nil` on every other test in this
+    /// file precisely so this is the only one that needs to pass a real one.
+    func testOversizedClipIsLoggedWithItsSize() {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-pasteboard-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4, log: log)
+        watcher.poll()
+        let oversized = FrameConstants.maxPayloadBytes
+        pasteboard.set(String(repeating: "x", count: oversized))
+        watcher.poll()
+        log.flush()
+
+        let contents = try? String(contentsOfFile: logPath, encoding: .utf8)
+        XCTAssertEqual(contents?.contains("skipping a clip of \(oversized) bytes"), true,
+                       "expected the skip to be logged with its size; got: \(contents ?? "<unreadable>")")
+    }
 }
 
 // MARK: - Race coverage (added beyond the brief; see task-13-report.md)

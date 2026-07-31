@@ -371,16 +371,21 @@ func handleFrame(
             ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
         switch resolveFreshness(mine: mine, peer: peerState) {
         case .sendMine:
+            guard let data = pasteboard.readText(), !data.isEmpty else { return }
             // The size bound matches PasteboardWatcher's own send-side guard
             // (Pasteboard.swift): this branch reads the live pasteboard
             // independently, and without it, winning a reconciliation over
             // content at or beyond the cap would build a `ClipPayload` whose
             // encoded frame exceeds `FrameConstants.maxPayloadBytes` -- the
             // peer's `Frame.decode` rejects that as oversized and drops the
-            // whole channel.
-            guard let data = pasteboard.readText(), !data.isEmpty,
-                  data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes
-            else { return }
+            // whole channel. Logged (unlike a merely-empty pasteboard, which
+            // is not a skip at all) so a user whose large paste never syncs
+            // has something to look at, matching the Python agent's
+            // existing "skipping a clip of N bytes" line for the same cap.
+            guard data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+                log.line("skipping a clip of \(data.count) bytes: over the frame cap")
+                return
+            }
             let text = String(decoding: data, as: UTF8.self)
             // `mine.ts`, not `now`: the content has not changed, only been
             // re-announced, so its recorded age must be preserved. Sending
@@ -491,7 +496,8 @@ func runAgent() -> Int32 {
     let systemPasteboard = SystemPasteboard()
     let watcher = PasteboardWatcher(
         pasteboard: systemPasteboard,
-        pollInterval: Double(config.macPollIntervalMs) / 1000.0)
+        pollInterval: Double(config.macPollIntervalMs) / 1000.0,
+        log: log)
     let clipStateStore = ClipStateStore(path: ClipStateStoreConstants.defaultPath)
     let clipStateAnnouncement = ClipStateAnnouncement()
 

@@ -86,6 +86,48 @@ final class ClipStateStoreTests: XCTestCase {
         XCTAssertEqual(nestedStore.load(), ClipState(sha256: "aa", ts: 1))
     }
 
+    // MARK: - concurrent saves must not corrupt the file
+
+    /// Task 9 gave this type its first two concurrent callers: the
+    /// pasteboard watcher's timer thread (a local change) and the channel's
+    /// decode thread (an applied remote clip) can now call `save()` at
+    /// genuinely the same time. Both write the same fixed temp path with a
+    /// plain, non-atomic `Data.write(to:)`; unsynchronized, one thread's
+    /// write could in principle interleave with another's, and whichever
+    /// `replaceItemAt` runs next would move a corrupt file into place --
+    /// `load()` then reads it as "nothing stored," and the next connection
+    /// stamps stale content with `now`, winning a reconciliation it should
+    /// have lost.
+    ///
+    /// This hammers the store with 200 genuinely concurrent writers as a
+    /// robustness/regression guard. Two other empirical approaches were
+    /// tried and deliberately NOT kept, and are recorded here rather than
+    /// silently dropped: (1) a standalone byte-corruption probe (2 MB and
+    /// 20 MB payloads, a synchronized start gate, 300 trials) never
+    /// reproduced a torn file on this machine's macOS/APFS, lock or no lock
+    /// -- the write+rename pair appears to be serialized by the OS more
+    /// strongly than `Data.write(to:)` documents, at least here; (2) a
+    /// wall-clock timing test asserting that locked concurrent saves take
+    /// close to N times a single call's duration, unlocked ones close to
+    /// 1x -- an initial small sample showed a clean ~2x gap, but a wider
+    /// run (8 trials each way) showed real overlap between the two
+    /// distributions (without-lock ratios up to 1.42x the serial estimate;
+    /// with-lock ratios as low as 0.47x), so no fixed threshold could
+    /// avoid misclassifying some runs in either direction. Shipping that
+    /// assertion would have been a flakier test than no test. The fix
+    /// itself does not depend on any of this: it removes reliance on an
+    /// atomicity guarantee `Data.write(to:)` does not document, costs
+    /// nothing measurable, and mirrors `AgentStatus`'s existing lock around
+    /// the identical temp-and-replace pattern in StatusFile.swift.
+    func testConcurrentSavesNeverLeaveAFileThatFailsToLoad() {
+        let concurrentStore = store!
+        DispatchQueue.concurrentPerform(iterations: 200) { i in
+            try? concurrentStore.save(ClipState(sha256: "writer-\(i)", ts: Double(i)))
+        }
+        XCTAssertNotNil(concurrentStore.load(),
+                        "concurrent saves must never leave a file that fails to load")
+    }
+
     // MARK: - init(path:) expands ~
 
     /// No real home directory or filesystem access here -- pure string

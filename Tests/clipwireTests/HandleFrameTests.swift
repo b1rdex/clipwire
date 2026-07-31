@@ -441,6 +441,34 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(try ClipPayload.decode(sent[0].payload).text, text)
     }
 
+    /// A user whose large paste wins a reconciliation but can't actually be
+    /// sent has nothing to look at otherwise -- matches the Python agent's
+    /// existing "skipping a clip of N bytes: over the frame cap" line for
+    /// the same cap, and `PasteboardTests.testOversizedClipIsLoggedWithItsSize`
+    /// for the watcher's own send-side guard.
+    func testWinningClipStateWithOversizedContentIsLoggedWithItsSize() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: "aa", ts: 777))
+        let pasteboard = RecordingPasteboard()
+        let oversized = FrameConstants.maxPayloadBytes
+        pasteboard.textToRead = Data(repeating: 0x61, count: oversized)
+        let peerState = ClipState(sha256: nil, ts: 0)
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        let contents = try? String(contentsOfFile: logPath, encoding: .utf8)
+        XCTAssertEqual(contents?.contains("skipping a clip of \(oversized) bytes"), true,
+                       "expected the skip to be logged with its size; got: \(contents ?? "<unreadable>")")
+    }
+
     /// If the store's own load somehow returns nothing (the fallback path
     /// for a disk failure on an earlier save, never expected in ordinary
     /// operation), `handleFrame` must still resolve a real state from the
