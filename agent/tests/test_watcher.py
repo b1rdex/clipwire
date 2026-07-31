@@ -1979,6 +1979,55 @@ class TestIncomingClipState(unittest.TestCase):
         )
         self.assertEqual(decode_clip_payload(clip_frames[0][1])[1], b"B")
 
+    def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
+        """The reboot flow (acceptance item 5), where the stash is stale by
+        construction. The Mac announces its clip-state, then copies again
+        and sends the newer clip -- both while this side is still
+        PHASE_PENDING, so the announcement is stashed and the clip queued.
+        clipboard_became_ready then APPLIES the queued clip and only
+        afterwards drains the stash, so it resolves the Mac's superseded
+        announcement (ts 1000) against the clip it just applied (ts 3000),
+        gets SEND_MINE, and sends the Mac its own clip straight back.
+
+        A clip frame from a peer is strictly NEWER information than that
+        same peer's earlier announcement -- the announcement describes what
+        the peer held before it sent the clip -- so once the clip has been
+        applied there is nothing left in the stash worth resolving.
+
+        The harm is bounded (noteWrittenLocally is armed before the write,
+        EchoGuard suppresses, content converges), which is exactly why it
+        needs a test: nothing about the end state is wrong, so only the
+        redundant frame itself is observable."""
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"whatever the PC held")  # the connect-time seed
+        agent = self.build(clipboard=clipboard, already_reconciled=False)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        # The Mac's announcement, describing what IT held at the time.
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"the mac's older clip"), 1000.0))
+        # ... then the Mac copies something else and sends it. Still pending
+        # here, so it is queued rather than applied.
+        agent.on_frame(TYPE_CLIP, encode_clip_payload(3000.0, b"the mac's newer clip"))
+        self.assertEqual(sent, [], "nothing may go out before the clipboard is ready")
+
+        with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
+            agent.clipboard_became_ready()
+
+        self.assertEqual(
+            [f for f in sent if f[0] == TYPE_CLIP], [],
+            "the Mac's own clip must not be sent back to the Mac: its earlier "
+            "announcement was superseded by the very clip we just applied",
+        )
+        self.assertEqual(
+            len([f for f in sent if f[0] == TYPE_CLIP_STATE]), 1,
+            "our own one-shot announcement must still go out",
+        )
+        self.assertIsNone(
+            agent._pending_peer_clip_state,
+            "a superseded stash must be dropped, not left for a later drain",
+        )
+
 
 class TestModuleDefinitionOrder(unittest.TestCase):
     """The file ends with `if __name__ == "__main__": sys.exit(main(...))`.

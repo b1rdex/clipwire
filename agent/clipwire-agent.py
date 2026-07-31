@@ -577,6 +577,27 @@ class Agent:
             # clipboard held a moment earlier.
             applied_pending = self._write_clip(self.pending_clip)
             self.pending_clip = None
+            if applied_pending is not None:
+                # And it supersedes any STASHED announcement from that same
+                # peer too, which is why this cannot wait for the drain
+                # below. A clip frame is strictly newer information than an
+                # earlier clip-state from the same peer: the announcement
+                # describes what the peer held BEFORE it sent the clip. Left
+                # in place, the drain resolves that superseded announcement
+                # (old ts) against the clip we just applied (the peer's own,
+                # newer ts), reads SEND_MINE, and sends the peer its own clip
+                # straight back -- deterministically, in the reboot flow.
+                #
+                # The harm is bounded (_write_clip armed the echo
+                # suppression before writing, so the peer's own guard
+                # discards the bounce and the content converges), so this
+                # costs one redundant frame and one redundant clipboard
+                # write rather than a loop. Cleared here rather than inside
+                # the `not self._clip_state_sent` block below so a
+                # mid-connection Wayland flap -- which re-enters this method
+                # with the announcement already sent, skipping that block
+                # entirely -- cannot leave a superseded stash behind either.
+                self._pending_peer_clip_state = None
         if not self._clip_state_sent:
             # Sent exactly once per connection (== once per process here --
             # see __init__), after the store has been consulted, and after
