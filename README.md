@@ -116,5 +116,10 @@ remote: GPaste is not reporting clipboard changes (is the gnome-shell extension 
 ```
 
 The command above is how you answer that question. It prints nothing when the extension is
-off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`. The fallback
-is scoped to one connection, so event-driven watching resumes on the next reconnect.
+off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`.
+
+Re-enabling it is the actual fix, and reconnecting is not. The fallback never stops
+listening for signals — it only speeds the safety-net poll up from 30 seconds to 1 — and
+that faster interval is scoped to one connection, so the next connection starts back at 30
+seconds whether or not anything was repaired. With the extension still disabled, the agent
+just spends another detection budget before reaching the same conclusion again.
