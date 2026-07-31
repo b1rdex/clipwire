@@ -465,7 +465,28 @@ func handleFrame(
             break
         }
     case .clip:
-        guard let decoded = try? ClipPayload.decode(frame.payload), !decoded.text.isEmpty else { return }
+        // Logged rather than swallowed by `try?`. The drop itself is right --
+        // there is nothing valid to apply -- but doing it invisibly is what
+        // makes it permanent: `wl-paste` hands the PC agent RAW BYTES, which
+        // `_local_change` hashes and sends unchanged, so a clip whose bytes
+        // are not valid UTF-8 fails here, is not applied, and is not stored.
+        // The two persistent stores then disagree forever, and on every
+        // subsequent reconnect the PC resolves SEND_MINE (its ts is the newer
+        // one), re-sends the same bytes, and this side discards them again --
+        // with nothing logged on either machine, ever. One line is what turns
+        // a permanent silent failure into something a user can find.
+        //
+        // Empty text stays silent by contrast: it decoded fine, and applying
+        // nothing is the correct uneventful outcome, matching the PC agent's
+        // own `_write_clip`, which returns quietly for exactly that input.
+        let decoded: ClipPayload
+        do {
+            decoded = try ClipPayload.decode(frame.payload)
+        } catch {
+            log.line("could not decode a clip from the peer: \(error)")
+            return
+        }
+        guard !decoded.text.isEmpty else { return }
         let textData = Data(decoded.text.utf8)
         // Arm suppression BEFORE writing to the pasteboard, with the
         // PLAIN TEXT bytes -- not `frame.payload`, which carries the

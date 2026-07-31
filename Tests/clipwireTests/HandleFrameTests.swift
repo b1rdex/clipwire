@@ -176,6 +176,73 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertTrue(pasteboard.writtenTexts.isEmpty)
     }
 
+    // MARK: - Contract 1b (final wave): an undecodable clip is logged, never dropped in silence
+
+    /// `wl-paste` hands the PC agent raw bytes, `_local_change` hashes and
+    /// sends them unchanged, and this side then fails to decode them. The
+    /// drop itself is correct -- there is nothing valid to apply -- but
+    /// with `try?` swallowing the error, nothing was written anywhere: not
+    /// the pasteboard, not the store, not the log. So the two persistent
+    /// stores disagree permanently, and on EVERY subsequent reconnect the
+    /// PC resolves SEND_MINE (its ts is the newer one), re-sends the same
+    /// bytes, and this side discards them again -- forever, with nothing
+    /// logged on either machine. The repeat-forever property is what makes
+    /// the invisibility, rather than the drop, the actual defect.
+    func testAnUndecodableClipIsLogged() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        var invalidUTF8 = Data(repeating: 0, count: ClipPayloadConstants.timestampBytes)
+        invalidUTF8.append(contentsOf: [0xFF, 0xFE, 0xFD])
+
+        handleFrame(Frame(type: .clip, payload: invalidUTF8),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path),
+                       ["could not decode a clip from the peer: invalidUTF8"],
+                       "the drop is correct; doing it invisibly is what makes it permanent")
+    }
+
+    /// The other way `ClipPayload.decode` now throws. Pinned separately so
+    /// the log line is known to carry the REASON rather than a fixed string
+    /// that happens to match one input -- a test with only the UTF-8 case
+    /// would pass against an implementation that hardcoded "invalidUTF8".
+    func testAClipWithANonFiniteTimestampIsLogged() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clip, payload: ClipPayload(ts: .nan, text: "x").encode()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path),
+                       ["could not decode a clip from the peer: nonFiniteTimestamp"])
+    }
+
+    /// Empty text is deliberately NOT logged: it decoded fine and applying
+    /// nothing is the correct, uneventful outcome, exactly as the PC
+    /// agent's own `_write_clip` returns quietly for the same input. Only
+    /// a decode FAILURE is a defect worth a line.
+    func testAnEmptyClipIsDroppedInSilence() {
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 5, text: "").encode()),
+                    send: { _ in }, noteWrittenLocally: { _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        XCTAssertEqual(loggedMessages(at: path), [])
+    }
+
     // MARK: - Contract 2 (new in Task 9): the peer's timestamp is what gets stored
 
     /// The assertion the persistent store's whole design exists to make
