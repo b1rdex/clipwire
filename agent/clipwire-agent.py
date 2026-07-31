@@ -493,7 +493,15 @@ def load_clip_state(path=None):
         return None
     try:
         return decode_clip_state(payload)
-    except ClipStateError:
+    except (ClipStateError, OverflowError):
+        # json.loads parses an integer literal as arbitrary-precision int,
+        # unlike a float literal (1e400 already becomes inf, which
+        # decode_clip_state's own isfinite check turns into a
+        # ClipStateError). A 400-digit integer ts instead passes
+        # decode_clip_state's isinstance(ts, (int, float)) check and only
+        # fails inside math.isfinite's int-to-float conversion, raising
+        # OverflowError -- a different exception type than the malformed
+        # payloads above, but the same "nothing usable was stored" outcome.
         return None
 
 

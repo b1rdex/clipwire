@@ -87,6 +87,22 @@ class TestLoadNeverRaises(_TempPathCase):
         self.assertIsNone(load_clip_state(path=self.path),
                            "valid JSON missing the required ts key is still not a clip state")
 
+    def test_oversized_integer_timestamp_loads_as_none(self):
+        """json.loads parses integer literals as arbitrary-precision int, so
+        a 400-digit ts sails past decode_clip_state's
+        isinstance(ts, (int, float)) check and only fails once
+        math.isfinite(ts) tries to convert it to a float -- raising
+        OverflowError, not ClipStateError. The float form of the same
+        hazard (`1e400`) is already safe: json.loads gives back `inf`
+        directly, isfinite reports False, and decode_clip_state raises its
+        own ClipStateError. Only the integer literal form takes a
+        different path through the standard library and needs its own
+        test."""
+        with open(self.path, "wb") as handle:
+            handle.write(b'{"sha256": "aa", "ts": 1' + b"0" * 400 + b"}")
+        self.assertIsNone(load_clip_state(path=self.path),
+                           "an oversized ts must read as absent, not raise OverflowError")
+
     def test_truncated_write_loads_as_none(self):
         """The literal torn-write scenario: a crash mid-write leaves a
         syntactically incomplete JSON object (no closing brace), not a
