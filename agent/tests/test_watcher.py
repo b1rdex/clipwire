@@ -4,6 +4,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -11,10 +12,12 @@ from unittest import mock
 from agent_under_test import (
     Agent,
     ClipStateError,
+    DEGRADED_POLL_SECONDS,
     GPASTE_BUS_NAME,
     GPasteWatcher,
     MAX_PAYLOAD_BYTES,
     PollingWatcher,
+    SAFETY_NET_POLL_SECONDS,
     TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
@@ -36,6 +39,10 @@ import clipwire_agent
 
 AGENT = pathlib.Path(__file__).resolve().parents[1] / "clipwire-agent.py"
 JOIN_TIMEOUT = 2  # generous relative to the millisecond-scale intervals below
+# A verbatim line captured from the target machine -- see
+# TestGPasteSignalParsing.test_accepts_the_real_captured_signal.
+GPASTE_UPDATE_LINE = ("/org/gnome/GPaste: org.gnome.GPaste2.Update "
+                      "('REPLACE', 'ALL', uint64 0)")
 
 
 class TestGPasteSignalParsing(unittest.TestCase):
@@ -74,26 +81,30 @@ class TestGPasteWatcherAvailability(unittest.TestCase):
     """available() gates whether the agent ever leaves the polling fallback.
     Every case here patches subprocess.run, so no real gdbus, no real
     session bus, and therefore no dependency on what happens to be
-    installed on the machine running the suite."""
+    installed on the machine running the suite.
+
+    clipboard=None throughout: available() is a pure gdbus probe and never
+    touches the clipboard, and none of these watchers is ever started, so the
+    safety net that does use it never runs."""
 
     def test_true_when_introspection_succeeds(self):
         completed = subprocess.CompletedProcess(args=[], returncode=0)
         with mock.patch("subprocess.run", return_value=completed):
-            self.assertTrue(GPasteWatcher().available())
+            self.assertTrue(GPasteWatcher(clipboard=None).available())
 
     def test_false_when_introspection_fails(self):
         completed = subprocess.CompletedProcess(args=[], returncode=1)
         with mock.patch("subprocess.run", return_value=completed):
-            self.assertFalse(GPasteWatcher().available())
+            self.assertFalse(GPasteWatcher(clipboard=None).available())
 
     def test_false_when_gdbus_binary_is_missing(self):
         with mock.patch("subprocess.run", side_effect=FileNotFoundError()):
-            self.assertFalse(GPasteWatcher().available())
+            self.assertFalse(GPasteWatcher(clipboard=None).available())
 
     def test_false_when_the_probe_times_out(self):
         error = subprocess.TimeoutExpired(cmd="gdbus", timeout=3)
         with mock.patch("subprocess.run", side_effect=error):
-            self.assertFalse(GPasteWatcher().available())
+            self.assertFalse(GPasteWatcher(clipboard=None).available())
 
     def test_false_when_gdbus_is_not_executable(self):
         """A gdbus present but not executable (wrong permissions, an
@@ -103,7 +114,7 @@ class TestGPasteWatcherAvailability(unittest.TestCase):
         uncaught here, this crashes selftest() instead of just reporting
         GPaste unavailable."""
         with mock.patch("subprocess.run", side_effect=PermissionError("denied")):
-            self.assertFalse(GPasteWatcher().available())
+            self.assertFalse(GPasteWatcher(clipboard=None).available())
 
     def test_probes_the_bus_name_not_the_interface_name(self):
         """org.gnome.GPaste2 is the INTERFACE name, not the bus name.
@@ -117,7 +128,7 @@ class TestGPasteWatcherAvailability(unittest.TestCase):
             return subprocess.CompletedProcess(args=cmd, returncode=0)
 
         with mock.patch("subprocess.run", side_effect=fake_run):
-            GPasteWatcher().available()
+            GPasteWatcher(clipboard=None).available()
         self.assertEqual(GPASTE_BUS_NAME, "org.gnome.GPaste")
         self.assertIn(GPASTE_BUS_NAME, captured["cmd"])
         self.assertNotIn("org.gnome.GPaste2", captured["cmd"])
@@ -156,14 +167,23 @@ class FakeGPasteProcess:
 class TestGPasteWatcherLifecycle(unittest.TestCase):
     """No real gdbus is ever spawned here -- subprocess.Popen is patched to
     return a fake process backed by a real pipe, so the pump thread's
-    blocking read behaves like it would against a real one."""
+    blocking read behaves like it would against a real one.
+
+    These tests are about the SIGNAL path only, so the safety net gets an
+    interval far longer than the suite's own JOIN_TIMEOUT: it reads its
+    baseline once and is then stopped mid-wait, and can never fire a change of
+    its own into the assertions below. TestGPasteSafetyNet drives it instead."""
 
     def start_watcher(self, fake_process, on_change):
         patcher = mock.patch("subprocess.Popen", return_value=fake_process)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(fake_process.close)
-        watcher = GPasteWatcher()
+        watcher = GPasteWatcher(
+            ScriptedReadClipboard([b"unchanged"]),
+            safety_net_interval_seconds=JOIN_TIMEOUT * 100,
+        )
+        self.addCleanup(watcher.stop)
         watcher.start(on_change)
         return watcher
 
@@ -267,17 +287,324 @@ class TestPollingWatcher(unittest.TestCase):
         )
 
 
+class SignallingClipboard:
+    """A clipboard whose read() DRIVES the signal source: on the tick that
+    first sees new content it emits a real GPaste Update line and blocks until
+    the pump has delivered it, only then returning the changed value. So "the
+    signal for this very change has already been delivered" is a fact by the
+    time the safety net compares, not a timing hope -- the same
+    deterministic-side-effect-inside-read() trick RacyClipboard uses further
+    down this file, instead of racing two real threads and hoping.
+
+    Deliberately waits on the CALLBACK having run rather than on the watcher's
+    private signal counter, so the test is evidence about behaviour and stays
+    red against an implementation that counts a signal only after dispatching
+    it (which would let a tick landing inside a slow _local_change see an
+    unmoved counter and declare a healthy source dead)."""
+
+    def __init__(self, before, after):
+        self.process = None       # set by start_watcher, before anything reads
+        self.delivered = threading.Event()
+        self.reports = 0
+        self._before = before
+        self._after = after
+        self.calls = 0
+        self.last = None
+
+    def observe(self):
+        """The on_change both paths share: counts reports and releases the
+        read() waiting for the signal to have been delivered."""
+        self.reports += 1
+        self.delivered.set()
+
+    def read(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.last = self._before   # the poll loop's own baseline
+            return self.last
+        if not self.delivered.is_set():
+            self.process.emit(GPASTE_UPDATE_LINE)
+            self.delivered.wait(JOIN_TIMEOUT)
+        self.last = self._after
+        return self.last
+
+
+class TestGPasteSafetyNet(unittest.TestCase):
+    """GPasteWatcher.available() probes the bus NAME, but GPaste tracks the
+    clipboard through a gnome-shell extension: a GNOME upgrade can leave the
+    daemon running and the bus answering while the extension is disabled, so
+    Update never fires, PC->Mac sync is silently dead, and every probe still
+    reports health. The safety net is the only thing keyed on events being
+    ABSENT rather than on the bus being unreachable.
+
+    No real gdbus is ever spawned -- subprocess.Popen is patched, exactly as in
+    TestGPasteWatcherLifecycle -- and both intervals are constructor
+    parameters so these tests run at millisecond scale instead of the
+    production 30 seconds."""
+
+    SWITCH_MARKER = "not reporting clipboard changes"
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        self.changes = []
+
+    def switch_log_lines(self):
+        return [line for line in self.log_lines if self.SWITCH_MARKER in line]
+
+    def start_watcher(self, clipboard, on_change=None,
+                      safety_net_interval_seconds=0.01,
+                      degraded_interval_seconds=0.01):
+        fake_process = FakeGPasteProcess()
+        # A clipboard that drives the signal source from inside its own read()
+        # must hold the process BEFORE anything reads: PollingWatcher takes
+        # its baseline read the instant start() is called.
+        if hasattr(clipboard, "process"):
+            clipboard.process = fake_process
+        patcher = mock.patch("subprocess.Popen", return_value=fake_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(fake_process.close)
+        watcher = GPasteWatcher(
+            clipboard,
+            safety_net_interval_seconds=safety_net_interval_seconds,
+            degraded_interval_seconds=degraded_interval_seconds,
+        )
+        # Stopped in cleanup as well as in the tests themselves, so a failing
+        # assertion cannot leave a poll thread running against a torn-down
+        # fixture.
+        self.addCleanup(watcher.stop)
+        watcher.start(on_change or (lambda: self.changes.append(clipboard.last)))
+        return watcher, fake_process
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    def quiesce(self, watcher):
+        watcher.stop()
+        watcher._safety_net._thread.join(timeout=JOIN_TIMEOUT)
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+    def test_changes_the_signal_path_missed_are_reported_and_the_switch_logged_once(self):
+        """The whole point of the task: a signal source that produces nothing
+        while the clipboard content moves. Two changes across two ticks, so
+        this pins both halves at once -- every missed change is still reported
+        through the same on_change a signal would use, and the switch is
+        logged exactly ONCE however many further changes the poll goes on to
+        catch (the latch, mirroring Agent._clip_state_sent's shape)."""
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: len(self.changes) >= 2)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            self.changes, [b"b", b"c"],
+            "both changes the dead signal path missed must be reported",
+        )
+        self.assertEqual(
+            len(self.switch_log_lines()), 1,
+            "the switch must be logged exactly once, not once per missed "
+            "change; got: %r" % self.log_lines,
+        )
+
+    def test_a_healthy_signal_source_plus_a_content_change_does_not_log_the_switch(self):
+        """THE trap in this task. When GPaste is healthy the user copies
+        something, the signal fires and is handled -- and then the safety net's
+        next tick ALSO sees content differing from its own baseline, because it
+        keeps one. An implementation that concludes "the event source is dead"
+        from a content difference alone logs the switch and degrades EVERY
+        healthy installation to polling on the user's first copy: worse than
+        the bug the safety net fixes, and entirely invisible to a test that
+        only ever drives a dead source. The discriminator is the count of
+        accepted signals, not the content difference."""
+        clipboard = SignallingClipboard(before=b"a", after=b"b")
+        watcher, _ = self.start_watcher(clipboard, on_change=clipboard.observe)
+
+        # calls >= 3: the baseline read, the tick that sees the change (having
+        # first driven the signal to completion), and one further tick.
+        self.wait_until(lambda: clipboard.calls >= 3)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 3,
+            "the safety net must actually have compared across a content "
+            "change, or this test proves nothing",
+        )
+        self.assertGreaterEqual(
+            clipboard.reports, 1, "the signal path must actually have fired"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a healthy signal source must not be declared dead just because "
+            "the safety net also noticed the change it reported",
+        )
+
+    def test_a_failed_read_and_its_recovery_are_not_read_as_a_missed_change(self):
+        """WaylandClipboard.read() returns None for a failed wl-paste -- it
+        keeps a dedicated one-shot log line for exactly that timeout -- and
+        also for a genuinely empty selection. No selection change is involved
+        either way, so the signal counter is GUARANTEED not to have moved:
+        judging a None transition as a missed change needs no race at all to
+        fire, and one flaky wl-paste on a healthy, idle system would
+        permanently degrade the connection while blaming the gnome-shell
+        extension for it. Both the failure (a->None) and the recovery
+        (None->a) look like changes to the comparison."""
+        clipboard = ScriptedReadClipboard([b"a", None, b"a", b"a"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: clipboard.calls >= 5)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 5, "the poll must actually have run past the recovery"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a failed read and its recovery are not evidence that the event "
+            "source missed anything",
+        )
+
+    def test_the_pump_counts_only_accepted_update_lines(self):
+        """The discriminator's own input. Counting every line gdbus prints
+        (it opens with a "Monitoring signals..." banner, and GPaste emits
+        other signals on the same object) would make a dead source look alive
+        on unrelated traffic; not counting at all makes every healthy
+        installation look dead."""
+        clipboard = ScriptedReadClipboard([b"unchanged"])
+        watcher, fake_process = self.start_watcher(
+            clipboard, safety_net_interval_seconds=JOIN_TIMEOUT * 100)
+
+        fake_process.emit("Monitoring signals...")
+        fake_process.emit("/org/gnome/GPaste: org.gnome.GPaste2.ShowHistory ()")
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: len(self.changes) >= 1)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            watcher._signals, 1,
+            "only the Update line is a signal; the banner and ShowHistory are not",
+        )
+
+    def test_production_defaults_are_a_thirty_second_budget_and_a_one_second_degraded_poll(self):
+        """The interval ruling, pinned without timing anything: 30 seconds is
+        a DETECTION budget, an acceptable worst case for noticing a broken
+        subscription and an unusable one for actually syncing. Leaving it as
+        the operating interval after the switch would keep PC->Mac half a
+        minute behind while reporting itself as working."""
+        watcher = GPasteWatcher(clipboard=None)  # never started
+        self.assertEqual(watcher._safety_net.interval, SAFETY_NET_POLL_SECONDS)
+        self.assertEqual(SAFETY_NET_POLL_SECONDS, 30.0)
+        self.assertEqual(watcher._degraded_interval, DEGRADED_POLL_SECONDS)
+        self.assertEqual(DEGRADED_POLL_SECONDS, 1.0)
+
+    def test_the_switch_polls_at_the_degraded_interval_not_the_detection_budget(self):
+        """The same ruling as a live transition rather than a default: the
+        interval changes, the mechanism does not."""
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, safety_net_interval_seconds=0.01, degraded_interval_seconds=0.05)
+
+        self.wait_until(lambda: self.switch_log_lines())
+        self.quiesce(watcher)
+
+        self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
+        self.assertEqual(
+            watcher._safety_net.interval, 0.05,
+            "after switching, the poll must run at the degraded interval, not "
+            "stay on the detection budget",
+        )
+
+    def test_the_gdbus_child_survives_the_switch_and_recovered_signals_still_report(self):
+        """Deliberately NOT terminating the subscription on the switch: if the
+        extension is re-enabled the signals resume and still funnel through the
+        same on_change, which dedupes by content on the Agent side. Tearing
+        that child down mid-connection is the SIGPIPE class of bug that already
+        killed this project's Mac agent once, at exactly the moment the PC
+        rebooted."""
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, fake_process = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: self.switch_log_lines())
+        self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
+        self.assertFalse(
+            fake_process.terminated,
+            "the subscription must be left alive to recover on its own",
+        )
+
+        # The script is exhausted and repeats its last value forever, so the
+        # poll cannot add a change here: only the emitted signal can.
+        reported = len(self.changes)
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: len(self.changes) > reported)
+        self.quiesce(watcher)
+
+        self.assertGreater(
+            len(self.changes), reported,
+            "a recovered signal must still reach the same on_change after the switch",
+        )
+
+    def test_the_safety_net_reports_through_the_very_callback_the_signal_path_got(self):
+        """Not a wrapper around it: the safety net hands the observation to
+        Agent._local_change itself, so exactly one place decides what a local
+        change means -- one observation, one one-shot echo suppression, one
+        _last_seen. A second copy of that decision is the shape of the echo bug
+        this project has already fixed two races in."""
+        clipboard = ScriptedReadClipboard([b"a"])
+
+        def callback():
+            pass
+
+        with mock.patch.object(PollingWatcher, "start") as safety_net_start:
+            self.start_watcher(clipboard, on_change=callback,
+                               safety_net_interval_seconds=JOIN_TIMEOUT * 100)
+
+        safety_net_start.assert_called_once_with(callback)
+
+    def test_stop_ends_the_safety_net_poll_too(self):
+        """A leaked poll thread keeps forking wl-paste against a session that
+        has gone away -- and Agent.clipboard_lost() drops its reference to the
+        watcher, so nothing can ever stop it afterwards."""
+        clipboard = ScriptedReadClipboard([b"a"])
+        watcher, _ = self.start_watcher(clipboard, safety_net_interval_seconds=0.02)
+
+        watcher.stop()
+        watcher._safety_net._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertFalse(
+            watcher._safety_net._thread.is_alive(),
+            "stop() must end the safety-net poll, not only the gdbus pump",
+        )
+
+
 class TestMakeWatcher(unittest.TestCase):
     def test_uses_gpaste_when_available(self):
+        clipboard = object()
         with mock.patch.object(GPasteWatcher, "available", return_value=True):
-            watcher = make_watcher(clipboard=object())
+            watcher = make_watcher(clipboard=clipboard)
         self.assertIsInstance(watcher, GPasteWatcher)
+        self.assertIs(
+            watcher.clipboard, clipboard,
+            "the clipboard must reach the watcher, or its safety net polls nothing",
+        )
 
     def test_falls_back_to_polling_when_gpaste_unavailable(self):
         with mock.patch.object(GPasteWatcher, "available", return_value=False):
             watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)
         self.assertIsInstance(watcher, PollingWatcher)
         self.assertEqual(watcher.interval, 2.5)
+
+    def test_the_polling_fallback_defaults_to_the_interval_degraded_mode_uses(self):
+        """One constant, two modes: a machine that never had GPaste and a
+        connection whose GPaste went silent must poll at the same rate, or the
+        two silently drift the next time one of them is tuned."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            watcher = make_watcher(clipboard=object())
+        self.assertEqual(watcher.interval, DEGRADED_POLL_SECONDS)
 
 
 class QueueClipboard:
@@ -1415,6 +1742,8 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "class GPasteWatcher",
             "class PollingWatcher",
             "def parse_gpaste_line",
+            "SAFETY_NET_POLL_SECONDS = 30.0",
+            "DEGRADED_POLL_SECONDS = 1.0",
             "TIMESTAMP_BYTES = 8",
             "class ClipPayloadError",
             "def encode_clip_payload",

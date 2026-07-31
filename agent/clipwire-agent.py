@@ -460,9 +460,13 @@ class Agent:
         # pump has no baseline of its own, unlike PollingWatcher) send
         # whatever the PC's clipboard already held, and the Mac applies it
         # unconditionally -- destroying a copy the user made on the Mac
-        # while the channel was down. Read outside the lock, same as
-        # _local_change: clipboard.read() is a wl-paste round trip that
-        # can take up to SUBPROCESS_TIMEOUT=3s.
+        # while the channel was down. GPasteWatcher's safety-net poll does
+        # keep a baseline of its own, but it is not a substitute for this
+        # one: the pump can fire long before that poll's first tick, so the
+        # seed here is still what stands between a spurious connect-time
+        # signal and a clobber. Read outside the lock, same as _local_change:
+        # clipboard.read() is a wl-paste round trip that can take up to
+        # SUBPROCESS_TIMEOUT=3s.
         #
         # Trade-off, accepted deliberately: re-copying on the PC to force a
         # push no longer works as the FIRST action after a connect. That is
@@ -1055,7 +1059,11 @@ def selftest():
         ok = ok and found
 
     log("info wayland session: %s" % ("present" if os.path.exists(wayland_socket_path()) else "absent (fine before login)"))
-    log("info gpaste: %s" % ("available" if GPasteWatcher().available() else "unavailable, will poll"))
+    # available() never touches the clipboard, but GPasteWatcher takes one for
+    # its safety net, so hand it the same one production would use rather than
+    # a None that a future start() call could trip over.
+    gpaste = GPasteWatcher(_select_clipboard())
+    log("info gpaste: %s" % ("available" if gpaste.available() else "unavailable, will poll"))
 
     return 0 if ok else 1
 
@@ -1068,6 +1076,22 @@ GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
 # owner, so probing it would make available() always false and silently leave
 # the watcher on the polling fallback forever.
 GPASTE_BUS_NAME = "org.gnome.GPaste"
+
+# available() below probes the bus NAME, but GPaste tracks the clipboard
+# through a gnome-shell extension: a GNOME upgrade can leave the daemon
+# running and the bus answering while the extension is disabled, so Update
+# never fires, PC->Mac sync is silently dead, and the polling fallback does
+# not engage because it is keyed on the bus being unreachable rather than on
+# events being absent. This is the detection budget for that state -- an
+# acceptable worst case for NOTICING a broken subscription.
+SAFETY_NET_POLL_SECONDS = 30.0
+# What the safety net polls at once it has concluded the event source is dead.
+# Deliberately NOT SAFETY_NET_POLL_SECONDS: 30 seconds is a detection budget,
+# and leaving it as the OPERATING interval would keep PC->Mac sync half a
+# minute behind while reporting itself as working. This is also make_watcher's
+# fallback interval, shared from one place so degraded mode and the
+# never-had-GPaste mode cannot drift apart.
+DEGRADED_POLL_SECONDS = 1.0
 
 
 def parse_gpaste_line(line):
@@ -1090,12 +1114,94 @@ def parse_gpaste_line(line):
 
 class GPasteWatcher:
     """Event-driven. Python has no stdlib DBus binding, so this shells out to
-    gdbus monitor and parses its output line by line."""
+    gdbus monitor and parses its output line by line.
 
-    def __init__(self):
+    Composes a PollingWatcher as a slow safety net (see
+    SAFETY_NET_POLL_SECONDS): a subscription that has silently stopped
+    delivering is indistinguishable from an idle clipboard until something
+    else actually looks at the content.
+
+    `clipboard` is only used by that safety net -- available() never touches
+    it -- but it is a required argument rather than a defaulted one, because a
+    GPasteWatcher built without one would look healthy and silently have no
+    safety net at all, which is the exact failure this class exists to catch.
+    """
+
+    def __init__(self, clipboard,
+                 safety_net_interval_seconds=SAFETY_NET_POLL_SECONDS,
+                 degraded_interval_seconds=DEGRADED_POLL_SECONDS):
+        self.clipboard = clipboard
         self._process = None
         self._thread = None
         self._stop = threading.Event()
+        # Accepted Update lines. Written ONLY by the gdbus pump thread and read
+        # only by the safety net's poll thread, so `+= 1` has a single writer
+        # and cannot lose an update; no lock is needed, and the worst the
+        # reader can do is see the previous value a moment longer -- which is
+        # exactly the window the ordering in start()/PollingWatcher.start is
+        # arranged to absorb.
+        self._signals = 0
+        # Only ever touched by _observe_tick, i.e. by that one poll thread.
+        self._signals_at_last_tick = 0
+        # Latch, mirroring Agent._clip_state_sent's shape: assigned in exactly
+        # one place (_observe_tick) and never cleared, so the switch is logged
+        # once however many further changes the poll goes on to catch.
+        #
+        # It lives on the watcher, so a mid-connection Wayland flap
+        # (clipboard_lost -> clipboard_became_ready) builds a fresh one and
+        # re-arms the detection budget. Deliberate: that flap terminated the
+        # old gdbus child, the new subscription's liveness is genuinely
+        # unproven, and re-detection lands in exactly the same place. What it
+        # is not is a latch that survives everything for the whole process.
+        self._degraded = False
+        self._degraded_interval = degraded_interval_seconds
+        # PollingWatcher is defined below this class: resolved at call time
+        # from module globals, so the forward reference is fine -- nothing
+        # constructs a GPasteWatcher until main() runs.
+        self._safety_net = PollingWatcher(
+            clipboard, safety_net_interval_seconds, on_tick=self._observe_tick)
+
+    def _observe_tick(self, previous, current):
+        """Judge the event source from one safety-net tick.
+
+        Runs on the safety net's own poll thread, after it has already reported
+        any change through on_change -- see PollingWatcher.start for why that
+        ordering is load-bearing.
+        """
+        signals = self._signals
+        # A content difference ALONE does not prove the signal path missed it.
+        # When GPaste is healthy the user copies something, the signal fires
+        # and is handled -- and then this tick also sees content differing from
+        # the poll's own baseline, because the poll keeps one. Concluding
+        # "dead" from the difference alone would degrade every healthy
+        # installation to polling on the user's first copy, which is worse than
+        # the bug this safety net exists to fix. The count of accepted signals
+        # is the discriminator: the source is dead only if the content moved
+        # while no signal arrived to report it.
+        #
+        # Both reads must also have SUCCEEDED. read() returns None for a failed
+        # wl-paste (WaylandClipboard.read keeps a dedicated one-shot log line
+        # for exactly that timeout) and for a genuinely empty selection, and
+        # neither involves a selection change -- so the counter is GUARANTEED
+        # not to have moved, and this needs no race at all to misfire: one
+        # flaky wl-paste on a healthy, idle system would permanently degrade
+        # the connection while blaming the gnome-shell extension for it, twice
+        # over, since the failure and its recovery both look like changes.
+        # _local_change returns early on empty text anyway, so a None
+        # transition can never produce a sync and is no evidence of one being
+        # missed. Cost: with an empty clipboard at connect, the first
+        # None->text change is still REPORTED but is not counted as evidence,
+        # so the verdict waits for the change after it -- deferred, never lost.
+        missed = (previous is not None and current is not None
+                  and previous != current
+                  and signals == self._signals_at_last_tick)
+        if missed and not self._degraded:
+            self._degraded = True
+            log("GPaste is not reporting clipboard changes (is the gnome-shell "
+                "extension enabled?), polling every %.1fs for the rest of this "
+                "connection" % self._degraded_interval)
+            self._safety_net.interval = self._degraded_interval
+        self._signals_at_last_tick = signals
 
     def available(self):
         try:
@@ -1121,24 +1227,62 @@ class GPasteWatcher:
                 if self._stop.is_set():
                     return
                 if parse_gpaste_line(line):
+                    # Counted BEFORE dispatching, deliberately: on_change is
+                    # Agent._local_change, whose wl-paste round trip can take
+                    # up to SUBPROCESS_TIMEOUT=3s. Counting afterwards would
+                    # let a safety-net tick landing inside that window see an
+                    # unmoved counter and declare a perfectly healthy source
+                    # dead.
+                    self._signals += 1
                     on_change()
 
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
+        # The SAME on_change object the signal path just got -- in production
+        # Agent._local_change -- so a change only the safety net catches goes
+        # through one observation, one one-shot echo suppression and one
+        # _last_seen. A parallel path here would be a second copy of echo
+        # logic this project has already fixed two races in.
+        #
+        # Its cost, deliberately accepted: _local_change stamps the clip at
+        # the moment IT observes the change, so a clip caught only by the
+        # safety net carries a timestamp up to one safety-net interval late
+        # (30 seconds with the production default).
+        self._safety_net.start(on_change)
 
     def stop(self):
+        """Session teardown (Agent.clipboard_lost), NOT the degrade path.
+
+        Terminating the gdbus child is correct here -- the Wayland session it
+        was watching is gone -- and deliberately absent from _observe_tick's
+        switch, where the subscription is left alive to recover on its own.
+        """
         self._stop.set()
+        self._safety_net.stop()
         if self._process:
             self._process.terminate()
 
 
 class PollingWatcher:
     """Degraded mode: forks wl-paste and reads the whole clipboard each time,
-    so it runs at a slower interval than the Mac's in-process poll."""
+    so it runs at a slower interval than the Mac's in-process poll.
 
-    def __init__(self, clipboard, interval_seconds):
+    `interval` is re-read on every iteration, so a caller can change the poll
+    rate mid-flight -- GPasteWatcher does exactly that when its safety net
+    concludes the event source is dead -- without stopping and restarting the
+    loop.
+
+    `on_tick` is an optional pure observer, invoked with (previous, current)
+    after EVERY tick, change or not. It exists so this stays the file's only
+    content-comparison-and-notify loop, with a single owner of `previous`: the
+    safety net judges the event source from these observations rather than
+    running a second comparison of its own.
+    """
+
+    def __init__(self, clipboard, interval_seconds, on_tick=None):
         self.clipboard = clipboard
         self.interval = interval_seconds
+        self._on_tick = on_tick
         self._stop = threading.Event()
         self._thread = None
 
@@ -1150,9 +1294,24 @@ class PollingWatcher:
             previous = self.clipboard.read()
             while not self._stop.wait(self.interval):
                 current = self.clipboard.read()
+                before = previous
                 if current != previous:
                     previous = current
                     on_change()
+                # AFTER on_change, and load-bearing rather than tidy:
+                # on_change is Agent._local_change, whose own clipboard round
+                # trip (up to SUBPROCESS_TIMEOUT=3s) and send are the grace
+                # period the event source gets to deliver the signal for this
+                # very change before an observer judges it missing. Hoisting
+                # this above on_change looks like a harmless cleanup and
+                # silently reopens that window.
+                #
+                # `before` is passed rather than a bare `changed` flag so the
+                # observer can tell a real change from a failed read and its
+                # recovery -- both are `!=` here, and neither involves a
+                # selection change at all.
+                if self._on_tick is not None:
+                    self._on_tick(before, current)
 
         self._thread = threading.Thread(target=pump, daemon=True)
         self._thread.start()
@@ -1161,10 +1320,11 @@ class PollingWatcher:
         self._stop.set()
 
 
-def make_watcher(clipboard, fallback_interval_seconds=1.0):
-    watcher = GPasteWatcher()
+def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS):
+    watcher = GPasteWatcher(clipboard)
     if watcher.available():
-        log("watching the clipboard through GPaste")
+        log("watching the clipboard through GPaste, with a safety-net poll every %.0fs"
+            % SAFETY_NET_POLL_SECONDS)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
     return PollingWatcher(clipboard, fallback_interval_seconds)
