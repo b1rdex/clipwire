@@ -264,6 +264,17 @@ class Agent:
         # would invite a deadlock later, and this one is held across
         # nothing that ever blocks.
         self._echo_lock = threading.Lock()
+        # Serializes _local_change against ITSELF. A third lock rather than a
+        # wider _echo_lock, deliberately: this one IS held across a wl-paste
+        # round trip and a send, and widening _echo_lock to cover those would
+        # block _write_clip on run()'s thread for the whole round trip --
+        # exactly what _local_change's own comment explains it must not do.
+        # Nothing on run()'s thread ever acquires this one, so it blocks only
+        # the two watcher threads against each other. Acquired first and
+        # released last within _local_change, and never held while acquiring
+        # it, so the lock order _observe_lock -> _echo_lock -> _write_lock is
+        # total and acyclic.
+        self._observe_lock = threading.Lock()
 
     # --- outbound -------------------------------------------------------
 
@@ -554,8 +565,9 @@ class Agent:
         behaviour to change.
 
         Runs on the main thread. _local_change() (below) runs on the
-        watcher's background thread and reads this same bookkeeping, so the
-        two fields are only ever touched under _echo_lock.
+        watcher's background threads -- two of them since the safety-net poll
+        was added -- and reads this same bookkeeping, so the two fields are
+        only ever touched under _echo_lock.
 
         Returns the (sha256, ts) pair that was applied and (best-effort)
         persisted, or None if the payload never decoded or decoded with
@@ -600,6 +612,33 @@ class Agent:
         return sha256, ts
 
     def _local_change(self):
+        """The single funnel for an observed local change, and the one entry
+        point BOTH watcher threads use.
+
+        Serialized against itself. Until the safety-net poll was added exactly
+        one thread ever entered here -- the gdbus pump or the fallback poll,
+        never both -- and this method structurally cannot dedupe against a
+        sibling: it snapshots _last_seen before the clipboard read and only
+        advances it after the send, so two observations of ONE copy that
+        overlap inside that window both find `stale` false, both find the text
+        different from a now-stale `last_seen`, and both send a TYPE_CLIP frame
+        with its own observed_at, behind two competing clip-state writes.
+
+        The snapshot block below is what closes it: taken while this lock is
+        held, it reads a _last_seen the winner has already advanced, so the
+        sibling recognises the content as already synced and returns at the
+        `text == last_seen` check. There is deliberately no separate re-read --
+        the existing snapshot IS the read-after-acquire.
+
+        It BLOCKS rather than skipping, which matters: PollingWatcher's
+        `previous` has already advanced past the change it is reporting, so a
+        skipped observation is a clip LOST until the next change, not one
+        merely deferred.
+        """
+        with self._observe_lock:
+            self._observe_local_change()
+
+    def _observe_local_change(self):
         # Snapshot what we expect and the generation it belongs to BEFORE
         # reading the clipboard. clipboard.read() is a wl-paste round trip
         # that can take up to SUBPROCESS_TIMEOUT=3s, and _write_clip() can

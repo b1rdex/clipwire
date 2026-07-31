@@ -1334,12 +1334,39 @@ class RacyClipboard:
         return True
 
 
+class GatedReadClipboard:
+    """read() blocks on a gate the test controls, so one _local_change can be
+    held inside its clipboard round trip while a second one runs on another
+    thread. That is not hypothetical: since the safety-net poll was added, the
+    gdbus pump thread and the poll thread BOTH call _local_change, and a
+    wl-paste round trip can take up to SUBPROCESS_TIMEOUT=3s."""
+
+    def __init__(self, text, gate):
+        self._text = text
+        self._gate = gate
+        self._lock = threading.Lock()
+        self.reads = 0
+
+    def ready(self):
+        return True
+
+    def read(self):
+        with self._lock:
+            self.reads += 1
+        self._gate.wait(JOIN_TIMEOUT)
+        return self._text
+
+    def write(self, data):
+        pass
+
+
 class TestLocalChangeRaceSafety(unittest.TestCase):
     """_write_clip() always runs on the main thread (driven by run()'s
-    single-threaded loop); _local_change() always runs on the watcher's
-    background thread. clipboard.read() -- a wl-paste round trip -- can
-    take up to SUBPROCESS_TIMEOUT=3s, so a new _write_clip() can land on
-    the main thread at any point during that window, not just cleanly
+    single-threaded loop); _local_change() only ever runs on watcher
+    threads -- plural since the safety-net poll was added, which is what the
+    last test in this class is about. clipboard.read() -- a wl-paste round
+    trip -- can take up to SUBPROCESS_TIMEOUT=3s, so a new _write_clip() can
+    land on the main thread at any point during that window, not just cleanly
     before or after it."""
 
     def setUp(self):
@@ -1384,6 +1411,68 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
             agent._last_written, b"B",
             "the newer write's suppression must stay armed for its own echo",
         )
+
+    def test_two_watcher_threads_observing_one_copy_send_a_single_clip(self):
+        """Before the safety net there was exactly ONE caller of
+        _local_change -- the gdbus pump or the fallback poll, never both. Now
+        both threads are live at once, and this method structurally cannot
+        dedupe against a sibling: it snapshots _last_seen BEFORE its clipboard
+        read and only advances it AFTER the send, so two observations of one
+        copy that overlap inside that window both find `stale` false, both find
+        the text different from a stale `last_seen`, and both send a TYPE_CLIP
+        frame -- two frames for one copy, with different observed_at values and
+        two competing clip-state writes behind them.
+
+        Serialization must BLOCK, not skip: PollingWatcher's `previous` has
+        already advanced past the change it is reporting, so a skipped
+        observation is a clip lost until the next change rather than deferred.
+        Hence the assertion is one send, not zero."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)  # never leave the two threads parked
+        clipboard = GatedReadClipboard(b"copied once", gate)
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=self.clip_state_path)
+        sent = []
+        send_lock = threading.Lock()
+
+        def record(frame_type, payload):
+            with send_lock:
+                sent.append((frame_type, payload))
+
+        agent.send = record
+
+        pump = threading.Thread(target=agent._local_change)
+        poll = threading.Thread(target=agent._local_change)
+        pump.start()
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while clipboard.reads < 1 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertEqual(clipboard.reads, 1, "the first observation must be in flight")
+
+        poll.start()
+        # Bounded, and only ever consumed in full when the two observations ARE
+        # serialized: unserialized, the second thread reaches its own read
+        # within microseconds and this returns immediately.
+        deadline = time.monotonic() + 0.02
+        while clipboard.reads < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        reads_while_first_in_flight = clipboard.reads
+
+        gate.set()
+        pump.join(timeout=JOIN_TIMEOUT)
+        poll.join(timeout=JOIN_TIMEOUT)
+
+        self.assertEqual(
+            reads_while_first_in_flight, 1,
+            "the second observation must not enter its own clipboard read while "
+            "the first is still in flight",
+        )
+        self.assertEqual(
+            len(sent), 1,
+            "one copy must produce exactly one clip frame, whichever thread "
+            "observes it; got %r" % (sent,),
+        )
+        self.assertEqual(decode_clip_payload(sent[0][1])[1], b"copied once")
 
 
 class TestIncomingClipState(unittest.TestCase):
