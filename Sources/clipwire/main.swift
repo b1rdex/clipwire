@@ -1,4 +1,5 @@
 // Sources/clipwire/main.swift
+import CryptoKit
 import Foundation
 
 // Namespaced rather than bare top-level `let`: main.swift is the file
@@ -15,24 +16,52 @@ enum AgentPaths {
 }
 
 enum ProtocolConstants {
-    static let version = 1
+    static let version = 2
     static let agentVersion = "0.1.0"
 
     static var helloPayload: Data {
-        (try? JSONEncoder().encode(HelloPayload(version: version, agent: agentVersion))) ?? Data()
+        (try? JSONEncoder().encode(
+            HelloPayload(version: version, agent: agentVersion,
+                         sentAt: Date().timeIntervalSince1970)
+        )) ?? Data()
     }
 }
 
-/// Wire shape of a hello frame's JSON payload: `{"protocol": <int>, "agent": "<version>"}`.
+/// Wire shape of a hello frame's JSON payload:
+/// `{"protocol": <int>, "agent": "<version>", "sent_at": <epoch seconds>}`.
 /// `version` maps to the wire key `protocol` (a Swift keyword) via `CodingKeys`,
 /// the same pattern `Config` already uses for its own snake_case wire keys.
 private struct HelloPayload: Codable {
     let version: Int
     let agent: String?
+    // Optional, like `agent`: we always populate it in what WE build (see
+    // `helloPayload` above), but decoding stays tolerant of a peer that
+    // omits it -- an old v1 peer, or any hand-built test payload -- so
+    // `decodeHello` keeps reporting the real version mismatch instead of
+    // degrading to "malformed hello" the moment a v1 peer's payload lacks a
+    // key v2 introduced. `skewLogLine` reads it back out and treats a
+    // missing value as "not measurable", never as an error.
+    //
+    // That tolerance is narrower than "Optional" suggests, and it is the one
+    // place the two sides deliberately disagree -- written down here because
+    // it reads as a bug to anyone who finds it from one side only. An absent
+    // key and an explicit `null` are the ONLY two shapes both sides accept.
+    // Every other shape fails the WHOLE payload here, so the Mac logs
+    // "malformed hello from peer" and records a mismatch: a string or a bool
+    // as `typeMismatch`, and `NaN`, `Infinity`, `1e309` and an integer too
+    // large for a Double as `dataCorrupted` (probed against this exact
+    // struct). `agent/clipwire-agent.py`'s `skew_log_line` ignores all of
+    // them in silence and syncs on. Left as is deliberately: making this
+    // field lenient means a custom `init(from:)`, which changes what counts
+    // as a decodable hello -- and the `NaN` case already had this outcome
+    // before skew measurement existed, so this is the blessed shape rather
+    // than a new divergence.
+    let sentAt: Double?
 
     enum CodingKeys: String, CodingKey {
         case version = "protocol"
         case agent
+        case sentAt = "sent_at"
     }
 }
 
@@ -40,11 +69,57 @@ private struct HelloPayload: Codable {
 /// decoded at all -- `runAgent()`'s `.hello` case treats that the same as
 /// a version mismatch, since an undecodable declaration is not something
 /// this side can confirm as compatible.
-func decodeHello(_ payload: Data) -> (version: Int, agent: String?)? {
+func decodeHello(_ payload: Data) -> (version: Int, agent: String?, sentAt: Double?)? {
     guard let decoded = try? JSONDecoder().decode(HelloPayload.self, from: payload) else {
         return nil
     }
-    return (decoded.version, decoded.agent)
+    return (decoded.version, decoded.agent, decoded.sentAt)
+}
+
+enum SkewConstants {
+    // Above this, the two clocks disagree by enough that a freshness
+    // comparison between them can pick the wrong side. Compared with `>`:
+    // five seconds exactly is the boundary, not a warning. Written into the
+    // message below as a literal rather than interpolated, so the Python
+    // twin of that line does not have to reproduce a second float-formatting
+    // bridge byte for byte; the tests pin the literal against this constant.
+    static let warnSeconds: Double = 5
+}
+
+/// The peer's clock offset from ours, as a log line -- or `nil` when it
+/// cannot be measured.
+///
+/// Measures `abs(now - sentAt)` from the HELLO, never the age of a clip: a
+/// clip legitimately copied this morning is hours old, so warning on that
+/// would fire on nearly every handshake and teach everyone to ignore the log.
+///
+/// A missing or non-finite `sentAt` means the same thing -- skew is not
+/// measurable -- and returns `nil`. An unmeasurable peer clock is not a
+/// protocol violation, so this neither warns nor reports a mismatch.
+///
+/// Mirrors `agent/clipwire-agent.py`'s `skew_log_line` one branch at a time,
+/// including the exact text of both outcomes, the way the two "over the frame
+/// cap" lines already match. `String(format:)` with no explicit locale is
+/// non-localized, so `%.1f` writes the same "." separator Python's `%` does,
+/// on any machine.
+///
+/// The `isFinite` guard is the mirror of the Python side's, where it is
+/// load-bearing: `json.loads` accepts the bare literals `NaN`/`Infinity`, and
+/// `abs(now - nan) > 5.0` is `False`, so an unguarded implementation there
+/// logs `peer clock skew nan` and silently never warns. Foundation's
+/// `JSONDecoder` rejects those tokens outright, so on this side such a payload
+/// never gets past `decodeHello` -- the guard costs one clause and keeps the
+/// two functions readable as one formula. `HelloPayload.sentAt`'s own comment
+/// lists every shape where that rejection makes the two sides diverge; it is
+/// wider than the non-finite literals alone.
+func skewLogLine(peerSentAt: Double?, now: Double) -> String? {
+    guard let sentAt = peerSentAt, sentAt.isFinite else { return nil }
+    let skew = abs(now - sentAt)
+    if skew > SkewConstants.warnSeconds {
+        return String(format: "peer clock skew %.1fs — over 5s, check the clock on both machines",
+                      skew)
+    }
+    return String(format: "peer clock skew %.1fs", skew)
 }
 
 /// Owns the single in-memory `Status` for this run and serializes every
@@ -125,10 +200,49 @@ final class AgentStatus: @unchecked Sendable {
         locked { status.lastReceivedAt = Date() }
     }
 
+    /// `.clipboardPending`, not `.up`. A matched hello proves only that the
+    /// peer PROCESS is alive: the PC agent sends its hello the instant sshd
+    /// spawns it, which after a reboot is minutes before GNOME login and the
+    /// Wayland session that makes its clipboard readable at all. Reporting
+    /// `.up` there overwrote -- microseconds later, from that same frame's
+    /// handler -- the `.clipboardPending` that `Channel.attempt()` had just
+    /// set, so `clipwire status` claimed a healthy channel for the whole
+    /// pre-login window while nothing could sync. `recordPeerClipboardReady`
+    /// below is what promotes now, and the spec names precisely this as the
+    /// reason clip-state is its own frame rather than fields on `hello`: it
+    /// "gives `status` its long-missing protocol basis for reporting
+    /// `clipboard-pending` durably".
+    ///
+    /// Observability only. Nothing reads `status.state` to gate a send; the
+    /// FUNCTIONAL `.clipboardPending` that re-arms the one-shot announcement
+    /// comes from `Channel`'s `onStateChange` in `wireAgent`, not from here,
+    /// so this cannot feed back into the protocol.
     func recordHelloMatched() {
         locked {
             hasHeardFromChannel = true
             protocolMismatchReason = nil
+            status.state = .clipboardPending
+            status.reason = nil
+        }
+    }
+
+    /// The peer's clip-state announcement arrived, so its clipboard is
+    /// readable and this channel can actually sync. The PC agent sends that
+    /// frame from inside `clipboard_became_ready` and nowhere else, so the
+    /// frame's mere existence is the proof -- a null hash means an EMPTY
+    /// clipboard, not an unavailable one, and syncing works fine in that
+    /// state.
+    ///
+    /// A pinned protocol mismatch outranks this, mirroring
+    /// `applyChannelState`'s existing rule. Nothing about a version mismatch
+    /// stops the peer's own frames from already being in flight, and
+    /// promoting on one would erase the specific "run `clipwire install`"
+    /// diagnosis -- reporting a healthy channel that is about to close --
+    /// which is the whole reason that reason is pinned.
+    func recordPeerClipboardReady() {
+        locked {
+            hasHeardFromChannel = true
+            guard protocolMismatchReason == nil else { return }
             status.state = .up
             status.reason = nil
         }
@@ -180,6 +294,167 @@ final class AgentStatus: @unchecked Sendable {
     }
 }
 
+/// Lowercase hex, no separators -- the exact shape `hashlib.sha256(data).hexdigest()`
+/// produces on the Python side, and the shape every `ClipState.sha256` on the wire
+/// must match byte-for-byte: `resolveStartupState`/`resolveFreshness` compare these
+/// strings with plain `==`, so a case or separator difference here would make every
+/// startup comparison see "hashes differ" and take the `now` branch meant only for
+/// content that genuinely changed while nothing was watching -- the systematic
+/// clobber the persistent store exists to prevent. `EchoGuard` already computes a
+/// `SHA256.Digest` elsewhere in this target and never hexes it, so there is no
+/// existing conversion to reuse here; this is the first, and is pinned against a
+/// known vector in `Tests/clipwireTests/HandleFrameTests.swift`.
+func sha256Hex(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+/// Reconciles what the pasteboard holds right now against what was last persisted.
+/// `nil` (an empty or unreadable pasteboard) is never hashed, matching the wire
+/// contract that `sha256` is `null` for exactly that case -- see `resolveStartupState`
+/// for the rule this applies once a current hash is in hand.
+func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double) -> ClipState {
+    let currentHash: String?
+    if let data = pasteboard.readText(), !data.isEmpty {
+        currentHash = sha256Hex(data)
+    } else {
+        currentHash = nil
+    }
+    return resolveStartupState(currentHash: currentHash, stored: stored, now: now)
+}
+
+/// Whether THIS connection's one-shot clip-state announcement has already gone out.
+/// `handleFrame` checks and claims it via `markSent()`, on a matched hello only;
+/// `wireAgent` calls `reset()` on `.clipboardPending`, the signal `Channel` raises
+/// exactly once per established connection attempt (see `Channel.attempt()`'s
+/// `established` guard) -- so the announcement re-arms on every reconnect, not only
+/// the process's first connection ever. That re-arming is the entire point: Mac
+/// sleep/wake cycles reconnect constantly, and each one needs its own reconciliation,
+/// which is exactly what v1 never did.
+///
+/// Holds no lock, unlike `AgentStatus`: this is only ever touched from
+/// `channel.onFrame`/`channel.onStateChange`, both invoked synchronously from
+/// whichever single thread drives `Channel.run()`'s decode loop -- never from
+/// `PasteboardWatcher`'s timer or the heartbeat timer, which is what forces a lock
+/// onto `AgentStatus`.
+final class ClipStateAnnouncement {
+    private(set) var sent = false
+
+    /// What THIS connection actually put on the wire. Kept because the store
+    /// is not a reliable way to read it back: `announceClipState`'s save is
+    /// best-effort and, like all three save sites, its failure is only
+    /// logged. See the `.clipState` case for what depends on it.
+    ///
+    /// Cleared by `reset()` along with `sent`, so a value announced on one
+    /// connection can never be resolved against on the next -- by then it
+    /// describes an older reading of the pasteboard than the reconciliation
+    /// that connection is about to perform for itself.
+    private(set) var announced: ClipState?
+
+    func reset() {
+        sent = false
+        announced = nil
+    }
+
+    /// Records what `announceClipState` resolved and sent. Separate from
+    /// `markSent()` because that call has to happen BEFORE the announcement
+    /// is built (it is what claims the one-shot), and the value only exists
+    /// afterwards.
+    func record(announced state: ClipState) {
+        announced = state
+    }
+
+    /// Marks it sent and returns whether THIS call is the one that did so --
+    /// `false` if an earlier call already claimed it this connection.
+    @discardableResult
+    func markSent() -> Bool {
+        guard !sent else { return false }
+        sent = true
+        return true
+    }
+}
+
+/// Saves, and logs rather than swallowing if it cannot. Every one of this
+/// file's three `clipStateStore.save` calls goes through here.
+///
+/// The line matches the text all three of `agent/clipwire-agent.py`'s own
+/// `save_clip_state` call sites already log (`could not persist clip state:
+/// %r`), the way the two "over the frame cap" lines and the two skew lines
+/// already match. All three Swift sites were bare `try?`, which mattered
+/// specifically because the silent side is the one whose disk failure is the
+/// PRECONDITION for a store-goes-stale clobber: with nothing readable on
+/// disk, the next reconciliation re-derives an age from `now` and wins a
+/// comparison it should have lost, which is the failure the persistent store
+/// exists to prevent.
+///
+/// One function rather than three copies of the same `do/catch`: three
+/// identical literals in one file is exactly the drift this project has
+/// already been bitten by, and `ClipStateStore.save` deliberately throws so
+/// that a CALLER can log -- it just should not be three callers writing the
+/// string out independently.
+func persistClipState(_ state: ClipState, to store: ClipStateStore, log: Log) {
+    do {
+        try store.save(state)
+    } catch {
+        log.line("could not persist clip state: \(error)")
+    }
+}
+
+/// Builds and sends this side's one-shot clip-state announcement: reconciles
+/// whatever the pasteboard currently holds against the persistent store (so
+/// unchanged content keeps its true recorded age instead of looking freshly
+/// copied -- see `resolveStartupState`), persists the reconciled value, and sends
+/// it. The send is unconditional on the save's success -- a local disk failure is
+/// not the peer's fault, and must not silently disable reconciliation for this
+/// connection the way gating the send behind the save's result would.
+///
+/// Pulled out of `wireAgent` for the same reason `handleFrame` was pulled out of
+/// `runAgent()`: a `send` spy can verify the exact frame this produces without a
+/// live channel. See `Tests/clipwireTests/HandleFrameTests.swift`.
+@discardableResult
+func announceClipState(
+    send: (Frame) -> Void,
+    pasteboard: PasteboardReading,
+    clipStateStore: ClipStateStore,
+    log: Log,
+    now: Double
+) -> ClipState? {
+    let stored = clipStateStore.load()
+    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now)
+    // The line the design spec mandates by name for exactly this branch --
+    // startup reconciliation finding that the content no longer matches what
+    // was last recorded, so only `now` is honest about its age. Two things
+    // rest on it: the acceptance checklist requires a divergence to be
+    // visible in the log, and the design's one accepted trade-off (with both
+    // clipboards changed while apart, the side whose agent was born more
+    // recently wins) is justified on the grounds of being "visible in the log
+    // rather than mysterious" -- which is only true if this line exists.
+    //
+    // Exactly the negation of `resolveStartupState`'s "the stored timestamp
+    // is authoritative" condition, nothing-ever-stored included: content that
+    // APPEARED while nothing was watching is the same judgement as content
+    // that changed. A nil hash is deliberately silent -- an empty or
+    // unreadable pasteboard never reaches a timestamp comparison at all, so
+    // there is no reconciliation judgement to report.
+    //
+    // Logged here rather than inside `resolveCurrentClipState`, which the
+    // `.clipState` case's own store-failure fallback also calls with
+    // `stored: nil`: that call would then claim "changed while apart" on
+    // every clip-state frame arriving while the store is unreadable, when
+    // nothing changed at all. The spec ties this line to startup
+    // reconciliation, which is this function. Byte-identical to
+    // `announce_clip_state`'s own line on the PC side.
+    if let hash = resolved.sha256, stored?.sha256 != hash {
+        log.line("clipboard changed while apart")
+    }
+    persistClipState(resolved, to: clipStateStore, log: log)
+    // Returns what actually reached the wire, and only that: a payload that
+    // failed to encode was never announced, so there is nothing for a later
+    // reconciliation to be consistent WITH.
+    guard let payload = try? resolved.encodePayload() else { return nil }
+    send(Frame(type: .clipState, payload: payload))
+    return resolved
+}
+
 /// Handles one decoded frame. Pulled out of `runAgent()`'s inline closure
 /// so the two contracts this task exists for are directly assertable: the
 /// echo suppression must be armed strictly before the incoming clip is
@@ -207,9 +482,12 @@ func handleFrame(
     _ frame: Frame,
     send: (Frame) -> Void,
     noteWrittenLocally: (Data) -> Void,
-    pasteboard: PasteboardWriting,
+    pasteboard: PasteboardReading & PasteboardWriting,
     status: AgentStatus,
-    log: Log
+    log: Log,
+    clipStateStore: ClipStateStore,
+    clipStateAnnouncement: ClipStateAnnouncement,
+    now: Double = Date().timeIntervalSince1970
 ) {
     switch frame.type {
     case .hello:
@@ -249,17 +527,190 @@ func handleFrame(
         }
         status.recordHelloMatched()
         log.line("peer said hello (agent \(peer.agent ?? "unknown"))")
+        // Matched peers only: a clock reading from one we cannot talk to is
+        // noise next to the mismatch itself.
+        if let skew = skewLogLine(peerSentAt: peer.sentAt, now: now) {
+            log.line(skew)
+        }
+        // Sent exactly once per connection, immediately after a matched
+        // hello -- per the design spec. `clipStateAnnouncement` is what
+        // makes "once" true, not the assumption that hello itself only
+        // ever arrives once: `wireAgent` resets it on the next
+        // `.clipboardPending`, so it re-arms on every reconnect.
+        if clipStateAnnouncement.markSent() {
+            if let announced = announceClipState(send: send, pasteboard: pasteboard,
+                                                 clipStateStore: clipStateStore, log: log, now: now) {
+                clipStateAnnouncement.record(announced: announced)
+            }
+        }
+    case .clipState:
+        // Logged rather than dropped in silence, exactly as the `.clip`
+        // case below now does. The DROP itself stays, and so does the
+        // divergence it embodies: `Channel` exposes no way to force-close
+        // the ssh process from here, which is why the PC agent's
+        // `_on_clip_state` deliberately raises instead and lets the
+        // connection go (its own docstring in `agent/clipwire-agent.py`
+        // spells that out). What must not stay is the silence. A frame
+        // whose `sha256` is well-formed JSON but not 64 lowercase hex is
+        // rejected here, which also skips `recordPeerClipboardReady()`
+        // below -- so on a real codec desync the PC tears the channel down
+        // WITH a line while this side sits at `clipboard-pending` for the
+        // rest of the connection having written nothing anywhere. Same
+        // "failures are visible" principle the `.clip` line rests on; the
+        // wording follows `could not decode a clip from the peer` and
+        // `could not persist clip state`, its two nearest siblings.
+        let peerState: ClipState
+        do {
+            peerState = try ClipState.decodePayload(frame.payload)
+        } catch {
+            log.line("could not decode a clip state from the peer: \(error)")
+            return
+        }
+        // After the decode guard, not before it: a frame we cannot read
+        // proves nothing about the peer's clipboard. This is the only frame
+        // that proves the channel can actually sync -- see
+        // `recordPeerClipboardReady` -- and it is reported regardless of
+        // which way the reconciliation below then goes, since who wins says
+        // nothing about whether the channel is healthy.
+        status.recordPeerClipboardReady()
+        // `clipStateStore.load()` should already reflect our own current
+        // state -- either from this connection's own announcement above,
+        // or from an ordinary local-change/applied-clip save since -- so
+        // the fallback below only matters if an earlier save failed. It
+        // must still resolve a REAL state from the live pasteboard rather
+        // than a bare nil-hash placeholder: a wrong nil here would make
+        // both sides resolve waitForPeer against each other's (correctly
+        // announced) state and silently lose the clip, reintroducing v1's
+        // bug through the fallback path instead of the main one.
+        // `load()` first, then what THIS connection announced, and only
+        // then a fresh re-derivation.
+        //
+        // The store should already be current -- from this connection's own
+        // announcement, or an ordinary local-change/applied-clip save since --
+        // so the rest only matters once a save has failed, which every one of
+        // the three sites merely logs. The old code went straight to the
+        // re-derivation there, and that is a clobber, not a fallback: it
+        // stamps `now` on content whose age this connection already ANNOUNCED
+        // to this same peer, so a peer that is genuinely fresher than what we
+        // put on the wire still loses to a number nobody was told about. The
+        // announced pair is the only value consistent with the announcement
+        // the peer is answering.
+        //
+        // `load()` still outranks it, unlike the PC agent, which prefers its
+        // just-computed pair outright -- and the asymmetry is deliberate, not
+        // drift. There, `_resolve_clip_state` is called from
+        // `clipboard_became_ready`'s own call frame, one line after computing
+        // the pair, so nothing can have happened in between. Here the
+        // `.clipState` frame arrives arbitrarily later than the `.hello` that
+        // announced, and a local change may legitimately have moved the store
+        // on since; the freshest readable value wins.
+        //
+        // The re-derivation survives as the last resort for the case neither
+        // covers: a clip-state arriving before we ever announced (this side
+        // does not stash, unlike the PC). A nil-hash placeholder there would
+        // make both sides resolve waitForPeer against each other's correctly
+        // announced state and silently lose the clip -- v1's bug through the
+        // fallback path.
+        //
+        // Accepted trade-off, stated rather than left to be discovered: if a
+        // local change ALSO failed to save after the announcement, the
+        // announced pair now describes older content than the pasteboard
+        // holds, and a `.sendMine` below would send the current text under the
+        // announced `ts` -- underselling its age. That needs two independent
+        // save failures plus a concurrent announcement, where the previous
+        // behaviour needed only one, and the local change in question was
+        // already sent to the peer by the watcher's own path.
+        let mine = clipStateStore.load()
+            ?? clipStateAnnouncement.announced
+            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
+        let decision = resolveFreshness(mine: mine, peer: peerState)
+        // Every reconciliation outcome is reported, not only the interesting
+        // ones. Acceptance item 2 requires the conflict to appear in the log,
+        // and the design's accepted trade-off -- with both clipboards changed
+        // while apart, the more recently born agent wins -- is only tolerable
+        // because it is visible here rather than mysterious.
+        //
+        // The decision word is the shared vocabulary: `FreshnessDecision`'s
+        // raw values are the same three strings the PC agent's SEND_MINE /
+        // WAIT_FOR_PEER / DO_NOTHING constants hold, so the two sides' lines
+        // are byte-identical with no formatting bridge -- the convention the
+        // frame-cap and skew lines already follow, which has caught drift
+        // twice. In production both sides' lines land in the SAME file:
+        // `Channel.attempt` pipes the agent's stderr into this log with a
+        // `remote: ` prefix, so one file shows the conflict and its winner.
+        log.line("reconciled with the peer: \(decision.rawValue)")
+        switch decision {
+        case .sendMine:
+            guard let data = pasteboard.readText(), !data.isEmpty else { return }
+            // The size bound matches PasteboardWatcher's own send-side guard
+            // (Pasteboard.swift): this branch reads the live pasteboard
+            // independently, and without it, winning a reconciliation over
+            // content at or beyond the cap would build a `ClipPayload` whose
+            // encoded frame exceeds `FrameConstants.maxPayloadBytes` -- the
+            // peer's `Frame.decode` rejects that as oversized and drops the
+            // whole channel. Logged (unlike a merely-empty pasteboard, which
+            // is not a skip at all) so a user whose large paste never syncs
+            // has something to look at, matching the Python agent's
+            // existing "skipping a clip of N bytes" line for the same cap.
+            guard data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+                log.line("skipping a clip of \(data.count) bytes: over the frame cap")
+                return
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            // `mine.ts`, not `now`: the content has not changed, only been
+            // re-announced, so its recorded age must be preserved. Sending
+            // with `now` would perpetually refresh it and let it win every
+            // future reconciliation regardless of what happens next.
+            send(Frame(type: .clip, payload: ClipPayload(ts: mine.ts, text: text).encode()))
+        case .waitForPeer, .doNothing:
+            // Hashes equal means we agree -- not a signal to resend. A
+            // peer that is fresher means we wait. Conflating either with
+            // sendMine reintroduces a clobber or a ping-pong.
+            break
+        }
     case .clip:
-        guard !frame.payload.isEmpty,
-              let text = String(data: frame.payload, encoding: .utf8) else { return }
-        // Arm suppression BEFORE writing to the pasteboard.
-        // PasteboardWatcher's lock keeps its own bookkeeping
-        // consistent, but it does not own this write, so only this
-        // ordering keeps the watcher from observing our write before
-        // the suppression exists and bouncing it straight back to the
-        // peer.
-        noteWrittenLocally(frame.payload)
-        pasteboard.writeText(text)
+        // Logged rather than swallowed by `try?`. The drop itself is right --
+        // there is nothing valid to apply -- but doing it invisibly is what
+        // makes it permanent: `wl-paste` hands the PC agent RAW BYTES, which
+        // `_local_change` hashes and sends unchanged, so a clip whose bytes
+        // are not valid UTF-8 fails here, is not applied, and is not stored.
+        // The two persistent stores then disagree forever, and on every
+        // subsequent reconnect the PC resolves SEND_MINE (its ts is the newer
+        // one), re-sends the same bytes, and this side discards them again --
+        // with nothing logged on either machine, ever. One line is what turns
+        // a permanent silent failure into something a user can find.
+        //
+        // Empty text stays silent by contrast: it decoded fine, and applying
+        // nothing is the correct uneventful outcome, matching the PC agent's
+        // own `_write_clip`, which returns quietly for exactly that input.
+        let decoded: ClipPayload
+        do {
+            decoded = try ClipPayload.decode(frame.payload)
+        } catch {
+            log.line("could not decode a clip from the peer: \(error)")
+            return
+        }
+        guard !decoded.text.isEmpty else { return }
+        let textData = Data(decoded.text.utf8)
+        // Arm suppression BEFORE writing to the pasteboard, with the
+        // PLAIN TEXT bytes -- not `frame.payload`, which carries the
+        // 8-byte timestamp prefix. PasteboardWatcher's own poll() hashes
+        // whatever `pasteboard.readText()` returns, which is this text
+        // alone; arming with the ts-prefixed payload would make
+        // EchoGuard's digest never match, `shouldSend` would always
+        // return true, and every applied remote clip would bounce
+        // straight back out to the peer it came from. PasteboardWatcher's
+        // lock keeps its own bookkeeping consistent, but it does not own
+        // this write, so only this ordering keeps the watcher from
+        // observing our write before the suppression exists.
+        noteWrittenLocally(textData)
+        pasteboard.writeText(decoded.text)
+        // The peer's timestamp, never `now`: this is the entire reason it
+        // travels in the frame. Stamping it with `now` would make applied
+        // content look freshly copied here and win the next
+        // reconciliation against the machine it actually came from.
+        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts),
+                         to: clipStateStore, log: log)
         status.recordReceived()
     }
 }
@@ -276,22 +727,41 @@ func handleFrame(
 /// attempted before any channel is established (`stdinPipe` still nil) must
 /// not make `clipwire status` claim a clip that never left the machine.
 func wireAgent(
-    channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardWriting,
-    status: AgentStatus, log: Log
+    channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardReading & PasteboardWriting,
+    status: AgentStatus, log: Log, clipStateStore: ClipStateStore, clipStateAnnouncement: ClipStateAnnouncement
 ) {
-    watcher.onChange = { payload in
-        channel.send(Frame(type: .clip, payload: payload), onSent: { sent in
+    watcher.onChange = { payload, observedAt in
+        // A genuine local change: `observedAt` -- the moment PasteboardWatcher
+        // actually read it, not whenever this closure happens to run -- is
+        // the timestamp both for what we persist and for what we send. The
+        // save must happen regardless of whether the send below ever reaches
+        // the peer (no channel yet, or the write fails): the store's job is
+        // "what do we hold and how old is it", independent of delivery.
+        persistClipState(ClipState(sha256: sha256Hex(payload), ts: observedAt),
+                         to: clipStateStore, log: log)
+        let text = String(decoding: payload, as: UTF8.self)
+        let framePayload = ClipPayload(ts: observedAt, text: text).encode()
+        channel.send(Frame(type: .clip, payload: framePayload), onSent: { sent in
             if sent { status.recordSent() }
         })
     }
 
     channel.onFrame = { frame in
         handleFrame(frame, send: channel.send, noteWrittenLocally: watcher.noteWrittenLocally,
-                    pasteboard: pasteboard, status: status, log: log)
+                    pasteboard: pasteboard, status: status, log: log,
+                    clipStateStore: clipStateStore, clipStateAnnouncement: clipStateAnnouncement)
     }
 
     channel.onStateChange = { state, reason in
         status.applyChannelState(state, reason)
+        // Channel raises `.clipboardPending` exactly once per established
+        // connection attempt (see `Channel.attempt()`'s `established`
+        // guard) -- the reset point that lets the one-shot announcement
+        // re-arm on every reconnect rather than firing only on the
+        // process's first connection ever.
+        if state == .clipboardPending {
+            clipStateAnnouncement.reset()
+        }
     }
 }
 
@@ -319,9 +789,13 @@ func runAgent() -> Int32 {
     let systemPasteboard = SystemPasteboard()
     let watcher = PasteboardWatcher(
         pasteboard: systemPasteboard,
-        pollInterval: Double(config.macPollIntervalMs) / 1000.0)
+        pollInterval: Double(config.macPollIntervalMs) / 1000.0,
+        log: log)
+    let clipStateStore = ClipStateStore(path: ClipStateStoreConstants.defaultPath)
+    let clipStateAnnouncement = ClipStateAnnouncement()
 
-    wireAgent(channel: channel, watcher: watcher, pasteboard: systemPasteboard, status: status, log: log)
+    wireAgent(channel: channel, watcher: watcher, pasteboard: systemPasteboard, status: status, log: log,
+              clipStateStore: clipStateStore, clipStateAnnouncement: clipStateAnnouncement)
 
     watcher.start()
 
@@ -344,7 +818,16 @@ func printStatus() -> Int32 {
         if let received = status.lastReceivedAt { print("last received: \(received)") }
         return 0
     case .unhealthy(let status, let reason):
-        print("\(status.state.rawValue) — \(reason)")
+        // `Status.read` falls back to the state's own name when the agent
+        // recorded no specific reason, which would print it twice. That was
+        // unreachable until `clipboard-pending` became a state the agent
+        // actually reports -- it is now the normal state for the whole window
+        // between a PC reboot and someone logging in to GNOME.
+        if reason == status.state.rawValue {
+            print(status.state.rawValue)
+        } else {
+            print("\(status.state.rawValue) — \(reason)")
+        }
         return 1
     case .agentDead(let why):
         print("agent dead — \(why)")

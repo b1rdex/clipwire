@@ -4,12 +4,27 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 import pathlib
+from unittest import mock
 
-from agent_under_test import Agent, TYPE_HELLO, decode_frame, encode_frame
+from agent_under_test import (
+    Agent,
+    PROTOCOL_VERSION,
+    TYPE_CLIP,
+    TYPE_CLIP_STATE,
+    TYPE_HELLO,
+    decode_clip_payload,
+    decode_frame,
+    encode_clip_state,
+    encode_frame,
+    load_clip_state,
+    save_clip_state,
+    sha256_hex,
+)
 
 # agent_under_test registers the loaded module under this name in
 # sys.modules; grabbed here only to reach a module-level tuning constant
@@ -128,6 +143,43 @@ class TestMainLoop(unittest.TestCase):
                     "not an uncaught AttributeError",
                 )
 
+    def test_agent_exits_cleanly_on_an_oversized_integer_timestamp_in_a_clip_state_frame(self):
+        """The real deployed agent's twin of test_freshness.py's
+        test_decode_rejects_an_oversized_integer_timestamp and
+        test_watcher.py's TestIncomingClipState.
+        test_a_malformed_clip_state_raises_a_clip_state_error_not_a_crash.
+
+        json.loads parses a 400-digit integer ts as arbitrary-precision
+        int; math.isfinite's int-to-float conversion then raises a bare
+        OverflowError, which (before this task's fix) is not a FrameError
+        and so is not caught by main()'s `except FrameError` -- an
+        uncaught exception exits 1 with a raw traceback on stderr. Exit
+        code 2 is the discriminator, exactly as
+        test_agent_exits_cleanly_on_non_object_hello_payload's own comment
+        explains: it is only reachable through main()'s `except
+        FrameError`, so it proves decode_clip_state raised the intended
+        ClipStateError rather than crashing."""
+        env = dict(os.environ, CLIPWIRE_FAKE_CLIPBOARD="never-ready")
+        process = subprocess.Popen(
+            [sys.executable, str(AGENT)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
+        # 64 lowercase hex: decode_clip_state rejects any other shape, and
+        # this case is about the oversized TS, so the hash must be valid or
+        # the test would pass on the wrong rejection.
+        oversized_ts_payload = ('{"sha256": "%s", "ts": 1' % ("aa" * 32)).encode() + b"0" * 400 + b"}"
+        process.stdin.write(encode_frame(TYPE_CLIP_STATE, oversized_ts_payload))
+        process.stdin.flush()
+        self.assertEqual(
+            process.wait(timeout=10), 2,
+            "an oversized-integer ts in a clip-state frame must fail via "
+            "ClipStateError/FrameError (exit 2), not an uncaught OverflowError",
+        )
+
     def test_partial_hello_frame_split_across_two_writes_is_reassembled(self):
         """A frame split across two stdin reads (a slow or chunked SSH
         channel) must still be assembled into one frame. Sends a
@@ -144,7 +196,11 @@ class TestMainLoop(unittest.TestCase):
         self.addCleanup(process.kill)
         self.addCleanup(process.stdout.close)
         self.addCleanup(process.stdin.close)
-        frame = encode_frame(TYPE_HELLO, b'{"protocol":1}')
+        # Built from PROTOCOL_VERSION rather than a hardcoded literal: a
+        # hardcoded "1" would silently become a MISMATCHED hello once the
+        # agent's own version bumps, flipping this test's outcome for a
+        # reason unrelated to what it actually checks (reassembly).
+        frame = encode_frame(TYPE_HELLO, ('{"protocol":%d}' % PROTOCOL_VERSION).encode())
         split = len(frame) // 2
         process.stdin.write(frame[:split])
         process.stdin.flush()
@@ -207,6 +263,16 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             setattr, clipwire_agent, "CLIPBOARD_RECHECK_SECONDS", original_interval
         )
 
+        # This test's script drives the clipboard into READY, which now
+        # (since the clip-state wiring landed) runs clipboard_became_ready's
+        # announce step -- save_clip_state/load_clip_state touch the real
+        # production path (~/.local/state/clipwire/clip-state.json) when
+        # clip_state_path is None. Missed when that wiring first landed;
+        # caught here while touching this same file for a related fix.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        clip_state_path = os.path.join(tmp.name, "clip-state.json")
+
         # run() calls the module-level log() by its bare name, resolved from
         # clipwire_agent's globals at call time -- so replacing the module
         # attribute captures every call, in whichever thread makes it,
@@ -227,7 +293,8 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             [False, False, True, True, True, False, False], write_fd
         )
         self.addCleanup(clipboard.close_write_end)
-        agent = Agent(stdin=stdin, stdout=io.BytesIO(), clipboard=clipboard)
+        agent = Agent(stdin=stdin, stdout=io.BytesIO(), clipboard=clipboard,
+                      clip_state_path=clip_state_path)
 
         # This calls run() directly, not through a subprocess -- nothing
         # external bounds it the way process.wait(timeout=...) bounds every
@@ -273,6 +340,176 @@ class TestClipboardTransitionLogging(unittest.TestCase):
             "losing the clipboard must log once, not once per tick: %r" % log_lines,
         )
         self.assertEqual(agent.phase, clipwire_agent.PHASE_PENDING)
+
+
+class _NoOpWatcher:
+    """Same shape as test_lifecycle.py's/test_watcher.py's own doubles of
+    this name: avoids a real gdbus probe or a leaked PollingWatcher thread
+    for tests that do not care about the watcher itself."""
+
+    def start(self, on_change):
+        pass
+
+    def stop(self):
+        pass
+
+
+class ScriptedClipboardWithContent:
+    """Like ScriptedClipboard above, but read() returns real content and
+    write() records what was written, instead of both being no-ops --
+    needed to reproduce Finding 1's exact scenario: the PC's actual
+    clipboard already holds new content (the user copied it locally while
+    disconnected), predating this connection, while the on-disk store
+    still describes older, stale content (nothing observed the change --
+    no agent process was running to watch it)."""
+
+    def __init__(self, script, write_fd, read_value):
+        self._script = list(script)
+        self._write_fd = write_fd
+        self._read_value = read_value
+        self.calls = 0
+        self.written = []
+
+    def ready(self):
+        value = self._script[min(self.calls, len(self._script) - 1)]
+        self.calls += 1
+        if self.calls > len(self._script):
+            self.close_write_end()
+        return value
+
+    def close_write_end(self):
+        if self._write_fd is not None:
+            os.close(self._write_fd)
+            self._write_fd = None
+
+    def read(self):
+        return self._read_value
+
+    def write(self, data):
+        self.written.append(data)
+
+
+class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
+    """Fix round 1, Finding 1 (Critical): clipboard_became_ready is not the
+    ordering-equivalent of Swift's matched-hello. run()'s real loop drains
+    and dispatches every complete frame on stdin BEFORE it ever checks
+    clipboard.ready() in that same iteration -- so a peer's TYPE_CLIP_STATE
+    frame can reach _on_clip_state while this agent is still PHASE_PENDING,
+    before clipboard_became_ready has ever reconciled the (possibly stale)
+    on-disk store against what the clipboard actually holds right now.
+
+    Reproduced end to end here, driving the REAL run() loop (not by calling
+    _on_clip_state/clipboard_became_ready by hand in a chosen order, which
+    is the inverse of production and the reason this defect went unnoticed):
+
+    1. Both sides were last synced on "A"; the on-disk store holds
+       (sha256("A"), t_A).
+    2. This agent process starts fresh (as it always does -- sshd spawns
+       one per SSH connection). The user copied "B" locally while
+       disconnected; nothing observed it, so the store still says "A".
+    3. The peer's TYPE_CLIP_STATE frame -- announcing its own last-known
+       state, (sha256("A"), t_A), since the peer hasn't changed either --
+       arrives and is dispatched before the clipboard is ever checked for
+       readiness in run()'s loop.
+    4. The clipboard becomes ready on a later loop iteration.
+
+    Before the fix: step 3's _on_clip_state loads the STALE store, sees
+    hashes match the peer's announcement, resolves DO_NOTHING, and never
+    reconsiders. Step 4's own announce step reconciles the store correctly
+    (B) -- but only AFTER the decision not to send B was already made and
+    discarded. Neither side ever transmits B: the peer resolves
+    waitForPeer against the PC's newly-correct announcement, and the PC
+    already said nothing. B is silently lost -- v1's exact defect.
+
+    After the fix: the peer's announcement is stashed while
+    _clip_state_sent is still False, and resolved immediately after step
+    4's reconciliation -- by which point the store correctly says B, so
+    resolve_freshness returns SEND_MINE and B goes out.
+    """
+
+    def test_peer_clip_state_arriving_before_readiness_is_resolved_correctly_once_ready(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        clip_state_path = os.path.join(tmp.name, "clip-state.json")
+
+        hash_a, ts_a = sha256_hex(b"A"), 100.0
+        save_clip_state(hash_a, ts_a, path=clip_state_path)
+
+        original_interval = clipwire_agent.CLIPBOARD_RECHECK_SECONDS
+        clipwire_agent.CLIPBOARD_RECHECK_SECONDS = 0.01
+        self.addCleanup(setattr, clipwire_agent, "CLIPBOARD_RECHECK_SECONDS", original_interval)
+
+        read_fd, write_fd = os.pipe()
+        stdin = os.fdopen(read_fd, "rb", buffering=0)
+        self.addCleanup(stdin.close)
+
+        # The peer's stale-but-still-matching-each-other announcement,
+        # already sitting in the pipe before run() ever starts -- so it is
+        # read and dispatched on the very first loop iteration, well before
+        # the clipboard is ever checked. False on the first ready() call
+        # guarantees _on_clip_state runs while still PHASE_PENDING.
+        peer_announcement = encode_frame(TYPE_CLIP_STATE, encode_clip_state(hash_a, ts_a))
+        os.write(write_fd, peer_announcement)
+
+        clipboard = ScriptedClipboardWithContent(
+            script=[False, True], write_fd=write_fd, read_value=b"B",
+        )
+        self.addCleanup(clipboard.close_write_end)
+        stdout = io.BytesIO()
+        agent = Agent(stdin=stdin, stdout=stdout, clipboard=clipboard,
+                      clip_state_path=clip_state_path)
+
+        outcome = {}
+
+        def _call_run():
+            try:
+                with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
+                    outcome["result"] = agent.run()
+            except BaseException as error:  # pragma: no cover - surfaced below
+                outcome["error"] = error
+
+        runner = threading.Thread(target=_call_run, daemon=True)
+        runner.start()
+        runner.join(timeout=5)
+        self.assertFalse(
+            runner.is_alive(),
+            "run() did not return within 5s -- likely blocked in select() "
+            "forever, the same regression guarded against elsewhere in "
+            "this file",
+        )
+        if "error" in outcome:
+            raise outcome["error"]
+        self.assertEqual(outcome.get("result"), 0,
+                         "run() must exit cleanly once the script ends and stdin closes")
+
+        frames = []
+        buffer = bytearray(stdout.getvalue())
+        while True:
+            frame = decode_frame(buffer)
+            if frame is None:
+                break
+            frames.append(frame)
+
+        clip_frames = [f for f in frames if f[0] == TYPE_CLIP]
+        self.assertEqual(
+            len(clip_frames), 1,
+            "expected exactly one outgoing clip frame carrying B; got frame "
+            "types %r -- B was silently lost, the exact defect this fix "
+            "closes" % [f[0] for f in frames],
+        )
+        ts, text = decode_clip_payload(clip_frames[0][1])
+        self.assertEqual(text, b"B", "must send B, not stale content or nothing at all")
+        self.assertGreater(
+            ts, ts_a,
+            "must carry the reconciled (fresh) timestamp, not the stale t_A "
+            "the peer's announcement described",
+        )
+
+        # The store itself must also have been correctly reconciled to B,
+        # not left holding stale A -- announce_clip_state's own job,
+        # unaffected by this fix, but worth confirming end to end here too.
+        stored = load_clip_state(path=clip_state_path)
+        self.assertEqual(stored[0], sha256_hex(b"B"))
 
 
 if __name__ == "__main__":

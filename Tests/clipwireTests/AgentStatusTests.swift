@@ -38,12 +38,61 @@ final class AgentStatusTests: XCTestCase {
                         "no longer be masked by the stale mismatch")
     }
 
-    func testRecordHelloMatchedReportsUp() {
+    /// Inverted by the final wave, deliberately: this used to assert `.up`.
+    /// A matched hello proves the peer PROCESS is alive, which is not the
+    /// same as the channel being able to sync -- the PC agent sends its
+    /// hello the instant sshd spawns it, after a reboot minutes before the
+    /// Wayland session its clipboard needs. Promoting here overwrote the
+    /// `.clipboardPending` that `Channel.attempt()` had set microseconds
+    /// earlier, from that same frame. The reason must still be CLEARED,
+    /// which is unchanged and is what keeps a stale mismatch from sticking.
+    func testRecordHelloMatchedReportsClipboardPendingNotUp() {
         let status = AgentStatus(pid: 1, url: url())
         status.recordHelloMatched()
         let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .clipboardPending,
+                       "a live peer process is not yet a channel that can sync")
+        XCTAssertNil(snapshot.reason)
+    }
+
+    /// The spec's stated reason for splitting clip-state off `hello` at all:
+    /// it "gives `status` its long-missing protocol basis for reporting
+    /// `clipboard-pending` durably". A matched hello only proves the PEER
+    /// PROCESS is alive -- the PC agent sends its hello immediately, long
+    /// before the Wayland session exists -- so it cannot mean the channel can
+    /// actually sync. The peer's clip-state announcement is the first and
+    /// only frame that does prove it: the agent sends it from inside
+    /// `clipboard_became_ready`.
+    func testPeerClipboardReadyIsWhatReportsUp() {
+        let status = AgentStatus(pid: 1, url: url())
+        status.recordHelloMatched()
+        XCTAssertEqual(status.snapshot().state, .clipboardPending,
+                       "a matched hello proves the peer process is alive, not that it can sync")
+
+        status.recordPeerClipboardReady()
+        let snapshot = status.snapshot()
         XCTAssertEqual(snapshot.state, .up)
         XCTAssertNil(snapshot.reason)
+    }
+
+    /// The non-obvious half. `recordProtocolMismatch` pins a specific
+    /// diagnosis precisely so a user running `clipwire status` is told to run
+    /// `clipwire install` instead of being shown something generic -- and a
+    /// clip-state frame can arrive after one (nothing about a version
+    /// mismatch stops the peer's own frames from being in flight). Promoting
+    /// unconditionally would erase that diagnosis and report a healthy
+    /// channel that is about to close. Mirrors `applyChannelState`'s existing
+    /// rule that a pinned mismatch outranks whatever is reported next.
+    func testPeerClipboardReadyDoesNotOverwriteAPinnedProtocolMismatch() {
+        let status = AgentStatus(pid: 1, url: url())
+        let mismatch = "protocol mismatch: peer speaks 3, we speak 2 — run `clipwire install`"
+        status.recordProtocolMismatch(mismatch)
+
+        status.recordPeerClipboardReady()
+
+        let snapshot = status.snapshot()
+        XCTAssertEqual(snapshot.state, .down, "a mismatched peer's clipboard readiness changes nothing")
+        XCTAssertEqual(snapshot.reason, mismatch)
     }
 
     func testSentAndReceivedTimestampsAreRecorded() {
@@ -131,8 +180,11 @@ final class AgentStatusTests: XCTestCase {
         status.recordHelloMatched()
         status.tickHeartbeat(reconnects: 2)
         let snapshot = status.snapshot()
-        XCTAssertEqual(snapshot.state, .up)
-        XCTAssertNil(snapshot.reason, "an established, healthy channel must not grow a synthesized " +
+        XCTAssertEqual(snapshot.state, .clipboardPending)
+        // The reason-is-nil half is this test's actual subject: whatever
+        // the state, a channel that HAS reported must not be given a
+        // synthesized "peer unreachable" reason by the heartbeat.
+        XCTAssertNil(snapshot.reason, "an established channel must not grow a synthesized " +
                      "'unreachable' reason just because reconnects is nonzero from an earlier drop")
     }
 
@@ -174,5 +226,69 @@ final class AgentStatusTests: XCTestCase {
     func testDecodeHelloReturnsNilWhenTheProtocolKeyIsMissing() {
         XCTAssertNil(decodeHello(Data(#"{"agent":"0.1.0"}"#.utf8)),
                       "no protocol field means the version cannot be confirmed compatible")
+    }
+
+    func testDecodeHelloExposesTheSentAtItDecodes() {
+        let peer = decodeHello(Data(#"{"protocol":2,"agent":"0.1.0","sent_at":1000.5}"#.utf8))
+        XCTAssertEqual(peer?.sentAt, 1000.5)
+    }
+
+    func testDecodeHelloToleratesAMissingSentAt() {
+        // Same tolerance as the agent field, for the same reason: a peer
+        // that omits it must still report its real version, not degrade to
+        // "malformed hello".
+        let peer = decodeHello(Data(#"{"protocol":1}"#.utf8))
+        XCTAssertEqual(peer?.version, 1)
+        XCTAssertNil(peer?.sentAt ?? nil)
+    }
+
+    // MARK: - skewLogLine
+    //
+    // The twin of agent/clipwire-agent.py's skew_log_line, asserted against
+    // the same strings: both sides are meant to log the same quantity in the
+    // same shape, the way the two "over the frame cap" lines already do.
+    // agent/tests/test_frame.py's TestSkewLogLine is the mirror of this
+    // section, case for case.
+
+    func testSkewLogLineReportsASmallDifferenceWithoutAWarning() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1000.5), "peer clock skew 0.5s")
+    }
+
+    func testSkewLogLineMeasuresAnAbsoluteDifferenceSoDirectionDoesNotMatter() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.5, now: 1000.0),
+                       skewLogLine(peerSentAt: 1000.0, now: 1000.5))
+    }
+
+    func testSkewLogLineWarnsAboveTheThreshold() {
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1006.0),
+                       "peer clock skew 6.0s — over 5s, check the clock on both machines")
+    }
+
+    func testSkewLogLineDoesNotWarnExactlyAtTheThreshold() {
+        // "Warn ABOVE five seconds": the boundary itself is not a warning.
+        XCTAssertEqual(skewLogLine(peerSentAt: 1000.0, now: 1005.0), "peer clock skew 5.0s")
+    }
+
+    func testTheSkewWarningTextQuotesTheThresholdConstant() {
+        // The threshold is a literal inside the message (no second
+        // float-formatting bridge to keep byte-identical with Python), so
+        // pin the literal against the constant here instead.
+        XCTAssertEqual(SkewConstants.warnSeconds, 5)
+        XCTAssertEqual(
+            skewLogLine(peerSentAt: 0, now: 1000)?.contains("over \(Int(SkewConstants.warnSeconds))s"),
+            true)
+    }
+
+    func testSkewLogLineSaysNothingWhenItCannotBeMeasured() {
+        // A peer that omits sent_at, and the non-finite values a peer could
+        // in principle hand us. Not measurable is not a violation: no line,
+        // no warning. (Foundation's JSONDecoder rejects the bare NaN and
+        // Infinity JSON literals outright, so on THIS side those never even
+        // reach here through decodeHello -- the guard mirrors the Python
+        // side, where json.loads does accept them.)
+        XCTAssertNil(skewLogLine(peerSentAt: nil, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: .nan, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: .infinity, now: 1000))
+        XCTAssertNil(skewLogLine(peerSentAt: -.infinity, now: 1000))
     }
 }

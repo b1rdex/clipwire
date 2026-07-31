@@ -18,6 +18,7 @@ enum FrameConstants {
 enum FrameType: UInt8 {
     case hello = 0x00
     case clip = 0x01
+    case clipState = 0x02
 }
 
 enum FrameError: Error, Equatable {

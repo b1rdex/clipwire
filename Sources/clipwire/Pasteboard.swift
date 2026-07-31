@@ -87,22 +87,30 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// second is this class's responsibility, the first belongs to the task
 /// that builds the frame handler.
 final class PasteboardWatcher {
-    var onChange: ((Data) -> Void)?
+    var onChange: ((Data, Double) -> Void)?
 
     private let pasteboard: PasteboardReading
     private let pollInterval: TimeInterval
     private var lastChangeCount: Int
     private var echo = EchoGuard()
     private var timer: DispatchSourceTimer?
+    // Optional, and defaulted to nil, so every existing call site (this
+    // class predates any need to log) keeps compiling unchanged; only
+    // `runAgent()` passes a real one. `Log` is `Sendable` and `line(_:)`
+    // only enqueues onto its own serial queue, so calling it from inside
+    // `pollLocked()`'s critical section below is safe and does not hold
+    // `stateLock` for any meaningful extra time.
+    private let log: Log?
 
     // Guards `echo` and `lastChangeCount` together — see the class doc
     // comment for why both, not just `echo`, need to be under this lock.
     private let stateLock = NSLock()
 
-    init(pasteboard: PasteboardReading, pollInterval: TimeInterval) {
+    init(pasteboard: PasteboardReading, pollInterval: TimeInterval, log: Log? = nil) {
         self.pasteboard = pasteboard
         self.pollInterval = pollInterval
         self.lastChangeCount = pasteboard.changeCount
+        self.log = log
     }
 
     func noteWrittenLocally(_ payload: Data) {
@@ -112,19 +120,27 @@ final class PasteboardWatcher {
     }
 
     func poll() {
-        guard let toSend = pollLocked() else { return }
+        guard let (toSend, observedAt) = pollLocked() else { return }
         // Invoked after the lock is released, both because it can be slow
         // (it hands off to the channel) and because a callback that
         // re-entered the watcher while the lock was still held would
         // deadlock against a non-reentrant NSLock.
-        onChange?(toSend)
+        onChange?(toSend, observedAt)
     }
 
     /// The entire read-and-decide sequence, as one critical section shared
     /// with `noteWrittenLocally`. `defer` releases the lock on every path,
     /// including the early "nothing changed" return, so a raised guard can
     /// never leak a held lock into the next `noteWrittenLocally` call.
-    private func pollLocked() -> Data? {
+    ///
+    /// The timestamp is read here, under the same lock as the text it is
+    /// paired with, because it must be the moment of OBSERVATION -- this
+    /// poll's read -- not the moment `onChange` eventually runs, which is
+    /// deliberately invoked outside the lock and can lag behind it. This
+    /// timestamp becomes the outgoing clip's `ts`; a receiving peer stores
+    /// it unchanged (see `handleFrame`'s `.clip` case), so inflating it here
+    /// would misstate how old the content actually is everywhere downstream.
+    private func pollLocked() -> (Data, Double)? {
         stateLock.lock()
         defer { stateLock.unlock() }
 
@@ -138,9 +154,22 @@ final class PasteboardWatcher {
         lastChangeCount = current
 
         guard let text = pasteboard.readText(), !text.isEmpty else { return nil }
-        guard text.count <= FrameConstants.maxPayloadBytes else { return nil }
+        // `wireAgent` wraps this text in `ClipPayload(ts:text:)` before it
+        // ever reaches the wire, adding an 8-byte prefix -- so the bound
+        // here must leave room for it. Checking `text.count` alone (exact
+        // before Task 9, when this text WAS the frame payload) would let
+        // text at exactly the cap encode to a frame 8 bytes over it, which
+        // the peer's `Frame.decode` rejects as oversized, dropping the
+        // whole channel over a single large-but-not-overlong clip.
+        guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxPayloadBytes else {
+            // Logged so a user whose large local copy never reaches the
+            // peer has something to look at, matching the Python agent's
+            // existing "skipping a clip of N bytes" line for the same cap.
+            log?.line("skipping a clip of \(text.count) bytes: over the frame cap")
+            return nil
+        }
         guard echo.shouldSend(text) else { return nil }
-        return text
+        return (text, Date().timeIntervalSince1970)
     }
 
     func start() {
