@@ -170,7 +170,61 @@ func handleFrame(
         let mine = clipStateStore.load()
             ?? clipStateAnnouncement.announced
             ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now, log: log)
-        let decision = resolveFreshness(mine: mine, peer: peerState)
+        // PROVENANCE FIRST, and if it fires `resolveFreshness` is not
+        // consulted at all. This is the call site v3.2's first plan draft
+        // left unowned -- the rule, the wire field, the PC's recording, its
+        // persistence and its disarm were all built, and NOTHING invoked
+        // them. A capability built and never connected is this project's
+        // signature planning defect; it has now cost it twice, and the
+        // remedy is that this branch exists rather than that it is tidy.
+        //
+        // What it buys, stated as the bug it closes: the PC applied this
+        // Mac's screenshot, GPaste re-encoded it, and the PC recorded that
+        // re-encode at the peer's own timestamp PLUS a millisecond -- so at
+        // the next reconnect the PC was deterministically fresher and handed
+        // this Mac back its own screenshot with the density gone. No
+        // ordering of two timestamps can say the two sides hold the same
+        // picture, and two attempts to compare image CONTENT both failed
+        // because GPaste applies the embedded ICC profile and the samples
+        // genuinely move. The PC knows the hash it was GIVEN, so neither
+        // side has to deduce anything.
+        let decision: FreshnessDecision
+        if resolveProvenance(mine: mine, peer: peerState) {
+            // A suppression that leaves no trace is indistinguishable from a
+            // bug, and this one fires exactly when the user expects
+            // something to happen: the screenshot does not come back, and
+            // nothing anywhere says why. So the line names WHICH SIDE'S
+            // content descended from which, not merely that something did.
+            //
+            // The direction is read off `mine.origin`, and that is a LABEL
+            // rather than a second copy of the rule: the verdict was already
+            // reached above, and getting this `if` wrong could only ever
+            // mislabel a line. Written as an `if let` anyway, matching
+            // `resolveProvenance`'s own spelling, so nothing here rests on
+            // `Optional`'s `nil == nil` -- the trap the whole rule is built
+            // around.
+            //
+            // Neither sentence interpolates anything, the convention
+            // `clipboard changed before the send` already follows, so this
+            // side and the PC agent's twin in `_resolve_clip_state` cannot
+            // drift apart in formatting -- and in production both land in
+            // the same file, since `Channel.attempt` pipes the agent's
+            // stderr into this log with a `remote: ` prefix.
+            if let mineOrigin = mine.origin, mineOrigin == peerState.sha256 {
+                log.line("what we hold descends from the peer's clipboard: standing down")
+            } else {
+                log.line("the peer's clipboard descends from what we hold: standing down")
+            }
+            // `.doNothing`, flowing through the ordinary reporting and the
+            // `switch` below rather than returning from here: the acceptance
+            // checklist requires EVERY reconciliation outcome in the log,
+            // and the pairing harness reads a connection's decision out of
+            // that one line. An early return would satisfy "sends no frame"
+            // and silently drop the connection's only verdict.
+            decision = .doNothing
+        } else {
+            decision = resolveFreshness(mine: mine, peer: peerState)
+        }
         // Every reconciliation outcome is reported, not only the interesting
         // ones. Acceptance item 2 requires the conflict to appear in the log,
         // and the design's accepted trade-off -- with both clipboards changed

@@ -2036,4 +2036,130 @@ final class HandleFrameTests: XCTestCase {
         let frame = try XCTUnwrap(sent.first { $0.type == .imageClip })
         XCTAssertEqual(try ImagePayload.decode(frame.payload).png, Self.heldImage)
     }
+
+    // MARK: - v3.2, Task 6b: the .clipState case actually consults provenance
+
+    /// Tasks 1-6 built `resolveProvenance`, put `origin` on the wire, taught
+    /// the PC to record it, made it survive that agent's death and disarmed
+    /// the expectation that could poison it -- and NOTHING invoked any of
+    /// it. A capability built and never connected is this project's
+    /// signature planning defect, and these are what make the connection
+    /// observable on the Mac side alone: the pairing harness proves it end
+    /// to end, but it drives both implementations at once, so with only
+    /// that test a break here and a break in the PC agent's `_resolve_clip_state`
+    /// are the same red.
+    ///
+    /// The bug, at the size a unit test holds it: the PC applied this Mac's
+    /// screenshot, GPaste re-encoded the selection, and `_consume_image_reoffer`
+    /// recorded the re-encode at the peer's own timestamp PLUS a
+    /// millisecond -- deliberately, so the first reconnect resolves
+    /// deterministically instead of by hex tie-break. That determinism is
+    /// exactly what hands this Mac back its own screenshot with the density
+    /// gone. Two attempts to compare image CONTENT both failed, measured,
+    /// because GPaste applies the embedded ICC profile and the samples move.
+
+    private static let macsOriginal = Data([0x89, 0x50, 0x4E, 0x47, 0x6D, 0x61, 0x63])
+    private static let pcsReEncode = Data([0x89, 0x50, 0x4E, 0x47, 0x67, 0x70, 0x61, 0x73, 0x74, 0x65])
+
+    /// THE FIX, in the direction the reported defect travels. The peer is a
+    /// millisecond fresher and holds different bytes, so `resolveFreshness`
+    /// alone says `waitForPeer` and this side then APPLIES the degraded copy
+    /// when it arrives. `doNothing` is what declines it.
+    ///
+    /// The pasteboard genuinely holds the original and the store genuinely
+    /// records its hash, the same arrangement every other reconciliation
+    /// fixture in this file uses, so nothing here passes because a guard
+    /// further down happened to refuse.
+    func testAPeerHoldingOurOwnScreenshotReEncodedIsDeclined() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(Self.macsOriginal), ts: 1000, kind: .image))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Self.macsOriginal
+        var sent: [Frame] = []
+        // What the PC announces after the substitution: its own re-encode,
+        // nudged past ours, naming the hash it was GIVEN.
+        let peer = ClipState(sha256: sha256Hex(Self.pcsReEncode), ts: 1000.001, kind: .image,
+                             origin: sha256Hex(Self.macsOriginal))
+
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty, "no frame in either direction")
+        XCTAssertTrue(loggedMessages(at: path).contains(where: { $0.contains("reconciled with the peer: doNothing") }),
+                      "waitForPeer here is waiting for the degraded copy; got: \(loggedMessages(at: path))")
+        XCTAssertTrue(loggedMessages(at: path).contains("the peer's clipboard descends from what we hold: standing down"),
+                      "a suppression that leaves no trace is indistinguishable from a bug, and " +
+                      "it fires exactly when the user expects something; got: \(loggedMessages(at: path))")
+        XCTAssertEqual(pasteboard.writes.count, 0, "the screenshot this Mac still holds is the good one")
+    }
+
+    /// The mirror, and the reason the rule is ONE symmetric function rather
+    /// than one per side: this Mac holds a derivative of what the peer has,
+    /// and `resolveFreshness` alone would say `sendMine` and push it. Both
+    /// sides stand down together, so neither is left waiting for a clip the
+    /// other already declined.
+    ///
+    /// The Mac reaches this state by having applied an image from a THIRD
+    /// state of the world and then recording an origin -- which this side
+    /// never does today. It is tested anyway because the rule is symmetric
+    /// by construction and a wiring that only ever consulted one half would
+    /// pass the test above.
+    func testWeDoNotPushTheAncestorsOwnerADerivativeOfWhatItHolds() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(Self.pcsReEncode), ts: 1000.001, kind: .image,
+                                 origin: sha256Hex(Self.macsOriginal)))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Self.pcsReEncode
+        var sent: [Frame] = []
+        let peer = ClipState(sha256: sha256Hex(Self.macsOriginal), ts: 1000, kind: .image)
+
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty, "the peer holds our ancestor; our derivative is not news")
+        XCTAssertTrue(loggedMessages(at: path).contains(where: { $0.contains("reconciled with the peer: doNothing") }),
+                      "got: \(loggedMessages(at: path))")
+        XCTAssertTrue(loggedMessages(at: path).contains("what we hold descends from the peer's clipboard: standing down"),
+                      "got: \(loggedMessages(at: path))")
+    }
+
+    /// The nil trap, pinned AT THE CALL SITE rather than only in the rule.
+    /// `nil == nil` is `true` for a Swift `Optional`, so the naive spelling
+    /// of provenance fires on our own origin-less state against a peer that
+    /// announced nothing -- a locked PC against an ordinary Mac, which
+    /// happens daily -- and would kill `resolveFreshness`'s `(_, nil) ->
+    /// .sendMine` recovery for EVERY kind of content, not merely for images.
+    /// fixtures/provenance.json's nil rows pin the rule; this pins that
+    /// wiring it in did not reintroduce the trap one layer up.
+    func testAnEmptyPeerIsStillHandedBackWhatItLost() throws {
+        let store = tempClipStateStore()
+        let held = Data("the clip the peer lost".utf8)
+        try store.save(ClipState(sha256: sha256Hex(held), ts: 777, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = held
+        var sent: [Frame] = []
+
+        handleFrame(Frame(type: .clipState,
+                          payload: try ClipState(sha256: nil, ts: 0, kind: nil).encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(sent.filter { $0.type == .clip }.count, 1,
+                       "a peer with nothing gets its clipboard back; suppressing this is v1's " +
+                       "silent loss, restored by a rule about images")
+    }
 }

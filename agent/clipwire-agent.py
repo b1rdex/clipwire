@@ -923,16 +923,69 @@ class Agent:
             # and silently lose the clip, reintroducing v1's bug through the
             # fallback path instead of the main one.
             mine = resolve_current_clip_state(self.clipboard, None, time.time())
-        # resolve_freshness's formula is unchanged by Task 6 and takes only
-        # (sha256, ts) -- kind plays no part in the comparison (see its own
-        # docstring) -- so only the first two elements of each record go in.
-        # Unchanged by v3.2 as well: `peer` is now a (sha256, ts, kind,
-        # origin) quadruple off the wire and `mine` is whichever shape its
-        # source produced, and this slice reads the same two elements from
-        # either. resolve_provenance, which does read the fourth, takes the
-        # WHOLE record for exactly that reason -- see its own docstring on
-        # why a [:2] here and a [:2] there would not mean the same thing.
-        decision = resolve_freshness(mine[:2], peer[:2])
+        # PROVENANCE FIRST, and if it fires the freshness formula is not
+        # consulted at all. This is the call site v3.2's first plan draft
+        # left unowned -- the rule, the wire field, the recording, the
+        # persistence and the disarm were all built, and NOTHING invoked
+        # them. A capability built and never connected is this project's
+        # signature planning defect; it has now cost it twice, and the
+        # remedy is that this branch exists rather than that it is tidy.
+        #
+        # WHOLE RECORDS, not the `mine[:2]` slice the freshness call one
+        # line below takes, and the difference is the whole hazard: the
+        # slice reads (sha256, ts), so copying it here would put this side's
+        # TIMESTAMP where an origin belongs, compare a float against a hex
+        # string, answer False forever and fail nothing. resolve_provenance
+        # raises ValueError on a short record to make that loud instead --
+        # see its docstring, and do not truncate to satisfy it.
+        #
+        # Every producer of `mine` above is already a quadruple:
+        # load_clip_state, resolve_current_clip_state (via
+        # resolve_startup_state, four elements on every branch),
+        # announce_clip_state's return and _write_clip's.
+        if resolve_provenance(mine, peer):
+            # A suppression that leaves no trace is indistinguishable from a
+            # bug, and this one fires exactly when the user expects
+            # something to happen: a screenshot they copied on the Mac does
+            # not come back, and nothing anywhere says why. So the line
+            # names WHICH SIDE'S content descended from which, not merely
+            # that something did.
+            #
+            # The direction is read off `mine`'s origin, and that is a
+            # LABEL rather than a second copy of the rule: the verdict was
+            # already reached above, and getting this if wrong could only
+            # ever mislabel a line. Written as an explicit `is not None`
+            # anyway, matching resolve_provenance's own spelling, so nothing
+            # here rests on how None compares to a hash.
+            #
+            # No interpolated values in either sentence, the convention
+            # `clipboard changed before the send` already follows, so this
+            # side and Sources/clipwire/HandleFrame.swift's twin cannot
+            # drift apart in formatting -- and in production both land in
+            # the same file, since Channel.attempt pipes this agent's stderr
+            # into the Mac's log with a `remote: ` prefix.
+            if mine[3] is not None and mine[3] == peer[0]:
+                log("what we hold descends from the peer's clipboard: standing down")
+            else:
+                log("the peer's clipboard descends from what we hold: standing down")
+            # DO_NOTHING, and it flows through the ordinary reporting and
+            # send-guard below rather than returning from here: the
+            # acceptance checklist requires EVERY reconciliation outcome in
+            # the log, and the harness reads this connection's decision out
+            # of that one line. An early return would satisfy "sends no
+            # frame" and silently drop the connection's only verdict.
+            decision = DO_NOTHING
+        else:
+            # resolve_freshness's formula is unchanged by Task 6 and takes only
+            # (sha256, ts) -- kind plays no part in the comparison (see its own
+            # docstring) -- so only the first two elements of each record go in.
+            # Unchanged by v3.2 as well: `peer` is now a (sha256, ts, kind,
+            # origin) quadruple off the wire and `mine` is whichever shape its
+            # source produced, and this slice reads the same two elements from
+            # either. resolve_provenance, which does read the fourth, takes the
+            # WHOLE record for exactly that reason -- see its own docstring on
+            # why a [:2] here and a [:2] there would not mean the same thing.
+            decision = resolve_freshness(mine[:2], peer[:2])
         # Every reconciliation outcome is reported, not only the interesting
         # ones. Acceptance item 2 requires the conflict to appear in the log,
         # and the design's accepted trade-off -- with both clipboards changed
