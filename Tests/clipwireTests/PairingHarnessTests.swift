@@ -176,12 +176,15 @@ final class PairingHarnessTests: XCTestCase {
     /// the design and not an accident -- a fake KINDER than the world is
     /// precisely what let the fix ship inert while this file stayed green, and
     /// a fake harsher than it costs only false alarms. See SUBSTITUTION in
-    /// `Tests/fakes/fake_clipboard.py`, which is where that property is now
-    /// pinned: this side used to read it off `imagePixelDifference`'s log line,
-    /// and that decoder went with the comparison it served, so nothing in the
-    /// Swift suite witnesses the sample movement any more. What this test can
-    /// still see is that the bytes came back different at all, asserted below
-    /// against the fakes' own invocation log.
+    /// `Tests/fakes/fake_clipboard.py`, and `ReencodeTests.test_every_pixel_moves`
+    /// in `Tests/fakes/test_fakes.py`, which is where that property is now
+    /// pinned exclusively -- and pinned harder than here, as equality against
+    /// the exact keystream rather than as a reported difference. This side used
+    /// to read it off `imagePixelDifference`'s log line; that decoder went with
+    /// the comparison it served, so nothing in the SWIFT suite witnesses the
+    /// sample movement any more. What this test can still see is that the bytes
+    /// came back different at all, asserted below against the fakes' own
+    /// invocation log.
     ///
     /// WHY TWO RECONNECTS. The PC stamps its re-offer at
     /// `peer_ts + REOFFER_TS_NUDGE_SECONDS` (1 ms) precisely so the first

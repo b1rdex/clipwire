@@ -150,11 +150,12 @@ struct ClipStateStore {
 /// comparison had to name it explicitly; v3.2 deleted that field with the
 /// density fix it existed for, so `sha256` is both what this side announces
 /// and what its clipboard returns. The match branch still returns `stored`
-/// rather than rebuilding a record around `currentHash` -- but with one hash
-/// the two are the same value, so that is now a way of saying "the stored `ts`
-/// and `kind` survive" and nothing more. On the PC, where the store carries an
-/// `origin` the Mac has no use for, returning the record whole is load-bearing
-/// and `resolve_startup_state` says so itself.
+/// rather than rebuilding a record around `currentHash` -- but with the hashes
+/// equal on that branch by definition, what it is now saying is that the
+/// stored `ts` and `kind` survive, and that any field a later version adds
+/// survives with them. On the PC, where the store carries an `origin` the Mac
+/// never records, that second half is load-bearing and `resolve_startup_state`
+/// says so itself.
 ///
 /// Before Task 8 made `pasteboard.read()` kind-aware, this parameter did
 /// not exist and this branch hardcoded `.text`: `resolveCurrentClipState`
