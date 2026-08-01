@@ -427,7 +427,10 @@ final class PasteboardTests: XCTestCase {
     }
 }
 
-// MARK: - Race coverage (added beyond the brief; see task-13-report.md)
+// MARK: - Race coverage (added beyond the brief; see the FIRST plan's
+// task-13-report.md, under 2026-07-30-clipwire-implementation/ -- that Task
+// 13 built this watcher and added this lock. Not v3's Task 13, which shares
+// the number and the file but is the Mac's image path.)
 //
 // The v2 plan's Task 11 (not v3's, which is the send branch's verification --
 // the two plans number independently) found that on the PC side, the watcher
@@ -566,7 +569,9 @@ final class PasteboardConcurrencyTests: XCTestCase {
     }
 }
 
-// MARK: - Fix round 1: changeCount read outside stateLock (see task-13-report.md)
+// MARK: - Fix round 1: changeCount read outside stateLock (see the FIRST
+// plan's task-13-report.md, under 2026-07-30-clipwire-implementation/ --
+// same collision as the MARK above)
 //
 // Review found that the first fix left `changeCount` itself read, and
 // `lastChangeCount` written, *before* `stateLock` was acquired — a gap the

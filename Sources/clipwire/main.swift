@@ -143,13 +143,14 @@ func skewLogLine(peerSentAt: Double?, now: Double) -> String? {
 /// unsynchronized threads can mutate different fields of the same struct
 /// with no ordering guarantee, and two concurrent `Status.write(to:)`
 /// calls would race the same temp-file-then-replace pair. This class
-/// applies the same fix, to the same class of hazard, that the v2 plan's
+/// applies the same fix, to the same class of hazard, that the FIRST plan's
 /// Task 13 already applied to `PasteboardWatcher` (a `stateLock` around
 /// `changeCount`/`echo`) and its Task 14 to `Channel` (a serial `writeQueue`
-/// around pipe writes). The v2 plan's, not this one's: v3's Task 13 is the
-/// Mac's image path, and touched none of these locks. The two plans number
-/// independently -- `PasteboardWatcher`'s own class comment carries the same
-/// warning about the same collision.
+/// around pipe writes) -- the plan whose reports are under
+/// `2026-07-30-clipwire-implementation/`, not this one's. Three plans now
+/// number independently, and the collision is live: v3's own Task 13 is the
+/// Mac's image path and touched neither lock. `PasteboardWatcher`'s class
+/// comment carries the same warning for its own Task 11 collision.
 final class AgentStatus: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
