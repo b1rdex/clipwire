@@ -365,9 +365,21 @@ final class PasteboardWatcher {
 
         let current = pasteboard.changeCount
         guard current != lastChangeCount else { return nil }
-        // Record the new count before any early return, so non-text content
-        // cannot wedge the watcher into rescanning the same item forever —
-        // and, per the class doc comment, record the generation this same
+        // Record the new count before any early return, so an item this poll
+        // declines cannot wedge the watcher into rescanning it forever. Four
+        // returns depend on it, and since Task 13 none of them is about
+        // "non-text" -- an image is emitted now. They are: a read that comes
+        // back with nothing (content of neither kind), an empty body, a body
+        // over its kind's limit, and a suppressed echo.
+        //
+        // Two of the four are loud, which is what makes this load-bearing
+        // rather than merely tidy: the oversize return logs its skip here,
+        // and an unconvertible TIFF logs `could not convert the pasteboard
+        // image to PNG: dropping it` inside `SystemPasteboard.readPNG` before
+        // reading back as nothing. At the 400ms default poll interval, a
+        // wedge turns either into more than 200,000 identical lines a day.
+        //
+        // And, per the class doc comment, record the generation this same
         // locked call is about to read and consult echo for, not one
         // observed earlier and now stale.
         lastChangeCount = current

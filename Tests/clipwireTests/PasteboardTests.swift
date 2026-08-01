@@ -127,6 +127,18 @@ final class PasteboardTests: XCTestCase {
         XCTAssertEqual(seen.count, 1, "changeCount unchanged means no work")
     }
 
+    /// The only test in this suite that puts an UNREADABLE board in front of
+    /// the watcher: content `chooseKind` declines outright, so `read()`
+    /// reports nothing at all. Deliberately not an image -- since Task 13 an
+    /// image is emitted rather than skipped, which is
+    /// `testAnImageOnThePasteboardIsEmittedAsAnImage`'s business.
+    ///
+    /// `setNonText()` is the whole of its teeth. Task 13 briefly deleted that
+    /// call while rewriting the comment beside it, which left three polls of
+    /// an unchanged board and a first assertion that passed because nothing
+    /// had happened -- a duplicate of `testEmitsOnChange` carrying a failure
+    /// message about an event that never occurred. Nothing warned, because
+    /// the only remaining reference to `setNonText()` was in a doc comment.
     func testNonTextIsSkippedButChangeCountIsConsumed() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
@@ -134,16 +146,15 @@ final class PasteboardTests: XCTestCase {
         watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
         // A board offering something this agent syncs neither kind of -- an
-        // RTF-only or file-URL copy. NOT an image: since Task 13 an image is
-        // emitted rather than skipped, which is
-        // `testAnImageOnThePasteboardIsEmittedAsAnImage`'s business.
+        // RTF-only or file-URL copy.
+        pasteboard.setNonText()
         watcher.poll()
         watcher.poll()
-        XCTAssertTrue(seen.isEmpty)
-        pasteboard.set("after the image")
+        XCTAssertTrue(seen.isEmpty, "content of neither kind must not be emitted as either")
+        pasteboard.set("after the unsyncable item")
         watcher.poll()
-        XCTAssertEqual(seen, [Data("after the image".utf8)],
-                       "the image must not have wedged the watcher")
+        XCTAssertEqual(seen, [Data("after the unsyncable item".utf8)],
+                       "and it must not have wedged the watcher into rescanning it forever")
     }
 
     /// Replaces `testAnImageOnThePasteboardIsNotEmittedAsText`, which pinned
