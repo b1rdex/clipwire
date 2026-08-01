@@ -26,7 +26,7 @@ func sha256Hex(_ data: Data) -> String {
 /// this exact same `read()` call, never derived separately: `read()` is Task 8's one
 /// canonical read, returning `(kind:, data:)` or `nil`, so the kind of what was just
 /// hashed is sitting right there in the pair already. This is the one place in the
-/// file that turns a raw `pasteboard.read()` into a (hash, kind) pair; every caller of
+/// target that turns a raw `pasteboard.read()` into a (hash, kind) pair; every caller of
 /// `resolveStartupState` goes through here rather than reading the pasteboard and
 /// deciding a kind independently, which is what keeps a hash and a kind from ever
 /// being paired up wrong. Mirrors `resolve_current_clip_state` on the PC side.
@@ -143,9 +143,9 @@ final class ClipStateAnnouncement {
     }
 }
 
-/// Saves, and logs rather than swallowing if it cannot. Every one of this
-/// file's `clipStateStore.save` calls goes through here -- four of them now:
-/// `announceClipState`, `handleLocalChange`, and `handleFrame`'s `.clip` and
+/// Saves, and logs rather than swallowing if it cannot. Every
+/// `clipStateStore.save` call in the target goes through here -- four of them
+/// now: `announceClipState`, `handleLocalChange`, and `handleFrame`'s `.clip` and
 /// `.imageClip` cases. Counting them here rather than naming a number alone,
 /// since the number has already changed once.
 ///
@@ -160,7 +160,7 @@ final class ClipStateAnnouncement {
 /// the persistent store exists to prevent.
 ///
 /// One function rather than a copy of the same `do/catch` per site:
-/// identical literals repeated in one file is exactly the drift this project
+/// identical literals repeated across the target is exactly the drift this project
 /// has already been bitten by, and `ClipStateStore.save` deliberately throws
 /// so that a CALLER can log -- it just should not be four callers writing the
 /// string out independently.

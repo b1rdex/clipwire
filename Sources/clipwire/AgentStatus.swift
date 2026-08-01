@@ -6,9 +6,9 @@ import Foundation
 ///
 /// Three independent execution contexts touch this after startup:
 /// `Channel`'s `onFrame`/`onStateChange` callbacks run synchronously on
-/// whichever thread calls `channel.run()` (this file's own top-level code,
-/// blocked inside `run()` for the rest of the process's life);
-/// `PasteboardWatcher`'s poll timer and the heartbeat timer below are two
+/// whichever thread calls `channel.run()` (`runAgent`, blocked inside
+/// `run()` for the rest of the process's life);
+/// `PasteboardWatcher`'s poll timer and `runAgent`'s heartbeat timer are two
 /// independent `DispatchSourceTimer`s, both scheduled on
 /// `.global(qos: .utility)` -- a CONCURRENT queue, so the two timers' own
 /// handlers can run on two different worker threads at the same instant,

@@ -7,9 +7,9 @@ import Foundation
 ///
 /// One function rather than the mapping written out at each of its two call
 /// sites (`handleLocalChange` below, and `handleFrame`'s `.sendMine` branch).
-/// Two inline copies is how the second one came to send text only: this file
+/// Two inline copies is how the second one came to send text only: `main.swift`
 /// carried the text codec in both places, so `.sendMine` had to decline an
-/// image it had otherwise verified. Two copies of one rule in one file is the
+/// image it had otherwise verified. Two copies of one rule in one target is the
 /// same drift the two "over the text limit" lines and the three-word
 /// reconciliation vocabulary already guard against across the two languages.
 ///
