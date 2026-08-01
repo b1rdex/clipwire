@@ -112,6 +112,47 @@ be run from the repo root.
    ~/.local/bin/clipwire status
    ```
 
+## Upgrading
+
+The steps above are for a first install. Upgrading is not the same, because launchd is
+executing the binary you are about to replace — copying over it gets the running process
+killed and leaves the file inconsistent, after which *every* invocation exits 137 and prints
+nothing. Stop the agent first:
+
+```sh
+launchctl bootout gui/$UID/dev.b1rdex.clipwire
+swift build -c release
+cp .build/release/clipwire ~/.local/bin/clipwire
+~/.local/bin/clipwire install                    # push the matching agent to the PC
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/dev.b1rdex.clipwire.plist
+```
+
+The `install` step is not optional on an upgrade that changes the wire protocol. The two
+sides negotiate a version in their `hello` frames and refuse to talk across a mismatch, so
+a new binary against an old agent does not sync at all.
+
+## A locked PC cannot serve its clipboard
+
+While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
+call returns in about 20 ms. That much is measured; *why* the lock screen has this effect
+was not established, and the GPaste daemon, the session bus and the compositor all keep
+answering normally throughout — so the usual health checks all pass while nothing works.
+Nothing syncs in either direction until the screen is unlocked, and the Mac's log fills with
+lines like:
+
+```
+remote: wl-paste failed: TimeoutExpired(['wl-paste', '--list-types'], 3)
+```
+
+This is a property of the desktop, not a fault in the sync, and it is why those timeouts
+appear in bursts overnight. Left-over `wl-copy` and `wl-paste` processes belonging to reads
+that could never finish are part of the same picture; they clear on their own once the
+session is unlocked and the selection can change hands again.
+
+Nothing degrades as a result: a read that fails proves nothing about whether the event
+source is alive, so it never counts toward the verdict that switches the agent to faster
+polling.
+
 ## After a GNOME upgrade
 
 Check that the GPaste shell extension is still enabled:
@@ -195,3 +236,10 @@ screenshot copied directly on the PC does currently cost two frames to the Mac �
 original, then the re-encode, back to back — before it settles. The picture that lands is
 still GPaste's re-encoding, though, not a byte-identical copy of what was on the Mac's
 pasteboard.
+
+**A known consequence: a retina screenshot can come back at double size.** The re-encode
+drops the PNG `pHYs` chunk, which is what records pixel density. That does not matter on the
+PC, but the re-encoded picture is what wins the next reconnect, so the Mac ends up holding a
+copy of its *own* screenshot with the density gone. Measured: 100×100 pixels that displayed
+at 50×50 before the round trip display at 100×100 after it. The pixels are all there and
+nothing is lost — it pastes twice as large. Not yet fixed.
