@@ -87,14 +87,16 @@ enum ImagePixelConstants {
 /// Different **samples** still compare different -- re-tagging does not turn
 /// this into a dimension check. That is pinned by its own test.
 ///
-/// One premise here is not measured: that GPaste's re-encode leaves the samples
-/// alone. The harness's fake preserves them by construction and so cannot
-/// answer it, and the only real observation is that the byte count grew from
-/// 105,700 to 180,287, which proves different filtering and says nothing about
-/// samples. `imagePixelDifference` below logs the evidence on the mismatch
-/// path so the first real reconnect settles it. If it turns out they move, no
-/// pixel comparison can work and the answer is provenance instead -- the PC
-/// announcing the hash it was GIVEN beside the hash it read back.
+/// That one premise -- that GPaste's re-encode leaves the samples alone -- was
+/// not measured when this shipped, and the harness could not measure it:
+/// `Tests/fakes/`'s substitution preserved samples by construction, so it
+/// agreed with whatever this file assumed. `imagePixelDifference` below logged
+/// the evidence on the mismatch path, the first real reconnect settled it, and
+/// the answer is at the top of this file: the samples move, no pixel comparison
+/// can work, and the replacement is provenance -- the PC announcing the hash it
+/// was GIVEN beside the hash it read back. The fake has since been made
+/// deliberately HARSHER than GPaste rather than kinder, so no comparison of
+/// image content can pass the harness again.
 ///
 /// **Every uncertain answer is `false`.** Undecodable bytes, a context that
 /// cannot be allocated, a decoder that reports no pixel data: all of them mean
@@ -206,18 +208,22 @@ private func normalizedRGBA(_ image: CGImage) -> Data? {
 /// Describes why two images did not compare equal, for the log line on the
 /// mismatch path. Returns `nil` when there is nothing useful to say.
 ///
-/// This exists because the fix it reports on rests on an unmeasured premise:
-/// that GPaste's re-encode leaves the pixel samples alone. Our harness's fake
-/// re-encoder preserves them by construction, so it cannot answer the
-/// question, and the only real observation is that the byte count grew from
-/// 105,700 to 180,287 -- which proves different filtering and says nothing
+/// This exists because the fix it reports on rested on an unmeasured premise:
+/// that GPaste's re-encode leaves the pixel samples alone. Nothing in the
+/// harness could answer that -- `Tests/fakes/`'s substitution preserved samples
+/// by construction -- so the only real observation was that the byte count grew
+/// from 105,700 to 180,287, which proves different filtering and says nothing
 /// about samples.
 ///
-/// So the release measures it. If the premise holds, this line never appears
-/// for a re-encoded screenshot; if it appears with a small delta, the samples
-/// moved and the whole comparison approach needs replacing with provenance --
+/// So the release measured it, through this line, and the premise was FALSE:
+/// 398,267 of 614,400 bytes differ, max delta 20. See the top of this file. The
+/// comparison it reports on is inert, and the replacement is provenance --
 /// having the PC announce the hash it was GIVEN alongside the hash it read
 /// back, which needs no pixels at all and survives any transformation.
+///
+/// This line outlives the comparison, twice over: it is what produced the
+/// measurement, and it is what the pairing harness now asserts to prove its
+/// fake clipboard really moved the samples rather than merely re-encoded them.
 ///
 /// **Reports a floor rather than a count once the difference is obvious**, and
 /// that is the difference between a diagnostic and a stall. The first version

@@ -136,53 +136,75 @@ final class PairingHarnessTests: XCTestCase {
         try harness.waitForTheMacsPasteboard(toHold: .image, PairingHarness.png)
     }
 
-    // MARK: - the density fix, in the loop that produced the bug
+    // MARK: - the density bug, in the loop that produces it
 
-    /// v3.1's user-visible defect, reproduced and then shown fixed by the two
-    /// implementations actually running against each other.
+    /// *** THIS TEST DOCUMENTS A KNOWN-UNFIXED BUG. *** Three of its
+    /// assertions pin the BROKEN outcome on purpose, because that is what the
+    /// two implementations actually do when run against each other. Read this
+    /// comment before reading them as a specification.
     ///
-    /// WHAT USED TO HAPPEN. A retina screenshot copied on the Mac carries
-    /// `pHYs` -- 160x120 pixels that `NSImage` displays at 80x60. It reaches
-    /// the PC, GPaste takes the selection over and re-offers a re-encode with
-    /// every ancillary chunk gone, and the PC hashes WHAT IT READ BACK, which
-    /// is correct and is not what this test questions. The PC therefore holds
-    /// a different hash at a later timestamp, wins the next reconnect, and
-    /// hands the Mac back a copy of its own screenshot with the density gone
-    /// -- which then pastes at 160x120. Measured on the owner's machines: 259
-    /// bytes in, 632 back, displaying at double size after one reconnect.
+    /// WHAT HAPPENS. A retina screenshot copied on the Mac carries `pHYs` --
+    /// 160x120 pixels that `NSImage` displays at 80x60. It reaches the PC,
+    /// GPaste takes the selection over and re-offers something else, and the
+    /// PC hashes WHAT IT READ BACK, which is correct and is not what this test
+    /// questions. The PC therefore holds a different hash at a later timestamp,
+    /// wins the next reconnect, and hands the Mac back a copy of its own
+    /// screenshot with the density gone -- which then pastes at 160x120.
+    /// Measured on the owner's machines: 259 bytes in, 632 back, displaying at
+    /// double size after one reconnect.
     ///
-    /// WHAT THE HARNESS STAGES. The fake clipboard's substituting mode, wired
-    /// in for the first time here (task 4 left it deliberately unwired, with
-    /// `writeClipboardState` already preserving the flag). It is a REAL
-    /// re-encode -- inflate, unfilter, re-filter, re-deflate, `IHDR` carried
-    /// over byte for byte -- so the decoded pixels are identical BY
-    /// CONSTRUCTION and the comparison the fix rests on cannot fail for the
-    /// wrong reason. Measured on this fixture: 95 bytes in, 74 out,
-    /// `IHDR pHYs IDAT IEND` becoming `IHDR IDAT IEND`, samples equal.
+    /// WHY IT IS STILL BROKEN, HAVING ONCE BEEN "FIXED". v3.1 fixed it by
+    /// comparing decoded pixels: if the peer's image has the same pixels as the
+    /// local one, keep the local bytes, which are the ones carrying the
+    /// metadata. That comparison was tuned against a fake clipboard whose
+    /// substitution preserved samples by construction, and it passed here. On
+    /// the real machines it never fires -- GPaste applies the image's embedded
+    /// ICC profile as it loads it and writes the result untagged, so the
+    /// samples move: 398,267 of 614,400 bytes, max delta 20, on a 480x320
+    /// screenshot with the Mac's original captured before it travelled. See
+    /// `ImagePixels.swift`, which records that measurement and both strategies
+    /// tried against it. The fix is inert in production and inert here.
     ///
-    /// WHY TWO RECONNECTS, WHICH IS ALSO WHY THE THIRD ASSERTION HAS TEETH.
-    /// The PC stamps its re-offer at `peer_ts + REOFFER_TS_NUDGE_SECONDS`
-    /// (1 ms) precisely so the first reconnect resolves DETERMINISTICALLY
-    /// rather than falling to the hex tie-break -- see
-    /// `_consume_image_reoffer`'s own account of what that buys and what it
-    /// costs. So convergence is one frame back on the first reconnect and
-    /// `doNothing` from then on, and it is the SECOND reconnect that runs the
-    /// startup seed against a store whose two hashes differ. With only one
-    /// reconnect, a fix that kept the local bytes but recorded no
-    /// `localSHA256` would still pass everything here: the false
+    /// WHAT THE HARNESS STAGES NOW. The fake clipboard's substituting mode,
+    /// deliberately HARSHER than the real transformation: it drops the
+    /// ancillary chunks AND moves every pixel sample, so no comparison of image
+    /// content can pass it. Measured on this fixture: 95 bytes in, 84 out,
+    /// `IHDR pHYs IDAT IEND` becoming `IHDR IDAT IEND`, and all 16 bytes of the
+    /// decoded 2x2 RGBA differing with a max delta of 236 -- which is this
+    /// test's own log line, not a separate calculation. That asymmetry is
+    /// the design and not an accident -- a fake KINDER than the world is
+    /// precisely what let the fix ship inert while this file stayed green, and
+    /// a fake harsher than it costs only false alarms. See SUBSTITUTION in
+    /// `Tests/fakes/fake_clipboard.py`.
+    ///
+    /// WHY TWO RECONNECTS. The PC stamps its re-offer at
+    /// `peer_ts + REOFFER_TS_NUDGE_SECONDS` (1 ms) precisely so the first
+    /// reconnect resolves DETERMINISTICALLY rather than falling to the hex
+    /// tie-break -- see `_consume_image_reoffer`'s own account of what that
+    /// buys and what it costs. So convergence is one frame back on the first
+    /// reconnect and `doNothing` from then on, and it is the SECOND reconnect
+    /// that runs the startup seed against the store the first one left behind.
+    /// With only one reconnect, a store that described a clipboard this Mac
+    /// does not hold would pass everything here: the false
     /// `clipboard changed while apart` it produces needs a later startup to
-    /// compare the store against a clipboard it no longer describes.
+    /// notice.
     ///
-    /// SO THE THREE ASSERTIONS GUARD THREE SEPARATE HALVES OF THE FIX:
+    /// SO THE ASSERTIONS SAY, IN ORDER:
     ///
-    /// - the Mac still holds its ORIGINAL bytes -> it did not apply the
-    ///   peer's re-encode;
-    /// - the second reconnect resolves `doNothing` -> it adopted the peer's
-    ///   hash as canonical, so the two sides agree instead of trading frames
-    ///   forever;
-    /// - no `clipboard changed while apart` anywhere -> it recorded its own
-    ///   bytes' hash in `localSHA256`, so the seed still sees unchanged
-    ///   content as unchanged.
+    /// - the Mac ends up holding the PEER's bytes -> the density is gone and
+    ///   the image pastes at double size. THE BUG, live, unfixed;
+    /// - it adopts the peer's hash as canonical, with no `localSHA256` ->
+    ///   which is right for the applying branch, because it wrote exactly the
+    ///   bytes it hashed and there is no divergence to record;
+    /// - the pixel comparison ran and reported a difference -> direct evidence
+    ///   from `ImageIO`, the decoder production uses, that the fake really did
+    ///   move the samples. Without it, a substitution that quietly stopped
+    ///   perturbing would leave this test asserting the old fix's failure mode
+    ///   against a world where it would have worked;
+    /// - the second reconnect resolves `doNothing`, and no
+    ///   `clipboard changed while apart` appears -> the loop CONVERGES. The
+    ///   bug costs one degraded image, not an endless exchange of frames, and
+    ///   the store still describes what this clipboard returns.
     ///
     /// A `waitForPeer` on the first reconnect is asserted too, and it is
     /// diagnostic rather than decorative: it is the only place the 1 ms nudge
@@ -191,7 +213,7 @@ final class PairingHarnessTests: XCTestCase {
     /// `JSONDecoder` (0.001 on a ~1.75e9 unix timestamp) and the tie-break is
     /// deciding -- which would look like a flaky harness rather than the
     /// precision loss it is.
-    func testARetinaScreenshotDoesNotComeBackFromThePCAtDoubleSize() throws {
+    func testARetinaScreenshotStillComesBackFromThePCAtDoubleSize() throws {
         let harness = try connected(substituting: true)
 
         // The Mac's user copies a screenshot: a PNG carrying `pHYs`.
@@ -217,28 +239,45 @@ final class PairingHarnessTests: XCTestCase {
         XCTAssertEqual(try harness.decisionOnThisConnection(), "waitForPeer",
                        "the PC's re-offer is stamped 1ms after the Mac's copy, so this side must " +
                        "lose deterministically rather than by hex tie-break")
-        // Settles on the canonical hash, which is what BOTH a fixed and a
-        // broken `.imageClip` case end up storing -- so the assertions below
-        // are what fails when the fix is gone, not this wait.
+        // Settles on the canonical hash, which is what BOTH branches of
+        // `.imageClip` end up storing -- so the assertions below are what
+        // describes which one ran, not this wait.
         try harness.waitForTheMacsStoreToRecord(sha256Hex(reEncoded))
 
-        XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
-                       "the Mac applied the PC's re-encode over its own screenshot: `pHYs` is " +
-                       "gone and the image now pastes at double size")
+        // THE BUG, asserted as it is rather than as it should be. v3.1's fix
+        // would have kept `PairingHarness.png` here; the pixel comparison it
+        // rests on cannot see past a transformation that moves samples, which
+        // is what the real GPaste does and what the fake now does too.
+        XCTAssertEqual(harness.pasteboard.read()?.data, reEncoded,
+                       "the Mac kept its own screenshot, which is the fixed behaviour and not " +
+                       "the measured one -- if this passes, either the fake stopped perturbing " +
+                       "or the density bug was actually fixed, and the comment above is stale")
         XCTAssertEqual(harness.macsClipState()?.state.sha256, sha256Hex(reEncoded),
                        "the Mac must adopt the PEER's hash as canonical, or the two sides never " +
                        "agree and a frame comes back on every reconnect forever")
-        XCTAssertEqual(harness.macsClipState()?.localSHA256, sha256Hex(PairingHarness.png),
-                       "the Mac must record ITS OWN bytes' hash locally, or the next startup " +
-                       "seed measures the clipboard against content it does not hold")
+        XCTAssertNil(harness.macsClipState()?.localSHA256,
+                     "the applying branch wrote the bytes it hashed, so there is no local " +
+                     "divergence to record; a hash here would send the next startup seed " +
+                     "looking for content this clipboard does not hold")
+        // Direct evidence from `ImageIO` -- the decoder `imagePixelsIdentical`
+        // itself uses -- that the fake moved the samples, rather than an
+        // inference from the bytes differing. `imagePixelDifference` writes
+        // this line from inside the comparison, and only on the branch where
+        // a local image existed and lost, so its presence says both that the
+        // comparison ran and that it said no.
+        XCTAssertTrue(harness.logHolds("the peer's image differs from the local one"),
+                      "the pixel comparison did not report a difference, so the fake's " +
+                      "substitution is no harsher than the re-encode that made this bug " +
+                      "invisible -- everything below is being asserted against a kind world")
 
         // --- the second reconnect: converged ------------------------------
         try harness.reconnect()
         XCTAssertEqual(try harness.decisionOnThisConnection(), "doNothing",
                        "both sides now hold the same hash at the same ts; anything else here is " +
                        "a frame this loop will keep exchanging forever")
-        XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
-                       "the Mac's original bytes must survive the converged reconnect too")
+        XCTAssertEqual(harness.pasteboard.read()?.data, reEncoded,
+                       "the converged reconnect must not move the clipboard again: the bug " +
+                       "costs one degraded image, not a fresh one on every reconnect")
 
         // Last, and deliberately so. `agentLog()` flushes this side's queue,
         // but a line the PC has written to its stderr reaches that file only
@@ -329,9 +368,11 @@ private final class PairingHarness {
     /// A real 2x2 PNG carrying `pHYs` (5669 px/m ≈ 144 dpi, what a retina
     /// screenshot has). Written out as bytes rather than built with AppKit so
     /// that what crosses the wire is a fixed, inspectable value and a failure
-    /// diff is readable. The density chunk is deliberate groundwork: v3.1's
-    /// second half is about `pHYs` surviving a round trip, and the fake
-    /// clipboard's substituting mode drops exactly this chunk.
+    /// diff is readable. The density chunk is what makes this fixture the
+    /// density bug's: the fake clipboard's substituting mode drops exactly this
+    /// chunk, the way GPaste does, and `pHYs` NOT surviving the round trip is
+    /// the defect `testARetinaScreenshotStillComesBackFromThePCAtDoubleSize`
+    /// records as unfixed.
     static let png = Data([
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02,
@@ -376,9 +417,10 @@ private final class PairingHarness {
     private let logPath: String
     /// The two clip-state stores, one per side, both inside this run's temp
     /// directory. They are what a reconnect actually reconciles -- each side's
-    /// answer to "what do I hold and how old is it" -- and the density fix is
-    /// visible in the Mac's as two hashes that differ, so the test reads them
-    /// directly rather than inferring their contents from behaviour.
+    /// answer to "what do I hold and how old is it" -- and which of
+    /// `.imageClip`'s two branches ran is visible in the Mac's as whether the
+    /// two hashes differ, so the test reads them directly rather than
+    /// inferring their contents from behaviour.
     private let macClipStatePath: String
     private let agentClipStatePath: String
     private let log: Log
@@ -802,11 +844,11 @@ private final class PairingHarness {
     // MARK: - watching the substitution, and the two stores
 
     /// Waits until the fake clipboard has actually SUBSTITUTED an image the
-    /// agent wrote -- GPaste taking the selection over and re-offering a
-    /// re-encode -- and hands back the bytes it stored instead.
+    /// agent wrote -- GPaste taking the selection over and re-offering
+    /// something else -- and hands back the bytes it stored instead.
     ///
     /// Read from the fakes' own invocation log (`... 95 bytes substituted as
-    /// 74 bytes`) rather than inferred from the stored body differing. The two
+    /// 84 bytes`) rather than inferred from the stored body differing. The two
     /// are not the same claim: `wl-copy` falls back to storing what it was
     /// given whenever `reencode_png` raises, and says so in that same line, so
     /// a fixture the re-encoder could not model would leave the clipboard
