@@ -42,7 +42,7 @@ final class Log: Sendable {
     /// immediately; a caller that logs a message and then calls `exit(_:)`
     /// cannot assume the write has happened, because `exit` tears the
     /// process down without waiting for anything still queued on `queue`.
-    /// Confirmed empirically (Task 15): `main.swift`'s fatal-config-error
+    /// Confirmed empirically (Task 15): `runAgent`'s fatal-config-error
     /// path used to call `log.line("\(error)")` immediately before
     /// `return 0` (which reaches `exit(0)` at the top level), and the log
     /// file was reliably left empty across repeated runs -- a brand-new

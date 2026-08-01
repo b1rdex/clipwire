@@ -13,7 +13,7 @@ enum ClipStateStoreConstants {
 /// still answer "how old is what I hold" for content it never personally
 /// observed. Written on every locally-observed clipboard change, on every
 /// applied remote clip, and by the startup announcement -- each of the four
-/// through `persistClipState` (main.swift), which is where they are
+/// through `persistClipState` (ClipStateAnnouncement.swift), which is where they are
 /// enumerated. Read at startup by whoever calls `resolveStartupState` below
 /// with the result, and again by `handleFrame`'s `.clipState` case.
 struct ClipStateStore {
@@ -118,7 +118,7 @@ struct ClipStateStore {
 ///
 /// Before Task 8 made `pasteboard.read()` kind-aware, this parameter did
 /// not exist and this branch hardcoded `.text`: `resolveCurrentClipState`
-/// (main.swift), this function's only non-test caller, could only ever
+/// (ClipStateAnnouncement.swift), this function's only non-test caller, could only ever
 /// derive `currentHash` from a text read, so there was no independent
 /// "current kind" to thread through yet. Task 6's own note on this function
 /// named the exact failure a purely mechanical fix to the CALLER (not to

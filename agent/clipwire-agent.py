@@ -3,7 +3,32 @@
 
 Only frames go to stdout. Everything else goes to stderr — a stray print()
 on stdout desynchronises the protocol.
+
+Contents. This stays one file on purpose: install scp's exactly this path,
+so a package would lose the copy's atomicity and a build step would put a
+generator between the file a person reads and the file the PC runs. What
+replaces the split is a declared order — the banners below, in this order,
+pinned by agent/tests/test_source_layout.py:
+
+  1. Frame codec
+  2. Clip payloads
+  3. Freshness
+  4. Agent runtime
+  5. class Agent
+  6. Clipboard state
+  7. Wayland clipboard
+  8. Selftest
+  9. Watchers and entry
+
+Selftest sits ahead of the watchers rather than after them. That is the
+file's real order; the list describes the file, because the alternative —
+moving code so the file matches a tidier list — is the thing the order is
+meant to protect against.
 """
+
+# ============================================================================
+# 1. Frame codec — constants, FrameError, encode_frame, decode_frame
+# ============================================================================
 
 # Three separate bounds, and they must stay separate even while two of them
 # hold the same number. The frame cap is what the decoder enforces; the two
@@ -58,6 +83,10 @@ def decode_frame(buffer):
     del buffer[:total]
     return frame_type, payload
 
+
+# ============================================================================
+# 2. Clip payloads — text and image, encode_*/decode_*
+# ============================================================================
 
 import struct
 
@@ -138,6 +167,10 @@ def decode_image_payload(payload):
         raise ClipPayloadError("image payload carries no image")
     return ts, bytes(body)
 
+
+# ============================================================================
+# 3. Freshness — decisions, kinds, clip-state codec, resolve_freshness
+# ============================================================================
 
 import json
 import math
@@ -333,6 +366,10 @@ def resolve_freshness(mine, peer):
     return SEND_MINE if mine_hash > peer_hash else WAIT_FOR_PEER
 
 
+# ============================================================================
+# 4. Agent runtime — version, phases, logging, skew
+# ============================================================================
+
 import os
 import select
 import sys
@@ -435,6 +472,10 @@ def skew_log_line(peer_sent_at, now):
                 % skew)
     return "peer clock skew %.1fs" % skew
 
+
+# ============================================================================
+# 5. class Agent — the protocol loop, with NeverReadyClipboard beside it
+# ============================================================================
 
 class Agent:
     def __init__(self, stdin, stdout, clipboard, clip_state_path=None):
@@ -1709,6 +1750,10 @@ class NeverReadyClipboard:
         pass
 
 
+# ============================================================================
+# 6. Clipboard state — XDG paths, the store, resolution, announcing
+# ============================================================================
+
 import subprocess
 
 SUBPROCESS_TIMEOUT = 3
@@ -2123,6 +2168,10 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     return resolved
 
 
+# ============================================================================
+# 7. Wayland clipboard — choose_kind, WaylandClipboard, subprocess plumbing
+# ============================================================================
+
 def wayland_socket_path(env=None):
     return os.path.join(runtime_dir(env), "wayland-0")
 
@@ -2457,6 +2506,10 @@ class WaylandClipboard:
                 log("wl-copy went away before the clip was handed over: %r" % error)
 
 
+# ============================================================================
+# 8. Selftest — _select_clipboard, selftest
+# ============================================================================
+
 def _select_clipboard():
     if os.environ.get("CLIPWIRE_FAKE_CLIPBOARD") == "never-ready":
         return NeverReadyClipboard()
@@ -2504,6 +2557,10 @@ def selftest():
 
     return 0 if ok else 1
 
+
+# ============================================================================
+# 9. Watchers and entry — GPaste, polling, the safety net, main, __main__
+# ============================================================================
 
 import threading
 
