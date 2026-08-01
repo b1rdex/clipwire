@@ -275,6 +275,50 @@ final class PasteboardTests: XCTestCase {
                        "one line per clipboard change, not one per tick; got: \(contents)")
     }
 
+    /// The same property as the test above, through the OTHER loud early
+    /// return, and it is the one that test cannot reach: a read that comes
+    /// back with nothing. Both are "record `lastChangeCount` before any early
+    /// return"; the oversize return is loud in `pollLocked` itself, while this
+    /// one is loud one layer DOWN -- `SystemPasteboard.readPNG` logs
+    /// `could not convert the pasteboard image to PNG: dropping it` and then
+    /// reports nothing, so through the `PasteboardReading` seam the two are
+    /// indistinguishable. That is exactly why this test drives a real
+    /// `SystemPasteboard` over a fake backend instead of a `FakePasteboard`:
+    /// the line that hurts lives below the seam every other watcher test uses.
+    ///
+    /// A TIFF `NSBitmapImageRep` cannot decode is the realistic source. Left
+    /// on the pasteboard it is polled forever, so a watcher that failed to
+    /// consume the changeCount would log this line at the 400ms default
+    /// interval -- over 200,000 a day, crossing the SSH channel into the Mac's
+    /// own log, which is the same flood this branch already paid to remove
+    /// once in Task 7.
+    ///
+    /// Verified to fail against `lastChangeCount = current` moved below only
+    /// the unreadable-read return -- the mutation that all 234 other tests
+    /// pass.
+    func testAnUnreadableItemIsLoggedOncePerChangeNotOncePerPoll() {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-pasteboard-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        // Offered as an image, with bytes no TIFF decoder accepts -- the same
+        // fixture `testAFailedConversionReadsAsNothingAndIsLogged` uses to
+        // pin the conversion failure itself.
+        let board = FakePasteboardBackend(types: [.tiff], data: [.tiff: Data("not a tiff".utf8)])
+        let watcher = PasteboardWatcher(pasteboard: SystemPasteboard(board, log: log),
+                                        pollInterval: 0.4, log: log)
+
+        board.changeCount = 1   // the user copied it; nothing has changed since
+        watcher.poll()
+        watcher.poll()
+        watcher.poll()
+        log.flush()
+
+        let contents = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        XCTAssertEqual(contents.components(separatedBy: "could not convert").count - 1, 1,
+                       "one line per clipboard change, not one per tick; got: \(contents)")
+    }
+
     /// The other half of the image boundary, and deliberately NOT the shape
     /// its text sibling
     /// (`testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt`)
