@@ -3310,8 +3310,11 @@ class TestIncomingClipState(unittest.TestCase):
         agent._resolve_clip_state(peer, mine=mine)
 
         line = next(l for l in log_lines if "reconciled with the peer" in l)
-        self.assertIn("mine=image", line)
-        self.assertIn("peer=text", line)
+        # One literal, not two independent substrings: pins the separator and
+        # the spacing too, the same shape as the "over the image limit" lines
+        # elsewhere in this suite, so a change that reordered the pair or
+        # dropped the space still goes red here.
+        self.assertIn("(mine=image peer=text)", line)
 
     def test_the_line_says_none_when_a_side_holds_nothing(self):
         """The complement: neither side's hash implies neither side's kind,
@@ -3322,8 +3325,7 @@ class TestIncomingClipState(unittest.TestCase):
         agent._resolve_clip_state((None, 1000.0, None), mine=(None, 5000.0, None))
 
         line = next(l for l in log_lines if "reconciled with the peer" in l)
-        self.assertIn("mine=none", line)
-        self.assertIn("peer=none", line)
+        self.assertIn("(mine=none peer=none)", line)
 
     def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
         """The reboot flow (acceptance item 5), where the stash is stale by
