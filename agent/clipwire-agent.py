@@ -455,11 +455,16 @@ class Agent:
         # hash: a second comparison branch is exactly the kind of mirrored
         # drift this project has already been bitten by twice, and holding
         # a hash instead of bytes is what keeps a synced image's pixels
-        # out of memory here once a later task starts syncing them. Every
-        # comparison against this field is itself still text-only for now
-        # (see _observe_local_change and _resolve_clip_state) -- the shape
-        # is ready for a kind other than KIND_TEXT before any call site
-        # actually produces one.
+        # out of memory here once a later task starts syncing them.
+        # _observe_local_change's own comparison against this field is
+        # text-only for now (its non-text guard already returned before
+        # ever reaching it). _resolve_clip_state's comparison is NOT
+        # text-only by itself -- it is kind-generic -- but its outcome
+        # stays text-only in practice today because of the
+        # `last_seen_text is not None` gate beside it (see that field's
+        # own comment), not because of this comparison. The shape is ready
+        # for a kind other than KIND_TEXT before any call site actually
+        # produces one.
         self._last_seen = None
         # Companion to _last_seen, holding the ACTUAL BYTES the pair
         # describes -- but ONLY when _last_seen's kind is KIND_TEXT: set
@@ -480,10 +485,10 @@ class Agent:
         # for one call site, not a second copy of the rule Task 9 exists to
         # keep singular.
         self._last_seen_text = None
-        # Guards _last_written/_write_gen/_last_seen only. A separate lock
-        # from _write_lock (which guards stdout) on purpose: nesting them
-        # would invite a deadlock later, and this one is held across
-        # nothing that ever blocks.
+        # Guards _last_written/_write_gen/_last_seen/_last_seen_text only. A
+        # separate lock from _write_lock (which guards stdout) on purpose:
+        # nesting them would invite a deadlock later, and this one is held
+        # across nothing that ever blocks.
         self._echo_lock = threading.Lock()
         # Serializes _local_change against ITSELF. A third lock rather than a
         # wider _echo_lock, deliberately: this one IS held across a wl-paste
@@ -706,19 +711,23 @@ class Agent:
             text = last_seen_text
         else:
             # Task 7 made read() kind-aware; this branch stays text-only
-            # until Task 11 teaches it to read by mine's OWN kind and send
-            # a non-text kind too -- see _observe_local_change's own
-            # comment on this same scope boundary. mine[2] can already be
-            # KIND_IMAGE here now that resolve_startup_state no longer
-            # hardcodes KIND_TEXT: an image-only clipboard resolves a real
-            # (hash, ts, KIND_IMAGE) triple instead of a None hash, which
-            # makes SEND_MINE reachable for it where it previously never
-            # was. Sending that hash's bytes as a TYPE_CLIP text frame
-            # would be a worse outcome than not sending at all, so a
-            # non-text read is treated the same as no read -- this
-            # connection silently does not sync the image, exactly as it
-            # silently does not today; Task 11 is where it starts sending
-            # it correctly instead.
+            # until Task 11 teaches it to read by mine's OWN kind and
+            # verify the hash before trusting it -- see _observe_local_change's
+            # own comment on this same scope boundary. Task 11's own scope
+            # stops at that verification: actually sending a non-text kind
+            # from here is Task 12's job (PC images end to end -- on_frame,
+            # _write_clip, _observe_local_change and clipboard_became_ready
+            # all need the wiring together, per that method's own comment),
+            # not Task 11's. mine[2] can already be KIND_IMAGE here now that
+            # resolve_startup_state no longer hardcodes KIND_TEXT: an
+            # image-only clipboard resolves a real (hash, ts, KIND_IMAGE)
+            # triple instead of a None hash, which makes SEND_MINE reachable
+            # for it where it previously never was. Sending that hash's
+            # bytes as a TYPE_CLIP text frame would be a worse outcome than
+            # not sending at all, so a non-text read is treated the same as
+            # no read -- this connection silently does not sync the image,
+            # exactly as it silently does not today; Task 12 is where it
+            # starts sending it correctly instead.
             read = self.clipboard.read()
             text = read[1] if read is not None and read[0] == KIND_TEXT else None
         if not text:
@@ -799,12 +808,17 @@ class Agent:
         # either. The previous asymmetry ran in the destructive direction,
         # which is worse than losing a convenience. Do not "fix" this back.
         read = self.clipboard.read()
-        # _last_seen is a (kind, hash) pair (Task 9), but every comparison
-        # against it is still text-only -- see _observe_local_change's own
-        # comment on that scope boundary. An image-only clipboard at
-        # connect time therefore seeds no baseline yet, exactly as an empty
-        # one already seeds none: there is nothing for a text-only
-        # comparison to ever match an image's kind against.
+        # _last_seen is a (kind, hash) pair (Task 9); this seed only ever
+        # produces a KIND_TEXT pair or None, never KIND_IMAGE.
+        # _observe_local_change's own comparison is genuinely text-only (it
+        # hardcodes KIND_TEXT on its own side), so a KIND_IMAGE seed could
+        # never match there. _resolve_clip_state's comparison is
+        # kind-generic, but its fast path also requires
+        # `last_seen_text is not None` (see that field's own comment), and
+        # _last_seen_text can only ever hold text bytes -- so a KIND_IMAGE
+        # seed would leave it None and could never be used there either.
+        # An image-only clipboard at connect time therefore seeds no
+        # baseline yet, exactly as an empty one already seeds none.
         seed_text = read[1] if read is not None and read[0] == KIND_TEXT else None
         seed = (KIND_TEXT, sha256_hex(seed_text)) if seed_text is not None else None
         with self._echo_lock:
@@ -1006,8 +1020,8 @@ class Agent:
         The snapshot block below is what closes it: taken while this lock is
         held, it reads a _last_seen the winner has already advanced, so the
         sibling recognises the content as already synced and returns at the
-        `text == last_seen` check. There is deliberately no separate re-read --
-        the existing snapshot IS the read-after-acquire.
+        `(KIND_TEXT, sha256) == last_seen` check. There is deliberately no
+        separate re-read -- the existing snapshot IS the read-after-acquire.
 
         It BLOCKS rather than skipping, which matters: PollingWatcher's
         `previous` has already advanced past the change it is reporting, so a

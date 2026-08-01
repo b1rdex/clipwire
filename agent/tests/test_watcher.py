@@ -2642,11 +2642,13 @@ class TestIncomingClipState(unittest.TestCase):
         the CORRECT mine[1] timestamp, which looks like a valid, fresh
         reconciliation response to the peer.
 
-        _last_seen already holds the applied clip's exact text (_write_clip
-        sets it before spawning wl-copy) -- and it is verified against
-        mine's hash before being trusted, so a stale/unrelated _last_seen
-        (e.g. clipboard_became_ready's own connect-time seed) still falls
-        back to a live read exactly as before.
+        _last_seen_text already holds the applied clip's exact bytes
+        (_write_clip sets it, alongside _last_seen's own (kind, hash) pair,
+        before spawning wl-copy) -- and _last_seen is verified against
+        mine's (kind, hash) before last_seen_text is trusted, so a
+        stale/unrelated _last_seen (e.g. clipboard_became_ready's own
+        connect-time seed) still falls back to a live read exactly as
+        before.
 
         QueueClipboard is the right double here, unmodified: its write()
         already never affects what a subsequently-queued read() returns --
