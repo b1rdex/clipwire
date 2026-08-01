@@ -247,6 +247,21 @@ class ScriptedClipboard:
     def read(self):
         return None
 
+    def probe(self):
+        """The poll loop's own entry point, and NOT dead code here:
+        TestClipboardTransitionLogging leaves make_watcher unpatched, so a
+        real PollingWatcher runs against this double. Without probe(), every
+        tick raised AttributeError into _handle_observer_error, which logs
+        and carries on -- so the loop was silently dead for the whole test
+        and its assertions passed on the frames alone. They still
+        discriminate, but any FUTURE assertion about poll behaviour in this
+        file would have passed vacuously.
+
+        None, matching read(): this double is about the phase machine, and
+        a clipboard that reports nothing is what keeps the poll from
+        signalling into assertions that are not about it."""
+        return None
+
     def write(self, kind, data):
         pass
 
@@ -388,6 +403,13 @@ class ScriptedClipboardWithContent:
         # this file's own TestClipStateOrderingAcrossRealDispatch constructs
         # one of these with.
         return (KIND_TEXT, self._read_value) if self._read_value else None
+
+    def probe(self):
+        """This double's tests DO patch make_watcher, so nothing reaches
+        the poll loop today -- present because both doubles model the same
+        two-method clipboard contract, and the one above was already
+        silently failing every tick for want of it."""
+        return self.read()
 
     def write(self, kind, data):
         self.written.append((kind, data))

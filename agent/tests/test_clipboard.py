@@ -396,6 +396,47 @@ class TestProbeIsCheapForImages(unittest.TestCase):
         self.assertNotEqual(token, read)
         self.assertNotIsInstance(token[1], bytes)
 
+    def test_a_reordered_type_list_is_not_a_change(self):
+        """The token is compared with `!=` by PollingWatcher.pump, so its
+        ORDER is as load-bearing as its membership -- and nothing in this
+        chain has a live compositor to establish that `wl-paste
+        --list-types` prints a stable order for an unchanged selection.
+
+        If it does not, the consequence is precisely the defect this
+        release exists to fix: pump signals a change nobody made,
+        _observe_tick arms its verdict, and one more silent tick CONFIRMS
+        it -- a healthy install declared dead and dropped to 1-second
+        polling for the rest of the connection. Under the old body
+        comparison the bytes were stable, so this is a new input class
+        rather than a pre-existing risk.
+
+        sorted() removes the assumption instead of betting on it, at no
+        cost: the token becomes a membership comparison, and every real
+        change alters the membership."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"image/png\nimage/webp\nimage/tiff\n"),
+            _completed(stdout=b"image/tiff\nimage/png\nimage/webp\n"),
+        ]):
+            first = clipboard.probe()
+            second = clipboard.probe()
+        self.assertEqual(first, second,
+                         "the same types in a different order are the same clipboard")
+
+    def test_a_genuinely_different_type_list_is_still_a_change(self):
+        """The complement, and what keeps the sort from being a way to
+        stop noticing things: order-insensitive is not change-insensitive.
+        A selection offering a different SET of formats is a different
+        selection, and the token must say so."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"image/png\nimage/webp\n"),
+            _completed(stdout=b"image/png\nimage/tiff\n"),
+        ]):
+            first = clipboard.probe()
+            second = clipboard.probe()
+        self.assertNotEqual(first, second)
+
     def test_a_second_image_probe_with_the_same_types_compares_equal(self):
         """What makes the token usable as `previous` at all -- and, said
         plainly, what the added latency IS: two selections offering the

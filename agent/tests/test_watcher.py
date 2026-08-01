@@ -2173,14 +2173,15 @@ class TestEchoBookkeeping(unittest.TestCase):
     # from the one-shot echo value* (_last_written/expected). With no
     # memory of what was last synced, any signal that is not a real change
     # -- a non-change GPaste Update (e.g. a history deletion), or a
-    # transient read() glitch in polling mode -- re-sends the current
+    # transient probe() glitch in polling mode -- re-sends the current
     # content even though nothing actually changed, and can race a real
     # incoming write and clobber it. _last_seen is set in _write_clip
     # (content arriving from the peer), after a successful send (content
-    # leaving to the peer), and -- since Task 10 -- in
-    # _consume_image_reoffer (the peer's own image as this clipboard
-    # re-encoded it), and _local_change returns early whenever the freshly
-    # read content already matches it.
+    # leaving to the peer, on both _observe_local_change's path and
+    # _resolve_clip_state's), by clipboard_became_ready's connect-time
+    # seed, and -- since Task 10 -- in _consume_image_reoffer (the peer's
+    # own image as this clipboard re-encoded it), and _local_change returns
+    # early whenever the freshly read content already matches it.
 
     def test_non_change_signal_after_receiving_a_clip_produces_no_send(self):
         """Failure A from the final review, receive side: "A" arrives from

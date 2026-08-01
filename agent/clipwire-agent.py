@@ -1290,10 +1290,12 @@ class Agent:
         # -- so by the time this method's own read runs, the change has
         # already stabilized. PollingWatcher's coarse interval (on the
         # order of a second, far longer than a subprocess spawn) means a
-        # tick that races _write_clip's wl-copy and sees stale content
+        # tick that races _write_clip's wl-copy and probes a stale token
         # simply finds nothing changed (not a false "revert") and fires on
         # a LATER tick once wl-copy has settled -- self-healing rather than
-        # sending anything wrong. Neither path needs the _last_seen-hash
+        # sending anything wrong. That argument is about the LOOP's timing,
+        # not about what it reads, so moving it from the body to a token
+        # left it intact. Neither path needs the _last_seen-hash
         # preference the other two call sites use.
         with self._echo_lock:
             expected = self._last_written
@@ -1757,10 +1759,15 @@ IMAGE_SUBPROCESS_TIMEOUT = 10
 # implied.
 #
 # A threshold alone would still leave a reader with nothing to judge an
-# outlier against, so WaylandClipboard.read() also logs its OWN first call
-# unconditionally (see the _first_read_done flag below), establishing at
-# least one baseline duration in the log per connection before the gate
-# takes over.
+# outlier against, so the connection's FIRST clipboard call logs
+# unconditionally, establishing at least one baseline duration in the log
+# before the gate takes over. First of either method, not of read()
+# specifically: _claim_first_call is shared by read() and probe() and
+# consumes one flag between them, so whichever runs first claims the
+# baseline and the other does not re-claim it. In production that is the
+# connect-time seed's read(), which runs before any watcher is built --
+# but nothing depends on that ordering, and a baseline duration from a
+# probe is worth exactly as much.
 SLOW_READ_SECONDS = 1.0
 SLOW_IMAGE_READ_SECONDS = 3.0
 
@@ -2279,11 +2286,26 @@ class WaylandClipboard:
             return None
         kind, types = listed
         if kind == KIND_IMAGE:
+            # SORTED, and that is a correctness guard rather than tidiness.
+            # PollingWatcher.pump compares this token with !=, so its ORDER
+            # would be as load-bearing as its membership -- and nothing in
+            # this project can establish that `wl-paste --list-types` prints
+            # a stable order for an unchanged selection, because there is no
+            # live compositor to check it against. If it does not, the
+            # consequence is exactly the defect this release exists to fix:
+            # pump signals a change nobody made, _observe_tick arms, and one
+            # more silent tick CONFIRMS -- a healthy install declared dead
+            # and dropped to 1-second polling for the rest of the connection.
+            # Under the body comparison this replaced, the bytes were stable,
+            # so this is a NEW input class rather than an inherited risk.
+            # Sorting removes the assumption instead of betting on it, and
+            # costs nothing: every real change alters the membership, so an
+            # order-insensitive token is not a change-insensitive one.
+            #
             # A tuple, not the list: this value is kept as `previous` across
-            # ticks and compared with !=, and a mutable one invites a caller
-            # to hold a reference to something that later changes underneath
-            # the comparison.
-            return kind, tuple(types)
+            # ticks, and a mutable one invites a caller to hold a reference
+            # to something that later changes underneath the comparison.
+            return kind, tuple(sorted(types))
         return self._read_body(kind, force_log)
 
     def _claim_first_call(self):
@@ -2345,10 +2367,12 @@ class WaylandClipboard:
         return kind, result.stdout
 
     def _run_wl_paste(self, args, timeout, slow_after, force_log):
-        """One wl-paste invocation, shared by every call read() makes --
-        `--list-types` and both body-fetch shapes -- so the failure
+        """One wl-paste invocation, shared by every call read() OR probe()
+        makes -- `--list-types` and both body-fetch shapes -- so the failure
         handling and the duration-logging gate live in exactly one place
-        rather than duplicated per call site.
+        rather than duplicated per call site. probe() reaches this through
+        _list_kind and, for text, _read_body; there is no wl-paste call in
+        this class that does not come through here.
 
         `slow_after` and `force_log` together decide whether this call's
         duration gets a log line -- see SLOW_READ_SECONDS's own comment for
@@ -2668,9 +2692,11 @@ def _start_observer(event, stop, on_change):
     it.
 
     No queue, deliberately. The handler reads clipboard STATE, not the contents
-    of any event -- GPaste's Update payload carries nothing this agent uses and
-    the poll loop's own payload is the clipboard itself -- so signals arriving
-    while it runs collapse into one set() and one re-read afterwards. That is
+    of any event -- GPaste's Update payload carries nothing this agent uses,
+    and the poll loop's own signal carries nothing either: it compares a
+    probe() token and sets the event, and the token never leaves that loop.
+    So signals arriving while the handler runs collapse into one set() and one
+    re-read afterwards. That is
     the semantics a clipboard wants; a queue would hold nothing and only add a
     way to fall behind.
     """
@@ -2701,7 +2727,10 @@ class GPasteWatcher:
     Composes a PollingWatcher as a slow safety net (see
     SAFETY_NET_POLL_SECONDS): a subscription that has silently stopped
     delivering is indistinguishable from an idle clipboard until something
-    else actually looks at the content.
+    else actually looks at the clipboard. What that poller looks at is a
+    probe() TOKEN, not the content -- for an image, the offered type list --
+    which is enough to tell "something changed" from "nothing did", and is
+    all this class ever asked of it.
 
     `clipboard` is only used by that safety net -- available() never touches
     it -- but it is a required argument rather than a defaulted one, because a
@@ -2792,15 +2821,22 @@ class GPasteWatcher:
         all it ever needed.
         """
         signals = self._signals
-        # A content difference ALONE does not prove the signal path missed it.
+        # A TOKEN difference ALONE does not prove the signal path missed it.
         # When GPaste is healthy the user copies something, the signal fires
-        # and is handled -- and then this tick also sees content differing from
+        # and is handled -- and then this tick also sees a token differing from
         # the poll's own baseline, because the poll keeps one. Concluding
         # "dead" from the difference alone would degrade every healthy
         # installation to polling on the user's first copy, which is worse than
         # the bug this safety net exists to fix. The count of accepted signals
-        # is the discriminator: the source is dead only if the content moved
+        # is the discriminator: the source is dead only if the clipboard moved
         # while no signal arrived to report it.
+        #
+        # "Token", not "content", throughout this function: for an image these
+        # values are the offered type list, so what this tick observes is that
+        # the SELECTION changed, not what it changed to. That is the only
+        # question asked here -- and it is why a change the token cannot see
+        # (an image replacing an identically-typed one) is not a false verdict
+        # either: no divergence is observed, so nothing arms.
         #
         # Both probes must also have SUCCEEDED. probe() returns None for a
         # failed wl-paste (WaylandClipboard keeps a dedicated one-shot log line

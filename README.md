@@ -146,12 +146,13 @@ just spends another detection budget before reaching the same conclusion again.
 
 One thing that poll deliberately does *not* do is read images. Copied text it compares
 byte for byte; for an image it compares only the list of formats the clipboard is offering,
-and fetches the picture itself only once that list changes. Reading a 4 MiB screenshot back
-out of the clipboard once a second — on every connection, healthy ones included — is not a
-price worth paying to notice a copy a little sooner. The trade is that while signals are
-dead, one image replacing another is noticed when the offered formats change rather than
-the instant the pixels do; in normal operation the `Update` signal carries that change and
-nothing waits at all.
+and fetches the picture itself only once that list changes. Pulling a 4 MiB screenshot back
+out of the clipboard on every tick is not a price worth paying to notice a copy a little
+sooner — every 30 seconds on a healthy connection, where this poll is only a safety net, and
+once a second once it has fallen back. The trade is that while signals are dead, one image
+replacing another is noticed when the offered formats change rather than the instant the
+pixels do; in normal operation the `Update` signal carries that change and nothing waits at
+all.
 
 ## GPaste trims whitespace, and that is not clipwire
 
