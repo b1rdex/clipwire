@@ -10,7 +10,13 @@ import Foundation
 /// unrecognized raw string (e.g. "video") already fails inside `JSONDecoder`
 /// via `ClipKind`'s own synthesized `Decodable` conformance, but "a hash
 /// with no kind, or a kind with no hash" is a cross-field rule `Codable`
-/// cannot express any more than a lone malformed `sha256` could.
+/// cannot express any more than a lone malformed `sha256` could. v3.2's
+/// `origin` needs a THIRD for the same reason and by a different rule --
+/// one-directional rather than nil-iff-nil; see `originWithoutHash`'s own
+/// comment below, and `init(from:)`'s for why copying `kind`'s would reject
+/// every ordinary announcement. Every cross-field rule this type has ever
+/// needed has arrived with a field, so read this list as "one per field
+/// that has one", not as a closed set.
 enum ClipStateError: Error, Equatable {
     case malformedSHA256
     case kindHashMismatch
@@ -63,8 +69,27 @@ struct ClipState: Codable, Equatable {
     /// call sites describes a clipboard nobody substituted anything into,
     /// so nil is the right value for all of them, and a required parameter
     /// would put a mechanical `origin: nil` on each -- noise that reads as
-    /// a decision. The two call sites that will ever pass a real one say so
-    /// by naming it.
+    /// a decision.
+    ///
+    /// NOTHING IN `Sources/` PASSES A REAL ONE, and that is the design
+    /// rather than a gap: an origin is recorded only by the side that wrote
+    /// the peer's bytes and read different ones back, and this side never
+    /// does. The substitution is GPaste's, it happens on the PC, and the PC
+    /// agent's `_consume_image_reoffer` is the one place in either codebase
+    /// that witnesses it. A reader who goes hunting here for the producer
+    /// will find none and is looking at finished wiring, not a loose end.
+    /// This side's whole relationship with the field is inbound: it arrives
+    /// off the wire through `init(from:)` and is read by
+    /// `resolveProvenance`. The `Sources/` call sites that construct a
+    /// `ClipState` (the store's `resolveCurrentClipState`, and the two
+    /// `persistClipState` calls on `handleFrame`'s apply paths) all describe
+    /// content this Mac holds in its own right, so all of them take the
+    /// default. Only the test suite names it -- the freshness fixture
+    /// loader, the round-trip encode test, and the two `HandleFrameTests`
+    /// cases that manufacture the PC's post-substitution announcement and
+    /// its mirror -- and the mirror is tested precisely because the rule is
+    /// symmetric by construction while only one side can ever produce the
+    /// input.
     init(sha256: String?, ts: Double, kind: ClipKind?, origin: String? = nil) {
         self.sha256 = sha256
         self.ts = ts

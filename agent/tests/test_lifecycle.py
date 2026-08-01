@@ -971,6 +971,151 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
                              "and it must stop asking once there is nothing to wait "
                              "for, or the poll observes a static clipboard forever")
 
+    def poll(self, agent_obj, ticks):
+        """The poll's no-change branch, driven exactly as PollingWatcher runs
+        it: ask the predicate, and read ONLY when it says True. Calling
+        _local_change() unconditionally would prove nothing about the thing
+        under test, which is how often the predicate provokes a read."""
+        for at in ticks:
+            with mock.patch("time.time", return_value=at):
+                if agent_obj._reoffer_pending():
+                    agent_obj._local_change()
+
+    # The moments the regression was measured at: the first tick past the
+    # budget, the three after it, and two far enough out to show it never
+    # stops. In degraded mode these are one second apart, so "every tick" is
+    # a wl-paste PAIR PER SECOND for the life of the connection.
+    LOOKS = [1000.0 + offset for offset in (30, 31, 32, 33, 90, 630)]
+
+    def test_a_clipboard_that_will_not_answer_is_looked_at_once(self):
+        """THE REGRESSION on_idle_tick introduced, and the one shape the
+        predicate cannot survive: nothing stops it asking except the
+        expectation going away, and a read that never reaches
+        _consume_image_reoffer never takes it away. Every tick past the
+        budget then provokes a fresh full clipboard read -- --list-types
+        plus the whole image body -- forever, which is precisely the expense
+        probe() was introduced to delete, reintroduced through the one
+        branch that bypasses it.
+
+        Bounded (one process per SSH connection) and lossless, so it is a
+        cost rather than a corruption -- but _reoffer_pending's own
+        docstring asserts the disarm needs exactly ONE look, and a comment
+        that denies a measured behaviour is worse than the behaviour."""
+        agent_obj, _ = self.armed()
+        clip = SilentClipboard()
+        agent_obj.clipboard = clip
+
+        self.poll(agent_obj, self.LOOKS)
+
+        self.assertEqual(clip.reads, 1,
+                         "a clipboard that will not answer is worth exactly one "
+                         "look; after that the poll is paying a full image read "
+                         "per tick to be told nothing, for the whole connection")
+        self.assertIsNone(agent_obj._expect_reoffer,
+                          "and the only thing that stops the asking is the "
+                          "expectation going away")
+        self.assertTrue(any("giving up on the re-offer" in line for line in self.logged),
+                        "giving up is a decision about the machine and must leave a "
+                        "trace, like the disarm beside it: %r" % self.logged)
+
+    def test_an_image_offered_with_no_bytes_is_looked_at_once(self):
+        """The same hole through the other early return: a type on offer
+        with nothing behind it. read() itself collapses an empty body to
+        None on the real clipboard (WaylandClipboard._read_body), so this
+        arrives only from a double or from whatever a later wl-paste does
+        -- pinned anyway, because the defect was never about WHICH read
+        failed. It was about a look that cannot reach a content decision
+        leaving the expectation armed."""
+        agent_obj, _ = self.armed()
+        clip = SilentClipboard(value=(KIND_IMAGE, b""))
+        agent_obj.clipboard = clip
+
+        self.poll(agent_obj, self.LOOKS)
+
+        self.assertEqual(clip.reads, 1)
+        self.assertIsNone(agent_obj._expect_reoffer)
+
+    def test_a_body_less_read_of_another_kind_is_looked_at_once(self):
+        """The THIRD early return, and the one no brief named: the kind
+        guard on the text path, reached by an empty text body today and by
+        any kind read() learns to return later. Covered because the rule is
+        about the INVARIANT -- no path out of _observe_local_change may
+        leave an overdue expectation armed -- not about the two paths that
+        happened to be measured. A fourth early return added later without
+        this call is the same defect again."""
+        agent_obj, _ = self.armed()
+        clip = SilentClipboard(value=(KIND_TEXT, b""))
+        agent_obj.clipboard = clip
+
+        self.poll(agent_obj, self.LOOKS)
+
+        self.assertEqual(clip.reads, 1)
+        self.assertIsNone(agent_obj._expect_reoffer)
+
+    def test_a_look_that_fails_before_the_budget_leaves_it_armed(self):
+        """The control, and the reason giving up is gated on OVERDUE rather
+        than on the read having failed. GPaste's takeover was measured
+        between one and four seconds; a transient wl-paste failure inside
+        that window is not evidence about the machine, and disarming on it
+        would ship the re-encode to the Mac live with no origin recorded --
+        the original bug, for that image.
+
+        Driven through _local_change directly rather than through the poll,
+        because the predicate would not ask this early: the CHANGE branch is
+        what delivers an observation before the budget."""
+        agent_obj, _ = self.armed()
+        agent_obj.clipboard = SilentClipboard()
+
+        with mock.patch("time.time", return_value=1000.0 + 1):
+            agent_obj._local_change()
+
+        self.assertIsNotNone(agent_obj._expect_reoffer,
+                             "a failed read inside the takeover window says nothing "
+                             "about whether a re-offer is coming")
+
+    def test_a_newer_write_is_not_disarmed_by_an_older_reads_failure(self):
+        """The generation check, which is this file's recorded defect shape
+        rather than a hypothetical: the read is in flight for two wl-paste
+        round trips, and a _write_clip on the main thread inside that window
+        arms a BRAND-NEW expectation. Giving up on it would disarm an
+        image applied microseconds ago, and the re-offer it is still waiting
+        for would then go to the Mac as a local change."""
+        agent_obj, _ = self.armed()
+        agent_obj.clipboard = RacyImageClipboard(
+            agent_obj,
+            value_read=b"",
+            interleaved_write=encode_image_payload(2.0, b"\x89PNG-newer-from-the-peer"),
+        )
+
+        with mock.patch("time.time", return_value=1000.0 + SAFETY_NET_POLL_SECONDS):
+            agent_obj._local_change()
+
+        self.assertIsNotNone(agent_obj._expect_reoffer,
+                             "the expectation this read could have judged is not the "
+                             "one that is armed by the time it finishes")
+        self.assertEqual(agent_obj._expect_reoffer[0], 2.0,
+                         "and the armed one is the newer write's")
+
+
+class SilentClipboard(ReofferingClipboard):
+    """A clipboard whose read() always gives the same unjudgeable answer, and
+    COUNTS how many times it was asked. The count is the whole point: the
+    regression this pins is not a wrong value anywhere, it is how much work
+    the poll provokes to learn nothing.
+
+    Separate from ReofferingClipboard's own empty-queue None, which means
+    "this test scripted no further observations" -- a different claim, and
+    one that would make the count meaningless if the two shared a double."""
+
+    def __init__(self, value=None):
+        super().__init__(reads=[])
+        self._value = value
+        self.reads = 0
+
+    def read(self):
+        self.reads += 1
+        return self._value
+
 
 class RacyImageClipboard:
     """The image twin of test_watcher.py's RacyClipboard: read() drives a

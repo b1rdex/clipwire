@@ -1323,16 +1323,21 @@ class Agent:
     @staticmethod
     def _reoffer_is_overdue(expectation):
         """Has an armed expectation waited longer than the detection budget?
-        THE one place that rule is written, read by both sides of it: the
-        poll's no-change branch, which asks whether an observation is worth
-        signalling at all, and _consume_image_reoffer's disarm, which spends
-        the answer. Two spellings of one threshold drifting apart is this
-        project's recorded defect shape, and this one would drift in the
-        direction where the poll stops looking before the disarm can fire.
+        THE one place that rule is written, and every reader of it is a
+        reader of THIS: _reoffer_pending, which asks whether an observation
+        is worth signalling at all; _consume_image_reoffer's disarm, which
+        spends the answer when the clipboard reads back as our own bytes;
+        and _give_up_on_reoffer, which spends it when the clipboard reads
+        back as nothing usable. Two spellings of one threshold drifting
+        apart is this project's recorded defect shape, and this one would
+        drift in the direction where the poll stops looking before the
+        disarm can fire. Add a reader, not a second threshold: a caller
+        needing an extra condition gates on it ALONGSIDE this call, the way
+        the two spenders gate on `gen`.
 
         A static method taking the record rather than reading the field,
-        because its two callers hold _echo_lock differently: _reoffer_pending
-        takes it here, _consume_image_reoffer is already inside it, and
+        because its callers hold _echo_lock differently: _reoffer_pending
+        takes it here, the two spenders are already inside it, and
         _echo_lock is not reentrant.
 
         SAFETY_NET_POLL_SECONDS is the CONSTANT, never the interval the poll
@@ -1376,6 +1381,18 @@ class Agent:
         tick past the budget. The only case that shifts is a re-offer whose
         type list happens to match, absorbed at the budget rather than a few
         seconds in; still absorbed, still decided by content.
+
+        "EXACTLY ONE LOOK" IS A PROPERTY OF THE OBSERVER, NOT OF THIS
+        PREDICATE, and it was measured false once already. Nothing here
+        stops the asking; the expectation going away is the only thing that
+        does, and a look that reaches no decision used to leave it armed --
+        so every tick past the budget provoked a fresh full read, forever.
+        What makes the sentence above true is that EVERY path out of
+        _observe_local_change now spends an overdue expectation: the disarm
+        and the consume in _consume_image_reoffer, the text path's outright
+        clear, and _give_up_on_reoffer on the three that reach no decision
+        at all. Whoever adds a fourth early return there owes this predicate
+        the same call.
 
         Runs on the poll thread and takes _echo_lock, which is held across
         nothing that blocks; it acquires no other lock, so the file's
@@ -1633,6 +1650,11 @@ class Agent:
         # Persisted and sent below, once we know this is a genuine change.
         observed_at = time.time()
         if read is None:
+            # The clipboard did not answer, so there is nothing to judge --
+            # but an OVERDUE expectation must not survive a look it was
+            # asked for, or the poll asks again on the very next tick and on
+            # every tick after it. See _give_up_on_reoffer.
+            self._give_up_on_reoffer(gen)
             return
         if read[0] == KIND_IMAGE:
             # Indexed off `read` rather than unpacked so the text path below
@@ -1642,7 +1664,10 @@ class Agent:
                 # A type offered with no bytes behind it: a wl-paste that
                 # failed rather than a clip. Nothing to consume, nothing to
                 # send -- and decode_image_payload would refuse an empty body
-                # on the far side anyway.
+                # on the far side anyway. Same reason as the None read above:
+                # a look reaching no decision must still spend an overdue
+                # expectation, or the poll re-provokes this read forever.
+                self._give_up_on_reoffer(gen)
                 return
             # Hashed once, here, and handed to both paths below. An image body
             # can be up to MAX_IMAGE_BYTES and this method runs on every
@@ -1727,6 +1752,14 @@ class Agent:
             # _resolve_clip_state's SEND_MINE branch, which builds a
             # TYPE_IMAGE_CLIP frame for a verified image rather than
             # declining to send it.
+            #
+            # The THIRD early return that must spend an overdue expectation,
+            # and the one it is easiest to miss because it is not obviously
+            # a failed read: this branch never reaches the clearing block
+            # below, so without this call an empty text body -- or whatever
+            # a later third kind reads back as -- leaves the poll asking on
+            # every tick. See _give_up_on_reoffer.
+            self._give_up_on_reoffer(gen)
             return
 
         # Consume the suppression on the FIRST observed change, whatever it is —
@@ -1830,6 +1863,69 @@ class Agent:
         # actually received.
         with self._echo_lock:
             self._last_seen = (KIND_TEXT, sha256)
+
+    def _give_up_on_reoffer(self, gen):
+        """Spends an OVERDUE expectation on a look that could not be judged,
+        so the poll stops asking for another one.
+
+        THE INVARIANT THIS EXISTS FOR: no path out of _observe_local_change
+        may leave an overdue expectation armed. Nothing stops
+        _reoffer_pending answering True except the expectation going away,
+        so a look that reaches no decision does not merely cost one
+        observation -- the next tick asks again, and every tick after it,
+        each one a full clipboard.read() (--list-types plus the whole image
+        body) provoked to learn nothing. On a GPaste-less machine the poll
+        runs at DEGRADED_POLL_SECONDS, so that is a wl-paste pair PER SECOND
+        for the life of the connection: bounded (one process per SSH
+        connection) and lossless, but it is the exact expense probe() was
+        introduced to delete, arriving through the one branch that bypasses
+        it. Three early returns above reach here -- a read that failed, an
+        image type offered with no bytes, and the kind guard on the text
+        path -- and a fourth added later without this call is the same
+        defect again.
+
+        GIVING UP IS A DISARM, not a deferral, and that is the file's own
+        ranking of the harms rather than a preference. An expectation left
+        armed absorbs the user's next image copy as the re-offer that never
+        came, and under v3.2 a clip so labelled is not sent late, it is
+        never sent at all (see save_clip_state's origin note). A look
+        deferred on a clipboard that is not answering is a look that may
+        never come. So the expectation is spent here, and
+        _reoffer_pending's "exactly one look" is true because of this
+        method rather than in spite of it.
+
+        WHAT IT COSTS when it is wrong is exactly what _consume_image_reoffer's
+        disarm branch already prices, and by the same mechanism: _last_seen
+        is deliberately NOT touched here -- this look learned nothing about
+        what the clipboard holds -- so a re-offer that does arrive
+        afterwards finds no expectation, falls through to the local-change
+        send, and goes to the Mac as a genuine local clip with no origin
+        recorded. That is the original bug for that image. Recoverable by
+        copying again, and the alternative is the permanent loss above.
+
+        OVERDUE, not merely "the read failed", which is the whole reason
+        this is gated at all: GPaste's takeover was measured between one
+        and four seconds, and a transient wl-paste failure inside that
+        window is no evidence about the machine. Gated on `gen` for this
+        file's recorded defect shape -- the read is in flight for two
+        wl-paste round trips, and a _write_clip landing on run()'s thread
+        inside that window arms a brand-new expectation this observation
+        never looked at.
+
+        Logged outside the lock, and with its own sentence rather than the
+        disarm's: "the clipboard would not say what it holds" and "the
+        clipboard still holds our own bytes" are different observations
+        about the machine, and a reader chasing a missing screenshot needs
+        to know which one fired.
+        """
+        with self._echo_lock:
+            if self._write_gen != gen:
+                return
+            if not self._reoffer_is_overdue(self._expect_reoffer):
+                return
+            self._expect_reoffer = None
+        log("the clipboard did not read back as an image within %gs of writing one: "
+            "giving up on the re-offer" % SAFETY_NET_POLL_SECONDS)
 
     def _consume_image_reoffer(self, png, sha256, gen):
         """Recognises the one image observation that is this agent's own
@@ -2240,14 +2336,21 @@ def load_clip_state(path=None):
     decode_clip_state -- so it grew the fourth element with the wire in
     v3.2. A missing key reading as None is what makes an existing store
     load rather than fail: a v3.1 file has no "origin" key at all, and
-    neither does one written since by any of the four save_clip_state call
-    sites that have no origin to record -- encode_clip_state omits the key
-    rather than writing an explicit null, so those files are byte-for-byte
-    what they were before this release. That is the same "absent means what
-    it meant before" rule the wire follows, applied to disk by the single
-    decoder both share. Exactly ONE writer supplies one:
-    Agent._consume_image_reoffer, which is the only place that witnesses
-    the clipboard hand back something other than what it was given.
+    neither does one written since by a save_clip_state call site with no
+    origin to record -- encode_clip_state omits the key rather than writing
+    an explicit null, so those files are byte-for-byte what they were before
+    this release. That is the same "absent means what it meant before" rule
+    the wire follows, applied to disk by the single decoder both share.
+
+    TWO writers can put an origin on this file, and only one of them ever
+    LEARNS one. Agent._consume_image_reoffer is the only place in either
+    codebase that witnesses the clipboard hand back something other than
+    what it was given, so it is the only place an origin is born.
+    announce_clip_state writes one too, by forwarding whatever
+    resolve_startup_state's matched branch preserved -- and that second
+    write is the reason the first is not inert, since the process that
+    learned it is dead by the connection that has to say so. The comment at
+    that call says what breaks if it is "tidied" into an explicit None.
 
     None covers three distinct failure reasons identically, on purpose: no
     file has ever been written, the file exists but cannot be opened as a
@@ -2282,10 +2385,11 @@ def load_clip_state(path=None):
         return None
 
 
-# Serializes the whole encode-write-replace below. save_clip_state has four
-# call sites, and they run on up to three threads: Agent._write_clip and
-# announce_clip_state on run()'s thread, Agent._observe_local_change and
-# Agent._consume_image_reoffer on the watcher threads. All four derive the SAME
+# Serializes the whole encode-write-replace below. save_clip_state has five
+# call sites in four functions, and they run on up to three threads:
+# Agent._write_clip and announce_clip_state on run()'s thread,
+# Agent._observe_local_change (once on each of its image and text paths) and
+# Agent._consume_image_reoffer on the watcher threads. All five derive the SAME
 # `target + ".tmp"`, so two concurrent savers truncate one another's temp file
 # and whichever os.replace runs second finds it already consumed -- observed
 # directly as a FileNotFoundError, and in the worse interleaving as a
@@ -2294,7 +2398,7 @@ def load_clip_state(path=None):
 # That failure is not cosmetic: a temp moved into place mid-write makes
 # load_clip_state return None, so the NEXT connection stamps ts=now on old
 # content and wins a reconciliation it should lose -- a silent clipboard
-# clobber, the exact failure protocol v2 exists to prevent. All four call
+# clobber, the exact failure protocol v2 exists to prevent. All five call
 # sites swallow the exception, so nothing would surface either.
 #
 # Module-level because these are module functions, not a store object: it is
@@ -2325,9 +2429,12 @@ def save_clip_state(sha256, ts, kind, origin=None, path=None):
     given IS ALREADY DEAD by the announce that needs to say so. An origin
     that lived only in Agent._expect_reoffer would be inert -- the third
     release running in which this bug was fixed and nothing changed on the
-    machine. It defaults to None because exactly one call site has one to
-    record (Agent._consume_image_reoffer); every other write is content this
-    side holds in its own right, and A STALE ORIGIN IS NOT HARMLESS: the PC
+    machine. It defaults to None because only one call site ever LEARNS one
+    (Agent._consume_image_reoffer) and only one other ever forwards it
+    (announce_clip_state, spreading a record resolve_startup_state returned
+    whole); the three remaining writes -- Agent._write_clip and
+    Agent._observe_local_change's two paths -- are content this side holds
+    in its own right, and A STALE ORIGIN IS NOT HARMLESS: the PC
     holding new user content under an origin the Mac still matches makes
     resolve_provenance fire and the PC never send it -- a clip the user
     copied, gone, on an entirely routine path. So the default is the safe
@@ -2601,6 +2708,22 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     # is this function.
     if resolved[0] is not None and (stored is None or stored[0] != resolved[0]):
         log("clipboard changed while apart")
+    # SPREAD WHOLE, and the fourth element is why. resolve_startup_state
+    # returns the stored record intact on a hash match -- origin included --
+    # so this is the second of the two writes in this file that can put an
+    # origin on disk, and the one that makes the first mean anything.
+    #
+    # DO NOT tidy this into an explicit `origin=None` on the reasoning that
+    # this function has nothing of its own to record. It is true and it is
+    # beside the point: sshd spawns a new agent per connection, so by the
+    # time any announce needs to say where these bytes came from,
+    # Agent._consume_image_reoffer -- the only place that ever finds out --
+    # died with an earlier process. Strip the origin here and it survives
+    # exactly as long as the connection that learned it, so the suppression
+    # works on the FIRST reconnect off in-memory state and dies on the
+    # second. That is the shape of an inert fix, and it is the blocker this
+    # design was rejected over before a line of it was written -- for the
+    # third release running.
     try:
         save_clip_state(*resolved, path=path)
     except (OSError, ClipStateError) as error:
@@ -3347,6 +3470,15 @@ class GPasteWatcher:
         # (an image replacing an identically-typed one) is not a false verdict
         # either: no divergence is observed, so nothing arms.
         #
+        # Benign for the VERDICT, not free. When that invisible change is an
+        # image re-offer, the poll's idle branch signals for it and the
+        # worker absorbs it, while this tick records no strike -- so the
+        # design's "health accounting outranks absorption" rule is met on the
+        # change path and not on the idle one. See PollingWatcher.pump's
+        # no-change branch for the whole of that gap and why it is disclosed
+        # rather than closed; a reader who arrives here first should not
+        # conclude the case is simply harmless.
+        #
         # Both probes must also have SUCCEEDED. probe() returns None for a
         # failed wl-paste (WaylandClipboard keeps a dedicated one-shot log line
         # for exactly that timeout) and for a genuinely empty selection, and
@@ -3673,6 +3805,36 @@ class PollingWatcher:
                         # content. Deliberately NOT `previous = current` (there
                         # was no change to absorb) and deliberately below the
                         # real-change branch, which must always win.
+                        #
+                        # THE DISCLOSED GAP, health accounting. The v3.2
+                        # design requires a re-offer seen by a signal-less
+                        # poll to count toward the two-tick dead-source
+                        # verdict BEFORE _consume_image_reoffer absorbs it,
+                        # or a dead extension whose first unsignalled change
+                        # happens to be a re-offer stays undiagnosed -- the
+                        # safety net blinded by the very mechanism that
+                        # proves it was needed. Through the CHANGE branch
+                        # above that holds: _observe_tick compares tokens
+                        # against THIS loop's own `previous`, which the
+                        # worker never touches, so an absorption downstream
+                        # cannot erase a divergence already observed.
+                        #
+                        # Through THIS branch it does not. A re-offer whose
+                        # offered type list happens to match the previous one
+                        # produces no token divergence at all, so it arrives
+                        # here rather than above, is absorbed by the worker,
+                        # and _observe_tick sees a settled token and arms
+                        # nothing. NOT CLOSED, deliberately: closing it needs
+                        # the WORKER to report what it found back into this
+                        # watcher, and that is the coupling this file removes
+                        # on purpose -- "signalled, never called" -- which
+                        # would hand a wedged worker the power to stop the
+                        # poll. The cost is bounded: the verdict is deferred
+                        # to the next change the token CAN see, never lost,
+                        # and every change is still reported throughout.
+                        # Recorded in the v3.2 design's acceptance list as
+                        # partially met, so it is inherited rather than
+                        # rediscovered.
                         self._event.set()
                     # AFTER the signal, which used to be load-bearing and is
                     # now merely conventional -- say so rather than leave the
