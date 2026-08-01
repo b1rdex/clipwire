@@ -786,32 +786,72 @@ class Agent:
             # with `remote: `.
             log("clipboard changed before the send")
             return
-        kind, text = read
-        # The verification above says nothing about which kinds this branch
-        # can actually SEND. mine[2] can be KIND_IMAGE (resolve_startup_state
-        # no longer hardcodes KIND_TEXT, so an image-only clipboard resolves
-        # a real (hash, ts, KIND_IMAGE) triple instead of a None hash, which
-        # makes SEND_MINE reachable for it), and the verification passes for
-        # an image the clipboard really does still hold -- but the only frame
-        # this branch builds is TYPE_CLIP, the text codec, and putting PNG
-        # bytes through it is a worse outcome than not sending at all. So a
-        # verified image falls out here silently.
+        # `body`, not `text`: this branch sends either kind now, and the
+        # verification above is what licenses trusting `kind` -- it proved
+        # the live clipboard agrees with mine[2] as well as with mine[0].
+        # mine[2] can be KIND_IMAGE because resolve_startup_state no longer
+        # hardcodes KIND_TEXT, so an image-only clipboard resolves a real
+        # (hash, ts, KIND_IMAGE) triple instead of a None hash, which is what
+        # makes SEND_MINE reachable for it in the first place.
+        kind, body = read
+        if not body:
+            # Defensive rather than reachable: resolve_current_clip_state
+            # records a None hash for an empty clipboard, so `mine` could
+            # only carry the empty string's digest if something else wrote
+            # the store. Refused here anyway, since neither codec below has
+            # anything to say about zero bytes.
+            return
+        # Both sends below use mine[1] (our stored ts), never now: the
+        # content has not changed, only been re-announced, so its recorded
+        # age must be preserved. Sending with now would perpetually refresh
+        # it and let it win every future reconciliation regardless of what
+        # happens next. And both use mine[0] rather than re-hashing `body`
+        # for the _last_seen update -- the verification above already proved
+        # the two are the same string, which is exactly what nothing had
+        # established before Task 11: resolve_freshness only ever compares
+        # mine[0] against peer[0], never against what the clipboard holds, so
+        # trusting it here used to be unfounded and the hash was recomputed.
+        # It is founded now, and a body can be megabytes, so hashing it twice
+        # per send is pure cost. The kind is mine[2] by the same proof.
         #
-        # KNOWN GAP, AND AN UNOWNED ONE. This is the branch a reconnect takes
-        # when the PC's image is the fresher of the two states, and nothing
-        # sends it: the task that taught this side to send images wired the
-        # inbound dispatch and the locally-OBSERVED send (_observe_local_change,
-        # which now builds a real TYPE_IMAGE_CLIP frame), and this call site
-        # is neither. Closing it needs the same three things that path
-        # already has -- the frame, the size guard and the _last_seen update
-        # -- driven from `mine` and the verified read rather than from an
-        # observation, plus the peer-side apply. Recorded here rather than
-        # attributed to a later task, because no task in the v3 plan owns it.
-        #
-        # Silent, unlike the mismatch above, and deliberately: nothing went
-        # wrong here -- it is a gap, not a race -- and it would log on every
-        # reconnect for as long as an image sits on the clipboard.
-        if kind != KIND_TEXT or not text:
+        # The _last_seen update itself is the same bookkeeping _local_change's
+        # own send path does, for the same reason: _last_seen is "what the
+        # peer already holds", and after this send the peer does (soon) hold
+        # `body` too. Sources/clipwire's own .clipState case has no
+        # EchoGuard-equivalent update here, but harmlessly so -- the Mac's
+        # PasteboardWatcher is changeCount-driven and never fires on a
+        # non-change. The PC's GPaste watcher DOES fire on non-changes (a
+        # history deletion emits Update too) -- the entire reason _last_seen
+        # exists on this side at all -- so skipping this update would let a
+        # later spurious signal see the clipboard still holding `body`,
+        # wrongly conclude a genuine local change happened, and resend it:
+        # wasteful at best, and a silent clobber of a real Mac-side change
+        # made in the meantime at worst, since the Mac applies any incoming
+        # clip frame unconditionally.
+        if kind == KIND_IMAGE:
+            # Compared against the bare body, unlike the text guard below,
+            # and this is the one place the difference is load-bearing rather
+            # than stylistic: MAX_IMAGE_BYTES bounds the IMAGE, so an image
+            # at exactly the limit is legal and encodes to a payload eight
+            # bytes over it -- which still fits MAX_PAYLOAD_BYTES with 4 MiB
+            # to spare. Writing this guard the way the text one is written
+            # would refuse a maximum-size screenshot that the protocol
+            # explicitly makes room for. Same phrasing as the other two image
+            # skips (_observe_local_change's and _consume_image_reoffer's):
+            # one verdict clause for one limit, so three sites cannot drift
+            # into three names for it.
+            if len(body) > MAX_IMAGE_BYTES:
+                log("skipping an image of %d bytes: over the image limit" % len(body))
+                return
+            self.send(TYPE_IMAGE_CLIP, encode_image_payload(mine[1], body))
+            with self._echo_lock:
+                self._last_seen = (KIND_IMAGE, mine[0])
+            return
+        if kind != KIND_TEXT:
+            # The honest default for whatever third kind may arrive later --
+            # choose_kind picks no other today, so this is unreachable rather
+            # than dead. Silent: a kind this agent cannot encode is a gap in
+            # this file, not an event worth a line on every reconnect.
             return
         # The size bound matches _local_change's own send-side guard: this
         # branch reads the live clipboard independently, and without it,
@@ -822,38 +862,10 @@ class Agent:
         # since Task 4 the two are separate, and a send this size would
         # still fit inside the frame cap; it is refused here purely as a
         # matter of the policy text clips are held to.
-        if len(text) + TIMESTAMP_BYTES > MAX_TEXT_BYTES:
-            log("skipping a clip of %d bytes: over the text limit" % len(text))
+        if len(body) + TIMESTAMP_BYTES > MAX_TEXT_BYTES:
+            log("skipping a clip of %d bytes: over the text limit" % len(body))
             return
-        # mine[1] (our stored ts), not now: the content has not changed, only
-        # been re-announced, so its recorded age must be preserved. Sending
-        # with now would perpetually refresh it and let it win every future
-        # reconciliation regardless of what happens next.
-        self.send(TYPE_CLIP, encode_clip_payload(mine[1], text))
-        # Same bookkeeping _local_change's own send path does, and for the
-        # same reason: _last_seen is "what the peer already holds", and
-        # after this send the peer does (soon) hold `text` too. Sources/clipwire's
-        # own .clipState case has no EchoGuard-equivalent update here either,
-        # but harmlessly so -- the Mac's PasteboardWatcher is
-        # changeCount-driven and never fires on a non-change. The PC's
-        # GPaste watcher DOES fire on non-changes (a history deletion emits
-        # Update too) -- the entire reason _last_seen exists on this side at
-        # all -- so skipping this update would let a later spurious signal
-        # see the clipboard still reading `text`, wrongly conclude a genuine
-        # local change happened, and resend it: wasteful at best, and a
-        # silent clobber of a real Mac-side change made in the meantime at
-        # worst, since the Mac applies any incoming .clip frame
-        # unconditionally.
-        #
-        # mine[0] rather than a second sha256_hex(text): the verification
-        # above already proved they are the same string, which is exactly
-        # what nothing had established before this task -- resolve_freshness
-        # only ever compares mine[0] against peer[0], never against what the
-        # clipboard holds, so trusting it here used to be unfounded and the
-        # hash was recomputed. It is founded now, and text can be up to
-        # MAX_TEXT_BYTES, so hashing it twice per send is pure cost.
-        # KIND_TEXT is likewise mine[2] by the same proof, via the guard
-        # above.
+        self.send(TYPE_CLIP, encode_clip_payload(mine[1], body))
         with self._echo_lock:
             self._last_seen = (KIND_TEXT, mine[0])
 
@@ -1299,12 +1311,13 @@ class Agent:
             # currently return (choose_kind picks nothing else), so this
             # guard is reached today only by an empty body, and remains as
             # the honest default for whatever third kind may arrive later.
-            # The two other read() call sites Task 7 touched draw the same
-            # text-only line, for their own reasons rather than by reference
-            # to this one: clipboard_became_ready's connect-time seed below,
-            # and _resolve_clip_state's SEND_MINE branch, which since Task 11
-            # verifies an image before declining to send it (the verification
-            # is kind-generic; only the frame it can build is not).
+            # This is now the ONLY read() call site that is kind-restricted
+            # at all, and only because its image case was handled and
+            # returned above. The two others Task 7 touched both act on
+            # either kind: clipboard_became_ready's connect-time seed, and
+            # _resolve_clip_state's SEND_MINE branch, which builds a
+            # TYPE_IMAGE_CLIP frame for a verified image rather than
+            # declining to send it.
             return
 
         # Consume the suppression on the FIRST observed change, whatever it is —

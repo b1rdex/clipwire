@@ -18,14 +18,17 @@ from agent_under_test import (
     GPasteWatcher,
     KIND_IMAGE,
     KIND_TEXT,
+    MAX_IMAGE_BYTES,
     MAX_TEXT_BYTES,
     PollingWatcher,
     SAFETY_NET_POLL_SECONDS,
     TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
+    TYPE_IMAGE_CLIP,
     decode_clip_payload,
     decode_clip_state,
+    decode_image_payload,
     encode_clip_payload,
     encode_clip_state,
     load_clip_state,
@@ -2857,24 +2860,26 @@ class TestIncomingClipState(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertIn("clipboard changed before the send", "\n".join(log_lines))
 
-    def test_the_send_branch_stays_silent_for_a_verified_image(self):
-        """The verification passes -- the clipboard really does hold the
-        image we announced -- and the branch still sends nothing, because
-        the only clip frame it can build is TYPE_CLIP, the TEXT codec.
-        Sending PNG bytes through it would be a worse outcome than not
-        sending at all.
+    def test_the_send_branch_sends_a_verified_image_as_an_image_clip(self):
+        """The branch a reconnect takes when the PC's image is the fresher of
+        the two states. It used to fall out silently here: the only frame it
+        could build was TYPE_CLIP, the TEXT codec, and putting PNG bytes
+        through that is worse than sending nothing. Task 12 fix round 1
+        gives it the image codec instead, so an image that wins a
+        reconciliation actually reaches the peer.
 
-        This is the branch a reconnect takes when the PC's image is the
-        fresher of the two states, and it remains silent after Task 12: that
-        task wires the on_frame dispatch and the locally-OBSERVED image
-        send, which is a different call site. No task in this plan owns this
-        one, so an image that wins a reconciliation is still not sent -- see
-        the Task 12 report. Recorded here rather than in a comment pointing
-        at a later task, because there is no later task to point at.
+        Left unclosed, the asymmetry ships: Task 13 gives the MAC this same
+        send, and a PC that verifies its image and then says nothing means
+        every reconnect where the PC's screenshot is the newer one silently
+        keeps it on the PC -- with no log line saying why, since the silence
+        was deliberate.
 
-        The silence must be the KIND guard's doing, not the verification's,
-        or this test would pass for the wrong reason -- distinguished by the
-        absence of the verification's own log line."""
+        The frame carries mine[1] -- the ANNOUNCED timestamp -- not a fresh
+        reading. The content did not change, it was only re-announced, and
+        stamping it with now would refresh its age on every reconnect and let
+        it win every future reconciliation regardless of what happens next.
+        That is the property the verification exists to make safe, and it is
+        pinned here rather than left to the text path alone."""
         png = b"\x89PNG\r\n\x1a\n" + b"pixels"
         save_clip_state(sha256_hex(png), 5000.0, KIND_IMAGE, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
@@ -2886,12 +2891,112 @@ class TestIncomingClipState(unittest.TestCase):
 
         agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
 
-        self.assertEqual(sent, [], "an image must not go out through the text codec")
+        self.assertEqual([frame_type for frame_type, _ in sent], [TYPE_IMAGE_CLIP],
+                         "an image must go out through the image codec, not the text one")
+        self.assertEqual(decode_image_payload(sent[0][1]), (5000.0, png),
+                         "the announced timestamp, and the bytes the clipboard verified")
         self.assertNotIn(
             "clipboard changed before the send", "\n".join(log_lines),
-            "the clipboard holds exactly what we announced -- this silence is the kind "
-            "guard's, and Task 12 replaces it with a real image send",
+            "the clipboard holds exactly what we announced, so this send is the "
+            "verification passing -- not it being skipped",
         )
+        self.assertEqual(
+            agent._last_seen, (KIND_IMAGE, sha256_hex(png)),
+            "the peer holds it now, so a later spurious GPaste Update must not read "
+            "it as a fresh local change and send it again",
+        )
+
+    def test_a_verified_but_empty_body_is_not_sent_under_either_kind(self):
+        """The guard that used to ride along on the text path's
+        `kind != KIND_TEXT or not text` and now stands on its own, because
+        the branch below it can build two different frames.
+
+        Constructible only by writing the empty string's digest into the
+        store directly -- resolve_current_clip_state records a None hash for
+        an empty clipboard, so nothing in the agent produces this state. But
+        the store is a file that outlives the process, and an empty body
+        reaching encode_image_payload would put a frame on the wire that
+        decode_image_payload refuses at the far end ("image payload carries
+        no image"): a send that cannot succeed, from a branch whose whole
+        purpose is that it verified first.
+
+        Found by mutation: deleting the guard failed no test."""
+        for kind, queue in ((KIND_TEXT, "queue_read"), (KIND_IMAGE, "queue_image_read")):
+            with self.subTest(kind=kind):
+                path = os.path.join(self._tmp.name, "empty-%s.json" % kind)
+                save_clip_state(sha256_hex(b""), 5000.0, kind, path=path)
+                clipboard = QueueClipboard(ready=True)
+                getattr(clipboard, queue)(b"")
+                agent = Agent(
+                    stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                    clip_state_path=path,
+                )
+                agent._clip_state_sent = True
+                sent = []
+                agent.send = lambda t, p: sent.append((t, p))
+                log_lines = self.capture_log()
+
+                agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+                self.assertEqual(sent, [], "an empty body is not a clip of any kind")
+                self.assertNotIn(
+                    "clipboard changed before the send", "\n".join(log_lines),
+                    "the verification PASSED here -- the clipboard really does hold "
+                    "the (empty) thing we announced -- so this silence must be the "
+                    "empty-body guard's, not the verification's",
+                )
+
+    def test_winning_clip_state_with_an_oversized_image_is_logged_with_its_size(self):
+        """The image twin of the text cap below, and the reason the two are
+        separate constants: this body is over MAX_IMAGE_BYTES, not over the
+        (larger) MAX_PAYLOAD_BYTES frame cap, so it is refused as a matter of
+        the policy images are held to rather than wire safety.
+
+        An image can only get onto the store at this size through the
+        re-offer path, which deliberately records an oversized read-back
+        rather than dropping it (GPaste's re-encode INFLATES -- 105 KB in,
+        180 KB out) -- so this is reachable in production, not a synthetic
+        case. The size is logged because a user whose screenshot wins a
+        reconciliation and still does not arrive has nothing else to look
+        at."""
+        oversized = b"\x89" * (MAX_IMAGE_BYTES + 1)
+        save_clip_state(sha256_hex(oversized), 777.0, KIND_IMAGE, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(oversized)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
+
+        self.assertEqual(sent, [])
+        self.assertIn(str(len(oversized)), "\n".join(log_lines))
+        self.assertIn(
+            "over the image limit", "\n".join(log_lines),
+            "one verdict clause for one limit: the same one the re-offer path and "
+            "the local-observation path already use, so three sites cannot drift",
+        )
+
+    def test_winning_clip_state_with_an_image_at_exactly_the_limit_still_sends(self):
+        """The boundary the three separated caps exist for. This body plus
+        its 8-byte timestamp exceeds the OLD single 4 MiB cap, so a guard
+        written as `len(body) + TIMESTAMP_BYTES > MAX_IMAGE_BYTES` -- correct
+        for TEXT one branch down -- would refuse a legal maximum-size image
+        here. MAX_IMAGE_BYTES bounds the image; MAX_PAYLOAD_BYTES bounds the
+        frame, with room for the prefix by construction."""
+        exact = b"\x89" * MAX_IMAGE_BYTES
+        save_clip_state(sha256_hex(exact), 777.0, KIND_IMAGE, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(exact)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
+
+        self.assertEqual([frame_type for frame_type, _ in sent], [TYPE_IMAGE_CLIP])
+        self.assertEqual(len(sent[0][1]), MAX_IMAGE_BYTES + TIMESTAMP_BYTES)
 
     def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
         """Unlike _local_change's own send path, this branch reads the live

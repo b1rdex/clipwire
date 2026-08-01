@@ -713,12 +713,11 @@ func handleFrame(
             // which needs this send, the `.imageClip` apply and the announce
             // wired together rather than one call site at a time.
             //
-            // Do not read the PC as the worked example: Task 12 landed
-            // "images end to end on the PC" and left the PC agent's own
-            // `_resolve_clip_state` guard exactly where it is, for want of a
-            // task that owns it (see that guard's own comment). The same
-            // guard on the same branch on both sides -- but only one of them
-            // has a task behind it.
+            // The PC agent's `_resolve_clip_state` IS the worked example:
+            // Task 12 gave that branch the image codec, so the PC sends a
+            // verified image from here and this side does not yet. Until
+            // Task 13 closes it, a reconnect where the MAC's image is the
+            // fresher of the two states keeps it on the Mac.
             //
             // Silent, unlike the mismatch above, and deliberately: nothing
             // went wrong here -- this is a known gap, not a race -- and it
