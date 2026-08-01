@@ -237,22 +237,21 @@ original, then the re-encode, back to back — before it settles. The picture th
 still GPaste's re-encoding, though, not a byte-identical copy of what was on the Mac's
 pasteboard.
 
-**A known consequence: a retina screenshot comes back at double size.** The re-encode drops
-the PNG `pHYs` chunk, which is what records pixel density. That does not matter on the PC, but
-the re-encoded picture is what wins the next reconnect, so the Mac ends up holding a copy of
-its *own* screenshot with the density gone — 100×100 pixels that displayed at 50×50 before the
-round trip display at 100×100 after it. The pixels are all there and nothing is lost; it pastes
-twice as large.
+**A screenshot used to come back at double size, and no longer does.** The re-encode drops the
+PNG `pHYs` chunk, which is what records pixel density. That does not matter on the PC, but the
+re-encoded picture used to win the next reconnect, so the Mac ended up holding a copy of its
+*own* screenshot with the density gone — 100×100 pixels that displayed at 50×50 before the
+round trip displayed at 100×100 after it.
 
-**Still unfixed, and the first attempt is worth knowing about.** v3.1 tried to fix it by
-keeping the Mac's own bytes whenever the incoming image decoded to the same pixels. That rested
-on GPaste re-encoding without touching the pixels themselves — and it does not. Measured on a
-480×320 screenshot, with the original captured before it travelled: the samples differ in
-398,267 of 614,400 bytes. GPaste applies the image's embedded colour profile as it loads it,
-and writes the result untagged. So no comparison of the two pictures can recognise one as the
-other, and the code that tries is dormant.
-
-The next attempt does not compare anything. The PC is the only witness to the substitution — it
+**The PC now says where its bytes came from.** It is the only witness to the substitution: it
 wrote the Mac's bytes and read different ones back, with nobody touching the clipboard in
-between — so it can simply report the hash it was *given* alongside the hash it read, and the
-Mac keeps its own copy when the two describe the same original.
+between. So it reports the hash it was *given* alongside the hash it read, and when the two
+machines see that one side's content descends from the other's, both stand down and neither
+sends anything.
+
+Two earlier attempts tried to recognise the two pictures as the same one, and both are worth
+knowing about because they failed for the same reason. GPaste does not merely strip metadata —
+it applies the image's embedded colour profile as it loads it and writes the result untagged,
+so the pixel samples genuinely move: measured on a 480×320 screenshot, 398,267 of 614,400
+bytes. Nothing that compares the two pictures can work, and comparing them was always the wrong
+question. The PC knew where its bytes came from and was throwing that away.
