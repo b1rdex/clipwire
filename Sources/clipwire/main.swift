@@ -711,10 +711,14 @@ func handleFrame(
             // silently does today; sending it properly, as an `.imageClip`
             // frame, is Task 13's job -- "images end to end on the Mac",
             // which needs this send, the `.imageClip` apply and the announce
-            // wired together rather than one call site at a time. Task 12 is
-            // its mirror on the PC, where the PC agent's `_resolve_clip_state`
-            // carries this same guard, for the same reason and with the same
-            // scope boundary.
+            // wired together rather than one call site at a time.
+            //
+            // Do not read the PC as the worked example: Task 12 landed
+            // "images end to end on the PC" and left the PC agent's own
+            // `_resolve_clip_state` guard exactly where it is, for want of a
+            // task that owns it (see that guard's own comment). The same
+            // guard on the same branch on both sides -- but only one of them
+            // has a task behind it.
             //
             // Silent, unlike the mismatch above, and deliberately: nothing
             // went wrong here -- this is a known gap, not a race -- and it

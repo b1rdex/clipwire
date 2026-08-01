@@ -2092,25 +2092,30 @@ class TestEchoBookkeeping(unittest.TestCase):
             "already held before anything synced",
         )
 
-    def test_an_image_only_clipboard_at_connect_seeds_no_baseline_but_still_announces_its_kind(self):
+    def test_an_image_only_clipboard_at_connect_seeds_its_baseline_and_announces_its_kind(self):
         """The Agent-level close of the loop resolve_startup_state's fix
         opens, one frame up from TestResolveCurrentClipState's direct-call
         coverage in test_clip_state_store.py: clipboard_became_ready's own
         seed read AND announce_clip_state's read (called from inside it)
         both go through this same kind-aware clipboard.read() now.
 
-        _last_seen is a (kind, hash) pair since Task 9, and since Task 10 an
-        image observation compares against it too -- but the SEED still only
-        ever produces a KIND_TEXT pair or None (see clipboard_became_ready's
-        own comment for why that is a scope boundary rather than a property
-        anything relies on), so an image-only clipboard at connect seeds no
-        baseline, exactly like an empty one already seeds none. But the
-        CLIP_STATE announcement that goes out in the same
-        call is a different matter: that frame is what gets PERSISTED to
-        the store and put on the wire, and a fabricated KIND_TEXT there is
-        exactly the regression resolve_startup_state's docstring warns
-        about -- not just wrong in memory for one connection, but wrong on
-        disk for every connection after it too."""
+        The seed covers both kinds since Task 12, and had to: a
+        locally-observed image is SENT now, so an image-only clipboard with
+        no baseline lets the first spurious signal after connect push
+        whatever the PC already held at the Mac, which applies it
+        unconditionally -- destroying a copy made there while the channel
+        was down. That is exactly the clobber
+        test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send
+        just above pins for text, arriving through the image door. Before
+        Task 12 the text-only seed was a scope boundary that cost nothing,
+        because an image observation had nowhere to go.
+
+        The CLIP_STATE announcement that goes out in the same call is a
+        separate matter, unchanged: that frame is what gets PERSISTED to the
+        store and put on the wire, and a fabricated KIND_TEXT there is
+        exactly the regression resolve_startup_state's docstring warns about
+        -- not just wrong in memory for one connection, but wrong on disk
+        for every connection after it too."""
         agent = self.build(ready=True)
         png = b"\x89PNG-the-only-thing-on-the-clipboard"
         # Same double-read shape as
@@ -2123,9 +2128,10 @@ class TestEchoBookkeeping(unittest.TestCase):
 
         self.become_ready_without_a_real_watcher(agent)
 
-        self.assertIsNone(
-            agent._last_seen,
-            "the connect-time seed stays text-only -- an image seeds no baseline yet",
+        self.assertEqual(
+            agent._last_seen, (KIND_IMAGE, sha256_hex(png)),
+            "the connect-time seed covers both kinds -- an image the PC already "
+            "held is not a change the peer needs to hear about",
         )
         announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
         self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
@@ -2133,6 +2139,28 @@ class TestEchoBookkeeping(unittest.TestCase):
         self.assertEqual(
             decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
             "the announced kind must be the real one, not a fabricated KIND_TEXT",
+        )
+
+    def test_a_spurious_signal_at_connect_with_an_image_already_present_produces_no_send(self):
+        """The other half of the seed's purpose, and the one that only became
+        reachable with Task 12: the seed exists to stop the FIRST observation
+        after connect from being read as a local change. Asserting the seed's
+        value alone would leave that unproven for images -- the send path
+        could still ignore it."""
+        agent = self.build(ready=True)
+        png = b"\x89PNG-already-on-the-pc"
+        agent.clipboard.queue_image_read(png)  # the seed read
+        agent.clipboard.queue_image_read(png)  # the announce step's own read
+        self.become_ready_without_a_real_watcher(agent)
+
+        agent.clipboard.queue_image_read(png)  # the spurious signal's read
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(
+            sent, [],
+            "a spurious signal right after connect must not resend an image the PC "
+            "already held before anything synced",
         )
 
     def test_last_seen_holds_a_kind_and_a_hash_for_text_too(self):
@@ -2146,14 +2174,11 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_the_same_bytes_under_a_different_kind_are_a_change(self):
         """Not text-by-value and images-by-hash: one rule. A second
-        comparison branch is how the two sides drift. _local_change still
-        never SENDS a locally-observed image (a later task's job), and the
-        one image observation it does act on since Task 10 -- the GPaste
-        re-offer of our own write -- needs an expectation armed by that
-        write, so this seeds _last_seen directly under KIND_IMAGE rather
-        than getting there through two scripted reads: the identity rule
-        under test lives in the comparison itself, not in how _last_seen
-        came to hold that value."""
+        comparison branch is how the two sides drift. _last_seen is seeded
+        directly under KIND_IMAGE here rather than reached through scripted
+        reads of a real image: the identity rule under test lives in the
+        comparison itself, not in how _last_seen came to hold that value,
+        and the shortest route there keeps the test about one thing."""
         agent = self.build(ready=True)
         agent._last_seen = (KIND_IMAGE, sha256_hex(b"x"))
         agent.clipboard.queue_read(b"x")
@@ -2832,17 +2857,24 @@ class TestIncomingClipState(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertIn("clipboard changed before the send", "\n".join(log_lines))
 
-    def test_the_send_branch_stays_silent_for_a_verified_image_until_task_12(self):
+    def test_the_send_branch_stays_silent_for_a_verified_image(self):
         """The verification passes -- the clipboard really does hold the
         image we announced -- and the branch still sends nothing, because
         the only clip frame it can build is TYPE_CLIP, the TEXT codec.
         Sending PNG bytes through it would be a worse outcome than not
-        sending at all. Task 12 is where this becomes a TYPE_IMAGE_CLIP
-        send; until then the silence must be the KIND guard's doing, not
-        the verification's, or Task 12 would find nothing here to replace.
+        sending at all.
 
-        Distinguished from the verification's own silence by the absence of
-        its log line."""
+        This is the branch a reconnect takes when the PC's image is the
+        fresher of the two states, and it remains silent after Task 12: that
+        task wires the on_frame dispatch and the locally-OBSERVED image
+        send, which is a different call site. No task in this plan owns this
+        one, so an image that wins a reconciliation is still not sent -- see
+        the Task 12 report. Recorded here rather than in a comment pointing
+        at a later task, because there is no later task to point at.
+
+        The silence must be the KIND guard's doing, not the verification's,
+        or this test would pass for the wrong reason -- distinguished by the
+        absence of the verification's own log line."""
         png = b"\x89PNG\r\n\x1a\n" + b"pixels"
         save_clip_state(sha256_hex(png), 5000.0, KIND_IMAGE, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)

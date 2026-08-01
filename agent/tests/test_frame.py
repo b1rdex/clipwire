@@ -5,6 +5,7 @@ import unittest
 
 from agent_under_test import (
     Agent,
+    KIND_IMAGE,
     MAX_IMAGE_BYTES,
     MAX_PAYLOAD_BYTES,
     MAX_TEXT_BYTES,
@@ -21,6 +22,7 @@ from agent_under_test import (
     decode_frame,
     encode_clip_payload,
     encode_frame,
+    encode_image_payload,
     skew_log_line,
 )
 
@@ -136,32 +138,40 @@ class TestV3Constants(unittest.TestCase):
 
 
 class TestImageClipDispatch(unittest.TestCase):
-    """Adding TYPE_IMAGE_CLIP to _KNOWN_TYPES removes decode_frame's
-    UnknownFrameType raise for 0x03: before this task, a stray 0x03 tore the
+    """Adding TYPE_IMAGE_CLIP to _KNOWN_TYPES removed decode_frame's
+    UnknownFrameType raise for 0x03: before that, a stray 0x03 tore the
     connection down loudly, caught by main()'s `except FrameError` and
-    logged as "protocol error: ...". on_frame's dispatch (if/elif, no else)
-    has no branch for the new type, so without this fix the exact same byte
-    that used to raise now vanishes in total silence -- decode_frame hands
-    it over, on_frame drops it, nothing reaches stderr, the one stream this
-    agent's diagnostics depend on. Mirrors
-    HandleFrameTests.testImageClipFrameIsReceivedAndLoggedButNotYetHandled
-    on the Swift side, whose forcing function is a compile error rather
-    than a lost exception path -- but the same minimal, one-line fix."""
+    logged as "protocol error: ...". on_frame's dispatch is an if/elif with
+    no else, so a byte that decode_frame now hands over and on_frame has no
+    branch for vanishes in total silence -- nothing reaches stderr, the one
+    stream this agent's diagnostics depend on.
 
-    def test_an_image_clip_is_received_and_logged_but_not_yet_handled(self):
+    That hole was held shut by a placeholder log line until the dispatch
+    became real. This test is what stops it reopening: it asserts the frame
+    reaches a handler that DOES something with it, which a dropped branch
+    cannot fake. What the handler then does with an image is
+    test_lifecycle.py's TestImagesEndToEndOnThePC; all this class asks is
+    that 0x03 is dispatched at all.
+
+    The pending phase is the shape that answers it without a clipboard:
+    this agent starts PHASE_PENDING (no Wayland session yet -- the ordinary
+    state on any reconnect before login), where every inbound clip is
+    queued rather than applied."""
+
+    def test_an_image_clip_reaches_a_handler_rather_than_being_dropped(self):
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=None)
-        original_log = clipwire_agent.log
-        log_lines = []
-        clipwire_agent.log = log_lines.append
-        self.addCleanup(setattr, clipwire_agent, "log", original_log)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
+        payload = encode_image_payload(1000.0, b"\x89PNG-from-the-peer")
 
-        agent.on_frame(TYPE_IMAGE_CLIP, b"not yet a real image")
+        agent.on_frame(TYPE_IMAGE_CLIP, payload)
 
-        self.assertEqual(sent, [], "must not reply to or forward an image clip yet")
-        self.assertTrue(any("image clip" in line for line in log_lines),
-                        "expected the receipt to be logged; got: %r" % log_lines)
+        self.assertEqual(sent, [], "an inbound clip is applied, never answered")
+        self.assertEqual(agent.pending_clip, payload,
+                         "0x03 must reach the clip handler, not fall off the dispatch")
+        self.assertEqual(agent.pending_clip_kind, KIND_IMAGE,
+                         "and carry the codec it belongs to, since the two wire "
+                         "shapes are indistinguishable")
 
 
 class TestSkewLogLine(unittest.TestCase):

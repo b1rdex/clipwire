@@ -161,10 +161,11 @@ class TestSaveIsAtomic(_TempPathCase):
 
 
 class TestSaveIsSerialized(_TempPathCase):
-    """save_clip_state has four call sites, and since the safety-net poll
-    landed they run on up to three threads: _write_clip and
-    announce_clip_state on run()'s thread, _observe_local_change and
-    _consume_image_reoffer on the watcher threads. All four write the SAME
+    """save_clip_state has five call sites across four methods, and since
+    the safety-net poll landed they run on up to three threads: _write_clip
+    and announce_clip_state on run()'s thread, _observe_local_change (once
+    on its text path and once on its image one) and _consume_image_reoffer
+    on the watcher threads. All of them write the SAME
     `target + ".tmp"` and then os.replace it, so two concurrent savers
     truncate one another's temp file and whichever replace runs second finds
     it already consumed.
