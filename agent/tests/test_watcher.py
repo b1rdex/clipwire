@@ -876,6 +876,83 @@ class TestPollingWatcher(unittest.TestCase):
 
         self.assertEqual(changes, [b"b", b"c"])
 
+    def test_an_unchanged_token_still_signals_when_on_idle_tick_says_so(self):
+        """v3.2's no-change branch, and the whole reason it exists.
+
+        A clipboard that never changes again is not the same thing as
+        nothing worth looking at. After this side applies an image from the
+        peer, an expectation is armed waiting for GPaste to re-offer it --
+        and on a machine with no GPaste that re-offer never comes and the
+        selection never moves again. Without this branch nothing observes
+        the clipboard a second time, _consume_image_reoffer never runs, and
+        the disarm is a branch nothing reaches: the user's next image copy,
+        whenever it happens, is absorbed as the re-offer instead. Under
+        v3.2 that clip is not late, it is gone.
+
+        The script never changes, so every signal here comes from the
+        predicate rather than from the token."""
+        clipboard = ScriptedReadClipboard([b"unmoving"])
+        observations = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005,
+                                 on_idle_tick=lambda: True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observations.append(1))
+
+        self.wait_until(lambda: len(observations) >= 2)
+        watcher.stop()
+        self.assertGreaterEqual(
+            len(observations), 2,
+            "a static clipboard must still be observed while the predicate asks for it",
+        )
+
+    def test_an_unchanged_token_signals_nothing_when_the_predicate_declines(self):
+        """The control, and the one that keeps the branch from being 'poll the
+        clipboard on every tick forever'. With no expectation armed the
+        predicate says no and the loop behaves exactly as it did before v3.2
+        -- which is what bounds the extra read to at most one detection
+        budget's worth of ticks per applied image, and to none at all once
+        the re-offer arrives.
+
+        Deliberately paired with the test above rather than folded into it:
+        a branch that signalled unconditionally would pass that one."""
+        clipboard = ScriptedReadClipboard([b"unmoving"])
+        observations = []
+        asked = []
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.002,
+            on_idle_tick=lambda: asked.append(1) or False)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observations.append(1))
+
+        self.wait_until(lambda: len(asked) >= 3)
+        watcher.stop()
+        self.assertGreaterEqual(len(asked), 3, "the predicate must actually be asked")
+        self.assertEqual(observations, [],
+                         "an unchanged clipboard nobody is waiting on is not an observation")
+
+    def test_a_real_change_still_reaches_the_tick_observer_when_the_predicate_is_wired(self):
+        """Health accounting outranks absorption. The no-change branch must
+        be an `elif` under the real-change branch and must not skip past
+        on_tick: _observe_tick is the safety net's whole judgement, and a
+        tick that returned early to service an expectation would leave a
+        dead event source undiagnosed for another full cycle -- the safety
+        net blinded by the very mechanism that proves it was needed."""
+        ticks = []
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"b", b"b"])
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.002,
+            on_tick=lambda previous, current: ticks.append((previous, current)),
+            on_idle_tick=lambda: True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        watcher.stop()
+        self.assertGreaterEqual(len(ticks), 3,
+                                "every tick must still reach the verdict, changed or not")
+        self.assertIn((b"a", b"b"), ticks,
+                      "and the real change must still be reported as one")
+
     def test_stop_ends_the_poll_loop_promptly(self):
         clipboard = ScriptedReadClipboard([b"x"] * 10000)
         watcher = PollingWatcher(clipboard, interval_seconds=0.02)
@@ -1712,6 +1789,34 @@ class TestMakeWatcher(unittest.TestCase):
             "and a watcher rebuilt already degraded must come up polling at it",
         )
 
+    def test_the_idle_tick_predicate_reaches_both_watcher_shapes(self):
+        """And the plain poller is the branch that matters, which is why
+        both are asserted here rather than only the interesting-looking one.
+
+        A machine with no GPaste gets the fallback below, and it is exactly
+        the machine whose applied image is never re-offered -- so a hook
+        wired only into the GPaste watcher would be inert in the one
+        installation Task 5 exists for. That is the shape of the two fixes
+        this bug has already outlived: correct code that no production path
+        reaches."""
+        predicate = object()
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            gpaste = make_watcher(clipboard=object(), on_idle_tick=predicate)
+        self.assertIs(
+            gpaste._safety_net._on_idle_tick, predicate,
+            "the GPaste watcher must hand it to the safety-net poll it composes",
+        )
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            plain = make_watcher(clipboard=object(), on_idle_tick=predicate)
+        self.assertIs(
+            plain._on_idle_tick, predicate,
+            "and the no-GPaste fallback must get it too: that is the machine whose "
+            "re-offer never comes, so a hook it never receives is a fix that is inert "
+            "exactly where it is needed",
+        )
+
 
 class QueueClipboard:
     """A clipboard double whose read() replays a queue of scripted values --
@@ -1769,9 +1874,15 @@ class FlapRecordingWatcher:
     the diagnosis on demand -- standing in for a real safety-net verdict
     without any thread or subprocess."""
 
-    def __init__(self, degraded=False, on_degrade=None):
+    def __init__(self, degraded=False, on_degrade=None, on_idle_tick=None):
         self.degraded = degraded
         self._on_degrade = on_degrade
+        # Recorded rather than ignored: the disarm that keeps a re-offer
+        # expectation from swallowing the user's next image copy is reached
+        # only through this hook, so a rebuild that quietly dropped it would
+        # leave every connection after the first Wayland flap with an
+        # expectation nothing can ever disarm.
+        self.on_idle_tick = on_idle_tick
         self.started_with = None
         self.stopped = False
 
@@ -1884,6 +1995,12 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
         self.assertEqual(
             built[1].started_with, agent._local_change,
             "and it must still be wired to the one observation funnel",
+        )
+        self.assertEqual(
+            built[1].on_idle_tick, agent._reoffer_pending,
+            "and to the predicate that lets a static clipboard still disarm a "
+            "re-offer expectation -- a rebuild that dropped it would leave the "
+            "user's next image copy to be absorbed as a re-offer that never came",
         )
 
 

@@ -7,11 +7,13 @@ from unittest import mock
 
 from agent_under_test import (
     Agent,
+    DEGRADED_POLL_SECONDS,
     KIND_IMAGE,
     KIND_TEXT,
     MAX_IMAGE_BYTES,
     PROTOCOL_VERSION,
     REOFFER_TS_NUDGE_SECONDS,
+    SAFETY_NET_POLL_SECONDS,
     SEND_MINE,
     TIMESTAMP_BYTES,
     TYPE_CLIP,
@@ -672,10 +674,285 @@ class TestImageReofferIsOurOwnWrite(ImageAgentTestCase):
         clip = ReofferingClipboard(reads=[])
         agent_obj = self.build(clipboard=clip)
         applied = agent_obj._write_clip(encode_clip_payload(1000.0, b"plain text"))
-        self.assertEqual(applied, (sha256_hex(b"plain text"), 1000.0, KIND_TEXT))
+        self.assertEqual(applied, (sha256_hex(b"plain text"), 1000.0, KIND_TEXT, None),
+                         "four elements since v3.2, with a null origin: this value "
+                         "travels to _resolve_clip_state as `mine`, where "
+                         "resolve_provenance refuses a short record outright")
         self.assertEqual(clip.written, [(KIND_TEXT, b"plain text")])
         self.assertIsNone(agent_obj._expect_reoffer,
                           "a text write expects no re-offer -- text reads back unchanged")
+
+
+class TestTheReofferRecordsWhereTheBytesCameFrom(ImageAgentTestCase):
+    """v3.2, Task 3. The PC is the only witness to the substitution -- it
+    wrote the Mac's bytes and read different ones back with nobody touching
+    the clipboard in between -- and until now it threw that testimony away
+    and left both machines to infer provenance from content that provably
+    no longer matches (measured: 398,267 of 614,400 samples differ).
+
+    So the re-offer's store entry names THE HASH IT WAS GIVEN. Recorded on
+    the branch that consumes the expectation and on no other: the other two
+    return True without consuming -- a read that predates a newer write,
+    and an observation that changed nothing -- and an origin stamped on
+    either would label a clip THE USER COPIED as a derivative of the peer's
+    content. Under v3.2 such a clip is not sent one connection late; it is
+    never sent at all."""
+
+    WRITTEN = b"\x89PNG-original-from-the-mac"
+    REOFFERED = b"\x89PNG-reencoded-by-gpaste-and-larger"
+
+    def test_the_consumed_re_offer_records_the_peers_own_hash(self):
+        """The peer's hash is never plumbed in from anywhere: the bytes
+        handed to the clipboard are the bytes the Mac hashed and announced,
+        so their digest IS the peer's canonical hash, and _write_clip has
+        it in hand at the moment it arms the expectation."""
+        clip = ReofferingClipboard(reads=[(KIND_IMAGE, self.REOFFERED)])
+        agent_obj = self.build(clipboard=clip)
+        agent_obj._write_clip(encode_image_payload(1000.0, self.WRITTEN), kind=KIND_IMAGE)
+        agent_obj._local_change()
+
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(stored[0], sha256_hex(self.REOFFERED),
+                         "the hash is still what the clipboard offers")
+        self.assertEqual(stored[3], sha256_hex(self.WRITTEN),
+                         "and the origin is what the peer sent us, which is the one "
+                         "fact no comparison of the two clipboards could recover")
+
+    def test_an_observation_of_our_own_bytes_records_no_origin(self):
+        """The second of the three True branches. Our own wl-copy write
+        raises an Update seconds before GPaste's takeover raises the real
+        one, so the first image observation after a write is normally the
+        bytes we wrote. Nothing changed, so nothing is consumed -- and
+        nothing may be labelled either."""
+        clip = ReofferingClipboard(reads=[(KIND_IMAGE, self.WRITTEN)])
+        agent_obj = self.build(clipboard=clip)
+        agent_obj._write_clip(encode_image_payload(1000.0, self.WRITTEN), kind=KIND_IMAGE)
+        agent_obj._local_change()
+
+        self.assertIsNone(
+            load_clip_state(path=self.clip_state_path)[3],
+            "an observation that changed nothing has no ancestry to declare",
+        )
+
+    def test_a_stale_read_racing_a_newer_write_records_no_origin(self):
+        """The third. The read could predate the newer write entirely, so
+        the bytes in hand are not the re-offer of anything -- and the newer
+        write has already persisted its own entry, which this must not
+        overwrite with an ancestry claim about the previous one."""
+        agent_obj = self.build(clipboard=ReofferingClipboard(reads=[]))
+        agent_obj.clipboard = RacyImageClipboard(
+            agent_obj,
+            value_read=b"\x89PNG-captured-before-the-newer-write",
+            interleaved_write=encode_image_payload(2.0, b"\x89PNG-newer-from-the-peer"),
+        )
+        agent_obj._local_change()
+
+        self.assertIsNone(
+            load_clip_state(path=self.clip_state_path)[3],
+            "a read that predates a newer write is nobody's descendant",
+        )
+
+    def test_the_origin_survives_the_agent_that_recorded_it(self):
+        """The point of putting it in the store at all, stated as the
+        failure it prevents: sshd spawns a NEW agent per connection, so the
+        process that watched the substitution is already dead by the
+        announce that needs to describe it. An origin living only in
+        _expect_reoffer would be a fix that changes nothing on the machine
+        -- for the third release running.
+
+        TWO reconnects, not one, and the second is the one that bites. Each
+        announce persists what it resolved, so a resolve_startup_state that
+        rebuilt the matched record around `current_hash` -- dropping the
+        origin while looking correct on all three fields anyone thinks to
+        check -- would write the stripped record back and take the SECOND
+        connection down while the first still passed. That is the shape
+        this pair exists to catch."""
+        clip = ReofferingClipboard(reads=[(KIND_IMAGE, self.REOFFERED)])
+        first = self.build(clipboard=clip)
+        first._write_clip(encode_image_payload(1000.0, self.WRITTEN), kind=KIND_IMAGE)
+        first._local_change()
+
+        for attempt in ("first reconnect", "second reconnect"):
+            with self.subTest(attempt=attempt):
+                self.sent.clear()
+                # Two reads because a connection makes two: the connect-time
+                # _last_seen seed, then the announce's own reconciliation.
+                reconnected = self.build(clipboard=ReofferingClipboard(
+                    reads=[(KIND_IMAGE, self.REOFFERED)] * 2))
+                self.become_ready(reconnected)
+
+                announced = [decode_clip_state(payload)
+                             for frame_type, payload in self.sent
+                             if frame_type == TYPE_CLIP_STATE]
+                self.assertEqual(len(announced), 1)
+                self.assertEqual(
+                    announced[0][3], sha256_hex(self.WRITTEN),
+                    "the connection that has to say where the bytes came from is "
+                    "never the connection that found out",
+                )
+                self.assertEqual(
+                    load_clip_state(path=self.clip_state_path)[3],
+                    sha256_hex(self.WRITTEN),
+                    "and the announce must persist it again, or the fix survives "
+                    "exactly one reconnect",
+                )
+
+
+class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
+    """v3.2, Task 5. On an installation with no GPaste the re-offer never
+    comes, so an expectation armed by an applied image used to stay armed
+    until the user's NEXT image copy, which was absorbed as though it were
+    the re-offer. That cost one clip arriving a connection late -- the
+    store carried it at the peer's ts plus the nudge, the PC won the
+    reconnect, and it went across. With an origin stamped on it the Mac
+    matches the ancestor, provenance stands both sides down, and the clip
+    is gone. v3.2 turns a late clip into a lost one, so the expectation has
+    to be disarmed when the re-offer does not come.
+
+    NOT BY A CLOCK, and the two mines are both in the phrase "30 seconds":
+
+      * the takeover happens at one to four seconds, but the window must
+        cover when it is OBSERVED, and with the event source dead only the
+        safety-net poll sees it -- up to a full interval later. A wall-clock
+        deadline and the tick carrying the observation then race, and the
+        phase decides: 29.9s absorbs correctly, 30.1s ships the degraded
+        copy live with no origin recorded.
+      * after the two-tick verdict the poll runs at DEGRADED_POLL_SECONDS,
+        SHORTER than the takeover, so a window meaning "the current
+        interval" would disarm deterministically before the re-offer.
+
+    So one read decides both, and the branches are mutually exclusive by
+    CONTENT: differing bytes are the re-offer whatever the clock says, and
+    our own bytes past the constant mean there is nothing here that
+    re-encodes clipboards."""
+
+    WRITTEN = b"\x89PNG-applied-from-the-mac"
+    LATER = b"\x89PNG-the-user-copied-this-days-later"
+
+    def armed(self, at=1000.0):
+        """An agent holding an image applied from the peer, written at a
+        known instant so the tests below can place an observation either
+        side of the threshold."""
+        clip = ReofferingClipboard(reads=[])
+        agent_obj = self.build(clipboard=clip)
+        with mock.patch("time.time", return_value=at):
+            agent_obj._write_clip(encode_image_payload(1000.0, self.WRITTEN),
+                                  kind=KIND_IMAGE)
+        self.sent.clear()
+        return agent_obj, clip
+
+    def observe(self, agent_obj, clip, value, at):
+        clip._reads.append(value)
+        with mock.patch("time.time", return_value=at):
+            agent_obj._local_change()
+
+    def test_our_own_bytes_past_the_threshold_disarm_it(self):
+        agent_obj, clip = self.armed()
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
+                     at=1000.0 + SAFETY_NET_POLL_SECONDS)
+
+        self.assertIsNone(agent_obj._expect_reoffer,
+                          "a clipboard still offering our own bytes a whole detection "
+                          "budget later is a machine with nothing re-encoding it")
+        self.assertEqual(self.sent, [],
+                         "and disarming sends nothing: the peer already holds this")
+        self.assertTrue(any("no re-offer" in line for line in self.logged),
+                        "a suppression that leaves no trace is indistinguishable from "
+                        "a bug: %r" % self.logged)
+
+    def test_our_own_bytes_before_the_threshold_leave_it_armed(self):
+        """The control. GPaste's takeover was measured at one to four
+        seconds, and the observation of our own write lands before it every
+        time -- disarming there would ship the re-encode to the Mac live,
+        as a genuine local change, with no origin recorded. That is the
+        original bug, delivered faster."""
+        agent_obj, clip = self.armed()
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
+                     at=1000.0 + SAFETY_NET_POLL_SECONDS - 0.1)
+
+        self.assertIsNotNone(agent_obj._expect_reoffer,
+                             "the takeover happens seconds after the write, and our own "
+                             "write's echo is observed before it")
+
+    def test_a_re_offer_first_observed_after_the_threshold_is_consumed_not_disarmed(self):
+        """THE PHASE CASE, and the one a wall-clock deadline gets wrong. With
+        the event source dead the substitution is seen only by the
+        safety-net poll, up to a full interval after it happened -- so the
+        observation legitimately arrives past the threshold. It is still
+        the re-offer, and content says so: these bytes are not the ones we
+        wrote. Consumed, whatever the clock says."""
+        agent_obj, clip = self.armed()
+        reoffered = b"\x89PNG-reencoded-by-gpaste"
+        self.observe(agent_obj, clip, (KIND_IMAGE, reoffered),
+                     at=1000.0 + SAFETY_NET_POLL_SECONDS * 1.5)
+
+        self.assertEqual(self.sent, [],
+                         "the re-offer is our own write coming back, not a local clip")
+        stored = load_clip_state(path=self.clip_state_path)
+        self.assertEqual(stored[0], sha256_hex(reoffered))
+        self.assertEqual(stored[3], sha256_hex(self.WRITTEN),
+                         "and it must still record where the bytes came from -- a "
+                         "disarm here is what delivers the degraded copy live")
+
+    def test_the_window_is_the_constant_never_the_interval_in_force(self):
+        """The second mine. After the two-tick dead-source verdict the poll
+        runs at DEGRADED_POLL_SECONDS for the rest of the connection --
+        ONE second, shorter than the measured takeover -- so a window
+        defined as "the current interval", or as any multiple of it, would
+        disarm deterministically before the re-offer could arrive, in the
+        mode the machine stays in for the whole connection once the verdict
+        ever fires.
+
+        Pinned as the inequality rather than as a number, so it stays true
+        if either constant is tuned."""
+        self.assertLess(DEGRADED_POLL_SECONDS, SAFETY_NET_POLL_SECONDS,
+                        "if these ever meet, this test proves nothing")
+        agent_obj, clip = self.armed()
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
+                     at=1000.0 + DEGRADED_POLL_SECONDS * 2)
+
+        self.assertIsNotNone(
+            agent_obj._expect_reoffer,
+            "two ticks of the degraded interval is not the detection budget: the "
+            "takeover has not even happened yet",
+        )
+
+    def test_after_a_disarm_the_next_image_is_the_users_own_clip(self):
+        """What the disarm is FOR, end to end. The image the user copies
+        after a disarm goes to the peer as a genuine local clip, stamped
+        with the moment it was observed and carrying no ancestry -- rather
+        than being absorbed as a re-offer that never came, stored under the
+        peer's timestamp with an origin the Mac still matches, and
+        therefore never sent at all."""
+        agent_obj, clip = self.armed()
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
+                     at=1000.0 + SAFETY_NET_POLL_SECONDS)
+        self.sent.clear()
+
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.LATER), at=5000.0)
+
+        self.assertEqual([frame_type for frame_type, _ in self.sent], [TYPE_IMAGE_CLIP])
+        self.assertEqual(decode_image_payload(self.sent[0][1]), (5000.0, self.LATER))
+        self.assertEqual(
+            load_clip_state(path=self.clip_state_path),
+            (sha256_hex(self.LATER), 5000.0, KIND_IMAGE, None),
+            "a clip born on the PC carries the PC's timestamp and no ancestry",
+        )
+
+    def test_the_poll_is_told_whether_an_expectation_is_still_armed(self):
+        """The predicate the poll's no-change branch asks, and the only
+        thing that gets the disarm observed at all on a machine whose
+        clipboard never moves again. It answers a bare flag test -- no
+        clipboard read, no decision -- so the file keeps one place that
+        decides what a local change means and one thread inside it."""
+        agent_obj, clip = self.armed()
+        self.assertTrue(agent_obj._reoffer_pending())
+
+        self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
+                     at=1000.0 + SAFETY_NET_POLL_SECONDS)
+        self.assertFalse(agent_obj._reoffer_pending(),
+                         "and it must stop asking once there is nothing to wait for, "
+                         "or the poll observes a static clipboard forever")
 
 
 class RacyImageClipboard:
@@ -797,7 +1074,11 @@ class TestImagesEndToEndOnThePC(ImageAgentTestCase):
         agent_obj.on_frame(TYPE_IMAGE_CLIP, encode_image_payload(1000.0, png))
         clip._ready = True
         self.become_ready(agent_obj)
-        self.assertEqual(agent_obj._expect_reoffer, 1000.0)
+        self.assertEqual(agent_obj._expect_reoffer[:2], (1000.0, sha256_hex(png)),
+                         "the peer's timestamp AND the peer's hash: the digest of the "
+                         "bytes just written is the peer's own, and this process dies "
+                         "with the connection, so the store write it authorises is the "
+                         "only place that fact survives")
 
     def test_a_wayland_flap_does_not_leave_a_re_offer_expectation_armed(self):
         """_expect_reoffer is cleared only by an image or a text OBSERVATION,
@@ -812,7 +1093,7 @@ class TestImagesEndToEndOnThePC(ImageAgentTestCase):
         agent_obj = self.build(clipboard=clip)
         agent_obj._write_clip(encode_image_payload(1000.0, b"\x89PNG-applied-before-the-flap"),
                               kind=KIND_IMAGE)
-        self.assertEqual(agent_obj._expect_reoffer, 1000.0)
+        self.assertEqual(agent_obj._expect_reoffer[0], 1000.0)
 
         agent_obj.clipboard_lost()
         self.become_ready(agent_obj)
@@ -892,7 +1173,7 @@ class TestImagesEndToEndOnThePC(ImageAgentTestCase):
         agent_obj._local_change()
         self.assertEqual(self.sent, [],
                          "a read that predates a newer write is not a local change")
-        self.assertEqual(agent_obj._expect_reoffer, 2.0,
+        self.assertEqual(agent_obj._expect_reoffer[0], 2.0,
                          "and the newer write's expectation must stay armed for its own re-offer")
 
     def test_an_empty_image_read_is_not_sent(self):

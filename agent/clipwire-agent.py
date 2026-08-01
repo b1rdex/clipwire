@@ -684,20 +684,26 @@ class Agent:
         # existed to avoid -- so the field went with it, and the rule above
         # is unqualified again.
         self._last_seen = None
-        # The peer timestamp of an image this side has just applied and is
-        # still waiting to see GPaste re-offer -- or None when no re-offer is
-        # expected. Set by _write_clip on an image write, spent by
-        # _consume_image_reoffer, and cleared three ways: by a TEXT WRITE
+        # What this side needs to remember about an image it has just
+        # applied and is still waiting to see GPaste re-offer -- or None
+        # when no re-offer is expected. A (peer_ts, peer_sha256, written_at)
+        # TRIPLE since v3.2, where it was the bare peer timestamp before;
+        # see _write_clip, which produces all three from the one write, for
+        # what each is for. Set by _write_clip on an image write, spent by
+        # _consume_image_reoffer, and cleared four ways: by a TEXT WRITE
         # (_write_clip's own `ts if kind == KIND_IMAGE else None` -- an
         # applied text clip replaces the selection, so the image's re-offer
         # will never come, and a stale expectation would swallow the next
         # image instead), by a text OBSERVATION (_observe_local_change: the
-        # user moved on, same reasoning from the other direction), or by
+        # user moved on, same reasoning from the other direction), by
         # clipboard_became_ready (a fresh connection or a Wayland flap: the
-        # session the write went into is gone). All three clear it for one
-        # reason -- the re-offer this was armed for can no longer arrive --
-        # and the write is easy to miss precisely because it is the same
-        # assignment that arms it.
+        # session the write went into is gone), and -- since v3.2 -- by
+        # _consume_image_reoffer's DISARM, when the clipboard has gone on
+        # offering our own bytes for longer than the detection budget, which
+        # is what "there is no GPaste on this machine" looks like from here.
+        # All four clear it for one reason -- the re-offer this was armed
+        # for can no longer arrive -- and the write is easy to miss
+        # precisely because it is the same assignment that arms it.
         #
         # It exists because the PC's clipboard does not necessarily hold what
         # was put in it. Measured on the live machine: a 105,700-byte PNG
@@ -718,18 +724,24 @@ class Agent:
         # race dressed as a constant. The expectation is spent by an EVENT
         # instead -- the first image observation whose hash differs from
         # _last_seen -- which is the echo guard's own shape, one door over.
+        # v3.2's disarm does not weaken that: `written_at` is never a
+        # deadline for the re-offer to beat, it only bounds how long an
+        # UNCHANGED clipboard keeps the expectation alive, and an
+        # observation that differs is consumed whatever the clock says.
         #
-        # It holds the timestamp rather than a bare flag because the store
-        # write it authorises needs one, and it must be derived from the
-        # PEER's: the re-offer is not a new clip, it is the applied one
+        # It holds the peer's timestamp rather than a bare flag because the
+        # store write it authorises needs one, and it must be derived from
+        # the PEER's: the re-offer is not a new clip, it is the applied one
         # re-encoded, so stamping it with the moment it was observed would
         # make content the Mac sent us look freshly copied here and beat
         # anything the Mac copied in between. What _consume_image_reoffer
         # actually stores is this value plus REOFFER_TS_NUDGE_SECONDS,
         # because the peer's value EXACTLY leaves the two sides at an
         # identical ts holding different bytes -- see that constant. Tested
-        # with `is not None`, never for truth: a ts of 0.0 is a real
-        # timestamp.
+        # with `is not None`, never for truth: the record is a tuple now,
+        # but its first element is still a ts of 0.0 for a clip copied at
+        # the epoch, and the habit of checking the field for truth is what
+        # that would break.
         self._expect_reoffer = None
         # Guards _last_written/_write_gen/_last_seen/_expect_reoffer only. A
         # separate lock from _write_lock (which guards stdout) on purpose:
@@ -1247,8 +1259,48 @@ class Agent:
                 self.clipboard,
                 degraded=self._event_source_degraded,
                 on_degrade=self._note_event_source_degraded,
+                # Handed to BOTH watcher shapes by make_watcher, and the
+                # standalone poller is the one that matters: it is what a
+                # machine with no GPaste gets, which is precisely the
+                # machine whose re-offer never comes. See _reoffer_pending.
+                on_idle_tick=self._reoffer_pending,
             )
             self._watcher.start(self._local_change)
+
+    def _reoffer_pending(self):
+        """Is an image re-offer still expected? Asked by the poll on every
+        tick that saw NO change, and answering True makes it signal an
+        observation anyway.
+
+        This is what keeps the disarm honest on the machine it exists for.
+        The poll signals on a change to its probe() TOKEN, and on an
+        installation with no GPaste there is no second change to see: our
+        own wl-copy write moves the token once, and from then on the
+        clipboard sits perfectly still. Without this the expectation is
+        never looked at again, _consume_image_reoffer never runs, and the
+        disarm is a branch nothing reaches -- inert, in exactly the
+        installation Task 5 exists for, which is how the previous two fixes
+        for this bug shipped.
+
+        So the poll's no-change branch asks, and the WORKER reads. This
+        thread neither reads the clipboard nor decides anything: one place
+        still decides what a local change means, and only one thread is ever
+        inside it. A second reader here would be a parallel observation path
+        with its own copy of the echo rules, which this file has already
+        fixed two races in.
+
+        Bounded by construction, which is what makes an extra read per tick
+        affordable: it can only return True while an expectation is armed,
+        and the disarm it enables is what ends that -- at most one detection
+        budget's worth of ticks per applied image, and none at all once the
+        re-offer arrives (the ordinary case, within four seconds).
+
+        Runs on the poll thread and takes _echo_lock, which is held across
+        nothing that blocks; it acquires no other lock, so the file's
+        _observe_lock -> _echo_lock -> _write_lock order is untouched.
+        """
+        with self._echo_lock:
+            return self._expect_reoffer is not None
 
     def _note_event_source_degraded(self):
         """Called once by the watcher when it diagnoses a dead event source, so
@@ -1309,13 +1361,24 @@ class Agent:
         was added -- and reads this same bookkeeping, so the two fields are
         only ever touched under _echo_lock.
 
-        Returns the (sha256, ts, kind) triple that was applied and
+        Returns the (sha256, ts, kind, origin) record that was applied and
         (best-effort) persisted, or None if the payload never decoded or
         decoded with an empty body and nothing was applied.
         clipboard_became_ready uses this to announce a just-applied pending
         clip's state DIRECTLY, rather than re-deriving it through a fresh
         clipboard read -- see that method's own comment for why a read
         immediately after this call cannot be trusted to reflect it yet.
+
+        FOUR elements as of v3.2, with a literal None origin, and that is
+        load-bearing rather than cosmetic. This return value travels to
+        _resolve_clip_state as `mine` (via clipboard_became_ready's
+        `announced`), where resolve_provenance takes whole records and
+        raises ValueError on a short one. The None is also the honest
+        answer: content applied FROM the peer is byte-identical to what the
+        peer holds, so the two agree by hash and have no ancestry to
+        declare. An origin is born one door over, in
+        _consume_image_reoffer, when the clipboard hands back something
+        else.
         """
         decode = decode_image_payload if kind == KIND_IMAGE else decode_clip_payload
         try:
@@ -1348,7 +1411,27 @@ class Agent:
             # Arm the expectation here, spend it in _consume_image_reoffer.
             # A text write clears it rather than leaving it: text reads back
             # unchanged, and a stale expectation would swallow a later image.
-            self._expect_reoffer = ts if kind == KIND_IMAGE else None
+            #
+            # A TRIPLE since v3.2, and all three elements come from this one
+            # write:
+            #
+            #   * `ts` -- the peer's own timestamp, which is what the store
+            #     entry the consumer authorises has to be stamped with.
+            #   * `sha256` -- THE PEER'S CANONICAL HASH, and the whole of
+            #     provenance's premise. It is not plumbed in from anywhere:
+            #     the bytes handed to the clipboard one line above are the
+            #     bytes the peer hashed and announced, so their digest --
+            #     already computed here, already assigned to _last_seen -- IS
+            #     the peer's hash. Recorded now because the process that
+            #     knows it dies with this connection.
+            #   * the wall-clock moment of the write, which is what lets
+            #     _consume_image_reoffer tell "GPaste has not acted YET" from
+            #     "there is no GPaste on this machine at all". Not a deadline
+            #     and not compared against any interval in force -- see that
+            #     method's disarm branch.
+            self._expect_reoffer = (
+                (ts, sha256, time.time()) if kind == KIND_IMAGE else None
+            )
         self.clipboard.write(kind, body)
         # WaylandClipboard.write() spawns wl-copy DETACHED (Popen(...,
         # start_new_session=True)) and returns as soon as its own stdin pipe
@@ -1379,11 +1462,16 @@ class Agent:
         # against the machine it actually came from. A local disk failure
         # here is not the peer's fault and must not undo the write above or
         # propagate as a FrameError and tear down the channel.
+        #
+        # No origin: what this side now holds IS the peer's bytes, so there
+        # is nothing to declare an ancestor for. Written as the default
+        # rather than passed, alongside every other store write in this file
+        # except the one in _consume_image_reoffer.
         try:
             save_clip_state(sha256, ts, kind, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
-        return sha256, ts, kind
+        return sha256, ts, kind, None
 
     def _local_change(self):
         """The single funnel for an observed local change, and the one entry
@@ -1704,6 +1792,15 @@ class Agent:
           tie-break. See that constant's own comment for the tie, and the
           note below for what the nudge costs.
 
+          AND THE ORIGIN, recorded here and NOWHERE ELSE in this file. The
+          store entry names the peer's own hash -- carried on
+          _expect_reoffer from the write, where it was the digest of the
+          bytes the peer sent -- so the next reconnect can say "what I hold
+          was born from what you hold" instead of leaving two machines to
+          infer it from content that no longer matches. Every attempt to
+          infer it is measured dead (see the v3.2 design); this side is the
+          only witness, and until now it discarded its own testimony.
+
         * A newer write landed while the read was in flight (`gen`) -- the
           same staleness rule the text path applies, and needed for the same
           reason: the read could predate that write. Consuming the
@@ -1722,25 +1819,49 @@ class Agent:
           text path applies one branch down, and the one the connect-time
           seed relies on.
 
+          THE DISARM LIVES ON THIS BRANCH (v3.2), and only on it: the
+          clipboard is still offering our own bytes, and it has been doing
+          so for at least SAFETY_NET_POLL_SECONDS, so there is nothing on
+          this machine that re-encodes clipboard images and the expectation
+          is dropped. See the code for why the position is the rule.
+
         False, then, means exactly one thing: nothing was expected. An image
         the USER copied, which the caller sends.
 
-        The remaining hazard is stated rather than closed. On an
-        installation with no GPaste the re-offer never comes at all, so an
-        expectation armed by an applied image stays armed until the user's
-        NEXT image copy, which is absorbed here as though it were the
-        re-offer -- one image silently not synced, and stored under the
-        peer's timestamp. It cannot be distinguished by content: a re-offer
-        IS a different image, so the only signal separating the two cases is
-        whether GPaste is going to act, which is unknowable at this instant.
-        A timer would be a race dressed as a constant (the takeover was
-        measured between one and four seconds, on one machine, on one day),
-        and any rule that sent the first differing image would send the
-        re-encode straight back on every installation the design does
-        target. Bounded to the installations where the expectation can never
-        be spent, and to one image per applied image; the flap and reconnect
-        cases, where it CAN be bounded, are cleared in
+        THE HAZARD THAT USED TO BE STATED RATHER THAN CLOSED, and what
+        v3.2 had to do about it. On an installation with no GPaste the
+        re-offer never comes at all, so an expectation armed by an applied
+        image stayed armed until the user's NEXT image copy, which was
+        absorbed here as though it were the re-offer. That cost one image
+        arriving a connection LATE: the store carried it at the peer's ts
+        plus the nudge, so the PC won the next reconnect and delivered it.
+        With an origin stamped on it the same clip is instead RECOGNISED AS
+        THE PEER'S OWN DESCENDANT, both sides stand down, and it is never
+        sent at all -- a late clip becomes a lost one. v3 weighed a timer
+        against that cost and rejected it correctly; v3.2 inverted the cost,
+        so the ruling had to be re-taken rather than inherited.
+
+        It is still not a timer, because a wall-clock deadline loses to a
+        phase race: the takeover happens at one to four seconds, but with
+        the event source dead it is OBSERVED only by the safety-net poll, up
+        to a full interval later, and a deadline and the tick carrying the
+        observation then arrive neck and neck. What decides both outcomes
+        here is a single READ instead -- the caller's, the one already made
+        -- and the two branches are mutually exclusive by CONTENT, so no
+        ordering remains to race. What is left of the hazard is the window
+        before the threshold, unchanged from v3 and bounded by it.
+
+        The flap and reconnect cases, where the expectation can be cleared
+        outright rather than waited out, are still handled in
         clipboard_became_ready.
+
+        Nothing here drives its own clock, which is the other half of why
+        this is not a timer: this method only ever runs when something
+        observed the clipboard. On a machine whose event source is silent,
+        the observations that reach the disarm are the safety-net poll's --
+        see Agent._reoffer_pending and PollingWatcher's no-change branch,
+        which is what keeps a static clipboard from going unobserved while
+        an expectation is armed.
 
         THE SECOND REMAINING COST, ALSO STATED RATHER THAN CLOSED, and it is
         what REOFFER_TS_NUDGE_SECONDS buys. After a Mac->PC image the two
@@ -1770,19 +1891,72 @@ class Agent:
         # above meaningful in the first place -- a snapshot would answer for
         # the moment before the read, which is exactly the moment `gen` exists
         # to reject.
+        disarmed = False
         with self._echo_lock:
             if self._write_gen != gen:
                 return True
             if (KIND_IMAGE, sha256) == self._last_seen:
-                return True
-            ts = self._expect_reoffer
-            if ts is None:
-                # `is None`, never a truth test: a ts of 0.0 is a real
-                # timestamp, and a falsy check would send the re-offer of a
-                # clip copied at the epoch back to the peer.
-                return False
-            self._expect_reoffer = None
-            self._last_seen = (KIND_IMAGE, sha256)
+                # THE DISARM, and it lives here -- inside the branch that
+                # already established the clipboard still holds exactly what
+                # we wrote -- rather than above the dispatch, because the
+                # position IS the rule. Reached only when the bytes are
+                # ours, so an expectation is never dropped on a tick that
+                # has the re-offer in its hand: the two outcomes are
+                # separated by CONTENT first and consult a clock only after,
+                # which is what leaves no ordering to race. Hoisted above
+                # this comparison instead, it would disarm on a re-offer
+                # first observed after the threshold -- the phase case, and
+                # the exact failure a wall-clock deadline produces.
+                expectation = self._expect_reoffer
+                if (expectation is not None
+                        and time.time() - expectation[2] >= SAFETY_NET_POLL_SECONDS):
+                    # SAFETY_NET_POLL_SECONDS, the CONSTANT, never whatever
+                    # interval the poll happens to be running at. After the
+                    # dead-source verdict that interval is
+                    # DEGRADED_POLL_SECONDS -- one second, shorter than the
+                    # takeover this waits for -- so a window meaning "the
+                    # current interval" would disarm deterministically
+                    # BEFORE the re-offer, in the mode a connection stays in
+                    # for the rest of its life once the verdict ever fired.
+                    #
+                    # What it costs when it is wrong is re-priced honestly
+                    # by v3.2 and is why the threshold is generous: a false
+                    # disarm no longer costs one extra frame, it costs the
+                    # original bug for that image -- the re-encode delivered
+                    # live as a local change, no origin recorded, and the
+                    # reconnect degraded. Still better than the alternative
+                    # it replaces (an expectation armed forever absorbs the
+                    # user's next image copy, and under provenance that clip
+                    # is lost PERMANENTLY rather than arriving one
+                    # connection late), but the margin is load-bearing now.
+                    self._expect_reoffer = None
+                    disarmed = True
+                else:
+                    return True
+            else:
+                expectation = self._expect_reoffer
+                if expectation is None:
+                    # `is None`, never a truth test: the expectation carries
+                    # a ts of 0.0 for a clip copied at the epoch, and a
+                    # falsy check on the record would send its re-offer back
+                    # to the peer.
+                    return False
+                self._expect_reoffer = None
+                self._last_seen = (KIND_IMAGE, sha256)
+        if disarmed:
+            # Logged because a disarm is a decision about the machine, not
+            # about this clip: it says GPaste did not take the selection
+            # within the detection budget, so nothing on this installation
+            # is going to re-offer anything, and the next image the user
+            # copies is theirs rather than ours. Silent, it is
+            # indistinguishable from the expectation having been consumed
+            # correctly -- and those two have opposite consequences for the
+            # image after this one.
+            log("no re-offer within %gs of writing an image: "
+                "nothing on this machine is re-encoding the clipboard"
+                % SAFETY_NET_POLL_SECONDS)
+            return True
+        ts, origin, _written_at = expectation
         if len(png) > MAX_IMAGE_BYTES:
             # The size limit belongs on the read-back body too, because
             # re-encoding INFLATES: 105 KB became 180 KB on the live machine,
@@ -1800,9 +1974,18 @@ class Agent:
             # separating it from the frame cap.
             log("the clipboard re-offered an image of %d bytes: over the image limit"
                 % len(png))
+        # `origin` -- the peer's own hash, carried here from the write --
+        # is the one store write in this file that records one, and this is
+        # the one branch of this method that may. The other two return True
+        # without consuming: an observation that changed nothing, and a read
+        # that predates a newer write. Stamping either with an origin would
+        # label a clip THE USER COPIED as a derivative of the peer's
+        # content, and under v3.2 a clip so labelled is not merely sent late
+        # -- resolve_provenance stands both sides down and it is never sent
+        # at all.
         try:
             save_clip_state(sha256, ts + REOFFER_TS_NUDGE_SECONDS, KIND_IMAGE,
-                            path=self._clip_state_path)
+                            origin=origin, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
         return True
@@ -1974,12 +2157,16 @@ def load_clip_state(path=None):
 
     The record is decode_clip_state's own shape, because this IS
     decode_clip_state -- so it grew the fourth element with the wire in
-    v3.2. Every file this side writes today decodes with origin None: a
-    v3.1 store has no "origin" key at all, and save_clip_state has no
-    origin to pass, so a missing key reading as None is what makes an
-    existing store load rather than fail. That is the same "absent means
-    what it meant before" rule the wire follows, applied to disk by the
-    single decoder both share.
+    v3.2. A missing key reading as None is what makes an existing store
+    load rather than fail: a v3.1 file has no "origin" key at all, and
+    neither does one written since by any of the four save_clip_state call
+    sites that have no origin to record -- encode_clip_state omits the key
+    rather than writing an explicit null, so those files are byte-for-byte
+    what they were before this release. That is the same "absent means what
+    it meant before" rule the wire follows, applied to disk by the single
+    decoder both share. Exactly ONE writer supplies one:
+    Agent._consume_image_reoffer, which is the only place that witnesses
+    the clipboard hand back something other than what it was given.
 
     None covers three distinct failure reasons identically, on purpose: no
     file has ever been written, the file exists but cannot be opened as a
@@ -2040,15 +2227,37 @@ def load_clip_state(path=None):
 _clip_state_write_lock = threading.Lock()
 
 
-def save_clip_state(sha256, ts, kind, path=None):
-    """Persists (sha256, ts, kind) atomically: encode, write to a `.tmp`
-    sibling, then os.replace it over the real path. os.replace is an
+def save_clip_state(sha256, ts, kind, origin=None, path=None):
+    """Persists (sha256, ts, kind, origin) atomically: encode, write to a
+    `.tmp` sibling, then os.replace it over the real path. os.replace is an
     atomic rename on POSIX, so load_clip_state above -- quite possibly
     running in an entirely different process, since the PC agent is a new
     process every connection -- can never observe a half-written file.
     Reuses encode_clip_state rather than a second JSON encoding, so its
     non-finite-ts guard protects this path too, and the on-disk format can
     never drift from the wire format of the same shape.
+
+    `origin` (v3.2) is the whole reason this function grew a fourth
+    parameter, and the reason is the agent's lifetime rather than the
+    record's tidiness: sshd spawns a new agent per connection, so the
+    process that watched the clipboard hand back different bytes than it was
+    given IS ALREADY DEAD by the announce that needs to say so. An origin
+    that lived only in Agent._expect_reoffer would be inert -- the third
+    release running in which this bug was fixed and nothing changed on the
+    machine. It defaults to None because exactly one call site has one to
+    record (Agent._consume_image_reoffer); every other write is content this
+    side holds in its own right, and A STALE ORIGIN IS NOT HARMLESS: the PC
+    holding new user content under an origin the Mac still matches makes
+    resolve_provenance fire and the PC never send it -- a clip the user
+    copied, gone, on an entirely routine path. So the default is the safe
+    value and the recording branch is the exception, not the other way
+    round.
+
+    Positioned BEFORE `path`, so the callers that spread a resolved record
+    (announce_clip_state's `save_clip_state(*resolved, path=path)`) keep
+    working by construction as that record grew its fourth element, and
+    every other call site -- all of which already pass `path` by keyword --
+    is untouched.
 
     Serialized in full under _clip_state_write_lock: the atomic rename alone
     protects readers, not the shared temp file that concurrent WRITERS both
@@ -2057,7 +2266,7 @@ def save_clip_state(sha256, ts, kind, path=None):
     target = clip_state_path() if path is None else path
     with _clip_state_write_lock:
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        payload = encode_clip_state(sha256, ts, kind)
+        payload = encode_clip_state(sha256, ts, kind, origin)
         tmp = target + ".tmp"
         with open(tmp, "wb") as handle:
             handle.write(payload)
@@ -2070,9 +2279,33 @@ def resolve_startup_state(current_hash, current_kind, stored, now):
     startup -- both produced by the same clipboard.read() call, never
     derived independently; `stored` is whatever load_clip_state() last
     returned (a (sha256, ts, kind, origin) record since v3.2, or None);
-    `now` is the caller's clock. Returns a (sha256, ts, kind) triple, and
-    reads only the first three elements of `stored` -- what a stored origin
-    means to this judgement is not a question this task answers.
+    `now` is the caller's clock. Returns a (sha256, ts, kind, origin)
+    record -- FOUR elements on every branch, without exception, because
+    resolve_provenance takes whole records and raises ValueError on a short
+    one. A branch that returned a triple would not fail here; it would fail
+    at a reconciliation this function cannot see.
+
+    THE ORIGIN FOLLOWS THE HASH, which is the whole of the rule and the one
+    line of it that is easy to get wrong:
+
+      * MATCHED -- the stored record is returned WHOLE, origin included.
+        Rebuilding it around `current_hash` looks identical for the three
+        fields anyone thinks to check and quietly drops the fourth, so the
+        suppression works on the first reconnect (the origin is still in
+        the recording process's memory) and dies on the SECOND, once the
+        only copy left is the one on disk. That is the shape of an inert
+        fix, and it is why this branch returns `stored` rather than
+        re-assembling it.
+      * CHANGED, or nothing stored -- `origin=None`, appended explicitly.
+        The origin describes bytes that are no longer on this clipboard,
+        and carrying it forward is not the harmless half of the mistake:
+        the PC holding new user content under an origin the Mac still
+        matches means resolve_provenance fires and the PC NEVER SENDS the
+        user's clip.
+      * A null hash -- `origin=None` too, for the reason decode_clip_state
+        already refuses an origin beside a null sha256: an origin with no
+        content of ours to describe can only ever be compared against
+        nothing.
 
     A timestamp can come from three places, in precedence order: a local
     change this process watched happen, a clip received from the peer
@@ -2132,10 +2365,15 @@ def resolve_startup_state(current_hash, current_kind, stored, now):
     either.
     """
     if current_hash is None:
-        return None, now, None
+        return None, now, None, None
     if stored is not None and stored[0] == current_hash:
-        return current_hash, stored[1], stored[2]
-    return current_hash, now, current_kind
+        # `stored`, not a record rebuilt from it: see the docstring's
+        # matched-branch note. tuple() rather than the value itself so a
+        # caller that hands in a list still gets the record shape every
+        # other branch returns, and so nothing downstream can mutate what a
+        # caller still holds.
+        return tuple(stored)
+    return current_hash, now, current_kind, None
 
 
 import hashlib
@@ -2923,7 +3161,7 @@ class GPasteWatcher:
     def __init__(self, clipboard,
                  safety_net_interval_seconds=SAFETY_NET_POLL_SECONDS,
                  degraded_interval_seconds=DEGRADED_POLL_SECONDS,
-                 degraded=False, on_degrade=None):
+                 degraded=False, on_degrade=None, on_idle_tick=None):
         self.clipboard = clipboard
         self._process = None
         self._thread = None
@@ -2976,10 +3214,18 @@ class GPasteWatcher:
         # keeps "one observation path" true now that neither reader calls the
         # handler: one place decides what a local change means, and only one
         # thread is ever inside it.
+        #
+        # `on_idle_tick` is passed straight through rather than consulted
+        # here: it belongs to the poll loop's no-change branch, and this
+        # class's own tick observer (_observe_tick) judges the EVENT SOURCE
+        # from probe tokens and must keep doing only that. Composing them
+        # would put a second question inside the one function whose silence
+        # is what the safety net exists to break.
         self._safety_net = PollingWatcher(
             clipboard,
             degraded_interval_seconds if degraded else safety_net_interval_seconds,
-            on_tick=self._observe_tick, event=self._event)
+            on_tick=self._observe_tick, event=self._event,
+            on_idle_tick=on_idle_tick)
 
     def _observe_tick(self, previous, current):
         """Judge the event source from one safety-net tick.
@@ -3259,6 +3505,16 @@ class PollingWatcher:
     `previous`: the safety net judges the event source from these
     observations rather than running a second comparison of its own.
 
+    `on_idle_tick` is an optional PREDICATE, asked only on ticks where the
+    token did not move, and answering True makes this loop signal an
+    observation anyway. It exists because a token that never changes is not
+    the same thing as nothing worth looking at: an image applied from the
+    peer leaves an expectation armed (Agent._expect_reoffer) that only an
+    observation can resolve, and on a machine with no GPaste the clipboard
+    it is waiting on never moves again. It must stay a cheap predicate --
+    this thread must not read the clipboard or decide anything, for the same
+    reason it signals rather than calling the handler.
+
     `event` is how this loop reports a change, and it is the whole reason a
     poll loop and a gdbus pump can share one handler. Composed as
     GPasteWatcher's safety net it is handed THAT watcher's event, so both
@@ -3267,10 +3523,12 @@ class PollingWatcher:
     worker, and then `on_change` is required rather than optional.
     """
 
-    def __init__(self, clipboard, interval_seconds, on_tick=None, event=None):
+    def __init__(self, clipboard, interval_seconds, on_tick=None, event=None,
+                 on_idle_tick=None):
         self.clipboard = clipboard
         self.interval = interval_seconds
         self._on_tick = on_tick
+        self._on_idle_tick = on_idle_tick
         self._stop = threading.Event()
         self._thread = None
         # Exactly one worker per watcher tree: whoever owns the event owns the
@@ -3313,6 +3571,27 @@ class PollingWatcher:
                         # Signalled, never called: a reader thread that ran the
                         # handler could block on Agent._observe_lock and could
                         # die of anything it raised -- see _start_observer.
+                        self._event.set()
+                    elif self._on_idle_tick is not None and self._on_idle_tick():
+                        # THE NO-CHANGE BRANCH, and the one place in this file
+                        # where an observation is asked for without the token
+                        # having moved. Agent._reoffer_pending is the only
+                        # caller's predicate: while an applied image is still
+                        # waiting for GPaste to re-offer it, the clipboard may
+                        # sit perfectly still forever -- on a machine with no
+                        # GPaste it certainly does -- and an expectation that
+                        # is never looked at again is never disarmed, so the
+                        # user's next image copy is absorbed as the re-offer
+                        # that never came.
+                        #
+                        # Still a signal, never a call, and still no clipboard
+                        # read on this thread: the predicate is a bare flag
+                        # test, and the WORKER's single read is what decides
+                        # between "the re-offer arrived" and "there is no
+                        # GPaste here" -- one read, two outcomes separated by
+                        # content. Deliberately NOT `previous = current` (there
+                        # was no change to absorb) and deliberately below the
+                        # real-change branch, which must always win.
                         self._event.set()
                     # AFTER the signal, which used to be load-bearing and is
                     # now merely conventional -- say so rather than leave the
@@ -3361,7 +3640,7 @@ class PollingWatcher:
 
 
 def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
-                 degraded=False, on_degrade=None):
+                 degraded=False, on_degrade=None, on_idle_tick=None):
     """`fallback_interval_seconds` is the ONE knob for "how fast we poll when
     signals cannot be relied on", and there are two ways to arrive there:
     GPaste was never available, or its event source was diagnosed silent. It
@@ -3371,9 +3650,18 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
 
     `degraded`/`on_degrade` carry the dead-event-source verdict in and out, so
     it belongs to the connection rather than to whichever watcher reached it --
-    see Agent._event_source_degraded."""
+    see Agent._event_source_degraded.
+
+    `on_idle_tick` reaches BOTH branches, and that is the point rather than
+    symmetry for its own sake. It is what lets an armed re-offer expectation
+    be disarmed by observation on a clipboard that never changes again, and
+    the machine where that clipboard is guaranteed never to change again is
+    the one with no GPaste at all -- the branch below, the plain poller. A
+    hook wired only into the GPaste watcher would be inert in exactly the
+    installation it exists for."""
     watcher = GPasteWatcher(clipboard, degraded_interval_seconds=fallback_interval_seconds,
-                            degraded=degraded, on_degrade=on_degrade)
+                            degraded=degraded, on_degrade=on_degrade,
+                            on_idle_tick=on_idle_tick)
     if watcher.available():
         if degraded:
             log("watching the clipboard through GPaste, already diagnosed as silent "
@@ -3383,7 +3671,8 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                 % SAFETY_NET_POLL_SECONDS)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
-    return PollingWatcher(clipboard, fallback_interval_seconds)
+    return PollingWatcher(clipboard, fallback_interval_seconds,
+                          on_idle_tick=on_idle_tick)
 
 
 def main(argv):
