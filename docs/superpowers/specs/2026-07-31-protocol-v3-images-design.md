@@ -1,7 +1,7 @@
 # ClipWire protocol v3 — images, and two production defects
 
 **Date:** 2026-07-31
-**Status:** draft, pending batya review
+**Status:** batya-approved; merged as protocol v3
 **Amends:** [2026-07-31-protocol-v2-freshness-design.md](2026-07-31-protocol-v2-freshness-design.md),
 which amends [2026-07-30-clipwire-design.md](2026-07-30-clipwire-design.md)
 
@@ -480,6 +480,29 @@ The v2 checklist still applies in full. New items:
    `pgrep -f 'gdbus monitor.*GPaste'` returns exactly one process, owned by the live agent.
 12. **Degraded-mode image latency.** With the event path forced to polling, confirm an image
     still arrives and note how long it takes.
+13. **A burst of screenshots, then a reconnect.** Copy three to five screenshots on the Mac in
+    quick succession, let them land, then reconnect. Each one runs apply → GPaste takeover →
+    read-back → the timestamp nudge, so a burst overlaps three races at once — the most loaded
+    point in the new machinery, and one that exists only on real hardware. The reconnect must
+    resolve `DO_NOTHING` with zero extra frames.
+14. **A full day of ordinary use, as the closing gate.** Leave a screenshot on the PC's
+    clipboard in the evening, let the Mac sleep overnight, reboot the PC through Windows in the
+    morning, and then read the day's reconciliation lines. No `clipboard changed while apart`
+    without a real change, and no image sent twice. This is the only check that exercises the
+    nudge, the store and the heartbeat in their natural rhythm rather than in a synthetic one.
+
+### A blind spot this design accepts, stated so it is not mistaken for a bug
+
+The safety net's image token is the **type list**, and under a GPaste owner that list is
+identical for every image. So if the event path dies while the user is copying **only**
+images, nothing looks changed, the verdict never arms, and they get neither sync nor a log
+line explaining why — until the first text copy, which restores the ordinary behaviour
+immediately.
+
+The window is short in practice because text is the dominant flow, and the alternative is
+fetching megabytes every tick, which is the defect this token exists to fix. It is a real
+trade rather than an oversight. The acceptance run should try it once — silence the event
+source, copy only screenshots, and confirm the behaviour matches this paragraph.
 
 ## What is deliberately unchanged
 
