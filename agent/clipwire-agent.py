@@ -335,6 +335,39 @@ PHASE_READY = "ready"
 READ_CHUNK = 65536
 CLIPBOARD_RECHECK_SECONDS = 1.0
 
+# How much later than the peer's own timestamp a consumed image re-offer is
+# recorded (_consume_image_reoffer). It exists to break one specific tie,
+# and the tie is unavoidable: after a Mac->PC image the two machines hold
+# DIFFERENT BYTES for the same picture -- the Mac has the PNG it sent, this
+# side has GPaste's re-encode of it -- while both record the SAME peer
+# timestamp. resolve_freshness then falls through to its hex tie-break, and
+# the winner is decided by hash bytes. One ordering has this side push the
+# re-encode once and converge; the other has the Mac re-send the original,
+# GPaste re-encode it back to exactly what was there before, and the next
+# reconnect repeat it identically. A loop with no exit, chosen by a coin.
+#
+# A millisecond, and both bounds are deliberate:
+#
+#   * Large enough to survive every serialization on the path. At epoch
+#     magnitude (~1.75e9) a double's ULP is about 2.4e-7 s, so a millisecond
+#     is thousands of representable steps -- and json.dumps/json.loads and
+#     struct.pack(">d") are all exact round trips, as is Swift's own Double
+#     coding, so `>` on the far side sees it. A 1-ULP nudge would also
+#     survive today, but it would vanish under any future formatting that
+#     rounds, and it reads as a rounding artifact rather than a decision.
+#
+#   * Small enough that it can never leapfrog real content. A clip genuinely
+#     copied after the image carries the moment its own watcher observed it,
+#     which is at minimum a poll interval later -- hundreds of milliseconds
+#     on the Mac, whole seconds here. Nothing a user can do lands inside one
+#     millisecond of the applied image's own timestamp.
+#
+# Degenerate case, stated rather than guarded: for an absurd (but finite)
+# peer ts above ~4.5e12 the addition is lost to floating-point precision and
+# the tie-break decides again, exactly as it did before. That is the old
+# behaviour, not a new failure, and no real clock reaches it.
+REOFFER_TS_NUDGE_SECONDS = 0.001
+
 
 def log(message):
     """Diagnostics go to stderr. stdout carries frames and nothing else."""
@@ -492,10 +525,17 @@ class Agent:
         # The peer timestamp of an image this side has just applied and is
         # still waiting to see GPaste re-offer -- or None when no re-offer is
         # expected. Set by _write_clip on an image write, spent by
-        # _consume_image_reoffer, and cleared by a text observation
-        # (_observe_local_change: the user moved on, so the re-offer will
-        # never come) or by clipboard_became_ready (a fresh connection or a
-        # Wayland flap: the session the write went into is gone).
+        # _consume_image_reoffer, and cleared three ways: by a TEXT WRITE
+        # (_write_clip's own `ts if kind == KIND_IMAGE else None` -- an
+        # applied text clip replaces the selection, so the image's re-offer
+        # will never come, and a stale expectation would swallow the next
+        # image instead), by a text OBSERVATION (_observe_local_change: the
+        # user moved on, same reasoning from the other direction), or by
+        # clipboard_became_ready (a fresh connection or a Wayland flap: the
+        # session the write went into is gone). All three clear it for one
+        # reason -- the re-offer this was armed for can no longer arrive --
+        # and the write is easy to miss precisely because it is the same
+        # assignment that arms it.
         #
         # It exists because the PC's clipboard does not necessarily hold what
         # was put in it. Measured on the live machine: a 105,700-byte PNG
@@ -518,12 +558,16 @@ class Agent:
         # _last_seen -- which is the echo guard's own shape, one door over.
         #
         # It holds the timestamp rather than a bare flag because the store
-        # write it authorises needs one, and the only correct value is the
+        # write it authorises needs one, and it must be derived from the
         # PEER's: the re-offer is not a new clip, it is the applied one
         # re-encoded, so stamping it with the moment it was observed would
-        # make content the Mac sent us look freshly copied here and win the
-        # next reconciliation against the machine it came from. Tested with
-        # `is not None`, never for truth: a ts of 0.0 is a real timestamp.
+        # make content the Mac sent us look freshly copied here and beat
+        # anything the Mac copied in between. What _consume_image_reoffer
+        # actually stores is this value plus REOFFER_TS_NUDGE_SECONDS,
+        # because the peer's value EXACTLY leaves the two sides at an
+        # identical ts holding different bytes -- see that constant. Tested
+        # with `is not None`, never for truth: a ts of 0.0 is a real
+        # timestamp.
         self._expect_reoffer = None
         # Guards _last_written/_write_gen/_last_seen/_expect_reoffer only. A
         # separate lock from _write_lock (which guards stdout) on purpose:
@@ -1469,11 +1513,15 @@ class Agent:
           mistaken for a new clip, and the store so a later reconnect finds
           the hash the clipboard will actually report and does not resolve
           "clipboard changed while apart" on every Mac wake. The stored
-          timestamp is the PEER's, carried on _expect_reoffer from the write:
-          the re-offer is not a new clip but the applied one re-encoded, and
-          stamping the moment it was observed would make content the Mac sent
-          us look freshly copied here and win the next reconciliation against
-          the machine it came from.
+          timestamp is the PEER's, carried on _expect_reoffer from the write,
+          plus REOFFER_TS_NUDGE_SECONDS: the re-offer is not a new clip but
+          the applied one re-encoded, so stamping the moment it was observed
+          would make content the Mac sent us look freshly copied here and
+          beat anything the Mac copied in between -- while stamping the
+          peer's value EXACTLY leaves the two sides at an identical ts
+          holding different bytes, which hands the next reconnect to the hex
+          tie-break. See that constant's own comment for the tie, and the
+          note below for what the nudge costs.
 
         * A newer write landed while the read was in flight (`gen`) -- the
           same staleness rule the text path applies, and needed for the same
@@ -1512,6 +1560,27 @@ class Agent:
         be spent, and to one image per applied image; the flap and reconnect
         cases, where it CAN be bounded, are cleared in
         clipboard_became_ready.
+
+        THE SECOND REMAINING COST, ALSO STATED RATHER THAN CLOSED, and it is
+        what REOFFER_TS_NUDGE_SECONDS buys. After a Mac->PC image the two
+        machines hold different bytes for the same picture and can never
+        agree by hash: the Mac has the PNG it sent, this side has the
+        re-encode, and nothing short of one of them telling the other can
+        make those equal. So a reconnect cannot resolve doNothing, whatever
+        is recorded here -- what it CAN do is resolve DETERMINISTICALLY. The
+        nudge makes this side win, push the re-encode once, and converge;
+        from then on both hold the same hash at the same ts and every later
+        reconnect really does resolve doNothing.
+
+        The price is one image frame back to the Mac on the first reconnect
+        after each Mac->PC image, and the Mac's clipboard then holding
+        GPaste's re-encode rather than its own original. That is worth
+        naming plainly, because it is a weakened form of the very failure
+        this method exists to prevent -- deferred from "immediately, on every
+        screenshot" to "once, at the next reconnect", and bounded instead of
+        permanent. The alternative is not zero frames: it is the same frame
+        on a coin flip, and on the losing half an identical exchange on
+        every reconnect for as long as that image stays on the clipboard.
         """
         # Compared against the LIVE _last_seen under the lock rather than
         # against _observe_local_change's pre-read snapshot: both values this
@@ -1551,7 +1620,8 @@ class Agent:
             log("the clipboard re-offered an image of %d bytes: over the image limit"
                 % len(png))
         try:
-            save_clip_state(sha256, ts, KIND_IMAGE, path=self._clip_state_path)
+            save_clip_state(sha256, ts + REOFFER_TS_NUDGE_SECONDS, KIND_IMAGE,
+                            path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
         return True

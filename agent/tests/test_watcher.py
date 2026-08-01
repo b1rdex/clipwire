@@ -3424,6 +3424,10 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "MAX_IMAGE_BYTES = 4194304",
             "TYPE_IMAGE_CLIP = 0x03",
             "def make_watcher",
+            # Final fix wave: the tie-break nudge a consumed image re-offer
+            # is stored with, defined alongside the other Agent-scoped
+            # constants above log().
+            "REOFFER_TS_NUDGE_SECONDS = 0.001",
             "import ctypes",
             "import signal",
             "PR_SET_PDEATHSIG = 1",

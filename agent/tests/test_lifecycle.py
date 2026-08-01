@@ -11,17 +11,21 @@ from agent_under_test import (
     KIND_TEXT,
     MAX_IMAGE_BYTES,
     PROTOCOL_VERSION,
+    REOFFER_TS_NUDGE_SECONDS,
+    SEND_MINE,
     TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
     TYPE_HELLO,
     TYPE_IMAGE_CLIP,
+    WAIT_FOR_PEER,
     decode_clip_state,
     decode_frame,
     decode_image_payload,
     encode_clip_payload,
     encode_image_payload,
     load_clip_state,
+    resolve_freshness,
     sha256_hex,
 )
 
@@ -482,22 +486,68 @@ class TestImageReofferIsOurOwnWrite(ImageAgentTestCase):
         self.assertNotEqual(stored[0], sha256_hex(written),
                             "storing the written hash is what breaks every reconnect")
 
-    def test_the_stored_timestamp_stays_the_peers_own(self):
-        """The other half of the store entry, and the plan's sample code does
-        not pin it. The re-offer is not a new clip -- it is our own applied
-        one, re-encoded -- so its recorded age is still the PEER's, exactly
-        as _write_clip already stores for text. Stamping observed_at here
-        would make an image the Mac sent us look freshly copied ON THE PC,
-        win the next reconciliation against the machine it came from, and
-        push the re-encoded copy back over the original: failure #1 arriving
-        through the store instead of through an unrecognised Update."""
+    def test_the_stored_timestamp_is_the_peers_own_plus_one_millisecond(self):
+        """The other half of the store entry, and the one the final review
+        found deciding a reconnect by coin flip.
+
+        The age recorded here is the PEER's, not observed_at -- the re-offer
+        is not a new clip, it is our own applied one re-encoded, and
+        stamping the moment we observed it would make an image the Mac sent
+        us look freshly copied ON THE PC, beat anything the Mac copied in
+        between, and push the re-encoded copy back over the original.
+
+        But it cannot be EXACTLY the peer's either, and that is what this
+        test now pins. The two sides genuinely hold different bytes for the
+        same picture -- the Mac has the PNG it sent, this side has GPaste's
+        re-encode -- so at an identical ts the shared formula falls through
+        to its hex tie-break, and the winner is decided by hash bytes. Half
+        the time the Mac wins, re-sends the original, GPaste re-encodes it
+        back, the store is restored unchanged, and the next reconnect
+        repeats it identically: a loop with no exit, forever.
+
+        REOFFER_TS_NUDGE_SECONDS breaks that tie in the one direction that
+        terminates. See the constant's own comment for why a millisecond,
+        and _consume_image_reoffer for the cost this buys."""
         clip = ReofferingClipboard(reads=[(KIND_IMAGE, b"\x89PNG-reencoded")])
         agent_obj = self.build(clipboard=clip)
         agent_obj._write_clip(encode_image_payload(1000.0, b"\x89PNG-original"),
                               kind=KIND_IMAGE)
         agent_obj._local_change()
-        self.assertEqual(load_clip_state(path=self.clip_state_path)[1], 1000.0,
-                         "the peer's timestamp, never the moment we observed the re-offer")
+        stored_ts = load_clip_state(path=self.clip_state_path)[1]
+        self.assertEqual(stored_ts, 1000.0 + REOFFER_TS_NUDGE_SECONDS)
+        self.assertGreater(stored_ts, 1000.0,
+                           "an equal ts hands the reconnect to the hex tie-break")
+        self.assertLess(stored_ts, 1000.5,
+                        "and observed_at would beat everything the peer copied in between")
+
+    def test_the_reconnect_no_longer_turns_on_a_hash_coin_flip(self):
+        """The failure that made this a blocker, stated as the decision both
+        sides actually run.
+
+        HASH_FLOOR and HASH_CEILING bracket every possible sha256 hex
+        digest, so asserting against both covers BOTH orderings of the real
+        pair -- which is the whole point: the outcome must not depend on
+        which way the re-encode's digest happens to sort against the
+        original's. Before the nudge, one of these two resolved the other
+        way, and that half never converged.
+
+        Both directions of the same comparison are asserted, because the
+        two machines run the identical formula on swapped arguments: the PC
+        pushing once is only an exit if the Mac agrees to wait for it."""
+        clip = ReofferingClipboard(reads=[(KIND_IMAGE, b"\x89PNG-reencoded")])
+        agent_obj = self.build(clipboard=clip)
+        agent_obj._write_clip(encode_image_payload(1000.0, b"\x89PNG-original"),
+                              kind=KIND_IMAGE)
+        agent_obj._local_change()
+        mine = load_clip_state(path=self.clip_state_path)[:2]
+
+        for peer_hash in ("0" * 64, "f" * 64):
+            with self.subTest(peer_hash=peer_hash[:4]):
+                peer = (peer_hash, 1000.0)
+                self.assertEqual(resolve_freshness(mine, peer), SEND_MINE,
+                                 "this side must deterministically carry the re-encode")
+                self.assertEqual(resolve_freshness(peer, mine), WAIT_FOR_PEER,
+                                 "and the Mac must deterministically wait for it")
 
     def test_our_own_write_observed_before_the_re_offer_does_not_spend_the_expectation(self):
         """The sequence the live machine actually produces, which the plan's
