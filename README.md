@@ -249,6 +249,18 @@ between. So it reports the hash it was *given* alongside the hash it read, and w
 machines see that one side's content descends from the other's, both stand down and neither
 sends anything.
 
+**This rests on an assumption about the machines, not on anything the protocol guarantees.**
+The rule that decides is symmetric — both sides run the same comparison — but the *witnessing*
+is not: only the PC recognises a substitution, because only GPaste performs one here. Install a
+clipboard manager on the Mac that rewrites what it stores, and the same bug reappears with the
+roles swapped and nobody in a position to report the origin. Nothing detects that
+automatically; it is written down because it is the kind of thing a future reader would
+otherwise have to rediscover.
+
+There is also a one-off cost if the Mac's clip-state file is lost: it alone carries the origin,
+so one degraded copy can arrive before the two sides agree again. It stops there rather than
+compounding.
+
 Two earlier attempts tried to recognise the two pictures as the same one, and both are worth
 knowing about because they failed for the same reason. GPaste does not merely strip metadata —
 it applies the image's embedded colour profile as it loads it and writes the result untagged,
