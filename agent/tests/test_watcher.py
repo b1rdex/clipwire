@@ -323,7 +323,8 @@ class TestPumpNeverCallsTheHandler(unittest.TestCase):
         """The pump must keep reading lines while the handler is busy.
 
         Agent._local_change blocks on _observe_lock and its own wl-paste round
-        trip can take up to SUBPROCESS_TIMEOUT=3s; a pump that calls it sits
+        trip can take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s
+    on an image clipboard; a pump that calls it sits
         inside that window instead of counting, so the second and third signals
         are never counted and a safety-net tick landing there sees an unmoved
         counter on a perfectly healthy source."""
@@ -690,6 +691,14 @@ class ScriptedReadClipboard:
         self.last = value
         return self.last
 
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
+
 
 class TestPollingWatcher(unittest.TestCase):
     """A standalone poller -- what make_watcher returns when GPaste is
@@ -714,8 +723,9 @@ class TestPollingWatcher(unittest.TestCase):
         """The poll loop is a reader thread like the gdbus pump, and it carries
         more: it is the only caller of _observe_tick, so a loop parked inside
         Agent._local_change is a safety net that has stopped judging anything.
-        _local_change blocks on _observe_lock and its own wl-paste round trip
-        can take up to SUBPROCESS_TIMEOUT=3s."""
+        _local_change blocks on _observe_lock and its own clipboard read can
+        take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s on an
+        image clipboard (--list-types, then the body)."""
         released = threading.Event()
         self.addCleanup(released.set)
         entered = threading.Event()
@@ -853,6 +863,100 @@ class TestPollingWatcher(unittest.TestCase):
         )
 
 
+class ProbeOnlyClipboard:
+    """read() is a trap. The poll loop must ask for the cheap change TOKEN
+    and nothing else.
+
+    The other doubles in this file alias probe to read, because their
+    scripts are cheap in-memory values with no body behind them and every
+    assertion about what the loop observed stays true either way. That
+    aliasing is exactly why this one has to exist: an alias cannot tell the
+    two calls apart, so nothing else in this suite would notice the loop
+    reverting to read()."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = 0
+        self.last = None
+
+    def read(self):
+        raise AssertionError("the poll loop must call probe(), never read()")
+
+    def probe(self):
+        index = min(self.calls, len(self._script) - 1)
+        self.calls += 1
+        self.last = self._script[index]
+        return self.last
+
+    def take(self):
+        return self.last
+
+
+class TestPollingWatcherAsksForATokenNotTheContent(unittest.TestCase):
+    """The spec's requirement, unimplemented until the final wave: "in
+    degraded mode the image body must be checked off a change in `wl-paste
+    --list-types` rather than the content itself".
+
+    It is not scoped to degraded mode in practice, and that is what made it
+    a defect rather than a tuning question: GPasteWatcher composes this
+    same PollingWatcher as its safety net on EVERY connection, so a HEALTHY
+    install with a screenshot on the clipboard forked two processes and
+    piped up to MAX_IMAGE_BYTES every SAFETY_NET_POLL_SECONDS, held two
+    4 MiB buffers resident as `previous` and `current`, and compared them
+    each tick -- for the life of the connection. See
+    WaylandClipboard.probe."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def test_the_loop_never_calls_read(self):
+        """Both assertions are needed. The loop guards every tick with
+        _handle_observer_error, and AssertionError is not in the fatal set,
+        so a loop that called read() would not crash -- it would log and
+        carry on observing nothing. So: the change must actually be
+        reported (proving probe drove the loop) AND nothing may have been
+        logged as a poll error (proving read was never reached)."""
+        seen = threading.Event()
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.002)
+        self.addCleanup(watcher.stop)
+        watcher.start(seen.set)
+
+        self.assertTrue(seen.wait(JOIN_TIMEOUT),
+                        "the change must be observed through probe(): %r" % self.log_lines)
+        watcher.stop()
+        self.assertEqual([line for line in self.log_lines if "poll error" in line], [])
+
+    def test_the_composed_safety_net_never_calls_read_either(self):
+        """The healthy path, which is where the cost actually lived: this
+        poller is GPasteWatcher's safety net, running on every connection
+        whether or not anything is wrong. A fix applied only to the
+        standalone poller would have left the reported defect untouched."""
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        ticks = []
+        process = FakeGPasteProcess()
+        self.addCleanup(process.close)
+        watcher = GPasteWatcher(clipboard, safety_net_interval_seconds=0.002,
+                                degraded_interval_seconds=0.002)
+        watcher._safety_net._on_tick = lambda previous, current: ticks.append((previous, current))
+        self.addCleanup(watcher.stop)
+        with mock.patch("subprocess.Popen", return_value=process):
+            watcher.start(lambda: None)
+
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while len(ticks) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        watcher.stop()
+
+        self.assertGreaterEqual(len(ticks), 2,
+                                "the safety net must keep ticking through probe(): %r"
+                                % self.log_lines)
+        self.assertEqual([line for line in self.log_lines if "poll error" in line], [])
+
+
 class SignallingClipboard:
     """A clipboard whose read() DRIVES the signal source: on the tick that
     first sees new content it emits a real GPaste Update line and blocks until
@@ -899,6 +1003,14 @@ class SignallingClipboard:
         self.last = self._after
         return self.last
 
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
+
 
 class ArmThenSignalClipboard:
     """Drives the exact interleaving the two-tick verdict exists to absorb: the
@@ -936,6 +1048,14 @@ class ArmThenSignalClipboard:
         elif self.calls == 3:
             self.watcher._signals += 1
         return self.last
+
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
 
 
 class TestGPasteSafetyNet(unittest.TestCase):
@@ -1408,7 +1528,8 @@ class TestGPasteSafetyNet(unittest.TestCase):
     def test_a_slow_handler_does_not_stop_the_safety_net_ticking(self):
         """The other hazard the split removes from this thread. A poll loop
         parked inside _local_change -- which blocks on _observe_lock and can
-        spend SUBPROCESS_TIMEOUT=3s in one wl-paste -- is a safety net that has
+        spend up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s in its
+    clipboard read -- is a safety net that has
         stopped observing for as long as the handler runs."""
         released = threading.Event()
         self.addCleanup(released.set)
@@ -2420,7 +2541,8 @@ class RacyClipboard:
     WHILE a read() is in flight -- deterministically, via a side effect
     inside read() itself, rather than by timing two real threads. This is
     the exact shape of the real race: a wl-paste round trip can take up to
-    SUBPROCESS_TIMEOUT=3 seconds, and a new frame can arrive and be
+    SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13 seconds on an image
+    clipboard, and a new frame can arrive and be
     written locally (on the main thread) at any point during that
     window."""
 
@@ -2447,7 +2569,8 @@ class GatedReadClipboard:
     held inside its clipboard round trip while a second one runs on another
     thread. That is not hypothetical: since the safety-net poll was added, the
     gdbus pump thread and the poll thread BOTH call _local_change, and a
-    wl-paste round trip can take up to SUBPROCESS_TIMEOUT=3s."""
+    clipboard read can take up to SUBPROCESS_TIMEOUT +
+    IMAGE_SUBPROCESS_TIMEOUT = 13s on an image clipboard."""
 
     def __init__(self, text, gate):
         self._text = text
@@ -2473,7 +2596,8 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
     single-threaded loop); _local_change() only ever runs on watcher
     threads -- plural since the safety-net poll was added, which is what the
     last test in this class is about. clipboard.read() -- a wl-paste round
-    trip -- can take up to SUBPROCESS_TIMEOUT=3s, so a new _write_clip() can
+    trips -- can take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT =
+    13s on an image clipboard, so a new _write_clip() can
     land on the main thread at any point during that window, not just cleanly
     before or after it."""
 

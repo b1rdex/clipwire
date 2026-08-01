@@ -325,9 +325,19 @@ kind before the feature is correct:
   every other path does, or a reconnect with an image on the clipboard misreports.
 - **The size guards are per-kind now.** Two limits exist; whichever guard runs must pick by
   kind rather than assume text.
-- **The polling fallback reads the whole clipboard body every tick.** Reading 4 MiB every
-  400 ms is not acceptable; in degraded mode the image body must be checked off a change in
+- **The clipboard-comparison poll reads the whole clipboard body every tick.** Reading 4 MiB
+  every second is not acceptable; the image body must be checked off a change in
   `wl-paste --list-types` rather than the content itself, with the added latency documented.
+
+  Two corrections to this bullet's own framing, made during implementation rather than left
+  to be inherited. It said "4 MiB every 400 ms": 400 ms is the *Mac's* poll interval, and the
+  Mac's poll is an in-process `changeCount` comparison that reads nothing. The PC's degraded
+  interval is `DEGRADED_POLL_SECONDS = 1.0`. And it scoped the problem to "the polling
+  fallback", which understates it: `GPasteWatcher` composes that same `PollingWatcher` as its
+  safety net on **every** connection, so the cost is paid by a **healthy** install too — one
+  read every `SAFETY_NET_POLL_SECONDS = 30`, two 4 MiB buffers held resident as `previous`
+  and `current`, and a `SLOW_IMAGE_READ_SECONDS` duration line on every tick for any body
+  slow enough to cross it, which a large one always is.
 
 Grep both implementations for `text` and `readText` and treat the result as the starting task
 list — but note that the three rules below are behaviour, not identifiers, and grep will not

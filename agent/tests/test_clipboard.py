@@ -344,16 +344,157 @@ class TestReadSubprocessBehavior(unittest.TestCase):
         )
 
 
+class TestProbeIsCheapForImages(unittest.TestCase):
+    """probe() is the poll loop's change token, and the spec requires it:
+    "in degraded mode the image body must be checked off a change in
+    `wl-paste --list-types` rather than the content itself, with the added
+    latency documented."
+
+    What the plan shipped instead was PollingWatcher.pump calling read() on
+    every tick. Once read() became kind-aware that meant two forks and the
+    WHOLE image body -- up to MAX_IMAGE_BYTES through a pipe -- on every
+    tick of every connection, HEALTHY ones included, since the safety net
+    runs whether or not anything is wrong. Two 4 MiB buffers stayed
+    resident as `previous` and `current` and were compared each tick, and
+    any read slow enough to cross SLOW_IMAGE_READ_SECONDS logged a duration
+    line EVERY TICK -- the exact flood TestDurationLoggingIsGated below
+    exists to prevent, arriving through the one call site its gate cannot
+    help.
+
+    In v2 none of this existed: the read was text-only, so an image
+    clipboard read back as nothing and cost nothing at all."""
+
+    def setUp(self):
+        self.log_lines = []
+        original_log = clipwire_agent.log
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def test_an_image_probe_asks_for_the_types_and_never_the_body(self):
+        """The whole deliverable, in call count: ONE wl-paste invocation
+        for an image clipboard, where read() makes two and pipes the body
+        through the second."""
+        with mock.patch("subprocess.run",
+                        return_value=_completed(stdout=b"image/png\nimage/webp\n")) as run:
+            token = WaylandClipboard().probe()
+        self.assertEqual(run.call_count, 1,
+                         "an image probe must never fetch the body")
+        self.assertEqual(token, (KIND_IMAGE, ("image/png", "image/webp")))
+
+    def test_the_image_token_is_the_type_list_not_the_body(self):
+        """Deliberately NOT the shape read() returns for the same
+        clipboard, so the two can never compare equal and confusing them is
+        loud rather than silent. Nothing may hash, send or write a token."""
+        with mock.patch("subprocess.run",
+                        return_value=_completed(stdout=b"image/png\n")):
+            token = WaylandClipboard().probe()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"image/png\n"),
+            _completed(stdout=b"\x89PNG-body"),
+        ]):
+            read = WaylandClipboard().read()
+        self.assertNotEqual(token, read)
+        self.assertNotIsInstance(token[1], bytes)
+
+    def test_a_second_image_probe_with_the_same_types_compares_equal(self):
+        """What makes the token usable as `previous` at all -- and, said
+        plainly, what the added latency IS: two selections offering the
+        same type list are indistinguishable to the poll loop, so an image
+        replacing an identical-typed image is not seen until the next
+        type-list change. See probe()'s own docstring for why that is
+        expected to be rare here and what covers it in healthy mode."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run",
+                        return_value=_completed(stdout=b"image/png\nimage/webp\n")):
+            first = clipboard.probe()
+            second = clipboard.probe()
+        self.assertEqual(first, second)
+
+    def test_a_text_probe_is_the_body_exactly_as_read_returns_it(self):
+        """Text keeps v2's behaviour byte for byte: there is no cheap proxy
+        for text, its cost is not what the spec objects to, and an
+        identical token means every text path behaves exactly as it did."""
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"text/plain;charset=utf-8\n"),
+            _completed(stdout=b"clip contents"),
+        ]) as run:
+            self.assertEqual(WaylandClipboard().probe(), (KIND_TEXT, b"clip contents"))
+        self.assertEqual(run.call_count, 2)
+
+    def test_probe_is_none_on_the_same_listing_failures_read_is(self):
+        """_observe_tick's `read_ok` treats None as "no evidence either
+        way" and resets an armed verdict, so probe() reporting a live token
+        where read() would report None changes what the safety net counts
+        as evidence. Both listing failures stay identical."""
+        for stdout, returncode in ((b"", 1), (b"TARGETS\nTIMESTAMP\n", 0)):
+            with self.subTest(returncode=returncode):
+                with mock.patch("subprocess.run",
+                                return_value=_completed(returncode=returncode, stdout=stdout)):
+                    self.assertIsNone(WaylandClipboard().probe())
+                    self.assertIsNone(WaylandClipboard().read())
+
+    def test_repeated_image_probes_never_log_a_body_read_duration(self):
+        """The compounding half of the finding. With the loop calling
+        read(), an image body slow enough to cross SLOW_IMAGE_READ_SECONDS
+        -- which a large screenshot through a pipe can easily be -- logged
+        a duration line on EVERY tick, 86,400 a day at
+        DEGRADED_POLL_SECONDS=1.0, all of it crossing the SSH channel into
+        the Mac's log. That is the flood the gate below was added to
+        prevent, arriving through the one call site the gate cannot help:
+        the read genuinely IS slow, so the threshold is genuinely met,
+        every single tick.
+
+        probe() never fetches the body, so the line has no way to recur.
+        Ten ticks produce exactly the one --list-types line the
+        connection's first call is entitled to, and no body line ever --
+        whatever the body would have cost."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run",
+                        return_value=_completed(stdout=b"image/png\n")):
+            for _ in range(10):
+                clipboard.probe()
+        duration_lines = [line for line in self.log_lines if line.startswith("clipboard read (")]
+        self.assertEqual(
+            len(duration_lines), 1,
+            "only the connection's first call may log unconditionally: %r" % self.log_lines)
+        self.assertNotIn("image/png", duration_lines[0],
+                         "no probe may ever report the duration of a body fetch")
+
+    def test_the_first_call_of_either_kind_claims_the_unconditional_baseline(self):
+        """_first_read_done belongs to the clipboard, not to read(): a
+        baseline duration from a probe is worth exactly as much as one from
+        a read, and the flag must be consumed once per connection however
+        it is first reached. In production read() still wins -- the
+        connect-time seed runs before any watcher is built -- but nothing
+        about the flag depends on that ordering, and this pins that a probe
+        which got there first does not leave a second baseline to be
+        claimed by the next read."""
+        clipboard = WaylandClipboard()
+        with mock.patch("subprocess.run", side_effect=[
+            _completed(stdout=b"image/png\n"),
+            _completed(stdout=b"image/png\n"),
+            _completed(stdout=b"\x89PNG-body"),
+        ]):
+            clipboard.probe()
+            clipboard.read()
+        self.assertEqual(
+            len([line for line in self.log_lines if line.startswith("clipboard read (")]), 1,
+            "the probe claimed the baseline; the read that follows must not re-claim it")
+
+
 class TestDurationLoggingIsGated(unittest.TestCase):
     """Fix round 1. Logging every read's duration unconditionally -- built
     exactly as the original brief specified, and exactly what
     TestReadSubprocessBehavior's own first-read test above still pins --
-    floods the log at production scale: PollingWatcher's safety net calls
-    clipboard.read() on every tick for as long as a connection lasts,
-    whether or not anything changed, and each read is up to two wl-paste
-    invocations. At DEGRADED_POLL_SECONDS=1.0 that is 86400 x 2 = 172,800
-    duration lines a day, all of it crossing the SSH channel into the Mac's
-    log. Every case here is pinned by LINE COUNT, not by wording -- the
+    floods the log at production scale: PollingWatcher's safety net forks
+    wl-paste on every tick for as long as a connection lasts, whether or not
+    anything changed. That was clipboard.read(), up to two invocations, so
+    at DEGRADED_POLL_SECONDS=1.0: 86400 x 2 = 172,800 duration lines a day,
+    all of it crossing the SSH channel into the Mac's log. The loop asks
+    clipboard.probe() now (TestProbeIsCheapForImages above), which is still
+    two invocations for text -- so that ceiling is unchanged and this gate
+    is still the only thing holding it down. Every case here is pinned by
+    LINE COUNT, not by wording -- the
     deliverable the coordinator asked for is a test that goes red if the
     gate is ever removed, and a wording-based assertion would not notice
     that; a count would."""

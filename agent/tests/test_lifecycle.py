@@ -682,9 +682,11 @@ class RacyImageClipboard:
     """The image twin of test_watcher.py's RacyClipboard: read() drives a
     _write_clip on the way past, so a newer write lands "on the main thread"
     while this read is still in flight -- deterministically, from one thread,
-    rather than by racing two real ones. The real window is a wl-paste round
-    trip, up to SUBPROCESS_TIMEOUT=3s (IMAGE_SUBPROCESS_TIMEOUT=10s for an
-    image), during which any number of frames can arrive and be applied."""
+    rather than by racing two real ones. The real window is TWO wl-paste round
+    trips, and on an image clipboard they are SUBPROCESS_TIMEOUT=3s
+    (--list-types) followed by IMAGE_SUBPROCESS_TIMEOUT=10s (the body) -- 13
+    seconds in total, not either one alone, during which any number of frames
+    can arrive and be applied."""
 
     def __init__(self, agent, value_read, interleaved_write):
         self._agent = agent
