@@ -64,8 +64,14 @@ func sha256Hex(_ data: Data) -> String {
 /// applies to `currentKind`. `nil` is legal and is what tests that assert
 /// only on the resolved state pass; both production callers pass the real
 /// one.
-func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double,
-                             log: Log?) -> ClipState {
+///
+/// Returns a `StoredClipState` since v3.1 -- the store's record, not the
+/// wire's state -- because the value it resolves is exactly what the caller
+/// persists, and the local hash has to survive that round trip or the store
+/// stops describing what the clipboard returns after one announcement. A
+/// caller that wants only the announceable half takes `.state`.
+func resolveCurrentClipState(pasteboard: PasteboardReading, stored: StoredClipState?, now: Double,
+                             log: Log?) -> StoredClipState {
     var currentHash: String? = nil
     var currentKind: ClipKind? = nil
     if let read = pasteboard.read(), !read.data.isEmpty {
@@ -164,9 +170,19 @@ final class ClipStateAnnouncement {
 /// has already been bitten by, and `ClipStateStore.save` deliberately throws
 /// so that a CALLER can log -- it just should not be four callers writing the
 /// string out independently.
-func persistClipState(_ state: ClipState, to store: ClipStateStore, log: Log) {
+///
+/// Takes the store's whole record rather than a `ClipState` plus a separate
+/// local hash, and that is deliberate: a two-argument shape would let a call
+/// site rebuild the pair from parts and drop the local half silently, which
+/// is the failure mode `resolveStartupState`'s own comment records from Task
+/// 6 (a same-arity caller changing its body is invisible to every test that
+/// checks only the callee). Three of the four sites hold content whose bytes
+/// this machine put on its own pasteboard, so they pass `localSHA256: nil`
+/// and say why; only `handleFrame`'s pixel-equivalent image branch passes a
+/// real one.
+func persistClipState(_ record: StoredClipState, to store: ClipStateStore, log: Log) {
     do {
-        try store.save(state)
+        try store.save(record)
     } catch {
         log.line("could not persist clip state: \(error)")
     }
@@ -218,14 +234,25 @@ func announceClipState(
     // nothing changed at all. The spec ties this line to startup
     // reconciliation, which is this function. Byte-identical to
     // `announce_clip_state`'s own line on the PC side.
-    if let hash = resolved.sha256, stored?.sha256 != hash {
+    //
+    // `localHash` on BOTH sides, never `state.sha256`, and for a sharper
+    // reason than the seed's: in the state the density fix creates, the
+    // canonical hash is the peer's and the clipboard holds this side's own
+    // bytes. If the user then copies something whose bytes hash to that same
+    // canonical value, the canonical comparison sees no difference and stays
+    // silent about a clipboard that genuinely changed -- an unannounced
+    // change with `now` stamped on it and no line to explain it, which is
+    // this line's entire job. `localHash` measures what the clipboard
+    // returns, which is the thing that either changed or did not.
+    if let hash = resolved.localHash, stored?.localHash != hash {
         log.line("clipboard changed while apart")
     }
     persistClipState(resolved, to: clipStateStore, log: log)
     // Returns what actually reached the wire, and only that: a payload that
     // failed to encode was never announced, so there is nothing for a later
-    // reconciliation to be consistent WITH.
-    guard let payload = try? resolved.encodePayload() else { return nil }
+    // reconciliation to be consistent WITH. `.state`, since that is all the
+    // wire has ever carried -- the local hash is this machine's business.
+    guard let payload = try? resolved.state.encodePayload() else { return nil }
     send(Frame(type: .clipState, payload: payload))
-    return resolved
+    return resolved.state
 }

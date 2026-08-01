@@ -79,7 +79,15 @@ func handleLocalChange(
     // would announce a PNG's digest as text on the next reconnect, and the
     // peer believes it -- `decode_clip_state` accepts both kinds, so nothing
     // rejects it on arrival.
-    persistClipState(ClipState(sha256: sha256Hex(body), ts: observedAt, kind: kind),
+    //
+    // `localSHA256: nil` -- the canonical hash IS what this machine's
+    // clipboard returns, because `body` came from reading it. It also clears
+    // any divergence a previous record held: a local change is the clipboard
+    // moving on, so a local hash left over from an image the peer sent back
+    // would outlive the content it described.
+    persistClipState(StoredClipState(state: ClipState(sha256: sha256Hex(body), ts: observedAt,
+                                                      kind: kind),
+                                     localSHA256: nil),
                      to: clipStateStore, log: log)
     let frame: Frame
     do {

@@ -166,9 +166,16 @@ func handleFrame(
         // save failures plus a concurrent announcement, where the previous
         // behaviour needed only one, and the local change in question was
         // already sent to the peer by the watcher's own path.
-        let mine = clipStateStore.load()
+        //
+        // `.state` on both store-derived values: this is a reconciliation
+        // against what the PEER announced, so only the announceable half of
+        // the store's record takes part. The local hash exists for the
+        // startup seed's comparison against this machine's own clipboard
+        // (see `StoredClipState`) and would be meaningless here -- the peer
+        // has never seen it.
+        let mine = clipStateStore.load()?.state
             ?? clipStateAnnouncement.announced
-            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now, log: log)
+            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now, log: log).state
         let decision = resolveFreshness(mine: mine, peer: peerState)
         // Every reconciliation outcome is reported, not only the interesting
         // ones. Acceptance item 2 requires the conflict to appear in the log,
@@ -384,7 +391,14 @@ func handleFrame(
         // `ClipPayload.decode` two lines up -- the text-clip codec, `.clip`
         // (type 0x01) exclusively. An image applied from the peer arrives
         // as `.imageClip` instead, which does not reach this branch.
-        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts, kind: .text),
+        //
+        // `localSHA256: nil`: we wrote these exact bytes, and `NSPasteboard`
+        // hands back what it was given, so the canonical hash is also what a
+        // later read will produce. The image branch below is the one place
+        // that is not true.
+        persistClipState(StoredClipState(state: ClipState(sha256: sha256Hex(textData),
+                                                          ts: decoded.ts, kind: .text),
+                                         localSHA256: nil),
                          to: clipStateStore, log: log)
         status.recordReceived()
     case .imageClip:
@@ -410,6 +424,51 @@ func handleFrame(
             decoded = try ImagePayload.decode(frame.payload)
         } catch {
             log.line("could not decode an image clip from the peer: \(error)")
+            return
+        }
+        // The density fix (v3.1). A retina screenshot copied here goes to the
+        // PC, GPaste takes the selection over and re-encodes it -- dropping
+        // `pHYs`, the pixel density -- and the PC correctly hashes what it
+        // READ BACK, so it holds a different hash with a later timestamp,
+        // wins the next reconnect, and hands this Mac a copy of its own
+        // screenshot that pastes at double size. Measured: 259 bytes in,
+        // 632 back, 100x100 pixels displaying at 100x100 instead of 50x50.
+        //
+        // So: if this pasteboard already holds an image whose PIXELS are the
+        // incoming one's, keep the local bytes -- they are the ones carrying
+        // the metadata -- and adopt the peer's hash as the canonical one, so
+        // the next reconciliation resolves `doNothing` rather than pulling
+        // the degraded copy across again. The bytes' own hash goes in the
+        // store's local field, which is what keeps the store describing what
+        // this clipboard returns; see `StoredClipState`.
+        //
+        // Nothing is written and nothing is armed, and the second follows
+        // from the first: `EchoGuard` is a ONE-SHOT consumed by the next
+        // observation, so arming it here -- with no write to suppress --
+        // would spend it on whatever the user copies next and swallow a
+        // genuine change. No write also means no `changeCount` bump, so
+        // `PasteboardWatcher` never sees this frame at all and there is
+        // nothing to suppress in the first place.
+        //
+        // The peer's timestamp, exactly as the applying branch below uses
+        // it, and `.image` for the same reason: this is the image codec.
+        // `status.recordReceived()` fires too -- the frame arrived and was
+        // resolved, and this is the steady state the fix creates, so
+        // suppressing it would make a working sync look dead in
+        // `clipwire status` precisely when it is working.
+        //
+        // Only the Mac can do this: comparing pixels needs a real PNG
+        // decoder, and the PC's clipboard will carry no `pHYs` regardless
+        // because GPaste re-encodes whatever it is handed.
+        if let local = pasteboard.read(), local.kind == .image,
+           imagePixelsIdentical(local.data, decoded.png) {
+            log.line("the peer's image has the same pixels: keeping the local bytes")
+            persistClipState(
+                StoredClipState(state: ClipState(sha256: sha256Hex(decoded.png), ts: decoded.ts,
+                                                 kind: .image),
+                                localSHA256: sha256Hex(local.data)),
+                to: clipStateStore, log: log)
+            status.recordReceived()
             return
         }
         // Arm suppression BEFORE writing, with the PNG bytes alone -- not
@@ -438,7 +497,15 @@ func handleFrame(
         // GPaste takes over the selection and re-encodes the image; see
         // `SystemPasteboard.write`'s doc comment for why no read-back belongs
         // here.
-        persistClipState(ClipState(sha256: sha256Hex(decoded.png), ts: decoded.ts, kind: .image),
+        //
+        // `localSHA256: nil`, unlike the pixel-equivalent branch above: these
+        // are the bytes that went onto the pasteboard, so the canonical hash
+        // is also the one a later read produces. It clears any divergence an
+        // earlier record held, too -- this write replaced whatever the
+        // clipboard was holding.
+        persistClipState(StoredClipState(state: ClipState(sha256: sha256Hex(decoded.png),
+                                                          ts: decoded.ts, kind: .image),
+                                         localSHA256: nil),
                          to: clipStateStore, log: log)
         status.recordReceived()
     }
