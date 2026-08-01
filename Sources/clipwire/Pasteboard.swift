@@ -444,15 +444,22 @@ final class PasteboardWatcher {
             // re-offer sites carry the identical note.
             //
             // The verdict clause `over the image limit` is byte-identical
-            // across all five sites that report this limit -- three on the PC
+            // across all SEVEN sites that report this limit -- four on the PC
             // (`_observe_local_change`, `_resolve_clip_state`,
-            // `_consume_image_reoffer`) and two here (this one and
-            // `handleFrame`'s `.sendMine` branch). Four of them share the
-            // whole `skipping an image of N bytes:` sentence; the PC's
-            // re-offer site reports a different EVENT about the same limit
-            // and says so, which is exactly why the shared thing is the
-            // clause rather than the sentence. The convention the frame-cap
-            // and skew lines already follow, which has caught drift twice.
+            // `_consume_image_reoffer`, `resolve_current_clip_state`) and
+            // three here (this one, `handleFrame`'s `.sendMine` branch, and
+            // `resolveCurrentClipState`). Four of them share the whole
+            // `skipping an image of N bytes:` sentence; the PC's re-offer
+            // site and the two announce sites report different EVENTS about
+            // the same limit and say so, which is exactly why the shared
+            // thing is the clause rather than the sentence. The convention
+            // the frame-cap and skew lines already follow, which has caught
+            // drift twice.
+            //
+            // Counted rather than merely listed because the number has now
+            // moved once: the announce path had no guard at all until the
+            // final wave, which let content this side can never send win a
+            // reconciliation and then refuse to travel.
             guard body.count <= FrameConstants.maxImageBytes else {
                 log?.line("skipping an image of \(body.count) bytes: over the image limit")
                 return nil

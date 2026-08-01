@@ -313,9 +313,10 @@ func sha256Hex(_ data: Data) -> String {
 }
 
 /// Reconciles what the pasteboard holds right now against what was last persisted.
-/// `nil` (an empty or unreadable pasteboard) is never hashed, matching the wire
-/// contract that `sha256` is `null` for exactly that case -- see `resolveStartupState`
-/// for the rule this applies once a current hash is in hand.
+/// `nil` (an empty or unreadable pasteboard, or one holding content over its
+/// kind's limit -- see below) is never hashed, matching the wire contract that
+/// `sha256` is `null` for exactly those cases -- see `resolveStartupState` for
+/// the rule this applies once a current hash is in hand.
 ///
 /// `currentKind` -- the OTHER half of `resolveStartupState`'s signature -- comes from
 /// this exact same `read()` call, never derived separately: `read()` is Task 8's one
@@ -500,9 +501,11 @@ func announceClipState(
     // Exactly the negation of `resolveStartupState`'s "the stored timestamp
     // is authoritative" condition, nothing-ever-stored included: content that
     // APPEARED while nothing was watching is the same judgement as content
-    // that changed. A nil hash is deliberately silent -- an empty or
-    // unreadable pasteboard never reaches a timestamp comparison at all, so
-    // there is no reconciliation judgement to report.
+    // that changed. A nil hash is deliberately silent -- a pasteboard that
+    // is empty, unreadable, or holding content over its kind's limit (all
+    // three resolve one, and the last says so in its own line) never reaches
+    // a timestamp comparison at all, so there is no reconciliation
+    // judgement to report.
     //
     // Logged here rather than inside `resolveCurrentClipState`, which the
     // `.clipState` case's own store-failure fallback also calls with

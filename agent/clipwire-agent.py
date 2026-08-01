@@ -908,10 +908,13 @@ class Agent:
             # bytes over it -- which still fits MAX_PAYLOAD_BYTES with 4 MiB
             # to spare. Writing this guard the way the text one is written
             # would refuse a maximum-size screenshot that the protocol
-            # explicitly makes room for. Same phrasing as the other two image
-            # skips (_observe_local_change's and _consume_image_reoffer's):
-            # one verdict clause for one limit, so three sites cannot drift
-            # into three names for it.
+            # explicitly makes room for. Same verdict clause as every other
+            # site reporting this limit -- three more on this side
+            # (_observe_local_change's, _consume_image_reoffer's and
+            # resolve_current_clip_state's) and three on the Mac, enumerated
+            # in full at Sources/clipwire/Pasteboard.swift's own image guard:
+            # one clause for one limit, so seven sites cannot drift into seven
+            # names for it.
             if len(body) > MAX_IMAGE_BYTES:
                 log("skipping an image of %d bytes: over the image limit" % len(body))
                 return
@@ -1336,11 +1339,13 @@ class Agent:
             # and the limit differ.
             if len(png) > MAX_IMAGE_BYTES:
                 # The verdict clause is byte-identical to the re-offer path's
-                # own oversize line, which is the whole reason both exist as
-                # separate sentences rather than one: they report different
-                # events (an image read back after our write, versus one the
-                # user copied) about the same limit, and the shared clause is
-                # what keeps the two from drifting into two different names
+                # own oversize line and to the announce path's
+                # (resolve_current_clip_state's), which is the whole reason
+                # they exist as separate sentences rather than one: they
+                # report different events (an image read back after our write,
+                # one the user copied, one there is simply nothing to announce
+                # for) about the same limit, and the shared clause is what
+                # keeps them from drifting into different names
                 # for it. The sentence shape mirrors the text-skip line the
                 # two text call sites already share.
                 #
@@ -1937,14 +1942,17 @@ def resolve_startup_state(current_hash, current_kind, stored, now):
     resolve_current_clip_state's own docstring for the other half: it is
     what actually derives `current_kind` from clipboard.read()'s pair.
 
-    A None current_hash (clipboard empty or unreadable right now) always
+    A None current_hash (the clipboard empty, unreadable, or holding content
+    over its kind's limit -- see resolve_current_clip_state, which is what
+    turns all three into this one value) always
     wins over whatever is on disk, regardless of what was previously
     stored: resolve_freshness never compares timestamps when either side's
     hash is None, so the timestamp returned here is never actually read.
     Its kind is None too, matching the null-iff-null rule decode_clip_state
     enforces on the wire -- a literal None, not `current_kind`, since a
-    caller reporting a None hash (an empty or unreadable clipboard) has no
-    real kind to go with it either.
+    caller reporting a None hash (nothing announceable on the clipboard,
+    whichever of the three reasons it was) has no real kind to go with it
+    either.
     """
     if current_hash is None:
         return None, now, None
@@ -2030,6 +2038,14 @@ def resolve_current_clip_state(clipboard, stored, now):
     sharing the clause. Mirrored on the Mac side in
     Sources/clipwire/main.swift's resolveCurrentClipState, which is why that
     one had to grow a `log` parameter.
+
+    One asymmetry with that mirror, stated rather than left to be noticed:
+    Swift writes these two as an exhaustive `switch` over ClipKind, so a
+    third kind would be a compile error there and is simply hashed unguarded
+    here. That is exactly what this function did for BOTH kinds before the
+    guards existed, choose_kind picks no third kind today, and inventing a
+    behaviour for one would add a branch no test can reach -- so the
+    difference is left as the honest one it is.
     """
     read = clipboard.read()
     if read is None:
@@ -2075,9 +2091,11 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     # Exactly the negation of resolve_startup_state's "the stored timestamp
     # is authoritative" condition, including the nothing-ever-stored case:
     # content that appeared while nothing was watching is the same judgement
-    # as content that changed. A null hash is deliberately silent -- an empty
-    # or unreadable clipboard never reaches a timestamp comparison at all, so
-    # there is no reconciliation judgement to report.
+    # as content that changed. A null hash is deliberately silent -- a
+    # clipboard that is empty, unreadable, or holding content over its kind's
+    # limit (all three resolve one, and the last says so in its own line)
+    # never reaches a timestamp comparison at all, so there is no
+    # reconciliation judgement to report.
     #
     # Logged HERE rather than inside resolve_current_clip_state, which
     # _resolve_clip_state's own store-failure fallback also calls with

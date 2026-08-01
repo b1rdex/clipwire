@@ -136,13 +136,16 @@ struct ClipStateStore {
 /// produce. See `resolveCurrentClipState`'s own doc comment for the other
 /// half -- it is what derives `currentKind` from the read's pair.
 ///
-/// A `nil` currentHash (clipboard empty or unreadable right now) always
+/// A `nil` currentHash (the pasteboard empty, unreadable, or holding content
+/// over its kind's limit -- see `resolveCurrentClipState`, which is what turns
+/// all three into this one value) always
 /// wins over whatever is on disk, regardless of what was previously stored:
 /// `resolveFreshness` never compares timestamps when either side's hash is
 /// `nil`, so the timestamp attached here is never actually read. Its kind is
 /// a literal `nil` too -- not `currentKind` -- matching the nil-iff-nil rule
 /// `ClipState.init(from:)` enforces on the wire: a caller reporting a `nil`
-/// hash has no real kind to go with it either, and `ClipState`'s memberwise
+/// hash (nothing announceable on the pasteboard, whichever of the three
+/// reasons it was) has no real kind to go with it either, and `ClipState`'s memberwise
 /// initializer does not enforce that rule, so a leak here would reach the
 /// wire and be rejected by the peer's decoder rather than by anything local.
 func resolveStartupState(currentHash: String?, currentKind: ClipKind?,
