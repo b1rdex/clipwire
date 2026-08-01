@@ -2078,7 +2078,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.clipboard.queue_read(b"already on the pc")  # the seed read
         agent.clipboard.queue_read(b"already on the pc")  # the announce step's own read
         self.become_ready_without_a_real_watcher(agent)
-        self.assertEqual(agent._last_seen, b"already on the pc")
+        self.assertEqual(agent._last_seen, (KIND_TEXT, sha256_hex(b"already on the pc")))
 
         agent.clipboard.queue_read(b"already on the pc")  # the spurious signal's read
         sent = []
@@ -2097,10 +2097,11 @@ class TestEchoBookkeeping(unittest.TestCase):
         seed read AND announce_clip_state's read (called from inside it)
         both go through this same kind-aware clipboard.read() now.
 
-        _last_seen stays a text-only value until Task 9 (see
-        clipboard_became_ready's own comment) -- an image-only clipboard at
-        connect seeds no baseline, exactly like an empty one already seeds
-        none. But the CLIP_STATE announcement that goes out in the same
+        _last_seen is a (kind, hash) pair since Task 9, but every
+        comparison against it stays text-only (see clipboard_became_ready's
+        own comment) -- an image-only clipboard at connect seeds no
+        baseline, exactly like an empty one already seeds none. But the
+        CLIP_STATE announcement that goes out in the same
         call is a different matter: that frame is what gets PERSISTED to
         the store and put on the wire, and a fabricated KIND_TEXT there is
         exactly the regression resolve_startup_state's docstring warns
@@ -2120,7 +2121,7 @@ class TestEchoBookkeeping(unittest.TestCase):
 
         self.assertIsNone(
             agent._last_seen,
-            "_last_seen stays text-only until Task 9 -- an image seeds no baseline yet",
+            "comparisons against _last_seen stay text-only -- an image seeds no baseline yet",
         )
         announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
         self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
@@ -2129,6 +2130,31 @@ class TestEchoBookkeeping(unittest.TestCase):
             decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
             "the announced kind must be the real one, not a fabricated KIND_TEXT",
         )
+
+    def test_last_seen_holds_a_kind_and_a_hash_for_text_too(self):
+        """Not text-by-value and images-by-hash: one rule. A second
+        comparison branch is how the two sides drift."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"hello")
+        agent.send = lambda t, p: None
+        agent._local_change()
+        self.assertEqual(agent._last_seen, (KIND_TEXT, sha256_hex(b"hello")))
+
+    def test_the_same_bytes_under_a_different_kind_are_a_change(self):
+        """Not text-by-value and images-by-hash: one rule. A second
+        comparison branch is how the two sides drift. _local_change is
+        text-only until a later task teaches it to observe a local image
+        change too, so this seeds _last_seen directly under KIND_IMAGE
+        rather than getting there through two scripted reads -- the
+        identity rule under test lives in the comparison itself, not in
+        how _last_seen came to hold that value."""
+        agent = self.build(ready=True)
+        agent._last_seen = (KIND_IMAGE, sha256_hex(b"x"))
+        agent.clipboard.queue_read(b"x")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(len(sent), 1, "kind is part of identity, not decoration")
 
 
 class OrderRecordingClipboard:
@@ -2596,7 +2622,7 @@ class TestIncomingClipState(unittest.TestCase):
         agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer empty -> sendMine
 
         self.assertEqual(
-            agent._last_seen, b"current clip text",
+            agent._last_seen, (KIND_TEXT, sha256_hex(b"current clip text")),
             "_last_seen must advance to what was just sent, exactly as "
             "_local_change's own send path already does",
         )

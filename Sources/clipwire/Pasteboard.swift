@@ -231,7 +231,7 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// fork a process and read the whole clipboard.
 ///
 /// Two actors touch this watcher's state: its own `poll()`, invoked on the
-/// timer's background queue, and `noteWrittenLocally(_:)`, called by the
+/// timer's background queue, and `noteWrittenLocally(kind:payload:)`, called by the
 /// channel's frame handler (a later task) from a different thread when it
 /// writes an incoming clip to the pasteboard. Task 11 found the PC analogue
 /// of this — the watcher thread and the main thread shared echo-suppression
@@ -320,9 +320,9 @@ final class PasteboardWatcher {
         self.log = log
     }
 
-    func noteWrittenLocally(_ payload: Data) {
+    func noteWrittenLocally(kind: ClipKind, payload: Data) {
         stateLock.lock()
-        echo.noteWrittenLocally(payload)
+        echo.noteWrittenLocally(kind: kind, payload: payload)
         stateLock.unlock()
     }
 
@@ -393,7 +393,7 @@ final class PasteboardWatcher {
             log?.line("skipping a clip of \(text.count) bytes: over the text limit")
             return nil
         }
-        guard echo.shouldSend(text) else { return nil }
+        guard echo.shouldSend(kind: .text, payload: text) else { return nil }
         return (text, Date().timeIntervalSince1970)
     }
 

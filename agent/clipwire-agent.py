@@ -449,7 +449,37 @@ class Agent:
         # never expires on its own: it is what the Mac already holds,
         # for as long as neither side has genuinely changed it. See
         # _local_change for why a one-shot echo alone is not enough.
+        #
+        # A (kind, hash) pair, or None -- never the content itself. One
+        # rule for both kinds, not text remembered by value and images by
+        # hash: a second comparison branch is exactly the kind of mirrored
+        # drift this project has already been bitten by twice, and holding
+        # a hash instead of bytes is what keeps a synced image's pixels
+        # out of memory here once a later task starts syncing them. Every
+        # comparison against this field is itself still text-only for now
+        # (see _observe_local_change and _resolve_clip_state) -- the shape
+        # is ready for a kind other than KIND_TEXT before any call site
+        # actually produces one.
         self._last_seen = None
+        # Companion to _last_seen, holding the ACTUAL BYTES the pair
+        # describes -- but ONLY when _last_seen's kind is KIND_TEXT: set
+        # together with _last_seen everywhere _last_seen is set to a
+        # KIND_TEXT pair, and None everywhere _last_seen is set to None or
+        # (once a later task teaches this side to hold one) a KIND_IMAGE
+        # pair. That invariant is the entire reason this field exists
+        # rather than folding bytes back into _last_seen itself:
+        # _resolve_clip_state's SEND_MINE branch needs to send WITHOUT
+        # re-reading the clipboard when it already trusts its own memory --
+        # re-reading there risks catching WaylandClipboard.write()'s
+        # asynchronous wl-copy handoff mid-flight (see that branch's own
+        # comment), and wl-paste is a subprocess call, not a free one.
+        # This field never participates in deciding WHETHER something is a
+        # change -- that decision is _last_seen's (kind, hash) comparison
+        # alone, everywhere it happens -- only in supplying bytes once that
+        # comparison has already decided a match. So it is an optimization
+        # for one call site, not a second copy of the rule Task 9 exists to
+        # keep singular.
+        self._last_seen_text = None
         # Guards _last_written/_write_gen/_last_seen only. A separate lock
         # from _write_lock (which guards stdout) on purpose: nesting them
         # would invite a deadlock later, and this one is held across
@@ -654,31 +684,32 @@ class Agent:
             return
         with self._echo_lock:
             last_seen = self._last_seen
-        # Prefer what we already know over a fresh clipboard read, exactly
-        # as clipboard_became_ready's own announce step does for a just-
-        # applied pending clip -- the same race, one door over. If a clip
-        # was recently applied (_on_clip's immediate path, or
-        # clipboard_became_ready's pending-clip path), _last_seen already
-        # holds its exact text; verifying its hash against mine confirms it
-        # is still the SAME content mine describes, not a stale or
-        # unrelated value (e.g. clipboard_became_ready's own connect-time
-        # seed, which has no such relationship to the store). A fresh
-        # clipboard.read() here would risk WaylandClipboard.write()'s
-        # asynchronous, detached wl-copy spawn: it returns as soon as its
-        # own stdin pipe closes, long before wl-copy necessarily registers
-        # as the Wayland selection owner, so a read issued shortly after
-        # could see stale content while mine (from the store) already
-        # correctly reflects the new content -- sending stale text stamped
-        # with a timestamp that looks like a valid, fresh reconciliation
-        # response.
-        if last_seen and sha256_hex(last_seen) == mine[0]:
-            text = last_seen
+            last_seen_text = self._last_seen_text
+        # last_seen is compared as (kind, hash) -- one rule, per Task 9 --
+        # to decide whether we have a specific reason to trust the
+        # clipboard already holds what mine describes: if a clip was
+        # recently applied (_on_clip's immediate path, or
+        # clipboard_became_ready's pending-clip path) or sent (_local_change's
+        # own send path), last_seen already agrees with mine on both kind
+        # and hash. When it does, last_seen_text -- the bytes that
+        # (kind, hash) pair describes, kept only alongside it and only for
+        # KIND_TEXT, see its own field comment -- IS what to send, with no
+        # read at all. A fresh clipboard.read() here would risk
+        # WaylandClipboard.write()'s asynchronous, detached wl-copy spawn:
+        # it returns as soon as its own stdin pipe closes, long before
+        # wl-copy necessarily registers as the Wayland selection owner, so
+        # a read issued shortly after could see stale content while mine
+        # (from the store) already correctly reflects the new content --
+        # sending stale text stamped with a timestamp that looks like a
+        # valid, fresh reconciliation response.
+        if last_seen == (mine[2], mine[0]) and last_seen_text is not None:
+            text = last_seen_text
         else:
             # Task 7 made read() kind-aware; this branch stays text-only
-            # until Task 11 teaches it to read by mine's OWN kind and
-            # verify the hash before sending -- see _observe_local_change's
-            # own comment on this same scope boundary. mine[2] can already
-            # be KIND_IMAGE here now that resolve_startup_state no longer
+            # until Task 11 teaches it to read by mine's OWN kind and send
+            # a non-text kind too -- see _observe_local_change's own
+            # comment on this same scope boundary. mine[2] can already be
+            # KIND_IMAGE here now that resolve_startup_state no longer
             # hardcodes KIND_TEXT: an image-only clipboard resolves a real
             # (hash, ts, KIND_IMAGE) triple instead of a None hash, which
             # makes SEND_MINE reachable for it where it previously never
@@ -686,8 +717,8 @@ class Agent:
             # would be a worse outcome than not sending at all, so a
             # non-text read is treated the same as no read -- this
             # connection silently does not sync the image, exactly as it
-            # silently does not today; Task 11 is where it starts verifying
-            # and sending it correctly instead.
+            # silently does not today; Task 11 is where it starts sending
+            # it correctly instead.
             read = self.clipboard.read()
             text = read[1] if read is not None and read[0] == KIND_TEXT else None
         if not text:
@@ -723,8 +754,20 @@ class Agent:
         # silent clobber of a real Mac-side change made in the meantime at
         # worst, since the Mac applies any incoming .clip frame
         # unconditionally.
+        #
+        # sha256_hex(text), not mine[0]: the two agree when text came from
+        # last_seen_text (that IS the match this branch required, by
+        # construction -- last_seen_text's hash is always last_seen[1], and
+        # the match above required last_seen[1] == mine[0]). In the OTHER
+        # branch, though, there is no such guarantee: resolve_freshness
+        # only ever compares mine[0] against peer[0] -- for equality, and
+        # as the tie-break's ordering -- never against a fresh clipboard
+        # read, so nothing has confirmed it is actually text's hash there.
+        # Hashing what was truly just sent is correct in both branches;
+        # trusting mine[0] blindly would not be in the second one.
         with self._echo_lock:
-            self._last_seen = text
+            self._last_seen = (KIND_TEXT, sha256_hex(text))
+            self._last_seen_text = text
 
     # --- phase transitions ----------------------------------------------
 
@@ -756,15 +799,17 @@ class Agent:
         # either. The previous asymmetry ran in the destructive direction,
         # which is worse than losing a convenience. Do not "fix" this back.
         read = self.clipboard.read()
-        # _last_seen stays a text-only value until Task 9 makes it a
-        # (kind, hash) pair -- see _observe_local_change's own comment on
-        # this same scope boundary. An image-only clipboard at connect
-        # time therefore seeds no baseline yet, exactly as an empty one
-        # already seeds none: there is nothing for _observe_local_change's
-        # own text-only read to ever compare an image against.
-        seed = read[1] if read is not None and read[0] == KIND_TEXT else None
+        # _last_seen is a (kind, hash) pair (Task 9), but every comparison
+        # against it is still text-only -- see _observe_local_change's own
+        # comment on that scope boundary. An image-only clipboard at
+        # connect time therefore seeds no baseline yet, exactly as an empty
+        # one already seeds none: there is nothing for a text-only
+        # comparison to ever match an image's kind against.
+        seed_text = read[1] if read is not None and read[0] == KIND_TEXT else None
+        seed = (KIND_TEXT, sha256_hex(seed_text)) if seed_text is not None else None
         with self._echo_lock:
             self._last_seen = seed
+            self._last_seen_text = seed_text
         applied_pending = None
         if self.pending_clip is not None:
             # Supersedes the seed above with the more authoritative value:
@@ -904,7 +949,14 @@ class Agent:
         with self._echo_lock:
             self._last_written = text
             self._write_gen += 1
-            self._last_seen = text
+            # KIND_TEXT: this method's only caller ever feeds it a
+            # TYPE_CLIP (text) payload, decoded above. Hashed again below,
+            # for save_clip_state's own return value, rather than reused:
+            # text is capped at MAX_PAYLOAD_BYTES by the wire, so a second
+            # SHA-256 of it is cheap enough not to be worth restructuring
+            # this method to thread one hash through both sites.
+            self._last_seen = (KIND_TEXT, sha256_hex(text))
+            self._last_seen_text = text
         # KIND_TEXT: see the same reasoning spelled out just below, at the
         # save_clip_state call this write() mirrors -- this method's only
         # caller ever feeds it a TYPE_CLIP (text) payload.
@@ -1052,7 +1104,21 @@ class Agent:
         # _last_seen has no such expiry: it is what the peer already holds,
         # for as long as neither side has genuinely changed it, and catches
         # exactly the non-change signals the one-shot value cannot.
-        if text == last_seen:
+        #
+        # Compared as (kind, hash), not text by value -- one rule for both
+        # kinds, per Task 9. This call only ever reaches here with
+        # KIND_TEXT (the guard above already returned for any other kind),
+        # so the kind half of THIS side is always KIND_TEXT. last_seen's
+        # own kind is not similarly fixed -- today it is always KIND_TEXT
+        # too, or None, since nothing yet ever sets it to KIND_IMAGE -- but
+        # comparing kind alongside hash, rather than hash alone, is what
+        # keeps a hash coincidence between two DIFFERENT kinds from ever
+        # silently reading as no-change, once something can set it to one.
+        # Hashed once, here, and reused below for both the persisted state
+        # and the updated value -- text can be up to MAX_TEXT_BYTES, and
+        # this method runs on every observed clipboard change.
+        sha256 = sha256_hex(text)
+        if (KIND_TEXT, sha256) == last_seen:
             return
         # This text is wrapped in encode_clip_payload before it reaches the
         # wire, so the cap must account for the 8-byte timestamp prefix --
@@ -1075,7 +1141,7 @@ class Agent:
         # (WaylandClipboard, a text/plain read) and is about to go out as a
         # TYPE_CLIP frame -- the text-clip type -- two lines down.
         try:
-            save_clip_state(sha256_hex(text), observed_at, KIND_TEXT, path=self._clip_state_path)
+            save_clip_state(sha256, observed_at, KIND_TEXT, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
         self.send(TYPE_CLIP, encode_clip_payload(observed_at, text))
@@ -1083,7 +1149,8 @@ class Agent:
         # channel), _last_seen must not advance to content the peer never
         # actually received.
         with self._echo_lock:
-            self._last_seen = text
+            self._last_seen = (KIND_TEXT, sha256)
+            self._last_seen_text = text
 
     # --- main loop --------------------------------------------------------
 

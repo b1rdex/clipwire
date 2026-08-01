@@ -114,7 +114,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 555, text: "hello").encode()),
                     send: { _ in XCTFail("a clip frame must never trigger a reply") },
-                    noteWrittenLocally: { _ in order.append("arm") },
+                    noteWrittenLocally: { _, _ in order.append("arm") },
                     pasteboard: pasteboard, status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -141,7 +141,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clip, payload: framePayload),
                     send: { _ in XCTFail("a clip frame must never trigger a reply") },
-                    noteWrittenLocally: { armedWith = $0 },
+                    noteWrittenLocally: { armedWith = $1 },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -160,7 +160,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clip, payload: Data()),
                     send: { _ in },
-                    noteWrittenLocally: { _ in XCTFail("must not arm for an undecodable clip") },
+                    noteWrittenLocally: { _, _ in XCTFail("must not arm for an undecodable clip") },
                     pasteboard: pasteboard, status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -181,7 +181,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clip, payload: emptyTextPayload),
                     send: { _ in },
-                    noteWrittenLocally: { _ in XCTFail("must not arm for empty text") },
+                    noteWrittenLocally: { _, _ in XCTFail("must not arm for empty text") },
                     pasteboard: pasteboard, status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -196,7 +196,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clip, payload: invalidUTF8),
                     send: { _ in },
-                    noteWrittenLocally: { _ in XCTFail("must not arm for undecodable text") },
+                    noteWrittenLocally: { _, _ in XCTFail("must not arm for undecodable text") },
                     pasteboard: pasteboard, status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -222,7 +222,7 @@ final class HandleFrameTests: XCTestCase {
         invalidUTF8.append(contentsOf: [0xFF, 0xFE, 0xFD])
 
         handleFrame(Frame(type: .clip, payload: invalidUTF8),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -242,7 +242,7 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: path)
 
         handleFrame(Frame(type: .clip, payload: ClipPayload(ts: .nan, text: "x").encode()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -261,7 +261,7 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: path)
 
         handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 5, text: "").encode()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -284,7 +284,7 @@ final class HandleFrameTests: XCTestCase {
         let framePayload = ClipPayload(ts: peersTimestamp, text: "peer's clip").encode()
 
         handleFrame(Frame(type: .clip, payload: framePayload),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -304,7 +304,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
                     send: { sent.append($0) },
-                    noteWrittenLocally: { _ in XCTFail("a hello must not touch the pasteboard") },
+                    noteWrittenLocally: { _, _ in XCTFail("a hello must not touch the pasteboard") },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -319,7 +319,7 @@ final class HandleFrameTests: XCTestCase {
         let mismatched = Data(#"{"protocol":999,"agent":"9.9.9"}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: mismatched),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -336,7 +336,7 @@ final class HandleFrameTests: XCTestCase {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
         handleFrame(Frame(type: .hello, payload: Data("not json".utf8)),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -350,7 +350,7 @@ final class HandleFrameTests: XCTestCase {
     func testTheReplyAlwaysCarriesOurOwnProtocolVersion() {
         var sent: [Frame] = []
         handleFrame(Frame(type: .hello, payload: Data(#"{"protocol":999}"#.utf8)),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -379,7 +379,7 @@ final class HandleFrameTests: XCTestCase {
         let hello = Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0","sent_at":1000.0}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: hello),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement(), now: 1000.5)
@@ -397,7 +397,7 @@ final class HandleFrameTests: XCTestCase {
         let hello = Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0","sent_at":1000.0}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: hello),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement(), now: 1060.0)
@@ -419,7 +419,7 @@ final class HandleFrameTests: XCTestCase {
         // testAMatchedHelloLogsTheSkewAgainstTheInjectedNow.
         handleFrame(Frame(type: .hello,
                           payload: Data(#"{"protocol":\#(ProtocolConstants.version),"agent":"0.1.0"}"#.utf8)),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status,
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement(), now: 1000.0)
@@ -439,7 +439,7 @@ final class HandleFrameTests: XCTestCase {
         let hello = Data(#"{"protocol":999,"agent":"9.9.9","sent_at":1000.0}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: hello),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement(), now: 1060.0)
@@ -463,13 +463,13 @@ final class HandleFrameTests: XCTestCase {
         let store = tempClipStateStore()
 
         handleFrame(Frame(type: .hello, payload: hello),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: store,
                     clipStateAnnouncement: ClipStateAnnouncement(), now: now)
         handleFrame(Frame(type: .clip,
                           payload: ClipPayload(ts: now - 86400, text: "copied yesterday").encode()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: store,
                     clipStateAnnouncement: ClipStateAnnouncement(), now: now)
@@ -488,7 +488,7 @@ final class HandleFrameTests: XCTestCase {
         var sent: [Frame] = []
 
         handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -512,7 +512,7 @@ final class HandleFrameTests: XCTestCase {
 
         for _ in 0..<2 {
             handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
-                        send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                        send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                         pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                         log: tempLog(), clipStateStore: store, clipStateAnnouncement: announcement)
         }
@@ -527,7 +527,7 @@ final class HandleFrameTests: XCTestCase {
         let mismatched = Data(#"{"protocol":999,"agent":"9.9.9"}"#.utf8)
 
         handleFrame(Frame(type: .hello, payload: mismatched),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -546,12 +546,12 @@ final class HandleFrameTests: XCTestCase {
         var sent: [Frame] = []
 
         handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 1, text: "x").encode()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: announcement)
 
         handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0, kind: nil).encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: announcement)
 
@@ -578,7 +578,7 @@ final class HandleFrameTests: XCTestCase {
         pasteboard.textToRead = Data("something to wrongly send".utf8)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -599,7 +599,7 @@ final class HandleFrameTests: XCTestCase {
         pasteboard.textToRead = Data("something to wrongly send".utf8)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -621,7 +621,7 @@ final class HandleFrameTests: XCTestCase {
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -654,7 +654,7 @@ final class HandleFrameTests: XCTestCase {
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -682,7 +682,7 @@ final class HandleFrameTests: XCTestCase {
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -705,7 +705,7 @@ final class HandleFrameTests: XCTestCase {
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -731,7 +731,7 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: logPath)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
         log.flush()
@@ -757,7 +757,7 @@ final class HandleFrameTests: XCTestCase {
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine, if mine resolves non-nil
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -798,7 +798,7 @@ final class HandleFrameTests: XCTestCase {
         let framePayload = ClipPayload(ts: 1, text: "hi").encode()
 
         handleFrame(Frame(type: .clip, payload: framePayload),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -902,7 +902,7 @@ final class HandleFrameTests: XCTestCase {
         var sent: [Frame] = []
 
         handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store,
                     clipStateAnnouncement: announcement, now: 1000)
@@ -917,7 +917,7 @@ final class HandleFrameTests: XCTestCase {
         // than the clock a re-derivation would stamp (2000 < 3000).
         let peer = ClipState(sha256: Self.hashB, ts: 2000, kind: .text)
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store,
                     clipStateAnnouncement: announcement, now: 3000)
@@ -969,7 +969,7 @@ final class HandleFrameTests: XCTestCase {
 
         // The hello, and this connection's one-shot announcement: ts 1000.
         handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store,
                     clipStateAnnouncement: announcement, now: 1000)
@@ -992,7 +992,7 @@ final class HandleFrameTests: XCTestCase {
 
         let peer = ClipState(sha256: Self.hashB, ts: 2000, kind: .text)
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
-                    send: { sent.append($0) }, noteWrittenLocally: { _ in },
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: tempLog(), clipStateStore: store,
                     clipStateAnnouncement: announcement, now: 4000)
@@ -1023,7 +1023,7 @@ final class HandleFrameTests: XCTestCase {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
         handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -1036,7 +1036,7 @@ final class HandleFrameTests: XCTestCase {
         let peer = ClipState(sha256: Self.hashB, ts: 9, kind: .text)
 
         handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -1052,7 +1052,7 @@ final class HandleFrameTests: XCTestCase {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
         handleFrame(Frame(type: .clipState, payload: try ClipState(sha256: nil, ts: 0, kind: nil).encodePayload()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -1065,7 +1065,7 @@ final class HandleFrameTests: XCTestCase {
         let status = AgentStatus(pid: 1, url: tempStatusURL())
 
         handleFrame(Frame(type: .clipState, payload: Data("not json".utf8)),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: status, log: tempLog(),
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
 
@@ -1104,7 +1104,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .clipState, payload: wellFormedJSONWithABadHash),
                     send: { _ in XCTFail("a rejected clip-state must not produce any frame") },
-                    noteWrittenLocally: { _ in },
+                    noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: tempClipStateStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -1245,7 +1245,7 @@ final class HandleFrameTests: XCTestCase {
             pasteboard.textToRead = Data("whatever we hold".utf8)
 
             handleFrame(Frame(type: .clipState, payload: try c.peer.encodePayload()),
-                        send: { _ in }, noteWrittenLocally: { _ in },
+                        send: { _ in }, noteWrittenLocally: { _, _ in },
                         pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
                         log: log, clipStateStore: store,
                         clipStateAnnouncement: ClipStateAnnouncement())
@@ -1302,7 +1302,7 @@ final class HandleFrameTests: XCTestCase {
         let log = Log(path: path)
 
         handleFrame(Frame(type: .clip, payload: ClipPayload(ts: 424242, text: "peer's clip").encode()),
-                    send: { _ in }, noteWrittenLocally: { _ in },
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
                     pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
                     log: log, clipStateStore: try unsaveableStore(),
                     clipStateAnnouncement: ClipStateAnnouncement())
@@ -1328,7 +1328,7 @@ final class HandleFrameTests: XCTestCase {
 
         handleFrame(Frame(type: .imageClip, payload: Data("not yet a real image".utf8)),
                     send: { sent.append($0) },
-                    noteWrittenLocally: { _ in XCTFail("must not arm echo suppression for an unhandled type") },
+                    noteWrittenLocally: { _, _ in XCTFail("must not arm echo suppression for an unhandled type") },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()), log: log,
                     clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
         log.flush()

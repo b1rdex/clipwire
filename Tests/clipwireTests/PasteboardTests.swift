@@ -175,7 +175,7 @@ final class PasteboardTests: XCTestCase {
         watcher.onChange = { data, _ in seen.append(data) }
         watcher.poll()
 
-        watcher.noteWrittenLocally(Data("from the peer".utf8))
+        watcher.noteWrittenLocally(kind: .text, payload: Data("from the peer".utf8))
         pasteboard.set("from the peer")     // the write we just made
         watcher.poll()
         XCTAssertTrue(seen.isEmpty, "our own write must not bounce back")
@@ -348,7 +348,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
 
         // Clip "A" arrives from the peer: written locally, suppression armed —
         // exactly what the future channel's frame handler will do.
-        watcher.noteWrittenLocally(Data("A".utf8))
+        watcher.noteWrittenLocally(kind: .text, payload: Data("A".utf8))
         pasteboard.set("A")
 
         // Make the read that follows pause mid-flight.
@@ -371,7 +371,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
         DispatchQueue.global().async {
             pasteboard.set("B")
             aboutToArmB.signal()
-            watcher.noteWrittenLocally(Data("B".utf8))
+            watcher.noteWrittenLocally(kind: .text, payload: Data("B".utf8))
             armedB.signal()
         }
         XCTAssertEqual(aboutToArmB.wait(timeout: .now() + 2), .success,
@@ -478,7 +478,7 @@ final class PasteboardGenerationTests: XCTestCase {
         }
 
         // Clip A: armed and written, but not yet polled.
-        watcher.noteWrittenLocally(Data("A".utf8))
+        watcher.noteWrittenLocally(kind: .text, payload: Data("A".utf8))
         pasteboard.set("A")
 
         // Pause the poll that is about to process A right after it reads
@@ -500,7 +500,7 @@ final class PasteboardGenerationTests: XCTestCase {
         // correctly block until poll() releases it.
         let armed = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
-            watcher.noteWrittenLocally(Data("B".utf8))
+            watcher.noteWrittenLocally(kind: .text, payload: Data("B".utf8))
             pasteboard.set("B")
             armed.signal()
         }

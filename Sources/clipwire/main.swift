@@ -494,7 +494,7 @@ func announceClipState(
 func handleFrame(
     _ frame: Frame,
     send: (Frame) -> Void,
-    noteWrittenLocally: (Data) -> Void,
+    noteWrittenLocally: (ClipKind, Data) -> Void,
     pasteboard: PasteboardReading & PasteboardWriting,
     status: AgentStatus,
     log: Log,
@@ -741,7 +741,7 @@ func handleFrame(
         // `.clip` (type 0x01) payload, the text-clip codec, so there is
         // nothing else it could be. An image applied from the peer arrives
         // as `.imageClip` and does not reach this branch.
-        noteWrittenLocally(textData)
+        noteWrittenLocally(.text, textData)
         pasteboard.write(kind: .text, data: textData)
         // The peer's timestamp, never `now`: this is the entire reason it
         // travels in the frame. Stamping it with `now` would make applied
