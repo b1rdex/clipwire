@@ -16,36 +16,49 @@ enum ImagePixelConstants {
 /// keep.
 ///
 /// **Defined operationally, because the loose reading has a trap.** "Identical
-/// pixels" here means byte equality of the two RGBA buffers after decoding
-/// BOTH images into one fixed format: one colour space (sRGB), one channel
-/// order, one alpha layout, eight bits a component. GPaste does not merely
-/// drop `pHYs` when it re-encodes; it drops the colour profile with it
-/// (`iCCP`, `sRGB`, `gAMA`, `cHRM` -- everything ancillary), so two images
-/// that are the same picture arrive tagged differently and "compare them as
-/// they decode" yields differences that are real in the buffer and meaningless
-/// on screen. Normalising both into one destination space is what makes the
-/// comparison answer the question actually being asked.
+/// pixels" here means byte equality of the two RGBA buffers after decoding both
+/// images into one fixed layout -- one channel order, one alpha layout, eight
+/// bits a component -- with each image **re-tagged** as sRGB rather than
+/// converted into it, so the samples pass through untouched.
+///
+/// Re-tagging rather than converting is the whole point, and the first version
+/// of this file got it wrong. GPaste does not merely drop `pHYs` when it
+/// re-encodes; it drops the colour profile with it (`iCCP`, `sRGB`, `gAMA`,
+/// `cHRM` -- everything ancillary). So a profile difference is not an edge
+/// case: it is part of the firing CONDITION, present exactly whenever this fix
+/// is needed. Converting both into sRGB made the comparison answer "different"
+/// for every real screenshot on the machine this was written for -- measured,
+/// 12,530 of 76,800 bytes, max delta **2**, which is rounding and not a
+/// picture.
+///
+/// The question being asked is not "are these the same picture" but **"is the
+/// peer's version derived from mine"**. Equal samples are the evidence of
+/// derivation, and the profile is then not a difference to see past -- it is
+/// the thing being rescued. Keeping the local bytes is right because they are
+/// the original, not because the two are interchangeable.
 ///
 /// Measured on this Mac rather than assumed, because the whole fix rests on
-/// it. Identical samples, decoded through this exact pipeline:
+/// it. Identical, decoded through this exact pipeline:
 ///
-/// - bare PNG vs the same PNG carrying `pHYs`: IDENTICAL
-/// - bare vs the same plus `sRGB` + `gAMA` + `cHRM`: IDENTICAL
-/// - the owner's own 259-byte retina fixture vs the harness's re-encode of it
-///   (`Tests/fakes/fake_clipboard.py`, which drops exactly what GPaste drops):
-///   IDENTICAL
-/// - a **Display P3**-tagged PNG vs an untagged re-encode of it: DIFFER, 96 of
-///   140 bytes, by up to 52/255
+/// - bare PNG vs the same PNG carrying `pHYs`
+/// - bare vs the same plus `sRGB` + `gAMA` + `cHRM`
+/// - a **Display P3**-tagged PNG vs an untagged re-encode of it -- the case a
+///   real screenshot from a wide-gamut display actually produces
+/// - a real `screencapture -c` PNG (`IHDR iCCP eXIf pHYs iTXt iDOT IDAT IDAT
+///   IEND`, 160x120 pixels displaying at 80x60) against a re-encode that drops
+///   `iCCP` and `pHYs`
 ///
-/// That last one is a real limit and is stated rather than hidden: if a
-/// screenshot carries a wide-gamut ICC profile and the peer's copy comes back
-/// without it, the two are genuinely different pictures once both are read in
-/// one colour space, this returns `false`, and the incoming bytes are applied
-/// exactly as they were before v3.1 -- the bug is not fixed for that image,
-/// but nothing is made worse. `Tests/fakes/fake_clipboard.py`'s own docstring
-/// carries the matching constraint for the harness: an image fixture must not
-/// carry a non-sRGB profile, or the comparison goes red for a real reason
-/// that looks exactly like the fix failing.
+/// Different **samples** still compare different -- re-tagging does not turn
+/// this into a dimension check. That is pinned by its own test.
+///
+/// One premise here is not measured: that GPaste's re-encode leaves the samples
+/// alone. The harness's fake preserves them by construction and so cannot
+/// answer it, and the only real observation is that the byte count grew from
+/// 105,700 to 180,287, which proves different filtering and says nothing about
+/// samples. `imagePixelDifference` below logs the evidence on the mismatch
+/// path so the first real reconnect settles it. If it turns out they move, no
+/// pixel comparison can work and the answer is provenance instead -- the PC
+/// announcing the hash it was GIVEN beside the hash it read back.
 ///
 /// **Every uncertain answer is `false`.** Undecodable bytes, a context that
 /// cannot be allocated, a decoder that reports no pixel data: all of them mean
@@ -117,7 +130,63 @@ private func normalizedRGBA(_ image: CGImage) -> Data? {
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
                                       | CGBitmapInfo.byteOrder32Big.rawValue)
     else { return nil }
-    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    // Re-tag as sRGB rather than converting into it, so the draw below moves
+    // samples through unchanged and only normalises layout and alpha.
+    //
+    // Converting was the first implementation and it made this whole fix inert
+    // on the machine it was written for. GPaste strips `iCCP` with the same
+    // motion that strips `pHYs`, so a profile difference is part of the firing
+    // CONDITION, present exactly whenever the fix is needed. Measured on a real
+    // screenshot from the owner's Mac: 12,530 of 76,800 bytes differed, max
+    // delta 2 -- rounding from converting a display-tagged original into sRGB
+    // while its untagged re-encode is already read as sRGB. Same picture, and
+    // the comparison said no.
+    //
+    // The question this answers is not "are these the same picture" but "is
+    // the peer's version derived from mine". Equal samples are the evidence of
+    // that, and the profile is then not a difference to see past -- it is the
+    // thing being rescued.
+    //
+    // `copy(colorSpace:)` returns nil when the models disagree (a greyscale
+    // source), which falls through to `false` and today's behaviour.
+    guard let retagged = image.copy(colorSpace: space) else { return nil }
+    context.draw(retagged, in: CGRect(x: 0, y: 0, width: width, height: height))
     guard let pixels = context.data else { return nil }
     return Data(bytes: pixels, count: height * bytesPerRow)
+}
+
+/// Describes why two images did not compare equal, for the log line on the
+/// mismatch path. Returns `nil` when there is nothing useful to say.
+///
+/// This exists because the fix it reports on rests on an unmeasured premise:
+/// that GPaste's re-encode leaves the pixel samples alone. Our harness's fake
+/// re-encoder preserves them by construction, so it cannot answer the
+/// question, and the only real observation is that the byte count grew from
+/// 105,700 to 180,287 -- which proves different filtering and says nothing
+/// about samples.
+///
+/// So the release measures it. If the premise holds, this line never appears
+/// for a re-encoded screenshot; if it appears with a small delta, the samples
+/// moved and the whole comparison approach needs replacing with provenance --
+/// having the PC announce the hash it was GIVEN alongside the hash it read
+/// back, which needs no pixels at all and survives any transformation.
+func imagePixelDifference(_ lhs: Data, _ rhs: Data) -> String? {
+    guard let left = decodeImage(lhs), let right = decodeImage(rhs) else {
+        return "one of them did not decode"
+    }
+    guard left.width == right.width, left.height == right.height else {
+        return "different dimensions (\(left.width)x\(left.height) vs \(right.width)x\(right.height))"
+    }
+    guard let a = normalizedRGBA(left), let b = normalizedRGBA(right) else {
+        return "could not normalise one of them"
+    }
+    guard a.count == b.count else { return "different buffer sizes" }
+    var differing = 0
+    var maxDelta = 0
+    for (x, y) in zip(a, b) where x != y {
+        differing += 1
+        maxDelta = max(maxDelta, abs(Int(x) - Int(y)))
+    }
+    guard differing > 0 else { return nil }
+    return "\(differing) of \(a.count) bytes differ, max delta \(maxDelta)"
 }

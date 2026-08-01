@@ -205,29 +205,50 @@ final class ImagePixelsTests: XCTestCase {
         XCTAssertFalse(imagePixelsIdentical(Data(), Data()))
     }
 
-    /// *** A stated limit, not a requirement. *** A wide-gamut original whose
-    /// profile the peer's copy has lost is genuinely a different picture once
-    /// both are read in one colour space -- measured through this exact
-    /// pipeline at 96 of 140 bytes differing, by up to 52/255 -- so the
-    /// comparison says no and the incoming bytes are applied exactly as they
-    /// were before v3.1. The density bug is not fixed for that image; nothing
-    /// is made worse either.
+    /// *** The case this fix exists for. *** It used to assert the opposite,
+    /// and inverting it is the whole of what changed in v3.1's second pass.
     ///
-    /// Pinned so the boundary is a decision rather than a surprise during the
-    /// manual check on the real machines: a Display P3 screenshot will not
-    /// take the keep-the-local-bytes path. If a later change makes this
-    /// `true` on purpose -- by comparing raw samples instead of normalised
-    /// ones, say -- this test should be deleted along with an explanation,
-    /// not adjusted until it passes. `Tests/fakes/fake_clipboard.py` carries
-    /// the matching constraint for the harness.
-    func testAWideGamutOriginalAgainstAnUntaggedCopyIsNotIdentical() {
+    /// The first implementation converted both images INTO sRGB before
+    /// comparing, which made the fix inert on the machine it was written for.
+    /// GPaste strips the colour profile with the same motion that strips
+    /// `pHYs`, so a profile difference is not an edge case — it is part of the
+    /// firing CONDITION, present exactly whenever the fix is needed. Measured
+    /// on a real screenshot from the owner's Mac: 12,530 of 76,800 bytes
+    /// differed, max delta **2** — rounding from converting a display-tagged
+    /// original into sRGB while its untagged re-encode is already read as sRGB.
+    /// The same picture, and the comparison said no.
+    ///
+    /// The question being asked is not "are these the same picture" but "is
+    /// the peer's version derived from mine". Equal samples are the evidence
+    /// of derivation, and the profile is then not a difference to see past —
+    /// it is the thing being rescued.
+    ///
+    /// So `normalizedRGBA` re-tags rather than converts, and this case must be
+    /// IDENTICAL. If it ever goes back to `false`, the fix has silently
+    /// stopped working for every real screenshot on a wide-gamut display,
+    /// while every other test in this file stays green.
+    func testAWideGamutOriginalAgainstAnUntaggedCopyIsIdentical() {
         let samples = TestPNG.samples(width: 9, height: 7)
         let p3 = TestPNG.encode(samples, width: 9, height: 7, dpi: 144,
                                 space: CGColorSpace(name: CGColorSpace.displayP3)!)
-        XCTAssertFalse(imagePixelsIdentical(p3, TestPNG.strippingAncillaryChunks(p3)),
-                       "a stripped wide-gamut image reads as a different picture, and this "
-                       + "comparison must not claim otherwise")
+        XCTAssertTrue(imagePixelsIdentical(p3, TestPNG.strippingAncillaryChunks(p3)),
+                      "a stripped wide-gamut image carries the same samples, which is the "
+                      + "evidence that it was derived from ours -- the profile is what we keep")
         XCTAssertTrue(imagePixelsIdentical(p3, p3), "the same tagged bytes are still the same picture")
+    }
+
+    /// Different SAMPLES must still be different, or re-tagging would have
+    /// turned the comparison into "same dimensions" and thrown away a picture
+    /// the user was actually sent.
+    func testDifferentSamplesAreStillDifferentAfterRetagging() {
+        let a = TestPNG.samples(width: 9, height: 7)
+        var b = a
+        b[0] = b[0] &+ 40
+        let p3 = TestPNG.encode(a, width: 9, height: 7, dpi: 144,
+                                space: CGColorSpace(name: CGColorSpace.displayP3)!)
+        let other = TestPNG.encode(b, width: 9, height: 7, dpi: 144,
+                                   space: CGColorSpace(name: CGColorSpace.sRGB)!)
+        XCTAssertFalse(imagePixelsIdentical(p3, other))
     }
 
     /// A truncated PNG -- a real failure mode for content that crossed a wire

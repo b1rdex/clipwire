@@ -470,6 +470,13 @@ func handleFrame(
                 to: clipStateStore, log: log)
             status.recordReceived()
             return
+        } else if let local = pasteboard.read(), local.kind == .image,
+                  let why = imagePixelDifference(local.data, decoded.png) {
+            // Only when a local image existed and lost the comparison. The
+            // fix's whole premise -- that a re-encode leaves the samples
+            // alone -- is unmeasured against the real GPaste, so the first
+            // real reconnect logs the evidence rather than us guessing.
+            log.line("the peer's image differs from the local one: \(why)")
         }
         // Arm suppression BEFORE writing, with the PNG bytes alone -- not
         // `frame.payload`, which carries the 8-byte timestamp prefix.
