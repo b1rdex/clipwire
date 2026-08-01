@@ -45,6 +45,44 @@ final class Channel: @unchecked Sendable {
 
     private let config: Config
     private let log: Log
+    /// The command `attempt()` spawns. These default to exactly the production
+    /// values, so `Commands.swift`'s `Channel(config:log:)` — the only
+    /// construction site outside tests — keeps spawning `/usr/bin/ssh` with
+    /// `sshArguments(for:host:)`, and nothing in production passes or depends
+    /// on either of them.
+    ///
+    /// They exist for v3.1's pairing harness, which points this at
+    /// `python3 agent/clipwire-agent.py` and runs the Swift and Python halves
+    /// of this project against each other — something they had never once
+    /// done, while every defect this project ever shipped was found by running
+    /// it rather than by a test. Substituting the *command* and not the
+    /// transport is the whole point: it keeps the real spawn, the real pipes,
+    /// real EOF and real SIGPIPE, which is where this channel's actual defect
+    /// history lives (see `ignoreSIGPIPE()` below, and `attempt()`'s labeled
+    /// `outer:` loop).
+    ///
+    /// Three alternatives were rejected on the record, so a later tidying pass
+    /// need not re-litigate them:
+    ///
+    /// - **An environment variable.** It would put "exec an arbitrary command"
+    ///   into a tool that lives beside the owner's ssh keys, in a public
+    ///   repository — a permanent surface to document and defend, bought for a
+    ///   testing convenience. Nothing here reads the environment; the test
+    ///   target injects through this initializer instead.
+    /// - **A mock, or a protocol over `Process`/`Pipe`.** That substitutes a
+    ///   drawing of the transport for the transport, and the transport is
+    ///   precisely the part with the defect history.
+    /// - **Storing already-built argv.** `host` varies per attempt — `run()`
+    ///   flips to `config.fallbackIP` after a dial that never established — so
+    ///   argv has to be a function of the host, evaluated inside `attempt()`,
+    ///   not a value fixed at init.
+    ///
+    /// Internal rather than `private` only so a test can pin the defaults:
+    /// once the command stopped being a literal at its call site, nothing else
+    /// guaranteed that production still spawns ssh (`attempt()` is private and
+    /// `run()` never returns, so neither can observe it).
+    let executablePath: String
+    let makeArguments: (Config, String) -> [String]
     private let writeQueue = DispatchQueue(label: "dev.b1rdex.clipwire.write")
     private var process: Process?
     private var stdinPipe: Pipe?
@@ -56,9 +94,13 @@ final class Channel: @unchecked Sendable {
     private var establishedAt: Date?
     private(set) var reconnects = 0
 
-    init(config: Config, log: Log) {
+    init(config: Config, log: Log,
+         executablePath: String = "/usr/bin/ssh",
+         arguments: @escaping (Config, String) -> [String] = sshArguments(for:host:)) {
         self.config = config
         self.log = log
+        self.executablePath = executablePath
+        self.makeArguments = arguments
     }
 
     func send(_ frame: Frame) {
@@ -159,8 +201,8 @@ final class Channel: @unchecked Sendable {
 
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = sshArguments(for: config, host: host)
+        task.executableURL = URL(fileURLWithPath: executablePath)
+        task.arguments = makeArguments(config, host)
         task.standardInput = stdin
         task.standardOutput = stdout
         task.standardError = stderr
