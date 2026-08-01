@@ -132,7 +132,7 @@ class TestProvenanceFixture(unittest.TestCase):
         and so does a file that quietly loses its null rows, which are the
         only ones that discriminate against the bug below."""
         self.assertTrue(self.cases, "fixtures/provenance.json must not be empty")
-        self.assertEqual(len(self.cases), 12, "expected exactly 12 provenance fixture cases")
+        self.assertEqual(len(self.cases), 13, "expected exactly 13 provenance fixture cases")
 
     def test_resolve_provenance_matches_fixture_table(self):
         """Drives every row of the table shared with FreshnessTests.swift's

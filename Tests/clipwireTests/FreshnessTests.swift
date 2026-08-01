@@ -421,7 +421,7 @@ final class FreshnessTests: XCTestCase {
     func testProvenanceFixtureFileIsNotEmpty() throws {
         let cases = try loadProvenanceFixtures()
         XCTAssertFalse(cases.isEmpty, "fixtures/provenance.json must not be empty")
-        XCTAssertEqual(cases.count, 12, "expected exactly 12 provenance fixture cases")
+        XCTAssertEqual(cases.count, 13, "expected exactly 13 provenance fixture cases")
     }
 
     /// Drives every row of the table shared with the PC agent's
