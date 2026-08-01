@@ -241,6 +241,21 @@ PC and the README must not promise one.
 macOS is where the conversion lives: screenshots land on the pasteboard as TIFF, which the Mac
 converts via `NSBitmapImageRep`.
 
+### GPaste substitutes bytes — the same family as `trim-items`
+
+`trim-items` silently stripped whitespace from text and looked exactly like a fidelity bug in
+the sync. Image re-encoding is the same phenomenon one step further: **GPaste takes over
+selection ownership and replaces the bytes with its own encoding.** For text it is curable by
+a setting; for images it is not curable at all, only designed around.
+
+Measured on the live machine: a 105,700-byte PNG written to the PC's clipboard read back a
+few seconds later as a different PNG of **180,287 bytes**, stable across repeated reads. It
+happens to images the *user* copies too, not only ones the agent writes.
+
+A reader who does not know this will read the single frame on the first reconnect after a
+Mac→PC screenshot as a sync bug. It is not; it is the platform, and the design below is what
+makes it converge instead of repeating.
+
 ### The clipboard is not a faithful store — hash what you read, never what you wrote
 
 Measured on the live machine, writing a 105,700-byte PNG to the PC's clipboard:
@@ -276,6 +291,22 @@ Two failures follow if the hash is taken from what was written:
 persistent store or a clip-state frame is the hash of bytes **read from the clipboard**, never
 of bytes handed to the write tool. For text the two coincide; for images on the PC they
 provably do not.
+
+**A refinement of the peer-timestamp rule, and it is a refinement rather than an exception.**
+"Content received from the peer keeps the peer's timestamp" is a statement about **the peer's
+bytes**. GPaste's re-encode is not the peer's bytes: it is a derivative produced by this
+machine at the moment of applying, which the peer has never held. New local content
+legitimately carries its own timestamp — so the re-offer is stored at **`peer_ts + ε`**, the
+minimal honest stamp for "produced immediately after the peer's content arrived".
+
+`now` would be wrong here: it would overtake real user actions that happened between the
+peer's timestamp and the apply. A millisecond cannot overtake anything a human did, because
+the window `(T, T + 1ms]` is physically empty on both machines.
+
+Write it down as a refinement of the rule, not as a special case, or the next refactor
+"restores purity" by removing the nudge — and brings back a coin flip whose losing half
+re-sends the same image on every reconnect indefinitely. The text path is untouched: there
+the read-back matches and the nudge never fires.
 
 **The mechanism must not depend on guessing when the takeover lands.** The measurement above
 puts it between one and four seconds, and that is one observation on one machine — a fixed
@@ -407,9 +438,25 @@ The v2 checklist still applies in full. New items:
 1. **Screenshot each direction.** The image arrives and opens. Mac→PC must show **one send and
    zero image frames coming back** — that is the test for the re-encode echo rule, and it is
    the item most likely to fail.
-2. **Reconnect after a screenshot Mac→PC.** Reconciliation must say `doNothing`, never
-   `clipboard changed while apart`. If it says the latter, the store is holding the written
-   hash instead of the read-back hash and every wake will clobber.
+2. **Reconnect after a screenshot Mac→PC.** The **first** reconnect produces exactly one
+   PC→Mac image frame, with `SEND_MINE` on the PC's side of the log. **Every reconnect after
+   that says `DO_NOTHING`.** More than one frame over a single image's lifetime is a failure.
+   `clipboard changed while apart` must never appear — if it does, the store is holding the
+   written hash instead of the read-back hash and every wake will clobber.
+
+   **`DO_NOTHING` on the *first* reconnect is unreachable while GPaste re-encodes** — see the
+   platform limitation above. This clause originally demanded it, on the premise that what is
+   written is what reads back; the measurement in this document disproved that premise, so the
+   clause was rewritten rather than defended. Same discipline as the one-tick verdict: a
+   criterion is attached to its premise, and a dead premise retires the criterion.
+3. **A retina screenshot survives the round trip at the right display size.** Copy a retina
+   screenshot on the Mac, let it reach the PC, reconnect, and paste back on the Mac. After
+   convergence the Mac holds GPaste's re-encode of its *own* screenshot, and a pixbuf re-encode
+   can drop metadata — `pHYs` above all, which carries the 2× DPI, and the ICC profile. If
+   `pHYs` is lost the paste renders at double size. This is the one place the accepted
+   convergence could cost something real, and it is a measurement, not a prediction: if it
+   degrades, that is either a trade-off to accept knowingly or the motivation for carrying
+   content lineage on the wire in a later version.
 3. **Spreadsheet copy.** Select cells in a spreadsheet and copy: **text** must arrive, not a
    picture of the table. This is the case that reversed the priority decision.
 4. **Re-copying the same screenshot sends nothing.** Copy one screenshot on the Mac twice. If
