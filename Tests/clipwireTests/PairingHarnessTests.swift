@@ -310,6 +310,183 @@ final class PairingHarnessTests: XCTestCase {
                        "line is a store failing to describe what its own clipboard returns")
     }
 
+    // MARK: - the three ways provenance could be inert or harmful
+
+    /// THE NIL CASE, in the loop. `None == None` is `True` in Python and
+    /// `nil == nil` is `true` for a Swift `Optional`, so the naive spelling of
+    /// `resolveProvenance` fires on an empty clipboard against a peer with no
+    /// origin -- and that is not an exotic pairing, it is a locked or
+    /// rebooted PC against an ordinary Mac, which happens daily. Both sides
+    /// would stand down, and the `(_, nil) -> sendMine` recovery that hands a
+    /// peer back the clipboard it lost would be dead for EVERY kind of
+    /// content, not merely for images. A rule about screenshots would have
+    /// silently deleted the recovery for text.
+    ///
+    /// `fixtures/provenance.json` pins the rule and the two suites pin the
+    /// call sites, so what is left for this file is the only thing neither
+    /// can see: that the recovery still happens between the two real
+    /// implementations, over a real pipe, with a real agent process on the
+    /// far end.
+    ///
+    /// BOTH DECISIONS ARE READ, and the nil case is precisely why that is not
+    /// belt and braces. Break the guard on the PYTHON side alone and the Mac
+    /// still resolves `sendMine`, still sends, and the PC still applies it --
+    /// the apply path does not consult its own verdict -- so the clipboard
+    /// assertion below passes over a PC that stood down when it should have
+    /// been waiting. One rule, two implementations, two readings.
+    ///
+    /// The clipboard is emptied `whileApart`, in the window where no agent is
+    /// watching, because that is what a reboot IS. Emptied on a live
+    /// connection it would be a local change the PC observes and reports, and
+    /// the reconnect this test turns on would never be reached.
+    func testAnEmptyPeerIsStillHandedBackWhatItLostBecauseTwoAbsencesDoNotMatch() throws {
+        let harness = try connected()
+        let clip = "the clip the PC lost ✓"
+
+        harness.pasteboard.set(clip)
+        try harness.waitForThePCsClipboard(toHold: Data(clip.utf8),
+                                           offeredAs: "text/plain;charset=utf-8")
+
+        // The PC reboots, or its session locks: it comes back offering
+        // nothing at all and announces a null hash.
+        try harness.reconnect(whileApart: { try harness.emptyThePCsClipboard() })
+
+        XCTAssertEqual(try harness.decisionOnThisConnection(), "sendMine",
+                       "a peer holding nothing gets its clipboard back. Reading doNothing " +
+                       "here is the naive rule matching this side's absent origin against " +
+                       "the peer's absent hash")
+        XCTAssertEqual(try harness.pcsDecisionOnThisConnection(), "waitForPeer",
+                       "and the PC must be WAITING for it rather than standing down -- a PC " +
+                       "that resolved doNothing still receives the clip below, so this line " +
+                       "is the only thing that can tell the two apart")
+        try harness.waitForThePCsClipboard(toHold: Data(clip.utf8),
+                                           offeredAs: "text/plain;charset=utf-8")
+    }
+
+    /// THE PERSISTENCE CASE, read off the disk rather than off the outcome.
+    ///
+    /// `sshd` spawns one agent per connection, so the process that watched
+    /// GPaste hand back different bytes than it was given is already dead at
+    /// the announce that has to say so. The store is the only thing that
+    /// crosses that gap, and an origin that lived only in `_expect_reoffer`
+    /// would be the third release running in which this bug was fixed and
+    /// nothing changed on the machine.
+    ///
+    /// WHY THIS IS NOT THE DENSITY TEST AGAIN. That one asserts the OUTCOME
+    /// -- `doNothing`, no frames, the Mac's own bytes -- across the same two
+    /// reconnects. This one asserts the CARRIER: after each reconnect the
+    /// record on the PC's disk still names both the re-encode it holds and
+    /// the ancestor it was born from, written there by an agent that never
+    /// saw the substitution. The distinction is worth a test because the two
+    /// go red at different moments and say different things: a
+    /// `resolve_startup_state` that rebuilt its matched record around the
+    /// current hash -- correct on all three fields anyone thinks to check --
+    /// strips the fourth on the FIRST reconnect's announce, and the outcome
+    /// test can only report that a screenshot came back.
+    ///
+    /// Both reconnects are asserted, not only the second. The design says the
+    /// fix "dies on the second reconnect", and the reasoning behind that is
+    /// about the origin surviving in the recording process's memory -- which
+    /// is true of a unit test sharing one process and NOT true here, where
+    /// every reconnect kills the agent outright. Asserting each one lets the
+    /// failure name whichever is actually first rather than the one predicted.
+    func testTheOriginOutlivesEveryAgentThatCarriesItAcross() throws {
+        let harness = try connected(substituting: true)
+
+        harness.pasteboard.setImage(PairingHarness.png)
+        let reEncoded = try harness.waitForThePCToReEncodeTheImageItWasSent()
+        XCTAssertNotEqual(reEncoded, PairingHarness.png,
+                          "the fake stored the bytes it was handed; there is no substitution " +
+                          "here to remember and the rest of this test proves nothing")
+        try harness.waitForThePCsAgentToRecord(sha256Hex(reEncoded))
+        XCTAssertEqual(harness.pcsClipState()?["origin"] as? String, sha256Hex(PairingHarness.png),
+                       "the agent that WATCHED the substitution must write down the hash it " +
+                       "was handed; everything below is that one record being carried forward")
+
+        for connection in ["the first reconnect", "the second reconnect"] {
+            try harness.reconnect()
+            // Before the store is read: `announce_clip_state` persists what
+            // it resolved and then sends it, and the reconciliation line
+            // follows the send -- so once the PC's verdict is in the log its
+            // save has already happened, and a read here cannot catch the
+            // file mid-connection.
+            XCTAssertEqual(try harness.pcsDecisionOnThisConnection(), "doNothing",
+                           "\(connection): the agent that saw the substitution is long dead, " +
+                           "so this verdict is reached entirely from what its store carried")
+            XCTAssertEqual(harness.pcsClipState()?["sha256"] as? String, sha256Hex(reEncoded),
+                           "\(connection): the PC still describes its OWN clipboard")
+            XCTAssertEqual(harness.pcsClipState()?["origin"] as? String,
+                           sha256Hex(PairingHarness.png),
+                           "\(connection): and it must RE-persist the ancestor it never " +
+                           "witnessed. A matched record rebuilt around the current hash looks " +
+                           "right on every field but this one, and the fix then lasts exactly " +
+                           "as long as the record that still has it")
+            XCTAssertEqual(try harness.decisionOnThisConnection(), "doNothing",
+                           "\(connection): and this side reads the origin it was sent")
+        }
+    }
+
+    /// THE STALE CASE: the mirror direction, and the one that is easy to miss
+    /// because the safe half of it is so obvious. An origin naming a hash the
+    /// peer no longer holds simply never matches, which is harmless. The
+    /// mirror is a silent loss: the PC holds new content `U` under an origin
+    /// `M` that the Mac still holds, `mine.origin == peer.sha256` fires, and
+    /// the PC NEVER SENDS `U`. A clip the user copied, gone, on an entirely
+    /// routine path -- and gone quietly, because both sides agree they have
+    /// nothing to do.
+    ///
+    /// So the origin has to die with the content it describes:
+    /// `resolve_startup_state`'s changed branch clears it, and every store
+    /// write outside the one recording branch writes none.
+    ///
+    /// STAGED THE ONLY WAY IT CAN HAPPEN. `U` is copied on the PC WHILE
+    /// APART, because that is the whole shape of the hazard: a change the PC
+    /// observes goes to the Mac over the live connection, which leaves the
+    /// Mac no longer holding `M` and nothing for a stale origin to match. It
+    /// takes an unobserved change for the PC to arrive at a reconciliation
+    /// still holding the ancestor's origin, and an unobserved change is one
+    /// made with no agent alive.
+    ///
+    /// TEXT, deliberately, for `U`. The substituting fake is armed for step
+    /// one and stays armed, and `wl-copy` only re-encodes PNGs -- so text is
+    /// the value that reaches the reconciliation unmangled, and it also
+    /// proves the loss is not about images: the origin is stale, and what it
+    /// would silence is whatever the user copied next.
+    ///
+    /// This connection DOES log `clipboard changed while apart`, correctly --
+    /// the PC's clipboard genuinely changed while nothing was watching -- so
+    /// unlike the density test above, its absence is not asserted here.
+    func testAClipCopiedOnThePCWhileApartIsStillSentThoughItsAncestorSitsOnTheMac() throws {
+        let harness = try connected(substituting: true)
+        let copiedOnThePC = "copied on the PC while the Mac slept ✓"
+
+        // Step one, only to manufacture a real origin: the Mac's screenshot,
+        // applied and re-encoded, leaves the PC's store naming the Mac's own
+        // hash as the ancestor of what it holds.
+        harness.pasteboard.setImage(PairingHarness.png)
+        let reEncoded = try harness.waitForThePCToReEncodeTheImageItWasSent()
+        try harness.waitForThePCsAgentToRecord(sha256Hex(reEncoded))
+        XCTAssertEqual(harness.pcsClipState()?["origin"] as? String, sha256Hex(PairingHarness.png),
+                       "without a recorded origin there is no stale origin to survive, and " +
+                       "this test would pass on a machine where provenance never ran at all")
+
+        // Step two: the user copies something else on the PC, with no agent
+        // alive to notice. The Mac still holds the screenshot the stale
+        // origin names.
+        try harness.reconnect(whileApart: {
+            try harness.copyOnThePC(text: copiedOnThePC)
+        })
+
+        XCTAssertEqual(try harness.pcsDecisionOnThisConnection(), "sendMine",
+                       "the PC's clipboard changed, so the origin describing what it USED to " +
+                       "hold is dead with it. Reading doNothing here is the stale origin " +
+                       "still matching the ancestor on the Mac -- and the user's clip is lost")
+        XCTAssertEqual(try harness.decisionOnThisConnection(), "waitForPeer",
+                       "and this side waits for it rather than standing down against an " +
+                       "ancestry claim about content the PC no longer holds")
+        try harness.waitForTheMacsPasteboard(toHold: .text, Data(copiedOnThePC.utf8))
+    }
+
     // MARK: - the harness refuses a world it cannot honestly test
 
     /// Task 3's measurement, kept as a test instead of as a sentence in a
@@ -597,7 +774,19 @@ private final class PairingHarness {
     /// output and return instantly, having confirmed nothing about the agent
     /// now running. That is the degrade-rather-than-refuse this whole file
     /// exists to make impossible.
-    func reconnect() throws {
+    ///
+    /// `whileApart` runs in the window where there is genuinely no agent: the
+    /// old one has exited and the new one has not been dialed. That window is
+    /// not a convenience, it is the only place two of this file's tests can
+    /// be staged at all. "The PC's clipboard changed while the Mac was away"
+    /// is what `resolve_startup_state` exists for -- an empty clipboard after
+    /// a reboot or a lock, and a clip the user copied on the PC while the Mac
+    /// slept -- and it is unreachable while an agent is watching, because a
+    /// watched change goes over the live connection instead and never reaches
+    /// a reconciliation. Its writes go straight to the shared state file, the
+    /// same way `copyOnThePC` does, so nothing is forked and the `Marks` taken
+    /// above stay honest.
+    func reconnect(whileApart: (() throws -> Void)? = nil) throws {
         try decisionOnThisConnection()
         try waitForThePCToReconcileOnThisConnection()
         let marks = Marks(self)
@@ -607,6 +796,9 @@ private final class PairingHarness {
                                    "python3 would go on to fail a later test instead of this one",
                                    diagnostics: diagnostics())
         }
+        // With the old agent gone and the new one not yet dialed, so a change
+        // made here is one nothing observed -- which is the whole point.
+        try whileApart?()
         // After the old agent has exited and its stderr handler has been
         // torn down (`attempt()` does both before returning), so nothing can
         // still be appending to either log as these are taken.
@@ -842,6 +1034,20 @@ private final class PairingHarness {
         try writeClipboardState(types: ["image/png"], body: png)
     }
 
+    /// A PC that comes back holding nothing: a reboot, or the locked session
+    /// the README documents. An empty `types` list is the fake's own spelling
+    /// of it -- `wl-paste` refuses with exit 1 ("No selection") for exactly
+    /// that state, which is what the agent reads as an empty clipboard and
+    /// announces as a null `sha256`.
+    ///
+    /// Deliberately not "delete the state file". That is also an empty
+    /// selection as far as `fake.load` is concerned, but it takes the state
+    /// path's own directory check into territory the fakes exit 2 for, and an
+    /// empty selection modelled two ways is one way too many.
+    func emptyThePCsClipboard() throws {
+        try writeClipboardState(types: [], body: Data())
+    }
+
     // MARK: - waiting for the other side
 
     func waitForThePCsClipboard(toHold body: Data, offeredAs type: String) throws {
@@ -972,6 +1178,23 @@ private final class PairingHarness {
         try wait(for: "the PC to reconcile with us on this connection") {
             self.reconciliations(remote: true).count > self.pcsReconciliationsAtConnect
         }
+    }
+
+    /// The PC's own verdict, indexed from its own baseline exactly as the
+    /// Mac's is.
+    ///
+    /// Not redundant with `clipsFromThePC()`, and the nil case is what proves
+    /// it: with the present-value guard dropped on the PYTHON side alone, the
+    /// Mac still resolves `sendMine` and still sends -- the PC applies any
+    /// clip it is handed, whatever it resolved -- so the clip arrives, the
+    /// counts are satisfied, and the only witness that the PC stood down when
+    /// it should have been waiting is this line. One rule with two
+    /// implementations needs a reading of each, or a break in either is a
+    /// break in neither.
+    @discardableResult
+    func pcsDecisionOnThisConnection() throws -> String {
+        try waitForThePCToReconcileOnThisConnection()
+        return reconciliations(remote: true)[pcsReconciliationsAtConnect]
     }
 
     /// Whether the shared log holds a line. Both sides' lines land in it --
