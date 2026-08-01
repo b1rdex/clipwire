@@ -6,17 +6,27 @@ No server, no accounts, no sessions, no listening ports, no certificates. The Ma
 out; `sshd` on the other end spawns a single-file Python agent. Authentication and
 encryption come from SSH, so there is no state that a reboot can invalidate.
 
-Built for a specific pair of machines — macOS Sequoia and Ubuntu 25.10 on GNOME/Wayland,
-where `wl-paste --watch` does not work because Mutter has no wlroots data-control protocol.
+Built for a specific pair of machines — macOS Sequoia and Ubuntu 26.04 LTS with GNOME Shell
+50.1 on Wayland (upgraded from 25.10 mid-project), where `wl-paste --watch` does not work
+because Mutter has no wlroots data-control protocol.
 
 **Status:** implemented. For architecture and the constraints that shaped it, read
-[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md) and then
+[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md), then
 [the protocol v2 amendment](docs/superpowers/specs/2026-07-31-protocol-v2-freshness-design.md),
 which supersedes it on the wire format and on what happens at connect time: the two sides
-now exchange what each holds and how old it is, and the fresher one sends. The Swift and
-Python test suites both run in CI. The acceptance test is manual and lives in the
-amendment; the two halves of the program have never been exercised against each other by
-any automated test, because each suite drives one side against scripted pipes.
+now exchange what each holds and how old it is, and the fresher one sends. [The protocol v3
+amendment](docs/superpowers/specs/2026-07-31-protocol-v3-images-design.md) adds image sync
+on top of that, unchanged on the freshness rule itself. The Swift and Python test suites
+both run in CI. The acceptance test is manual: the v2 amendment holds the base checklist
+and the v3 amendment adds items to it, covering images specifically. The two halves of the
+program have never been exercised against each other by any automated test, because each
+suite drives one side against scripted pipes.
+
+**Images sync too, up to 4 MiB, and text wins when the clipboard holds both.** A screenshot
+or a copied image syncs the same way text does. When both are on the clipboard at once —
+which is what Excel, LibreOffice Calc and Numbers all do, placing a bitmap of the copied
+cells alongside the text — text wins, so a spreadsheet range arrives as the text of the
+cells, not a picture of the table.
 
 **Passwords land in GPaste's history on the PC and stay there.** Anything copied on the
 Mac is written to the PC's clipboard, and GPaste records it in its on-disk history. A
@@ -27,6 +37,12 @@ synced, so the clearing does not replicate. Remove it on the PC with:
 ```sh
 gpaste-client delete-history
 ```
+
+**The same is true of screenshots, which may hold more than the person copying them
+intended.** GPaste writes image items to its on-disk history exactly as it writes text —
+verified: `images-support` is `true`, `~/.local/share/gpaste/images` holds them, and a
+screenshot taken on the PC was confirmed to appear in the history listing. As with the text
+case above, anything that reaches the PC's clipboard as an image lands in that history too.
 
 ## Installing
 
@@ -112,13 +128,14 @@ on the session bus, so every liveness check that probes the bus still passes —
 The agent notices on its own and keeps working: its safety-net poll compares the clipboard
 every 30 seconds, and once it sees content change with no signal to account for it, it
 falls back to polling every second for the rest of the connection. It says so in the Mac's
-log (`~/.local/state/clipwire/clipwire.log`):
+log (`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than
+guessing why:
 
 ```
-remote: GPaste is not reporting clipboard changes (is the gnome-shell extension enabled?), polling every 1.0s for the rest of this connection
+remote: GPaste reported no clipboard change while the content changed (signals=0 signals_at_last_tick=0 pump_alive=True worker_alive=True); the gnome-shell extension being disabled is one possible cause. Polling every 1s for the rest of this connection.
 ```
 
-The command above is how you answer that question. It prints nothing when the extension is
+The command above is how you check that possible cause. It prints nothing when the extension is
 off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`.
 
 Re-enabling it is the actual fix, and reconnecting is not. The fallback never stops
@@ -126,6 +143,16 @@ listening for signals — it only speeds the safety-net poll up from 30 seconds 
 that faster interval is scoped to one connection, so the next connection starts back at 30
 seconds whether or not anything was repaired. With the extension still disabled, the agent
 just spends another detection budget before reaching the same conclusion again.
+
+One thing that poll deliberately does *not* do is read images. Copied text it compares
+byte for byte; for an image it compares only the list of formats the clipboard is offering,
+and fetches the picture itself only once that list changes. Pulling a 4 MiB screenshot back
+out of the clipboard on every tick is not a price worth paying to notice a copy a little
+sooner — every 30 seconds on a healthy connection, where this poll is only a safety net, and
+once a second once it has fallen back. The trade is that while signals are dead, one image
+replacing another is noticed when the offered formats change rather than the instant the
+pixels do; in normal operation the `Update` signal carries that change and nothing waits at
+all.
 
 ## GPaste trims whitespace, and that is not clipwire
 
@@ -148,3 +175,23 @@ Set it to `false` if you would rather keep the whitespace:
 ```sh
 gsettings set org.gnome.GPaste trim-items false
 ```
+
+## GPaste re-encodes images, and that is not clipwire
+
+This is not something clipwire's write path does: it happens to images copied directly on
+the PC too, not only to ones clipwire writes there. Copy a screenshot, and a few seconds
+after it lands on the PC's clipboard, GPaste takes over selection ownership and silently
+replaces it with its own re-encoding of the same picture.
+
+Measured on the PC: a 105,700-byte PNG written to the clipboard read back a few seconds
+later as a *different* PNG — 180,287 bytes, 70% larger, and not the bytes that were
+written. The read-back value is stable after that, but it is never byte-identical to the
+one that was copied.
+
+This is the same disease as `trim-items` above: the clipboard does not necessarily hold
+what you put in it. clipwire is built around that rather than surprised by it: the re-encode
+does not confuse the two machines into re-sending the same screenshot forever, though a
+screenshot copied directly on the PC does currently cost two frames to the Mac — the
+original, then the re-encode, back to back — before it settles. The picture that lands is
+still GPaste's re-encoding, though, not a byte-identical copy of what was on the Mac's
+pasteboard.

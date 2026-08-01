@@ -5,7 +5,9 @@ import unittest
 from agent_under_test import (
     ClipPayloadError,
     decode_clip_payload,
+    decode_image_payload,
     encode_clip_payload,
+    encode_image_payload,
 )
 
 
@@ -53,6 +55,42 @@ class TestClipPayload(unittest.TestCase):
                 payload = struct.pack(">d", ts) + b"text"
                 with self.assertRaises(ClipPayloadError):
                     decode_clip_payload(payload)
+
+
+class TestImagePayload(unittest.TestCase):
+    """type-0x03 payload: [f64 BE ts][PNG bytes]. Same shape as the text clip
+    and for the same reason -- see encode_image_payload's own docstring.
+
+    Bare names imported from agent_under_test, not an `agent.` prefix: this
+    file has no Agent(...) instance to hang a dotted lookup off, matching
+    TestClipPayload just above and TestV3Constants's own note in
+    test_frame.py (test_watcher.py is the one file where `agent` is a local
+    variable bound to Agent(...), not a module).
+    """
+
+    def test_round_trip(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"body"
+        ts, body = decode_image_payload(encode_image_payload(1785400000.5, png))
+        self.assertEqual(ts, 1785400000.5)
+        self.assertEqual(body, png)
+
+    def test_an_empty_body_is_rejected(self):
+        with self.assertRaises(ClipPayloadError):
+            decode_image_payload(encode_image_payload(1.0, b""))
+
+    def test_a_payload_shorter_than_the_timestamp_is_rejected(self):
+        with self.assertRaises(ClipPayloadError):
+            decode_image_payload(b"\x00\x00\x00")
+
+    def test_a_non_finite_ts_is_rejected_on_both_sides(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(ts=bad):
+                with self.assertRaises(ClipPayloadError):
+                    encode_image_payload(bad, b"x")
+        # and on decode, since the wire is peer-controlled
+        payload = struct.pack(">d", float("nan")) + b"x"
+        with self.assertRaises(ClipPayloadError):
+            decode_image_payload(payload)
 
 
 if __name__ == "__main__":

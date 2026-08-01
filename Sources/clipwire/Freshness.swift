@@ -6,14 +6,82 @@ import Foundation
 /// reasons. Only the shape checks Foundation cannot express as a `Codable`
 /// conformance live here -- a malformed ts already fails inside
 /// `JSONDecoder` (see `decodePayload`), so `sha256` is the only field that
-/// needs one.
+/// needs one -- until Task 6 added `kind`, which needs a second: an
+/// unrecognized raw string (e.g. "video") already fails inside `JSONDecoder`
+/// via `ClipKind`'s own synthesized `Decodable` conformance, but "a hash
+/// with no kind, or a kind with no hash" is a cross-field rule `Codable`
+/// cannot express any more than a lone malformed `sha256` could.
 enum ClipStateError: Error, Equatable {
     case malformedSHA256
+    case kindHashMismatch
+}
+
+/// The two content kinds clip-state can describe -- `nil` (no content held)
+/// is the third, implicit state; see `ClipState.kind`. Mirrors Python's
+/// `KIND_TEXT`/`KIND_IMAGE` string constants as `String` raw values, so the
+/// wire representation (`"text"`/`"image"`) and this name can never drift
+/// apart independently of one another.
+enum ClipKind: String, Codable {
+    case text
+    case image
 }
 
 struct ClipState: Codable, Equatable {
     let sha256: String?
     let ts: Double
+    /// `nil` exactly when `sha256` is `nil` -- enforced in `init(from:)`
+    /// below, not merely assumed here. A hash alone cannot tell the two
+    /// sides what they are agreeing about (Task 6); `kind` is for the send
+    /// branch (Task 11) and the log (Task 14), never for `resolveFreshness`'s
+    /// comparison below, which stays exactly the formula it was.
+    let kind: ClipKind?
+
+    /// `init(from:)` below is a custom implementation (see its own comment
+    /// for why), and a struct that defines ANY initializer of its own loses
+    /// the compiler-synthesized memberwise one -- so this has to be written
+    /// out explicitly now, where before Task 6 it was free.
+    init(sha256: String?, ts: Double, kind: ClipKind?) {
+        self.sha256 = sha256
+        self.ts = ts
+        self.kind = kind
+    }
+
+    /// Custom rather than the synthesized decode, because `ClipStateStore.load()`
+    /// calls `JSONDecoder().decode(ClipState.self, from:)` directly (see its
+    /// own comment below for why it does not route through `decodePayload`)
+    /// -- so this is the ONE place the kind/hash pairing rule can live to be
+    /// enforced on BOTH the wire path and a direct store read. Putting it in
+    /// `decodePayload` alone, the way the `sha256` hex-shape check stays
+    /// there deliberately, would leave `load()` free to accept a v2-era
+    /// store file (a real `sha256`, no `"kind"` key at all) as "a hash of
+    /// unknown kind" -- exactly the silent mis-load Task 6 exists to close.
+    /// See `ClipStateStoreTests.testAV2StoreFileIsRejectedNotLoadedAsKindless`.
+    ///
+    /// `decodeIfPresent` returns `nil` identically whether the `"kind"` key
+    /// is ABSENT or present with a JSON `null`, and that conflation is
+    /// exactly what is wanted: a v2 file's absent key must be rejected the
+    /// same way a wire payload's explicit hash-without-kind pairing is,
+    /// with no separate `container.contains(.kind)` check needed to tell
+    /// the two apart -- they are meant to be indistinguishable here.
+    ///
+    /// An unknown kind value (e.g. `"video"`) needs no bespoke check in this
+    /// initializer: `decodeIfPresent(ClipKind.self, forKey: .kind)` already
+    /// throws when the raw string matches neither `.text` nor `.image`,
+    /// via `ClipKind`'s own synthesized `Decodable` conformance -- the same
+    /// "let `JSONDecoder`'s own error speak for itself" principle
+    /// `decodePayload` below already applies to a non-finite `ts`.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sha256 = try container.decodeIfPresent(String.self, forKey: .sha256)
+        let ts = try container.decode(Double.self, forKey: .ts)
+        let kind = try container.decodeIfPresent(ClipKind.self, forKey: .kind)
+        guard (kind == nil) == (sha256 == nil) else {
+            throw ClipStateError.kindHashMismatch
+        }
+        self.sha256 = sha256
+        self.ts = ts
+        self.kind = kind
+    }
 
     /// Throws rather than substituting a fallback payload. `JSONEncoder`
     /// already rejects a non-finite `ts` (`.nan`, `.infinity`, `-.infinity`)
@@ -66,7 +134,9 @@ struct ClipState: Codable, Equatable {
     /// `load()` already returns for a torn file. The PC agent's own
     /// `load_clip_state` does share its decoder with the wire path, so that
     /// one validates its store file as a side effect; the asymmetry is
-    /// harmless in both directions.
+    /// harmless in both directions. (The kind/hash pairing rule is NOT part
+    /// of this asymmetry -- see `init(from:)` above for why that one is
+    /// shared with `load()` rather than confined here.)
     static func decodePayload(_ data: Data) throws -> ClipState {
         let state = try JSONDecoder().decode(ClipState.self, from: data)
         if let sha256 = state.sha256, !isSHA256Hex(sha256) {

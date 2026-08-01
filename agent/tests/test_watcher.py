@@ -2,6 +2,7 @@
 import io
 import os
 import pathlib
+import signal
 import subprocess
 import tempfile
 import threading
@@ -15,14 +16,19 @@ from agent_under_test import (
     DEGRADED_POLL_SECONDS,
     GPASTE_BUS_NAME,
     GPasteWatcher,
-    MAX_PAYLOAD_BYTES,
+    KIND_IMAGE,
+    KIND_TEXT,
+    MAX_IMAGE_BYTES,
+    MAX_TEXT_BYTES,
     PollingWatcher,
     SAFETY_NET_POLL_SECONDS,
     TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
+    TYPE_IMAGE_CLIP,
     decode_clip_payload,
     decode_clip_state,
+    decode_image_payload,
     encode_clip_payload,
     encode_clip_state,
     load_clip_state,
@@ -245,35 +251,621 @@ class TestGPasteWatcherLifecycle(unittest.TestCase):
             "a daemon thread that keeps reading a dead pipe is a leak",
         )
 
+    def test_the_gdbus_child_is_spawned_with_the_pdeathsig_preexec(self):
+        fake_process = FakeGPasteProcess()
+        self.addCleanup(fake_process.close)
+        with mock.patch.object(clipwire_agent.subprocess, "Popen") as popen:
+            popen.return_value = fake_process
+            watcher = clipwire_agent.GPasteWatcher(clipboard=ScriptedReadClipboard([b"a"]))
+            watcher.start(lambda: None)
+        self.addCleanup(watcher.stop)
+        self.assertIs(
+            popen.call_args.kwargs.get("preexec_fn"), clipwire_agent._pdeathsig_preexec
+        )
+
+
+class TestPumpNeverCallsTheHandler(unittest.TestCase):
+    """The thread that reads gdbus and the thread that runs the handler are
+    deliberately separate.
+
+    Until v3 the pump called on_change -- Agent._local_change -- itself, which
+    made it able to BLOCK on Agent._observe_lock and able to DIE of any
+    exception the handler raised, silently and for the rest of the connection,
+    while the gdbus child stayed alive and kept printing lines nobody counted.
+    Both were candidate causes of a production false positive in which the
+    safety net declared a healthy event source dead and degraded to a
+    1-second poll; neither was ever proven, and this split removes both by
+    construction rather than by diagnosis.
+
+    The pump's only job is now `_signals += 1; _event.set()`, and _signals is
+    the discriminator the safety net judges the event source by -- see
+    _observe_tick. A pump that can stall or die makes a live source look dead;
+    a worker that dies takes the sync with it while the counter keeps climbing,
+    which is why worker_alive() exists.
+
+    There is deliberately NO queue: the GPaste Update payload carries nothing
+    this agent uses -- the handler reads clipboard STATE -- so signals arriving
+    while the handler runs collapse into one set() and one re-read afterwards.
+    Coalescing is the right semantics for a clipboard, and the tests below emit
+    their second line only after the first observation has been consumed rather
+    than assuming two lines must produce two calls."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def start_watcher(self, on_change):
+        """As TestGPasteWatcherLifecycle's: a fake process backed by a real
+        pipe, and a safety-net interval far past JOIN_TIMEOUT so the poll takes
+        its baseline read once and can never fire a change of its own into
+        these assertions. Only the signal path is under test here."""
+        fake_process = FakeGPasteProcess()
+        self.addCleanup(fake_process.close)
+        patcher = mock.patch("subprocess.Popen", return_value=fake_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        watcher = GPasteWatcher(
+            ScriptedReadClipboard([b"unchanged"]),
+            safety_net_interval_seconds=JOIN_TIMEOUT * 100,
+        )
+        self.addCleanup(watcher.stop)
+        watcher.start(on_change)
+        return watcher, fake_process
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    def test_a_slow_handler_does_not_stop_the_pump_counting(self):
+        """The pump must keep reading lines while the handler is busy.
+
+        Agent._local_change blocks on _observe_lock and its own wl-paste round
+        trip can take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s
+    on an image clipboard; a pump that calls it sits
+        inside that window instead of counting, so the second and third signals
+        are never counted and a safety-net tick landing there sees an unmoved
+        counter on a perfectly healthy source."""
+        released = threading.Event()
+        self.addCleanup(released.set)   # never leave the worker parked
+        entered = threading.Event()
+
+        def slow_handler():
+            entered.set()
+            released.wait(JOIN_TIMEOUT)
+
+        watcher, fake_process = self.start_watcher(slow_handler)
+        for _ in range(3):
+            fake_process.emit(GPASTE_UPDATE_LINE)
+
+        self.assertTrue(
+            entered.wait(JOIN_TIMEOUT),
+            "the handler must actually be in flight, or this test proves nothing",
+        )
+        self.wait_until(lambda: watcher._signals >= 3)
+        self.assertEqual(
+            watcher._signals, 3,
+            "the pump must count every line while the handler is busy",
+        )
+
+        released.set()
+        watcher.stop()
+
+    def test_a_signal_arriving_during_an_observation_earns_its_own_re_read(self):
+        """The lost wakeup this Event is one misplaced clear() away from.
+
+        Coalescing is only correct if the collapsed signals produce a re-read
+        AFTERWARDS: a signal landing while the handler runs must still leave the
+        event armed. Clearing it after the handler instead of before wipes
+        exactly the change that arrived while we were looking at the previous
+        one, and nothing else will ever report it -- the pump has already
+        counted the line, so the safety net still calls the source healthy."""
+        entered_first = threading.Event()
+        release_first = threading.Event()
+        self.addCleanup(release_first.set)
+        calls = []
+        lock = threading.Lock()
+
+        def handler():
+            with lock:
+                calls.append(1)
+                first = len(calls) == 1
+            if first:
+                entered_first.set()
+                release_first.wait(JOIN_TIMEOUT)
+
+        watcher, fake_process = self.start_watcher(handler)
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.assertTrue(
+            entered_first.wait(JOIN_TIMEOUT),
+            "the first observation must be in flight, or the second signal is "
+            "not landing where this test needs it to",
+        )
+
+        # Strictly INSIDE the first observation.
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: watcher._signals >= 2)
+        self.assertEqual(
+            watcher._signals, 2, "the pump must have taken the second line already"
+        )
+
+        release_first.set()
+        self.wait_until(lambda: len(calls) >= 2)
+        self.assertEqual(
+            len(calls), 2,
+            "a signal that arrived during an observation must produce one more",
+        )
+        watcher.stop()
+
+    def test_a_raising_handler_does_not_kill_the_observer(self):
+        """One bad observation is disposable -- the next one re-reads the
+        clipboard anyway. Against a worker with no guard the thread dies and
+        every later signal is silently lost for the rest of the connection.
+
+        The second line is emitted only after the first observation has been
+        counted, because coalescing makes "two lines, two calls" a race rather
+        than a contract."""
+        seen = []
+        lock = threading.Lock()
+
+        def handler():
+            with lock:
+                seen.append(1)
+                first = len(seen) == 1
+            if first:
+                # NOT a member of the fatal set below: a ValueError here would
+                # reach os._exit(0) unmocked and end the test RUNNER with a
+                # success status -- a truncated suite that reads as green.
+                raise RuntimeError("first observation explodes")
+
+        watcher, fake_process = self.start_watcher(handler)
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: len(seen) >= 1)
+        self.assertEqual(len(seen), 1, "the first observation must have happened")
+
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: len(seen) >= 2)
+
+        self.assertEqual(len(seen), 2, "the observer must survive a raising handler")
+        self.assertTrue(watcher.worker_alive())
+        watcher.stop()
+
+    def test_a_disposable_handler_error_is_logged_with_its_traceback(self):
+        """A thread that dies quietly is the exact defect this split removes;
+        a thread that swallows quietly is the same defect one debugging session
+        later. The traceback is the whole diagnostic value: the log line is all
+        anyone gets from the PC."""
+        def handler():
+            raise RuntimeError("first observation explodes")
+
+        watcher, fake_process = self.start_watcher(handler)
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: any("observer error" in line for line in self.log_lines))
+        watcher.stop()
+
+        logged = "\n".join(self.log_lines)
+        self.assertIn("observer error", logged)
+        self.assertIn(
+            "Traceback (most recent call last)", logged,
+            "log the traceback, not just the exception: %r" % self.log_lines,
+        )
+        self.assertIn("first observation explodes", logged)
+
+    def _assert_takes_the_agent_down(self, error):
+        def handler():
+            raise error
+
+        with mock.patch.object(clipwire_agent.os, "_exit") as exit_call:
+            watcher, fake_process = self.start_watcher(handler)
+            fake_process.emit(GPASTE_UPDATE_LINE)
+            self.wait_until(lambda: exit_call.called)
+            try:
+                self.assertTrue(
+                    exit_call.called,
+                    "%s must take the agent down" % type(error).__name__,
+                )
+                self.assertEqual(
+                    exit_call.call_args, mock.call(0),
+                    "a dead channel is a clean exit, not a crash status",
+                )
+            finally:
+                # Stopped and JOINED inside the patch, and in a finally rather
+                # than after the assertions: once os._exit is the real one
+                # again, a worker still in flight would end the test RUNNER
+                # outright -- with status 0, so a truncated suite would read as
+                # green. An AssertionError above escapes the `with` and
+                # restores os._exit, so the failing path needs this at least as
+                # much as the passing one. The None guard covers a watcher that
+                # never reached start(): a TypeError here would replace the
+                # real failure with a bogus one.
+                watcher.stop()
+                if watcher._worker is not None:
+                    watcher._worker.join(timeout=JOIN_TIMEOUT)
+            self.assertFalse(
+                watcher._worker.is_alive(),
+                "the worker must be gone before os._exit is unpatched",
+            )
+
+    def test_a_dead_channel_takes_the_agent_down(self):
+        """Not a disposable observation. This agent is one process per
+        connection and exiting IS how it reports a dead channel, mirroring
+        run()'s rule for stdin EOF -- a worker that logged and carried on would
+        leave a process syncing into a pipe nobody reads.
+
+        Both members of the fatal set are pinned here. ValueError is not
+        hypothetical: it is what a CLOSED stdout raises on write, and
+        Agent.send writes straight to it."""
+        for error in (BrokenPipeError("peer went away"),
+                      ValueError("I/O operation on closed file")):
+            with self.subTest(error=type(error).__name__):
+                self._assert_takes_the_agent_down(error)
+
+    def test_stop_wakes_a_worker_parked_on_the_event(self):
+        """A worker parked in Event.wait() has nothing else to wake it, and
+        Agent.clipboard_lost() drops its reference to the watcher the moment
+        stop() returns -- so a thread left parked here can never be reached
+        again, and every Wayland flap leaks another one.
+
+        Bounded rather than hanging: the join times out and the assertion
+        fails."""
+        watcher, _ = self.start_watcher(lambda: None)
+        self.assertTrue(
+            watcher.worker_alive(), "the worker must be running to begin with"
+        )
+
+        watcher.stop()
+        watcher._worker.join(timeout=JOIN_TIMEOUT)
+
+        self.assertFalse(
+            watcher._worker.is_alive(),
+            "stop() must wake a worker parked in _event.wait(), not only set a flag",
+        )
+        self.assertFalse(watcher.worker_alive())
+
+
+class TestPdeathsigPreexec(unittest.TestCase):
+    def test_load_libc_is_none_when_libc_is_unavailable(self):
+        """The macOS path: CDLL("libc.so.6") raises OSError there (no such
+        library), and _load_libc() must come back with None rather than let
+        it propagate -- this is what lets the whole module still import
+        cleanly on the machine this suite runs on. Mocked rather than relying
+        on the real macOS behavior, so this also pins the same contract on
+        Linux, where CDLL would otherwise succeed for real."""
+        with mock.patch.object(clipwire_agent.ctypes, "CDLL", side_effect=OSError):
+            self.assertIsNone(clipwire_agent._load_libc())
+
+    def test_load_libc_is_none_where_ctypes_itself_is_unavailable(self):
+        """`import ctypes` is guarded at module level, because ctypes is an
+        extension module and a stripped or unusual build can genuinely lack
+        it -- and this file is copied to whatever Python the PC happens to
+        have. The obvious follow-up guard is the wrong one: with `ctypes`
+        bound to None, `ctypes.CDLL(...)` raises AttributeError, which is
+        neither ImportError nor OSError and so escapes _load_libc entirely,
+        taking the whole module down at import. That turns a missing
+        optional nicety -- the pdeathsig belt on top of stop()'s braces --
+        into an agent that cannot start at all."""
+        with mock.patch.object(clipwire_agent, "ctypes", None):
+            self.assertIsNone(clipwire_agent._load_libc())
+
+    def test_it_does_not_resolve_libc_at_call_time(self):
+        """The whole point of _LIBC: nothing inside preexec_fn may import,
+        allocate, or take a lock, because preexec_fn runs in a forked child of
+        a threaded process. _load_libc() calling import ctypes is fine at
+        module load and would be a hazard here -- so this pins that
+        _pdeathsig_preexec never calls it, not merely that _PRCTL is read."""
+        with mock.patch.object(clipwire_agent, "_load_libc") as loader, \
+             mock.patch.object(clipwire_agent, "_PRCTL", None):
+            clipwire_agent._pdeathsig_preexec()
+        loader.assert_not_called()
+
+    def test_it_does_not_look_up_the_prctl_symbol_inside_the_fork(self):
+        """The same hazard as the test above, one layer further down, and
+        the one _LIBC alone did not close: ctypes resolves a CDLL's symbols
+        LAZILY. `_LIBC.prctl` performs a dlsym on first access and caches
+        the result on the library object -- so with the lookup written that
+        way, the FIRST forked child was the one paying for it, inside
+        preexec_fn. dlsym takes the dynamic loader's lock, and fork() clones
+        only the calling thread without releasing locks another thread
+        holds, so a child that forks at the wrong instant inherits that lock
+        held forever and wedges before it ever execs. That is exactly the
+        stuck-gdbus-child symptom the pdeathsig fix exists to remove,
+        reintroduced by a subtler path.
+
+        Binding the symbol once at import, into _PRCTL, is the fix; this
+        pins that _pdeathsig_preexec calls that handle and never reaches
+        through _LIBC for an attribute at all."""
+        calls = []
+
+        class ExplodingLibc:
+            def __getattr__(self, name):
+                raise AssertionError(
+                    "preexec_fn resolved %r through _LIBC inside the fork" % name)
+
+        def fake_prctl(*args):
+            calls.append(args)
+            return 0
+
+        with mock.patch.object(clipwire_agent, "_LIBC", ExplodingLibc()), \
+             mock.patch.object(clipwire_agent, "_PRCTL", fake_prctl), \
+             mock.patch.object(clipwire_agent.os, "getppid", return_value=42):
+            clipwire_agent._pdeathsig_preexec()
+
+        self.assertEqual(calls, [(clipwire_agent.PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)])
+
+    def test_the_prctl_handle_is_bound_at_import(self):
+        """The other half of the rule above, pinned at the module rather
+        than at the call: _PRCTL exists as a module-level name, and it is
+        non-None exactly when _LIBC is. On this suite's macOS host both are
+        None; on the PC both are real. Either way the binding has already
+        happened by the time any thread or fork exists."""
+        self.assertEqual(clipwire_agent._PRCTL is None, clipwire_agent._LIBC is None)
+
+    def test_it_requests_sigterm_when_the_parent_dies(self):
+        calls = []
+
+        def fake_prctl(option, sig, *rest):
+            calls.append((option, sig))
+            return 0
+
+        with mock.patch.object(clipwire_agent, "_PRCTL", fake_prctl), \
+             mock.patch.object(clipwire_agent.os, "getppid", return_value=42):
+            clipwire_agent._pdeathsig_preexec()
+
+        self.assertEqual(calls, [(clipwire_agent.PR_SET_PDEATHSIG, signal.SIGTERM)])
+
+    def test_it_exits_when_the_parent_already_died(self):
+        """The fork/prctl window: if the parent died in between, the signal
+        never arrives, so the child must notice and leave on its own.
+
+        os._exit is mocked rather than expected to raise: it does NOT raise
+        SystemExit, it ends the process immediately -- which is correct inside
+        a preexec_fn, where an exception would be re-raised in the PARENT and
+        take the agent down instead of the child. An assertRaises here would
+        kill the test runner.
+        """
+        with mock.patch.object(clipwire_agent, "_PRCTL", lambda *rest: 0), \
+             mock.patch.object(clipwire_agent.os, "getppid", return_value=1), \
+             mock.patch.object(clipwire_agent.os, "_exit") as exit_call:
+            clipwire_agent._pdeathsig_preexec()
+        exit_call.assert_called_once_with(0)
+
+    def test_it_is_a_no_op_where_prctl_is_unavailable(self):
+        with mock.patch.object(clipwire_agent, "_PRCTL", None):
+            clipwire_agent._pdeathsig_preexec()   # must not raise
+
+
+def _reject_image_shaped(script):
+    """Guards the `probe = read` aliases below, at construction, on the
+    test's own thread.
+
+    The poll loop asks its clipboard for a change TOKEN, not content -- see
+    WaylandClipboard.probe -- and those doubles answer probe() with their
+    read() because their scripts are opaque comparable values with no image
+    body behind them. Script one with a real (KIND_IMAGE, bytes) pair and the
+    equivalence silently becomes a LIE: the loop would compare image bodies,
+    which production never does, and every test built on that double would
+    pass for behaviour the agent does not have. ProbeOnlyClipboard catches
+    the loop reverting to read(); nothing catches this.
+
+    Checked here rather than inside probe() because the poll loop wraps every
+    tick in _handle_observer_error, which would swallow an AssertionError
+    raised on that thread into a log line nobody asserts on.
+    """
+    for value in script:
+        if isinstance(value, tuple) and value and value[0] == KIND_IMAGE:
+            raise AssertionError(
+                "%r is image-shaped: this double answers probe() with read(), so "
+                "an image BODY here would be compared as a token. Give it a "
+                "probe() of its own instead." % (value,))
+    return list(script)
+
 
 class ScriptedReadClipboard:
     """read() replays a fixed script, then repeats its last value forever --
     so a poll tick that lands after the test stops watching cannot raise
     IndexError. `last` records the most recent value returned, so a test
     callback can observe what the watcher just saw without threading the
-    value through on_change() itself (the real interface takes none)."""
+    value through on_change() itself (the real interface takes none).
 
-    def __init__(self, script):
-        self._script = list(script)
+    `paced` is what makes that observation DETERMINISTIC, and every test
+    asserting on which values were seen needs it. Since the watchers stopped
+    calling the handler on their reader threads, a change is signalled and the
+    handler runs later, on the worker: an unpaced script can advance `last`
+    between the two, and two changes inside one worker turnaround coalesce into
+    a single observation. Both are correct in production -- the real handler
+    re-reads current state -- and both make "which values were observed" depend
+    on the scheduler.
+
+    Paced, read() refuses to hand out a NEW value until the previous change has
+    been taken through take(). That is the same "block inside read() until the
+    other thread has caught up" handshake SignallingClipboard uses below, and
+    it removes the race structurally rather than making it unlikely. Bounded by
+    JOIN_TIMEOUT so a change nobody observes fails an assertion instead of
+    hanging the suite."""
+
+    def __init__(self, script, paced=False):
+        self._script = _reject_image_shaped(script)
         self.calls = 0
         self.last = None
+        self._paced = paced
+        # Set means "nothing is waiting to be observed", so the baseline read
+        # is free.
+        self._taken = threading.Event()
+        self._taken.set()
+
+    def take(self):
+        """For a test's on_change: the value the watcher just observed, and the
+        release that lets a paced script move on. Safe to call on an unpaced
+        clipboard, so one callback shape works for both."""
+        value = self.last
+        self._taken.set()
+        return value
 
     def read(self):
+        if self._paced:
+            self._taken.wait(JOIN_TIMEOUT)
         index = min(self.calls, len(self._script) - 1)
         self.calls += 1
-        self.last = self._script[index]
+        value = self._script[index]
+        # calls > 1 because the poll's FIRST read is its baseline, which it
+        # never reports: pending an observation on it would park the next read
+        # for the whole timeout.
+        if self._paced and self.calls > 1 and value != self.last:
+            self._taken.clear()
+        self.last = value
         return self.last
+
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
 
 
 class TestPollingWatcher(unittest.TestCase):
+    """A standalone poller -- what make_watcher returns when GPaste is
+    unavailable -- owns the event AND the worker, so the same "no handler call
+    on a reader thread" rule holds with nothing composed above it."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+
     def test_available_is_always_true(self):
         self.assertTrue(PollingWatcher(clipboard=None, interval_seconds=1).available())
 
+    def test_a_slow_handler_does_not_stop_the_poll_loop_reading(self):
+        """The poll loop is a reader thread like the gdbus pump, and it carries
+        more: it is the only caller of _observe_tick, so a loop parked inside
+        Agent._local_change is a safety net that has stopped judging anything.
+        _local_change blocks on _observe_lock and its own clipboard read can
+        take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s on an
+        image clipboard (--list-types, then the body)."""
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+
+        def slow_handler():
+            entered.set()
+            released.wait(JOIN_TIMEOUT)
+
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.002)
+        self.addCleanup(watcher.stop)
+        watcher.start(slow_handler)
+
+        self.assertTrue(
+            entered.wait(JOIN_TIMEOUT),
+            "the handler must actually be in flight, or this test proves nothing",
+        )
+        at_entry = clipboard.calls
+        self.wait_until(lambda: clipboard.calls >= at_entry + 3)
+        observed = clipboard.calls - at_entry
+
+        released.set()
+        watcher.stop()
+        self.assertGreaterEqual(
+            observed, 3,
+            "the poll must keep reading while the handler is busy; got %d more "
+            "reads" % observed,
+        )
+
+    def test_a_raising_handler_does_not_kill_the_poll_loop(self):
+        """One bad observation is disposable. A poll loop that dies with the
+        handler takes the ONLY remaining clipboard observer with it -- for a
+        standalone poller there is no signal path left to fall back to."""
+        seen = []
+        lock = threading.Lock()
+
+        def handler():
+            with lock:
+                seen.append(1)
+                first = len(seen) == 1
+            if first:
+                raise RuntimeError("first observation explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c", b"d"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        watcher.start(handler)
+
+        self.wait_until(lambda: len(seen) >= 2)
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertGreaterEqual(
+            len(seen), 2, "the poller must survive a raising handler"
+        )
+        self.assertTrue(
+            any("observer error" in line for line in self.log_lines),
+            "the disposable error must be logged: %r" % self.log_lines,
+        )
+
+    def test_a_raising_on_tick_does_not_kill_the_poll_loop(self):
+        """The other half, and the one with no second chance: on_tick is
+        GPasteWatcher._observe_tick, the safety net's whole judgement. An
+        exception there killed the loop and left NOTHING watching -- neither
+        syncing nor able to diagnose that it had stopped."""
+        ticks = []
+
+        def on_tick(previous, current):
+            ticks.append((previous, current))
+            if len(ticks) == 1:
+                raise RuntimeError("the first verdict explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005, on_tick=on_tick)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertGreaterEqual(
+            len(ticks), 3, "the poll loop must keep ticking after a bad verdict"
+        )
+
+    def test_stop_wakes_a_standalone_pollers_own_worker(self):
+        """Same leak as GPasteWatcher's: Agent.clipboard_lost drops its
+        reference the moment stop() returns, so a worker parked in
+        _event.wait() can never be reached again. Bounded rather than hanging:
+        the join times out and the assertion fails."""
+        clipboard = ScriptedReadClipboard([b"a"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+        self.assertIsNotNone(
+            watcher._worker, "a standalone poller must own a worker of its own"
+        )
+
+        watcher.stop()
+        watcher._worker.join(timeout=JOIN_TIMEOUT)
+
+        self.assertFalse(
+            watcher._worker.is_alive(),
+            "stop() must wake a worker parked in _event.wait(), not only set a flag",
+        )
+
     def test_fires_only_on_an_actual_change(self):
-        clipboard = ScriptedReadClipboard([b"a", b"a", b"a", b"b", b"b", b"c"])
+        # Paced: this asserts WHICH values were observed, and the handler no
+        # longer runs on the thread that read them -- see ScriptedReadClipboard.
+        clipboard = ScriptedReadClipboard(
+            [b"a", b"a", b"a", b"b", b"b", b"c"], paced=True)
         changes = []
         watcher = PollingWatcher(clipboard, interval_seconds=0.01)
-        watcher.start(lambda: changes.append(clipboard.last))
+        watcher.start(lambda: changes.append(clipboard.take()))
 
         deadline = time.monotonic() + JOIN_TIMEOUT
         while len(changes) < 2 and time.monotonic() < deadline:
@@ -297,6 +889,100 @@ class TestPollingWatcher(unittest.TestCase):
         )
 
 
+class ProbeOnlyClipboard:
+    """read() is a trap. The poll loop must ask for the cheap change TOKEN
+    and nothing else.
+
+    The other doubles in this file alias probe to read, because their
+    scripts are cheap in-memory values with no body behind them and every
+    assertion about what the loop observed stays true either way. That
+    aliasing is exactly why this one has to exist: an alias cannot tell the
+    two calls apart, so nothing else in this suite would notice the loop
+    reverting to read()."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.calls = 0
+        self.last = None
+
+    def read(self):
+        raise AssertionError("the poll loop must call probe(), never read()")
+
+    def probe(self):
+        index = min(self.calls, len(self._script) - 1)
+        self.calls += 1
+        self.last = self._script[index]
+        return self.last
+
+    def take(self):
+        return self.last
+
+
+class TestPollingWatcherAsksForATokenNotTheContent(unittest.TestCase):
+    """The spec's requirement, unimplemented until the final wave: "in
+    degraded mode the image body must be checked off a change in `wl-paste
+    --list-types` rather than the content itself".
+
+    It is not scoped to degraded mode in practice, and that is what made it
+    a defect rather than a tuning question: GPasteWatcher composes this
+    same PollingWatcher as its safety net on EVERY connection, so a HEALTHY
+    install with a screenshot on the clipboard forked two processes and
+    piped up to MAX_IMAGE_BYTES every SAFETY_NET_POLL_SECONDS, held two
+    4 MiB buffers resident as `previous` and `current`, and compared them
+    each tick -- for the life of the connection. See
+    WaylandClipboard.probe."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def test_the_loop_never_calls_read(self):
+        """Both assertions are needed. The loop guards every tick with
+        _handle_observer_error, and AssertionError is not in the fatal set,
+        so a loop that called read() would not crash -- it would log and
+        carry on observing nothing. So: the change must actually be
+        reported (proving probe drove the loop) AND nothing may have been
+        logged as a poll error (proving read was never reached)."""
+        seen = threading.Event()
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.002)
+        self.addCleanup(watcher.stop)
+        watcher.start(seen.set)
+
+        self.assertTrue(seen.wait(JOIN_TIMEOUT),
+                        "the change must be observed through probe(): %r" % self.log_lines)
+        watcher.stop()
+        self.assertEqual([line for line in self.log_lines if "poll error" in line], [])
+
+    def test_the_composed_safety_net_never_calls_read_either(self):
+        """The healthy path, which is where the cost actually lived: this
+        poller is GPasteWatcher's safety net, running on every connection
+        whether or not anything is wrong. A fix applied only to the
+        standalone poller would have left the reported defect untouched."""
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        ticks = []
+        process = FakeGPasteProcess()
+        self.addCleanup(process.close)
+        watcher = GPasteWatcher(clipboard, safety_net_interval_seconds=0.002,
+                                degraded_interval_seconds=0.002)
+        watcher._safety_net._on_tick = lambda previous, current: ticks.append((previous, current))
+        self.addCleanup(watcher.stop)
+        with mock.patch("subprocess.Popen", return_value=process):
+            watcher.start(lambda: None)
+
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while len(ticks) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        watcher.stop()
+
+        self.assertGreaterEqual(len(ticks), 2,
+                                "the safety net must keep ticking through probe(): %r"
+                                % self.log_lines)
+        self.assertEqual([line for line in self.log_lines if "poll error" in line], [])
+
+
 class SignallingClipboard:
     """A clipboard whose read() DRIVES the signal source: on the tick that
     first sees new content it emits a real GPaste Update line and blocks until
@@ -318,6 +1004,7 @@ class SignallingClipboard:
     untested rather than pinned by a test that would pass most of the time."""
 
     def __init__(self, before, after):
+        _reject_image_shaped((before, after))
         self.process = None       # set by start_watcher, before anything reads
         self.delivered = threading.Event()
         self.reports = 0
@@ -343,6 +1030,61 @@ class SignallingClipboard:
         self.last = self._after
         return self.last
 
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
+
+
+class ArmThenSignalClipboard:
+    """Drives the exact interleaving the two-tick verdict exists to absorb: the
+    content changes, the tick that sees it arms the verdict, and only THEN is
+    the Update signal for that very change counted -- before the tick that
+    would confirm. A healthy source whose signal was merely in flight looks
+    precisely like this, and it is reachable now that the poll loop no longer
+    spends a wl-paste round trip inside on_change.
+
+    The counter is moved from inside the read belonging to the confirming tick,
+    on the poll thread itself, so it is provably in place before that tick's
+    comparison -- the same deterministic-side-effect-inside-read() trick
+    SignallingClipboard uses above, rather than racing two real threads and
+    hoping. It is bumped directly rather than through a real gdbus line because
+    WHICH reader moved the counter is irrelevant to the rule under test, and a
+    real line would have to beat the confirming tick through the pump thread to
+    count."""
+
+    def __init__(self, before, after):
+        _reject_image_shaped((before, after))
+        self.watcher = None       # set by start_watcher, before anything reads
+        self.calls = 0
+        self.last = None
+        self._before = before
+        self._after = after
+
+    def take(self):
+        return self.last
+
+    def read(self):
+        self.calls += 1
+        if self.calls == 1:
+            self.last = self._before   # the poll loop's own baseline
+        elif self.calls == 2:
+            self.last = self._after    # the change: this tick arms the verdict
+        elif self.calls == 3:
+            self.watcher._signals += 1
+        return self.last
+
+    # PollingWatcher's loop asks for a change TOKEN, not content -- see
+    # WaylandClipboard.probe. This double's script is already a cheap
+    # in-memory value with no image body behind it, so the token and the
+    # read are literally the same call here. TestPollingWatcherUsesProbe
+    # is what pins that the loop actually asks for the token; an alias
+    # cannot, by construction.
+    probe = read
+
 
 class TestGPasteSafetyNet(unittest.TestCase):
     """GPasteWatcher.available() probes the bus NAME, but GPaste tracks the
@@ -357,7 +1099,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
     parameters so these tests run at millisecond scale instead of the
     production 30 seconds."""
 
-    SWITCH_MARKER = "not reporting clipboard changes"
+    SWITCH_MARKER = "reported no clipboard change"
 
     def setUp(self):
         original_log = clipwire_agent.log
@@ -390,11 +1132,18 @@ class TestGPasteSafetyNet(unittest.TestCase):
             degraded=degraded,
             on_degrade=on_degrade,
         )
+        # Same reason as `process` above, and the same instant: a clipboard
+        # that drives the SIGNAL COUNTER from inside its own read() must hold
+        # the watcher before the baseline read.
+        if hasattr(clipboard, "watcher"):
+            clipboard.watcher = watcher
         # Stopped in cleanup as well as in the tests themselves, so a failing
         # assertion cannot leave a poll thread running against a torn-down
         # fixture.
         self.addCleanup(watcher.stop)
-        watcher.start(on_change or (lambda: self.changes.append(clipboard.last)))
+        # take() rather than `last`: it is the release half of a paced script's
+        # handshake, and a plain read of `last` on an unpaced one.
+        watcher.start(on_change or (lambda: self.changes.append(clipboard.take())))
         return watcher, fake_process
 
     def wait_until(self, predicate):
@@ -414,7 +1163,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
         through the same on_change a signal would use, and the switch is
         logged exactly ONCE however many further changes the poll goes on to
         catch (the latch, mirroring Agent._clip_state_sent's shape)."""
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"], paced=True)
         watcher, _ = self.start_watcher(clipboard)
 
         self.wait_until(lambda: len(self.changes) >= 2)
@@ -428,6 +1177,130 @@ class TestGPasteSafetyNet(unittest.TestCase):
             len(self.switch_log_lines()), 1,
             "the switch must be logged exactly once, not once per missed "
             "change; got: %r" % self.log_lines,
+        )
+
+    def test_the_verdict_reports_evidence_and_does_not_assert_a_cause(self):
+        """The production incident this task exists for: the line said `GPaste
+        is not reporting clipboard changes (is the gnome-shell extension
+        enabled?)` on a machine where the extension was enabled and active,
+        the bus name was owned, and a direct probe caught three Update signals
+        for three copies. The line asserted a cause it could not know and
+        carried no evidence, which is why the mechanism was never established.
+
+        No emitted gdbus line ever reaches this watcher, so `_signals` and
+        `_signals_at_last_tick` are pinned at 0 by construction, and neither
+        thread is ever stopped before the verdict fires -- so the values are
+        exact, not just present."""
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: self.switch_log_lines())
+        self.quiesce(watcher)
+
+        self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
+        line = self.switch_log_lines()[0]
+        self.assertIn("signals=0", line)
+        self.assertIn("signals_at_last_tick=0", line)
+        self.assertIn("pump_alive=True", line)
+        self.assertIn("worker_alive=True", line)
+        self.assertNotIn(
+            "is the gnome-shell extension enabled?", line,
+            "the verdict must not assert a cause it cannot know",
+        )
+
+    def test_the_verdict_lands_on_the_tick_after_the_arming_one(self):
+        """The rule, pinned by WHICH tick fires it rather than by "it degrades
+        eventually" -- which passes against every version of this rule the
+        project has had and pins nothing.
+
+        One diverging tick ARMS: content changed while the counter stood still.
+        The next tick CONFIRMS if the counter is STILL unmoved, and whether the
+        content moved again is irrelevant, because the armed state is a claim
+        about the EVENT SOURCE, not about the clipboard -- only evidence about
+        the source may clear it. The script below changes exactly once and then
+        settles, so a rule that cleared the arm on a settled tick never fires
+        at all: a dead source on any machine whose copies fall more than one
+        tick apart would go undiagnosed forever, which is the defect this
+        version corrects.
+
+        on_degrade runs synchronously inside _observe_tick, on the poll thread,
+        and clipboard.calls is incremented only by that same thread, so the read
+        count at the moment of the verdict is exact with no sleep and no
+        waiting: one baseline read plus two ticks. A one-tick verdict records 2;
+        a settling-resets rule records nothing at all."""
+        reads_at_verdict = []
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, on_degrade=lambda: reads_at_verdict.append(clipboard.calls))
+
+        self.wait_until(lambda: reads_at_verdict)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            reads_at_verdict, [3],
+            "the verdict must land on the tick AFTER the arming one -- one "
+            "baseline read plus two ticks -- and must land even though the "
+            "content settled",
+        )
+
+    def test_a_signal_arriving_after_the_arming_tick_clears_the_run(self):
+        """Why one diverging tick is not a verdict, and the whole reason this
+        rule is two ticks long.
+
+        The poll loop stopped calling the handler, so the milliseconds that
+        call used to spend forking wl-paste -- the grace an in-flight Update
+        had to be counted in -- are gone. A copy landing just before a tick's
+        read is therefore SEEN before its signal is counted, on a perfectly
+        healthy source. That tick arms; the signal lands; the next tick must
+        find the counter moved and clear the run rather than confirm it.
+
+        Deterministic by construction: the counter moves from inside the read
+        belonging to the confirming tick, on the poll thread itself, so it is
+        provably in place before that tick's comparison."""
+        clipboard = ArmThenSignalClipboard(before=b"a", after=b"b")
+        watcher, _ = self.start_watcher(clipboard, on_change=lambda: None)
+
+        # The baseline, the arming tick, the tick that must clear the run, and
+        # two more after it.
+        self.wait_until(lambda: clipboard.calls >= 5)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 5,
+            "the poll must have run past the tick that would have confirmed",
+        )
+        self.assertEqual(
+            watcher._signals, 1, "the in-flight signal must have been counted"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a signal arriving after the arming tick must clear the run, not "
+            "leave it to be confirmed; got: %r" % self.log_lines,
+        )
+
+    def test_a_failed_read_clears_an_armed_run(self):
+        """The third reset condition. A read that failed is not evidence about
+        the event source either way -- WaylandClipboard.read() returns None for
+        a timed-out wl-paste and for a genuinely empty selection alike -- so it
+        cannot serve as the second half of a verdict. Without that, one flaky
+        wl-paste landing on the tick after a change would confirm a verdict on
+        a healthy machine, which is the same false positive by another route.
+
+        The script arms on b, then fails, so the tick that would otherwise
+        confirm has nothing to confirm with."""
+        clipboard = ScriptedReadClipboard([b"a", b"b", None, b"b"])
+        watcher, _ = self.start_watcher(clipboard)
+
+        self.wait_until(lambda: clipboard.calls >= 6)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 6, "the poll must have run past the recovery"
+        )
+        self.assertEqual(
+            self.switch_log_lines(), [],
+            "a failed read must clear an armed run, not confirm it; got: %r"
+            % self.log_lines,
         )
 
     def test_a_healthy_signal_source_plus_a_content_change_does_not_log_the_switch(self):
@@ -548,6 +1421,8 @@ class TestGPasteSafetyNet(unittest.TestCase):
         the budget cannot deliver even one, since Event.wait does not return
         early."""
         budget, degraded, window = 0.03, 0.002, 0.02
+        # Deliberately NOT paced: this counts ticks in a 20ms window and a
+        # blocking read would starve the count.
         clipboard = ScriptedReadClipboard([b"a", b"b"])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=budget,
@@ -578,7 +1453,10 @@ class TestGPasteSafetyNet(unittest.TestCase):
         that child down mid-connection is the SIGPIPE class of bug that already
         killed this project's Mac agent once, at exactly the moment the PC
         rebooted."""
-        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        # Paced so the poll's own change is observed before the count below
+        # is taken -- otherwise a poll-driven change still in flight could
+        # satisfy the assertion that only the emitted SIGNAL is supposed to.
+        clipboard = ScriptedReadClipboard([b"a", b"b"], paced=True)
         watcher, fake_process = self.start_watcher(clipboard)
 
         self.wait_until(lambda: self.switch_log_lines())
@@ -589,7 +1467,11 @@ class TestGPasteSafetyNet(unittest.TestCase):
         )
 
         # The script is exhausted and repeats its last value forever, so the
-        # poll cannot add a change here: only the emitted signal can.
+        # poll cannot add a change here: only the emitted signal can. Its one
+        # change must have been OBSERVED first, or the count below could be
+        # satisfied by that landing late.
+        self.wait_until(lambda: len(self.changes) >= 1)
+        self.assertEqual(len(self.changes), 1, "the poll-driven change must be in")
         reported = len(self.changes)
         fake_process.emit(GPASTE_UPDATE_LINE)
         self.wait_until(lambda: len(self.changes) > reported)
@@ -600,29 +1482,117 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "a recovered signal must still reach the same on_change after the switch",
         )
 
-    def test_the_safety_net_reports_through_the_very_callback_the_signal_path_got(self):
-        """Not a wrapper around it: the safety net hands the observation to
-        Agent._local_change itself, so exactly one place decides what a local
-        change means -- one observation, one one-shot echo suppression, one
-        _last_seen. A second copy of that decision is the shape of the echo bug
-        this project has already fixed two races in."""
+    def test_the_safety_net_signals_the_same_event_instead_of_calling_the_handler(self):
+        """One observation path, now structural rather than argued.
+
+        This used to assert that PollingWatcher.start received the very
+        callback object the signal path got -- true, and the strongest
+        statement available while the safety net still CALLED it. It no longer
+        does: the composed poller signals this watcher's own event, so the
+        handler is called from exactly one place in the process, by exactly one
+        thread. Exactly one place still decides what a local change means --
+        one observation, one one-shot echo suppression, one _last_seen -- and a
+        second copy of that decision remains the shape of the echo bug this
+        project has already fixed two races in.
+
+        The composed poller owning a worker of its own would be that second
+        copy, and would also put two threads back inside _local_change."""
         clipboard = ScriptedReadClipboard([b"a"])
+        watcher, _ = self.start_watcher(
+            clipboard, safety_net_interval_seconds=JOIN_TIMEOUT * 100)
 
-        def callback():
-            pass
+        self.assertIs(
+            watcher._safety_net._event, watcher._event,
+            "the safety net must signal the watcher's own event, not one of its own",
+        )
+        self.assertIsNone(
+            watcher._safety_net._worker,
+            "exactly one worker per watcher tree: the composed poller must not "
+            "start a second one",
+        )
+        self.assertIsNotNone(watcher._worker, "the watcher owns the only worker")
 
-        with mock.patch.object(PollingWatcher, "start") as safety_net_start:
-            self.start_watcher(clipboard, on_change=callback,
-                               safety_net_interval_seconds=JOIN_TIMEOUT * 100)
+    def test_the_verdict_still_arrives_after_the_handler_has_raised(self):
+        """The behaviour the wiring exists for, and the one a future refactor
+        will break while preserving the wiring.
 
-        safety_net_start.assert_called_once_with(callback)
+        The poll loop is the only caller of _observe_tick. While it called
+        on_change itself, one exception from Agent._local_change killed it --
+        and with it the only thing that can ever diagnose a dead event source
+        or switch to the degraded interval. Silent failure of the detector of
+        silent failure: the watcher would report itself healthy forever."""
+        calls = []
+        lock = threading.Lock()
+
+        def on_change():
+            with lock:
+                calls.append(1)
+                first = len(calls) == 1
+            if first:
+                raise RuntimeError("first observation explodes")
+
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        watcher, _ = self.start_watcher(clipboard, on_change=on_change)
+
+        # BOTH facts, not just the verdict: the two now happen on different
+        # threads and in no fixed order. _on_tick runs on the poll thread
+        # immediately after the signal, so the verdict can be logged before the
+        # worker has been scheduled at all -- waiting on the verdict alone
+        # quiesces a watcher whose handler has not run yet, and the premise
+        # below then fails on a correct implementation.
+        self.wait_until(lambda: calls and self.switch_log_lines())
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            len(calls), 1, "the handler must actually have raised, or this "
+            "test proves nothing",
+        )
+        self.assertEqual(
+            len(self.switch_log_lines()), 1,
+            "the safety net must still reach its verdict after the handler "
+            "blew up; got: %r" % self.log_lines,
+        )
+
+    def test_a_slow_handler_does_not_stop_the_safety_net_ticking(self):
+        """The other hazard the split removes from this thread. A poll loop
+        parked inside _local_change -- which blocks on _observe_lock and can
+        spend up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13s in its
+    clipboard read -- is a safety net that has
+        stopped observing for as long as the handler runs."""
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+
+        def slow_handler():
+            entered.set()
+            released.wait(JOIN_TIMEOUT)
+
+        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        watcher, _ = self.start_watcher(
+            clipboard, on_change=slow_handler, safety_net_interval_seconds=0.002)
+
+        self.assertTrue(
+            entered.wait(JOIN_TIMEOUT),
+            "the handler must actually be in flight, or this test proves nothing",
+        )
+        at_entry = clipboard.calls
+        self.wait_until(lambda: clipboard.calls >= at_entry + 3)
+        observed = clipboard.calls - at_entry
+
+        released.set()
+        self.quiesce(watcher)
+        self.assertGreaterEqual(
+            observed, 3,
+            "the safety net must keep polling while the handler is busy; got "
+            "%d more reads" % observed,
+        )
 
     def test_a_watcher_built_already_degraded_polls_fast_and_stays_quiet(self):
         """One half of the flap fix: `clipboard_lost` discards the watcher and
         `clipboard_became_ready` builds a fresh one, so the verdict has to be
         handed back IN. A rebuilt watcher must come up on the degraded interval
         and must not log the diagnosis a second time on the same connection."""
-        clipboard = ScriptedReadClipboard([b"a", b"b"])
+        clipboard = ScriptedReadClipboard([b"a", b"b"], paced=True)
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=0.20,
             degraded_interval_seconds=0.01, degraded=True)
@@ -646,7 +1616,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
         """The other half: an Agent-level latch is only connection-scoped if
         the watcher actually tells it. Two missed changes, one notification."""
         notified = []
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"], paced=True)
         watcher, _ = self.start_watcher(
             clipboard, on_degrade=lambda: notified.append(1))
 
@@ -747,7 +1717,14 @@ class QueueClipboard:
     """A clipboard double whose read() replays a queue of scripted values --
     lets a test dictate exactly what Agent._local_change observes on each
     call, independent of any subprocess or timing. write() records what the
-    agent wrote locally."""
+    agent wrote locally.
+
+    queue_read(value) queues a TEXT read -- the shape every test in this
+    file that predates Task 7 already exercises -- auto-wrapped here as
+    (KIND_TEXT, value) to match WaylandClipboard.read()'s (kind, bytes)
+    contract, so none of those existing call sites needed to change.
+    None still queues a "nothing there" read. queue_image_read(value)
+    queues an image read directly, for the tests that need one."""
 
     def __init__(self, ready=True):
         self._ready = ready
@@ -755,7 +1732,10 @@ class QueueClipboard:
         self.written = []
 
     def queue_read(self, value):
-        self._queue.append(value)
+        self._queue.append(None if value is None else (KIND_TEXT, value))
+
+    def queue_image_read(self, value):
+        self._queue.append(None if value is None else (KIND_IMAGE, value))
 
     def ready(self):
         return self._ready
@@ -763,8 +1743,8 @@ class QueueClipboard:
     def read(self):
         return self._queue.pop(0) if self._queue else None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class SpyWatcher:
@@ -937,14 +1917,14 @@ class TestEchoBookkeeping(unittest.TestCase):
     def test_write_clip_writes_and_arms_the_suppression(self):
         agent = self.build(ready=True)
         agent._write_clip(encode_clip_payload(1.0, b"hello"))
-        self.assertEqual(agent.clipboard.written, [b"hello"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"hello")])
         self.assertEqual(agent._last_written, b"hello")
 
     def test_immediate_clip_delivery_arms_the_suppression(self):
         agent = self.build(ready=True)
         self.become_ready_without_a_real_watcher(agent)
         agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"now"))
-        self.assertEqual(agent.clipboard.written, [b"now"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"now")])
         self.assertEqual(agent._last_written, b"now")
 
     def test_pending_clip_delivery_arms_the_same_suppression(self):
@@ -956,7 +1936,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.on_frame(TYPE_CLIP, encode_clip_payload(1.0, b"queued while pending"))
         agent.clipboard._ready = True
         self.become_ready_without_a_real_watcher(agent)
-        self.assertEqual(agent.clipboard.written, [b"queued while pending"])
+        self.assertEqual(agent.clipboard.written, [(KIND_TEXT, b"queued while pending")])
         self.assertEqual(agent._last_written, b"queued while pending")
 
     def test_matching_echo_is_suppressed_and_consumed(self):
@@ -1070,28 +2050,32 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_oversized_local_change_is_skipped_not_sent(self):
         agent = self.build(ready=True)
-        agent.clipboard.queue_read(b"x" * (MAX_PAYLOAD_BYTES + 1))
+        agent.clipboard.queue_read(b"x" * (MAX_TEXT_BYTES + 1))
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
         self.assertEqual(sent, [])
 
     def test_text_at_exactly_the_cap_is_skipped_because_the_encoded_frame_would_exceed_it(self):
-        """Since this task, _local_change wraps the observed text in
-        encode_clip_payload before it reaches the wire, adding an 8-byte
-        timestamp prefix -- so text at exactly MAX_PAYLOAD_BYTES would
-        encode to a frame 8 bytes OVER the cap. The pre-existing guard
-        (len(text) > MAX_PAYLOAD_BYTES) cannot see this boundary: it only
-        rejects text already over the cap, one byte too late for content
-        exactly AT it. Mirrors
+        """_local_change wraps the observed text in encode_clip_payload
+        before it reaches the wire, adding an 8-byte timestamp prefix -- so
+        text at exactly MAX_TEXT_BYTES would encode to a payload 8 bytes
+        over the TEXT limit. The pre-existing guard (len(text) >
+        MAX_TEXT_BYTES) cannot see this boundary: it only rejects text
+        already over the cap, one byte too late for content exactly AT it.
+        Since Task 4, MAX_TEXT_BYTES (this guard) and MAX_PAYLOAD_BYTES (the
+        wire's frame cap, enforced only by decode_frame) are separate
+        constants -- text here is checked against the text-content limit,
+        not the larger frame cap that exists to leave room for images.
+        Mirrors
         PasteboardTests.testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt
         on the Swift side."""
         agent = self.build(ready=True)
-        agent.clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        agent.clipboard.queue_read(b"x" * MAX_TEXT_BYTES)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
         agent._local_change()
-        self.assertEqual(sent, [], "text at exactly the cap would encode to a frame 8 bytes over it")
+        self.assertEqual(sent, [], "text at exactly the cap would encode to a payload 8 bytes over it")
 
     def test_text_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
         """The other half of the boundary: content that leaves exact room
@@ -1099,7 +2083,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         over-trimmed fix would silently refuse to sync content the wire
         format actually supports."""
         agent = self.build(ready=True)
-        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        text = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
         agent.clipboard.queue_read(text)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -1169,7 +2153,7 @@ class TestEchoBookkeeping(unittest.TestCase):
             handle.write(b"occupying this name")
         unsaveable_path = os.path.join(blocker, "clip-state.json")
         with self.assertRaises(OSError):
-            save_clip_state(HASH_A, 1, path=unsaveable_path)
+            save_clip_state(HASH_A, 1, KIND_TEXT, path=unsaveable_path)
 
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=QueueClipboard(ready=True),
                       clip_state_path=unsaveable_path)
@@ -1189,12 +2173,15 @@ class TestEchoBookkeeping(unittest.TestCase):
     # from the one-shot echo value* (_last_written/expected). With no
     # memory of what was last synced, any signal that is not a real change
     # -- a non-change GPaste Update (e.g. a history deletion), or a
-    # transient read() glitch in polling mode -- re-sends the current
+    # transient probe() glitch in polling mode -- re-sends the current
     # content even though nothing actually changed, and can race a real
     # incoming write and clobber it. _last_seen is set in _write_clip
-    # (content arriving from the peer) and after a successful send
-    # (content leaving to the peer), and _local_change returns early
-    # whenever the freshly read text already matches it.
+    # (content arriving from the peer), after a successful send (content
+    # leaving to the peer, on both _observe_local_change's path and
+    # _resolve_clip_state's), by clipboard_became_ready's connect-time
+    # seed, and -- since Task 10 -- in _consume_image_reoffer (the peer's
+    # own image as this clipboard re-encoded it), and _local_change returns
+    # early whenever the freshly read content already matches it.
 
     def test_non_change_signal_after_receiving_a_clip_produces_no_send(self):
         """Failure A from the final review, receive side: "A" arrives from
@@ -1296,7 +2283,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         agent.clipboard.queue_read(b"already on the pc")  # the seed read
         agent.clipboard.queue_read(b"already on the pc")  # the announce step's own read
         self.become_ready_without_a_real_watcher(agent)
-        self.assertEqual(agent._last_seen, b"already on the pc")
+        self.assertEqual(agent._last_seen, (KIND_TEXT, sha256_hex(b"already on the pc")))
 
         agent.clipboard.queue_read(b"already on the pc")  # the spurious signal's read
         sent = []
@@ -1308,6 +2295,101 @@ class TestEchoBookkeeping(unittest.TestCase):
             "already held before anything synced",
         )
 
+    def test_an_image_only_clipboard_at_connect_seeds_its_baseline_and_announces_its_kind(self):
+        """The Agent-level close of the loop resolve_startup_state's fix
+        opens, one frame up from TestResolveCurrentClipState's direct-call
+        coverage in test_clip_state_store.py: clipboard_became_ready's own
+        seed read AND announce_clip_state's read (called from inside it)
+        both go through this same kind-aware clipboard.read() now.
+
+        The seed covers both kinds since Task 12, and had to: a
+        locally-observed image is SENT now, so an image-only clipboard with
+        no baseline lets the first spurious signal after connect push
+        whatever the PC already held at the Mac, which applies it
+        unconditionally -- destroying a copy made there while the channel
+        was down. That is exactly the clobber
+        test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send
+        just above pins for text, arriving through the image door. Before
+        Task 12 the text-only seed was a scope boundary that cost nothing,
+        because an image observation had nowhere to go.
+
+        The CLIP_STATE announcement that goes out in the same call is a
+        separate matter, unchanged: that frame is what gets PERSISTED to the
+        store and put on the wire, and a fabricated KIND_TEXT there is
+        exactly the regression resolve_startup_state's docstring warns about
+        -- not just wrong in memory for one connection, but wrong on disk
+        for every connection after it too."""
+        agent = self.build(ready=True)
+        png = b"\x89PNG-the-only-thing-on-the-clipboard"
+        # Same double-read shape as
+        # test_a_spurious_signal_at_connect_with_content_already_present_produces_no_send
+        # just above: the seed read, and announce_clip_state's own read.
+        agent.clipboard.queue_image_read(png)  # the seed read
+        agent.clipboard.queue_image_read(png)  # the announce step's own read
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        self.become_ready_without_a_real_watcher(agent)
+
+        self.assertEqual(
+            agent._last_seen, (KIND_IMAGE, sha256_hex(png)),
+            "the connect-time seed covers both kinds -- an image the PC already "
+            "held is not a change the peer needs to hear about",
+        )
+        announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
+        self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
+        decoded = decode_clip_state(announced[0][1])
+        self.assertEqual(
+            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
+            "the announced kind must be the real one, not a fabricated KIND_TEXT",
+        )
+
+    def test_a_spurious_signal_at_connect_with_an_image_already_present_produces_no_send(self):
+        """The other half of the seed's purpose, and the one that only became
+        reachable with Task 12: the seed exists to stop the FIRST observation
+        after connect from being read as a local change. Asserting the seed's
+        value alone would leave that unproven for images -- the send path
+        could still ignore it."""
+        agent = self.build(ready=True)
+        png = b"\x89PNG-already-on-the-pc"
+        agent.clipboard.queue_image_read(png)  # the seed read
+        agent.clipboard.queue_image_read(png)  # the announce step's own read
+        self.become_ready_without_a_real_watcher(agent)
+
+        agent.clipboard.queue_image_read(png)  # the spurious signal's read
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(
+            sent, [],
+            "a spurious signal right after connect must not resend an image the PC "
+            "already held before anything synced",
+        )
+
+    def test_last_seen_holds_a_kind_and_a_hash_for_text_too(self):
+        """Not text-by-value and images-by-hash: one rule. A second
+        comparison branch is how the two sides drift."""
+        agent = self.build(ready=True)
+        agent.clipboard.queue_read(b"hello")
+        agent.send = lambda t, p: None
+        agent._local_change()
+        self.assertEqual(agent._last_seen, (KIND_TEXT, sha256_hex(b"hello")))
+
+    def test_the_same_bytes_under_a_different_kind_are_a_change(self):
+        """Not text-by-value and images-by-hash: one rule. A second
+        comparison branch is how the two sides drift. _last_seen is seeded
+        directly under KIND_IMAGE here rather than reached through scripted
+        reads of a real image: the identity rule under test lives in the
+        comparison itself, not in how _last_seen came to hold that value,
+        and the shortest route there keeps the test about one thing."""
+        agent = self.build(ready=True)
+        agent._last_seen = (KIND_IMAGE, sha256_hex(b"x"))
+        agent.clipboard.queue_read(b"x")
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._local_change()
+        self.assertEqual(len(sent), 1, "kind is part of identity, not decoration")
+
 
 class OrderRecordingClipboard:
     """write() snapshots agent._last_written at the exact moment it is
@@ -1317,7 +2399,13 @@ class OrderRecordingClipboard:
     (clipboard.written == [...] and agent._last_written == ...) pass, since
     both would still be true by the time the test looks -- only checking
     what was armed AT WRITE TIME can tell the two orderings apart. Mirrors
-    HandleFrameTests.swift's RecordingPasteboard.onWrite callback."""
+    HandleFrameTests.swift's RecordingPasteboard.onWrite callback.
+
+    _last_written specifically, so this pins the arm-then-write ORDER only
+    for a TEXT write: since Task 10 an image write deliberately leaves
+    _last_written None and arms _expect_reoffer and _last_seen instead (see
+    _write_clip), so a test that drove an image through this double would
+    record None and prove nothing. Every test here writes text."""
 
     def __init__(self):
         self.agent = None  # set after construction, once the real agent exists
@@ -1330,8 +2418,8 @@ class OrderRecordingClipboard:
     def read(self):
         return None
 
-    def write(self, data):
-        self.written.append(data)
+    def write(self, kind, data):
+        self.written.append((kind, data))
         self.armed_at_write_time.append(self.agent._last_written if self.agent else None)
 
 
@@ -1358,7 +2446,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
 
         agent._write_clip(encode_clip_payload(1.0, b"hello"))
 
-        self.assertEqual(clipboard.written, [b"hello"])
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"hello")])
         self.assertEqual(
             clipboard.armed_at_write_time, [b"hello"],
             "the suppression must already be armed with the decoded text at "
@@ -1394,7 +2482,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         agent._write_clip(encode_clip_payload(peers_ts, b"peer's clip"))
 
         stored = load_clip_state(path=self.clip_state_path)
-        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts),
+        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts, KIND_TEXT),
                          "must store the PEER's ts, never now")
 
     def test_stores_the_literal_known_hash_for_a_pinned_vector(self):
@@ -1413,7 +2501,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         stored = load_clip_state(path=self.clip_state_path)
         self.assertEqual(
             stored,
-            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0),
+            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0, KIND_TEXT),
         )
 
     def test_a_malformed_too_short_payload_touches_neither_suppression_nor_the_clipboard(self):
@@ -1462,7 +2550,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         unsaveable_path = os.path.join(blocker, "clip-state.json")
         # Confirm the setup actually forces a failure, or this test proves nothing.
         with self.assertRaises(OSError):
-            save_clip_state(HASH_A, 1, path=unsaveable_path)
+            save_clip_state(HASH_A, 1, KIND_TEXT, path=unsaveable_path)
 
         clipboard = OrderRecordingClipboard()
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
@@ -1471,7 +2559,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
 
         agent._write_clip(encode_clip_payload(1.0, b"still write this"))
 
-        self.assertEqual(clipboard.written, [b"still write this"],
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"still write this")],
                          "a local disk failure must not prevent the clipboard write")
         self.assertEqual(agent._last_written, b"still write this",
                          "the suppression must still be armed despite the disk failure")
@@ -1482,7 +2570,8 @@ class RacyClipboard:
     WHILE a read() is in flight -- deterministically, via a side effect
     inside read() itself, rather than by timing two real threads. This is
     the exact shape of the real race: a wl-paste round trip can take up to
-    SUBPROCESS_TIMEOUT=3 seconds, and a new frame can arrive and be
+    SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT = 13 seconds on an image
+    clipboard, and a new frame can arrive and be
     written locally (on the main thread) at any point during that
     window."""
 
@@ -1493,9 +2582,11 @@ class RacyClipboard:
 
     def read(self):
         self._agent._write_clip(self._interleaved_write)  # lands mid-flight
-        return self._value_read  # what the fork had already captured
+        # what the fork had already captured -- every test constructing one
+        # of these passes text, so KIND_TEXT unconditionally.
+        return (KIND_TEXT, self._value_read)
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
     def ready(self):
@@ -1507,7 +2598,8 @@ class GatedReadClipboard:
     held inside its clipboard round trip while a second one runs on another
     thread. That is not hypothetical: since the safety-net poll was added, the
     gdbus pump thread and the poll thread BOTH call _local_change, and a
-    wl-paste round trip can take up to SUBPROCESS_TIMEOUT=3s."""
+    clipboard read can take up to SUBPROCESS_TIMEOUT +
+    IMAGE_SUBPROCESS_TIMEOUT = 13s on an image clipboard."""
 
     def __init__(self, text, gate):
         self._text = text
@@ -1522,9 +2614,9 @@ class GatedReadClipboard:
         with self._lock:
             self.reads += 1
         self._gate.wait(JOIN_TIMEOUT)
-        return self._text
+        return (KIND_TEXT, self._text)
 
-    def write(self, data):
+    def write(self, kind, data):
         pass
 
 
@@ -1533,7 +2625,8 @@ class TestLocalChangeRaceSafety(unittest.TestCase):
     single-threaded loop); _local_change() only ever runs on watcher
     threads -- plural since the safety-net poll was added, which is what the
     last test in this class is about. clipboard.read() -- a wl-paste round
-    trip -- can take up to SUBPROCESS_TIMEOUT=3s, so a new _write_clip() can
+    trips -- can take up to SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT =
+    13s on an image clipboard, so a new _write_clip() can
     land on the main thread at any point during that window, not just cleanly
     before or after it."""
 
@@ -1683,23 +2776,37 @@ class TestIncomingClipState(unittest.TestCase):
         agent._clip_state_sent = already_reconciled
         return agent
 
+    def capture_log(self):
+        """Collects clipwire_agent.log's lines for the duration of one test.
+        Several tests below assert on the send branch's own log line, and
+        the module-level patch plus its cleanup is the same four lines every
+        time."""
+        original_log = clipwire_agent.log
+        lines = []
+        clipwire_agent.log = lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        return lines
+
     def test_losing_clip_state_with_peer_fresher_produces_no_send(self):
         """resolve_freshness's waitForPeer outcome: the peer is fresher, so
         we wait. Conflating this with doNothing would be harmless here, but
         the point of a resend would be to CLOBBER a fresher peer -- exactly
         the defect this whole design exists to prevent."""
-        save_clip_state(HASH_A, 5, path=self.clip_state_path)
-        # Real content on the clipboard, or a wrongly-resolved SEND_MINE
-        # would still send nothing (its first guard is a non-empty read)
-        # and this assertion would hold for the wrong reason. Mirrors
+        # Real content on the clipboard, and a stored hash that actually
+        # MATCHES it: a wrongly-resolved SEND_MINE would otherwise stop at
+        # one of that branch's own guards -- since Task 11 the first of them
+        # is the verification, which a placeholder hash fails -- and this
+        # assertion would hold for the wrong reason. Mirrors
         # HandleFrameTests.testLosingClipStateWithPeerFresherProducesNoSend.
+        save_clip_state(sha256_hex(b"something to wrongly send"), 5, KIND_TEXT,
+                        path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"something to wrongly send")
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 9))  # peer fresher
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 9, KIND_TEXT))  # peer fresher
 
         self.assertEqual(sent, [], "the peer is fresher -- we wait, we do not resend")
 
@@ -1707,16 +2814,20 @@ class TestIncomingClipState(unittest.TestCase):
         """resolve_freshness's doNothing outcome via equal hashes: "hashes
         equal" must mean "we agree", not "resend" -- conflating it with
         sendMine would ping-pong the same content back and forth forever."""
-        save_clip_state(HASH_A, 5, path=self.clip_state_path)
-        # See the test above: without real content a wrongly-resolved
-        # SEND_MINE sends nothing anyway, and this would pass regardless.
+        # See the test above: without real content the clipboard actually
+        # holds -- and a stored hash that matches it -- a wrongly-resolved
+        # SEND_MINE stops at one of that branch's own guards and this would
+        # pass regardless. The hash goes on BOTH sides here, since equal
+        # hashes are what the doNothing outcome under test turns on.
+        agreed = sha256_hex(b"something to wrongly send")
+        save_clip_state(agreed, 5, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"something to wrongly send")
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_A, 999))  # same hash
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(agreed, 999, KIND_TEXT))  # same hash
 
         self.assertEqual(sent, [], "hashes equal means we agree, not resend")
 
@@ -1725,15 +2836,20 @@ class TestIncomingClipState(unittest.TestCase):
         all (also the fix for v1's documented loss of Mac copies made while
         the PC was off). The resulting clip must carry OUR stored ts, not
         now -- resending with now would perpetually refresh its age and let
-        it win every future reconciliation regardless of what happens next."""
-        save_clip_state(HASH_A, 777, path=self.clip_state_path)
+        it win every future reconciliation regardless of what happens next.
+
+        The stored hash is the real digest of what the clipboard double
+        returns: since Task 11 the branch verifies the two against each
+        other before sending, so a placeholder hash here would make this
+        test prove only that the verification works."""
+        save_clip_state(sha256_hex(b"current clip text"), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer empty
 
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], TYPE_CLIP)
@@ -1763,21 +2879,21 @@ class TestIncomingClipState(unittest.TestCase):
         watcher does fire on non-changes (that is the entire reason
         _last_seen exists on this side at all), so the omission that is
         inert on the Mac is a real defect here."""
-        save_clip_state(HASH_A, 777, path=self.clip_state_path)
+        save_clip_state(sha256_hex(b"current clip text"), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
         agent.send = lambda t, p: None
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty -> sendMine
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer empty -> sendMine
 
         self.assertEqual(
-            agent._last_seen, b"current clip text",
+            agent._last_seen, (KIND_TEXT, sha256_hex(b"current clip text")),
             "_last_seen must advance to what was just sent, exactly as "
             "_local_change's own send path already does",
         )
 
-    def test_winning_clip_state_prefers_a_just_applied_clip_over_a_racy_reread(self):
+    def test_winning_clip_state_stays_silent_when_a_racy_reread_disagrees_with_the_applied_clip(self):
         """The same class of bug clipboard_became_ready's announce step was
         fixed for, one door over: a TYPE_CLIP frame applied via _write_clip
         (the immediate _on_clip path, once READY) followed closely by a
@@ -1785,18 +2901,33 @@ class TestIncomingClipState(unittest.TestCase):
         plausible on the same connection, e.g. the Mac's watcher pushing a
         fresh local change around the time of its own one-time clip-state
         announcement. _write_clip already wrote to and correctly persisted
-        state for that applied clip; if _on_clip_state instead re-reads the
-        clipboard fresh to find the TEXT to send, that read can race
-        wl-copy's asynchronous, detached write (see _write_clip's own
-        comment) and see stale content -- sending WRONG text stamped with
-        the CORRECT mine[1] timestamp, which looks like a valid, fresh
-        reconciliation response to the peer.
+        state for that applied clip; if _on_clip_state re-reads the
+        clipboard to find the content to send, that read can race wl-copy's
+        asynchronous, detached write (see _write_clip's own comment) and
+        see stale content -- sending WRONG text stamped with the CORRECT
+        mine[1] timestamp, which looks like a valid, fresh reconciliation
+        response to the peer, and which the peer cannot tell from a real
+        one.
 
-        _last_seen already holds the applied clip's exact text (_write_clip
-        sets it before spawning wl-copy) -- and it is verified against
-        mine's hash before being trusted, so a stale/unrelated _last_seen
-        (e.g. clipboard_became_ready's own connect-time seed) still falls
-        back to a live read exactly as before.
+        The defect this pins is unchanged; the remedy is Task 11's. The
+        branch no longer trusts remembered bytes (_last_seen_text, deleted
+        with this task -- see _resolve_clip_state's own comment on why the
+        two are mutually exclusive): it reads, hashes, compares against
+        mine's own (kind, hash), and on a disagreement sends NOTHING and
+        logs. Nothing wrong reaches the peer either way. What is lost, and
+        accepted deliberately, is the correct send this scenario used to
+        produce: the applied clip is not re-offered from anywhere else
+        afterwards, since the watcher's own eventual observation of our
+        write is (correctly) suppressed as an echo. See
+        _resolve_clip_state's comment for why that exposure is narrower
+        than sending unverified bytes.
+
+        This is also the one test in the file where _last_seen agrees with
+        mine on both kind and hash at the moment the branch runs, which is
+        the COMMON case for a send resolution (a just-applied clip, or a
+        just-sent local change). Restoring a "trust _last_seen_text and skip
+        the read" fast path would send `applied_text` here and turn this
+        red -- which is exactly what it is for.
 
         QueueClipboard is the right double here, unmodified: its write()
         already never affects what a subsequently-queued read() returns --
@@ -1824,55 +2955,286 @@ class TestIncomingClipState(unittest.TestCase):
 
         agent.on_frame(TYPE_CLIP, encode_clip_payload(applied_ts, applied_text))
         self.assertEqual(
-            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts),
+            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT),
             "test setup must actually apply and persist the clip, or this test proves nothing",
         )
+        self.assertEqual(
+            agent._last_seen, (KIND_TEXT, sha256_hex(applied_text)),
+            "the applied clip must really be what this side remembers holding, or the "
+            "fast path this test exists to keep deleted was never reachable here",
+        )
 
-        # Queued for _on_clip_state's OWN read, if it takes the (buggy)
-        # fresh-read path -- stale content that predates the clip just
-        # applied above, modeling wl-copy not yet having taken over.
+        # Queued for the send branch's OWN read -- stale content that
+        # predates the clip just applied above, modeling wl-copy not yet
+        # having taken over.
         clipboard.queue_read(b"stale content predating this connection")
 
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer empty -> sendMine
+        log_lines = self.capture_log()
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer empty -> sendMine
+
+        self.assertEqual(
+            sent, [],
+            "a read that disagrees with what we announced must send nothing -- neither the "
+            "stale bytes it returned nor the applied clip it contradicts",
+        )
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    # MARK: - Task 11: the send branch verifies before it sends
+
+    def test_the_send_branch_stays_silent_when_the_clipboard_moved_on(self):
+        """mine says text with hash A; by the time we send, the clipboard
+        holds an image. Sending it under A's timestamp is a clobber the peer
+        cannot detect: a well-formed text frame carrying a mojibake
+        transliteration of a PNG, at an age that was never that content's.
+
+        Both halves of the verification are wrong here at once (the kind and
+        the hash), which is the honest shape of the race: whatever replaced
+        the announced content is not required to be of the same kind."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(b"\x89PNG-something-else")
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        # Older than ours, so we resolve SEND_MINE.
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [], "the clipboard no longer holds what we announced")
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_stays_silent_when_only_the_hash_moved_on(self):
+        """The kind still matches and only the content changed -- the
+        ordinary shape of the race, a second text copy landing between the
+        announcement and this frame. A verification that compared only the
+        kind would pass this and send the wrong text under the announced
+        timestamp."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"whatever the user copied since")
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [], "the announced hash is not what the clipboard offers")
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_sends_when_the_clipboard_still_matches(self):
+        """The positive half: without it the two tests above pass against a
+        branch that never sends anything at all."""
+        body = b"still here"
+        save_clip_state(sha256_hex(body), 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(body)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
 
         self.assertEqual(len(sent), 1)
-        ts, text = decode_clip_payload(sent[0][1])
-        self.assertEqual(ts, applied_ts)
+        self.assertEqual(sent[0][0], TYPE_CLIP)
+        self.assertEqual(decode_clip_payload(sent[0][1]), (5000.0, body))
+        self.assertNotIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_stays_silent_when_the_clipboard_emptied(self):
+        """A clipboard that now reads back as nothing at all is the same
+        class of failure as one holding different content: it does not hold
+        what we announced. read() returning None is the shape a Wayland
+        session with no selection owner takes -- and the shape a transient
+        wl-paste timeout takes too, which is why staying quiet (rather than
+        sending the announced hash's presumed bytes) is the only safe
+        reading of it."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        agent = self.build(clipboard=QueueClipboard(ready=True))  # empty queue -> read() is None
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [])
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_sends_a_verified_image_as_an_image_clip(self):
+        """The branch a reconnect takes when the PC's image is the fresher of
+        the two states. It used to fall out silently here: the only frame it
+        could build was TYPE_CLIP, the TEXT codec, and putting PNG bytes
+        through that is worse than sending nothing. Task 12 fix round 1
+        gives it the image codec instead, so an image that wins a
+        reconciliation actually reaches the peer.
+
+        Left unclosed, the asymmetry ships: Task 13 gives the MAC this same
+        send, and a PC that verifies its image and then says nothing means
+        every reconnect where the PC's screenshot is the newer one silently
+        keeps it on the PC -- with no log line saying why, since the silence
+        was deliberate.
+
+        The frame carries mine[1] -- the ANNOUNCED timestamp -- not a fresh
+        reading. The content did not change, it was only re-announced, and
+        stamping it with now would refresh its age on every reconnect and let
+        it win every future reconciliation regardless of what happens next.
+        That is the property the verification exists to make safe, and it is
+        pinned here rather than left to the text path alone."""
+        png = b"\x89PNG\r\n\x1a\n" + b"pixels"
+        save_clip_state(sha256_hex(png), 5000.0, KIND_IMAGE, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(png)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual([frame_type for frame_type, _ in sent], [TYPE_IMAGE_CLIP],
+                         "an image must go out through the image codec, not the text one")
+        self.assertEqual(decode_image_payload(sent[0][1]), (5000.0, png),
+                         "the announced timestamp, and the bytes the clipboard verified")
+        self.assertNotIn(
+            "clipboard changed before the send", "\n".join(log_lines),
+            "the clipboard holds exactly what we announced, so this send is the "
+            "verification passing -- not it being skipped",
+        )
         self.assertEqual(
-            text, applied_text,
-            "must send the just-applied clip's own known text, not a stale "
-            "clipboard.read() racing wl-copy's asynchronous write",
+            agent._last_seen, (KIND_IMAGE, sha256_hex(png)),
+            "the peer holds it now, so a later spurious GPaste Update must not read "
+            "it as a fresh local change and send it again",
         )
 
-    def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
-        """Unlike _local_change's own send path, this branch reads the live
-        clipboard independently and, without this bound, winning a
-        reconciliation over content at or beyond the cap would build a
-        frame that exceeds MAX_PAYLOAD_BYTES once wrapped -- the peer's
-        decode_frame rejects that as oversized and drops the whole channel."""
-        save_clip_state(HASH_A, 777, path=self.clip_state_path)
+    def test_a_verified_but_empty_body_is_not_sent_under_either_kind(self):
+        """The guard that used to ride along on the text path's
+        `kind != KIND_TEXT or not text` and now stands on its own, because
+        the branch below it can build two different frames.
+
+        Constructible only by writing the empty string's digest into the
+        store directly -- resolve_current_clip_state records a None hash for
+        an empty clipboard, so nothing in the agent produces this state. But
+        the store is a file that outlives the process, and an empty body
+        reaching encode_image_payload would put a frame on the wire that
+        decode_image_payload refuses at the far end ("image payload carries
+        no image"): a send that cannot succeed, from a branch whose whole
+        purpose is that it verified first.
+
+        Found by mutation: deleting the guard failed no test."""
+        for kind, queue in ((KIND_TEXT, "queue_read"), (KIND_IMAGE, "queue_image_read")):
+            with self.subTest(kind=kind):
+                path = os.path.join(self._tmp.name, "empty-%s.json" % kind)
+                save_clip_state(sha256_hex(b""), 5000.0, kind, path=path)
+                clipboard = QueueClipboard(ready=True)
+                getattr(clipboard, queue)(b"")
+                agent = Agent(
+                    stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=clipboard,
+                    clip_state_path=path,
+                )
+                agent._clip_state_sent = True
+                sent = []
+                agent.send = lambda t, p: sent.append((t, p))
+                log_lines = self.capture_log()
+
+                agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+                self.assertEqual(sent, [], "an empty body is not a clip of any kind")
+                self.assertNotIn(
+                    "clipboard changed before the send", "\n".join(log_lines),
+                    "the verification PASSED here -- the clipboard really does hold "
+                    "the (empty) thing we announced -- so this silence must be the "
+                    "empty-body guard's, not the verification's",
+                )
+
+    def test_winning_clip_state_with_an_oversized_image_is_logged_with_its_size(self):
+        """The image twin of the text cap below, and the reason the two are
+        separate constants: this body is over MAX_IMAGE_BYTES, not over the
+        (larger) MAX_PAYLOAD_BYTES frame cap, so it is refused as a matter of
+        the policy images are held to rather than wire safety.
+
+        An image can only get onto the store at this size through the
+        re-offer path, which deliberately records an oversized read-back
+        rather than dropping it (GPaste's re-encode INFLATES -- 105 KB in,
+        180 KB out) -- so this is reachable in production, not a synthetic
+        case. The size is logged because a user whose screenshot wins a
+        reconciliation and still does not arrive has nothing else to look
+        at."""
+        oversized = b"\x89" * (MAX_IMAGE_BYTES + 1)
+        save_clip_state(sha256_hex(oversized), 777.0, KIND_IMAGE, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
-        clipboard.queue_read(b"x" * MAX_PAYLOAD_BYTES)
+        clipboard.queue_image_read(oversized)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
+
+        self.assertEqual(sent, [])
+        self.assertIn(str(len(oversized)), "\n".join(log_lines))
+        self.assertIn(
+            "over the image limit", "\n".join(log_lines),
+            "one verdict clause for one limit: the same one the re-offer path and "
+            "the local-observation path already use, so three sites cannot drift",
+        )
+
+    def test_winning_clip_state_with_an_image_at_exactly_the_limit_still_sends(self):
+        """The boundary the three separated caps exist for. This body plus
+        its 8-byte timestamp exceeds the OLD single 4 MiB cap, so a guard
+        written as `len(body) + TIMESTAMP_BYTES > MAX_IMAGE_BYTES` -- correct
+        for TEXT one branch down -- would refuse a legal maximum-size image
+        here. MAX_IMAGE_BYTES bounds the image; MAX_PAYLOAD_BYTES bounds the
+        frame, with room for the prefix by construction."""
+        exact = b"\x89" * MAX_IMAGE_BYTES
+        save_clip_state(sha256_hex(exact), 777.0, KIND_IMAGE, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(exact)
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
 
-        self.assertEqual(sent, [], "content of exactly the cap would encode to a frame 8 bytes over it")
+        self.assertEqual([frame_type for frame_type, _ in sent], [TYPE_IMAGE_CLIP])
+        self.assertEqual(len(sent[0][1]), MAX_IMAGE_BYTES + TIMESTAMP_BYTES)
+
+    def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
+        """Unlike _local_change's own send path, this branch reads the live
+        clipboard independently and, without this bound, winning a
+        reconciliation over content at or beyond the TEXT limit would build
+        a payload that exceeds MAX_TEXT_BYTES once wrapped in its 8-byte
+        timestamp -- refused here on content-limit grounds, independently of
+        whether the resulting frame would also exceed the (larger)
+        MAX_PAYLOAD_BYTES wire cap.
+
+        The stored hash is the real digest of the oversized content, not a
+        placeholder: since Task 11 the branch verifies before it sends, and
+        a placeholder would make this test pass on the verification's
+        silence while the cap it exists for went untested."""
+        save_clip_state(sha256_hex(b"x" * MAX_TEXT_BYTES), 777, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"x" * MAX_TEXT_BYTES)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
+
+        self.assertEqual(sent, [], "content of exactly the cap would encode to a payload 8 bytes over it")
 
     def test_winning_clip_state_with_content_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
-        save_clip_state(HASH_A, 777, path=self.clip_state_path)
-        text = b"x" * (MAX_PAYLOAD_BYTES - TIMESTAMP_BYTES)
+        text = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
+        save_clip_state(sha256_hex(text), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(text)
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
 
         self.assertEqual(len(sent), 1)
         self.assertEqual(decode_clip_payload(sent[0][1])[1], text)
@@ -1880,21 +3242,18 @@ class TestIncomingClipState(unittest.TestCase):
     def test_winning_clip_state_with_oversized_content_is_logged_with_its_size(self):
         """A user whose large paste wins a reconciliation but can't actually
         be sent has nothing to look at otherwise -- matches the existing
-        "skipping a clip of N bytes: over the frame cap" line used for
+        "skipping a clip of N bytes: over the text limit" line used for
         _local_change's own cap."""
-        save_clip_state(HASH_A, 777, path=self.clip_state_path)
-        oversized = MAX_PAYLOAD_BYTES
+        oversized = MAX_TEXT_BYTES
+        save_clip_state(sha256_hex(b"x" * oversized), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * oversized)
         agent = self.build(clipboard=clipboard)
         agent.send = lambda t, p: None
 
-        original_log = clipwire_agent.log
-        log_lines = []
-        clipwire_agent.log = log_lines.append
-        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        log_lines = self.capture_log()
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
 
         self.assertTrue(
             any("skipping a clip of %d bytes" % oversized in line for line in log_lines),
@@ -1917,7 +3276,7 @@ class TestIncomingClipState(unittest.TestCase):
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0))  # peer also empty
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer also empty
 
         self.assertEqual(len(sent), 1,
                          "an empty store must not silently resolve to waitForPeer against a "
@@ -1964,16 +3323,16 @@ class TestIncomingClipState(unittest.TestCase):
         peer's own decoded announcement ("bb", 42) -- not our local state,
         and not silently dropped -- which is a distinct assertion from
         "nothing was sent"."""
-        save_clip_state(HASH_A, 5, path=self.clip_state_path)
+        save_clip_state(HASH_A, 5, KIND_TEXT, path=self.clip_state_path)
         agent = self.build(already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 42))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 42, KIND_TEXT))
 
         self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
         self.assertEqual(
-            agent._pending_peer_clip_state, (HASH_B, 42.0),
+            agent._pending_peer_clip_state, (HASH_B, 42.0, KIND_TEXT),
             "the peer's own decoded state must be stashed, not silently dropped",
         )
 
@@ -1993,15 +3352,19 @@ class TestIncomingClipState(unittest.TestCase):
         # for the same double-read shape.
         clipboard.queue_read(b"B")  # the seed read
         clipboard.queue_read(b"B")  # the announce step's own read
+        # And the send branch's own read, which since Task 11 verifies what
+        # the clipboard actually holds against what was just announced
+        # before it sends anything.
+        clipboard.queue_read(b"B")
         agent = self.build(clipboard=clipboard, already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
         # Stale on disk: both sides last synced on "A" a long time ago.
-        save_clip_state(sha256_hex(b"A"), 100.0, path=self.clip_state_path)
+        save_clip_state(sha256_hex(b"A"), 100.0, KIND_TEXT, path=self.clip_state_path)
         # The peer's own announcement, also still describing "A" -- it
         # has not changed either.
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"A"), 100.0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"A"), 100.0, KIND_TEXT))
         self.assertEqual(sent, [], "must not resolve yet -- stashed")
 
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
@@ -2031,40 +3394,42 @@ class TestIncomingClipState(unittest.TestCase):
         just announced to the peer: an age we invented, inflated past the
         one on the wire, able to win a comparison it should have lost.
 
-        Pinned two ways: the clipboard must not be read a third time at
-        all (the seed and the announce step are the only two legitimate
-        reads), and the clip we send after winning must carry the exact
-        timestamp we announced. The queued third read is what a
-        re-derivation would consume, and it returns DIFFERENT content so a
-        re-derivation cannot accidentally agree."""
+        Pinned by the TIMESTAMP the clip we send carries: it must be the
+        exact one we announced, not one a re-derivation would stamp from a
+        later clock reading. The clipboard's own content is deliberately
+        the same "A" on every read, so the two implementations differ ONLY
+        in the timestamp -- which is the whole disagreement.
+
+        A read count is deliberately NOT asserted, and the difference
+        matters. Since Task 11 the send branch reads once of its own,
+        verifying that the clipboard still holds what we announced before
+        sending it -- a verification AGAINST the pair, not a re-derivation
+        OF it. Counting reads cannot tell those two apart, so an assertion
+        on the count would read as "the pair must never be re-derived" and
+        push a later reader straight back into skipping the verification."""
         blocker = os.path.join(self._tmp.name, "blocker")
         with open(blocker, "wb") as handle:
             handle.write(b"occupying this name")
         unsaveable = os.path.join(blocker, "clip-state.json")
         with self.assertRaises(OSError):
-            save_clip_state(HASH_A, 1, path=unsaveable)
+            save_clip_state(HASH_A, 1, KIND_TEXT, path=unsaveable)
 
         clipboard = QueueClipboard(ready=True)
-        clipboard.queue_read(b"A")          # the connect-time seed
-        clipboard.queue_read(b"A")          # announce_clip_state's own read
-        clipboard.queue_read(b"DIFFERENT")  # only a re-derivation consumes this
+        clipboard.queue_read(b"A")  # the connect-time seed
+        clipboard.queue_read(b"A")  # announce_clip_state's own read
+        clipboard.queue_read(b"A")  # the send branch's own verification read
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(),
                       clipboard=clipboard, clip_state_path=unsaveable)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
         # The peer holds something else and is OLDER, so we win and send.
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1.0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1.0, KIND_TEXT))
         self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
 
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
             agent.clipboard_became_ready()
 
-        self.assertEqual(
-            len(clipboard._queue), 1,
-            "the store's own pair was already in hand -- re-reading the clipboard "
-            "to rebuild it is what invents a timestamp nobody announced",
-        )
         announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
         clips = [f for f in sent if f[0] == TYPE_CLIP]
         self.assertEqual(len(announced), 1)
@@ -2090,18 +3455,32 @@ class TestIncomingClipState(unittest.TestCase):
         byte-identical for free -- the same convention the frame-cap and
         skew lines already follow. Both sides' lines land in the SAME file
         in production: Channel.attempt pipes this agent's stderr into the
-        Mac's log with a `remote: ` prefix."""
+        Mac's log with a `remote: ` prefix.
+
+        The line also carries a `(mine=... peer=...)` kind suffix since
+        Task 14 -- checked with `in` below rather than `==` for exactly that
+        reason, so this test does not have to know its shape. See
+        test_the_reconciliation_line_names_both_kinds for the suffix
+        itself."""
+        # The stored hash is the real digest of what the clipboard double
+        # returns, as in every other sendMine fixture in this class: the
+        # decision line under test is logged BEFORE Task 11's verification,
+        # so a placeholder would not break this test -- it would merely make
+        # the sendMine case emit a stray "clipboard changed before the send"
+        # and diverge from its siblings for no reason.
+        held = b"whatever we hold"
+        held_hash = sha256_hex(held)
         cases = [
             # (stored ts, peer state, expected decision)
-            (5, (HASH_B, 9), "waitForPeer"),   # peer fresher
-            (5, (HASH_A, 999), "doNothing"),   # same hash
-            (777, (None, 0), "sendMine"),      # peer has nothing
+            (5, (HASH_B, 9, KIND_TEXT), "waitForPeer"),     # peer fresher
+            (5, (held_hash, 999, KIND_TEXT), "doNothing"),  # same hash
+            (777, (None, 0, None), "sendMine"),             # peer has nothing
         ]
         for stored_ts, peer, expected in cases:
             with self.subTest(expected):
-                save_clip_state(HASH_A, stored_ts, path=self.clip_state_path)
+                save_clip_state(held_hash, stored_ts, KIND_TEXT, path=self.clip_state_path)
                 clipboard = QueueClipboard(ready=True)
-                clipboard.queue_read(b"whatever we hold")
+                clipboard.queue_read(held)
                 agent = self.build(clipboard=clipboard)
                 agent.send = lambda t, p: None
 
@@ -2113,7 +3492,49 @@ class TestIncomingClipState(unittest.TestCase):
                 finally:
                     clipwire_agent.log = original_log
 
-                self.assertIn("reconciled with the peer: %s" % expected, log_lines)
+                self.assertTrue(
+                    any(("reconciled with the peer: %s" % expected) in line for line in log_lines),
+                    "expected a line naming %s; got: %r" % (expected, log_lines),
+                )
+
+    def test_the_reconciliation_line_names_both_kinds(self):
+        """'why did a picture overwrite my text' must have an answer in the
+        log. The decision word alone cannot say it -- see this class's other
+        reconciliation tests, which never once ask what kind either side
+        held. Mirrors HandleFrameTests.swift's
+        testTheReconciliationLineNamesBothKinds."""
+        log_lines = self.capture_log()
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(b"\x89P")  # the send branch's own verification read
+        agent = self.build(clipboard=clipboard)
+        mine = (sha256_hex(b"\x89P"), 5000.0, KIND_IMAGE)
+        peer = (HASH_B, 1000.0, KIND_TEXT)
+
+        agent._resolve_clip_state(peer, mine=mine)
+
+        line = next(l for l in log_lines if "reconciled with the peer" in l)
+        # One literal, not two independent substrings: pins the separator and
+        # the spacing too, the same shape as the "over the image limit" lines
+        # elsewhere in this suite, so a change that reordered the pair or
+        # dropped the space still goes red here. The leading space is part of
+        # the literal deliberately, not decorative: the Swift twin of this
+        # line is built from two concatenated string literals with the space
+        # on the FIRST one, so a literal starting at "(" would miss a dropped
+        # space there. Python's own line is one literal today, but asserting
+        # the same leading space here keeps the two tests -- and what they
+        # actually pin -- symmetric.
+        self.assertIn(" (mine=image peer=text)", line)
+
+    def test_the_line_says_none_when_a_side_holds_nothing(self):
+        """The complement: neither side's hash implies neither side's kind,
+        and the line must say so rather than omit it or print "None"."""
+        log_lines = self.capture_log()
+        agent = self.build()
+
+        agent._resolve_clip_state((None, 1000.0, None), mine=(None, 5000.0, None))
+
+        line = next(l for l in log_lines if "reconciled with the peer" in l)
+        self.assertIn(" (mine=none peer=none)", line)
 
     def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
         """The reboot flow (acceptance item 5), where the stash is stale by
@@ -2133,15 +3554,30 @@ class TestIncomingClipState(unittest.TestCase):
         The harm is bounded (noteWrittenLocally is armed before the write,
         EchoGuard suppresses, content converges), which is exactly why it
         needs a test: nothing about the end state is wrong, so only the
-        redundant frame itself is observable."""
+        redundant frame itself is observable.
+
+        Which makes the SECOND queued read load-bearing rather than
+        housekeeping. With the supersede-drop removed, the drain resolves
+        SEND_MINE and reaches Task 11's verification read; an exhausted
+        QueueClipboard returns None there, which reads as "the clipboard
+        changed" and produces exactly the silence this test asserts. The
+        defect would pass. Queuing what the applied clip actually put on
+        the clipboard lets the verification succeed, so the bug sends the
+        redundant frame and is caught -- the discriminator the fast path
+        used to supply for free, when _write_clip's remembered bytes were
+        what this branch sent."""
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"whatever the PC held")  # the connect-time seed
+        # What the clipboard holds AFTER the pending clip below is applied --
+        # consumed only by the send branch's verification read, and only if
+        # the supersede-drop is missing. See the docstring.
+        clipboard.queue_read(b"the mac's newer clip")
         agent = self.build(clipboard=clipboard, already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
         # The Mac's announcement, describing what IT held at the time.
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"the mac's older clip"), 1000.0))
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(sha256_hex(b"the mac's older clip"), 1000.0, KIND_TEXT))
         # ... then the Mac copies something else and sends it. Still pending
         # here, so it is queued rather than applied.
         agent.on_frame(TYPE_CLIP, encode_clip_payload(3000.0, b"the mac's newer clip"))
@@ -2185,7 +3621,28 @@ class TestModuleDefinitionOrder(unittest.TestCase):
         source = AGENT.read_text()
         guard_index = source.index('if __name__ == "__main__"')
         for needle in (
+            # Task 4: the three-way cap split and the new image-clip type,
+            # all defined at the top of the file alongside MAX_PAYLOAD_BYTES.
+            "MAX_TEXT_BYTES = 4194304",
+            "MAX_IMAGE_BYTES = 4194304",
+            "TYPE_IMAGE_CLIP = 0x03",
             "def make_watcher",
+            # Final fix wave: the tie-break nudge a consumed image re-offer
+            # is stored with, defined alongside the other Agent-scoped
+            # constants above log().
+            "REOFFER_TS_NUDGE_SECONDS = 0.001",
+            "import ctypes",
+            "import signal",
+            "PR_SET_PDEATHSIG = 1",
+            "def _load_libc",
+            "_LIBC = _load_libc()",
+            # Final fix wave: the prctl symbol, bound eagerly next to _LIBC
+            # so no dlsym happens inside a forked child.
+            "_PRCTL = _LIBC.prctl if _LIBC is not None else None",
+            "def _pdeathsig_preexec",
+            "import traceback",
+            "def _handle_observer_error",
+            "def _start_observer",
             "class GPasteWatcher",
             "class PollingWatcher",
             "def parse_gpaste_line",
@@ -2195,7 +3652,16 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "class ClipPayloadError",
             "def encode_clip_payload",
             "def decode_clip_payload",
+            # Task 5: the image-clip codec, defined immediately after the
+            # text one it mirrors.
+            "def encode_image_payload",
+            "def decode_image_payload",
             "TYPE_CLIP_STATE = 0x02",
+            # Task 6: the clip-state kind constants, defined alongside
+            # SEND_MINE/WAIT_FOR_PEER/DO_NOTHING, just above ClipStateError.
+            'KIND_TEXT = "text"',
+            'KIND_IMAGE = "image"',
+            "_KNOWN_KINDS = (KIND_TEXT, KIND_IMAGE)",
             "class ClipStateError",
             "def encode_clip_state",
             "def _is_sha256_hex",
@@ -2215,6 +3681,15 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def announce_clip_state",
             "SKEW_WARN_SECONDS = 5.0",
             "def skew_log_line",
+            # Task 7: the one canonical clipboard read, and its longer
+            # image timeout, defined alongside SUBPROCESS_TIMEOUT and
+            # WaylandClipboard.
+            "IMAGE_SUBPROCESS_TIMEOUT = 10",
+            "def choose_kind",
+            # Task 7, Fix round 1: the duration-logging gate's two
+            # thresholds, defined alongside IMAGE_SUBPROCESS_TIMEOUT.
+            "SLOW_READ_SECONDS = 1.0",
+            "SLOW_IMAGE_READ_SECONDS = 3.0",
         ):
             with self.subTest(needle=needle):
                 self.assertLess(

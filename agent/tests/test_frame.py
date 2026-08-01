@@ -5,16 +5,24 @@ import unittest
 
 from agent_under_test import (
     Agent,
+    KIND_IMAGE,
+    MAX_IMAGE_BYTES,
+    MAX_PAYLOAD_BYTES,
+    MAX_TEXT_BYTES,
     OversizedFrame,
     PROTOCOL_VERSION,
     SKEW_WARN_SECONDS,
+    TIMESTAMP_BYTES,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
     TYPE_HELLO,
+    TYPE_IMAGE_CLIP,
     UnknownFrameType,
+    _KNOWN_TYPES,
     decode_frame,
     encode_clip_payload,
     encode_frame,
+    encode_image_payload,
     skew_log_line,
 )
 
@@ -60,13 +68,14 @@ class TestFrame(unittest.TestCase):
         self.assertEqual(decode_frame(buffer), (TYPE_CLIP, b""))
 
     def test_max_payload_boundary_incomplete(self):
-        # Frame declaring exactly MAX_PAYLOAD_BYTES (4194304) is incomplete, not oversized
-        buffer = bytearray(b"\x00\x40\x00\x00\x00")
+        # Frame declaring exactly MAX_PAYLOAD_BYTES (8388608, this task's new
+        # frame cap -- see TestV3Constants) is incomplete, not oversized
+        buffer = bytearray(b"\x00\x80\x00\x00\x00")
         self.assertIsNone(decode_frame(buffer))
 
     def test_max_payload_boundary_exceeded(self):
-        # Frame declaring MAX_PAYLOAD_BYTES + 1 (4194305) is oversized
-        buffer = bytearray(b"\x00\x40\x00\x01\x00")
+        # Frame declaring MAX_PAYLOAD_BYTES + 1 (8388609) is oversized
+        buffer = bytearray(b"\x00\x80\x00\x01\x00")
         with self.assertRaises(OversizedFrame):
             decode_frame(buffer)
 
@@ -89,8 +98,8 @@ class TestFrame(unittest.TestCase):
         self.assertEqual(decode_frame(buffer), (TYPE_CLIP_STATE, b"state"))
         self.assertEqual(len(buffer), 0)
 
-    def test_protocol_version_is_bumped_to_v2(self):
-        self.assertEqual(PROTOCOL_VERSION, 2)
+    def test_protocol_version_is_bumped_to_v3(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
 
     def test_hello_payload_contains_sent_at_as_a_number(self):
         # Checks only what we SEND: parse the built payload directly rather
@@ -102,12 +111,75 @@ class TestFrame(unittest.TestCase):
                                "sent_at must be a JSON number, not a string")
 
 
+class TestV3Constants(unittest.TestCase):
+    """Task 4: the frame cap and the two content limits are three separate
+    numbers that happen to share two values today (see the comment on the
+    constants themselves in clipwire-agent.py). Bare names here, not an
+    `agent.` prefix -- unlike test_watcher.py (which binds the local name
+    `agent` to `Agent(...)` instances at a dozen call sites), this file
+    imports individual names from agent_under_test and uses them bare, and
+    there is no module-level `agent` alias here to hang a dotted lookup off.
+    """
+
+    def test_the_frame_cap_is_larger_than_either_content_limit(self):
+        self.assertEqual(MAX_PAYLOAD_BYTES, 8388608)
+        self.assertEqual(MAX_TEXT_BYTES, 4194304)
+        self.assertEqual(MAX_IMAGE_BYTES, 4194304)
+        self.assertGreater(MAX_PAYLOAD_BYTES,
+                           MAX_IMAGE_BYTES + TIMESTAMP_BYTES,
+                           "a maximum-size image plus its ts must fit in a frame")
+
+    def test_the_image_clip_type_is_known(self):
+        self.assertEqual(TYPE_IMAGE_CLIP, 0x03)
+        self.assertIn(TYPE_IMAGE_CLIP, _KNOWN_TYPES)
+
+    def test_the_protocol_version_is_three(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
+
+
+class TestImageClipDispatch(unittest.TestCase):
+    """Adding TYPE_IMAGE_CLIP to _KNOWN_TYPES removed decode_frame's
+    UnknownFrameType raise for 0x03: before that, a stray 0x03 tore the
+    connection down loudly, caught by main()'s `except FrameError` and
+    logged as "protocol error: ...". on_frame's dispatch is an if/elif with
+    no else, so a byte that decode_frame now hands over and on_frame has no
+    branch for vanishes in total silence -- nothing reaches stderr, the one
+    stream this agent's diagnostics depend on.
+
+    That hole was held shut by a placeholder log line until the dispatch
+    became real. This test is what stops it reopening: it asserts the frame
+    reaches a handler that DOES something with it, which a dropped branch
+    cannot fake. What the handler then does with an image is
+    test_lifecycle.py's TestImagesEndToEndOnThePC; all this class asks is
+    that 0x03 is dispatched at all.
+
+    The pending phase is the shape that answers it without a clipboard:
+    this agent starts PHASE_PENDING (no Wayland session yet -- the ordinary
+    state on any reconnect before login), where every inbound clip is
+    queued rather than applied."""
+
+    def test_an_image_clip_reaches_a_handler_rather_than_being_dropped(self):
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(), clipboard=None)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        payload = encode_image_payload(1000.0, b"\x89PNG-from-the-peer")
+
+        agent.on_frame(TYPE_IMAGE_CLIP, payload)
+
+        self.assertEqual(sent, [], "an inbound clip is applied, never answered")
+        self.assertEqual(agent.pending_clip, payload,
+                         "0x03 must reach the clip handler, not fall off the dispatch")
+        self.assertEqual(agent.pending_clip_kind, KIND_IMAGE,
+                         "and carry the codec it belongs to, since the two wire "
+                         "shapes are indistinguishable")
+
+
 class TestSkewLogLine(unittest.TestCase):
     """The pure half of skew reporting: value in, log line (or None) out.
 
     Mirrors Sources/clipwire/main.swift's skewLogLine, whose own tests in
     AgentStatusTests.swift assert the same strings -- the two log lines are
-    meant to be byte-identical, the way the two "over the frame cap" lines
+    meant to be byte-identical, the way the two "over the text limit" lines
     already are.
     """
 

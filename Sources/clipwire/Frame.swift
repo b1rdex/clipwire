@@ -10,8 +10,18 @@ import Foundation
 // Namespacing them as `static let` makes them swift_once-guarded regardless of
 // entry-point status. This was scoped to Task 1: main.swift exists now, so
 // Frame.swift is no longer the main file and this hazard no longer applies here.
+//
+// Three separate bounds, and they must stay separate even while two of them
+// hold the same number. maxPayloadBytes is what Frame.decode enforces; the
+// two content limits are what senders (Pasteboard.swift, main.swift) enforce
+// BEFORE wrapping a body in its 8-byte timestamp (ClipPayloadConstants.
+// timestampBytes). v2 used one constant for all of it, which made a
+// maximum-size image unsendable while looking like it was within the limit:
+// a 4 MiB image plus its timestamp does not fit a 4 MiB frame cap.
 enum FrameConstants {
-    static let maxPayloadBytes = 4_194_304
+    static let maxPayloadBytes = 8_388_608
+    static let maxTextBytes = 4_194_304
+    static let maxImageBytes = 4_194_304
     static let headerBytes = 5
 }
 
@@ -19,6 +29,7 @@ enum FrameType: UInt8 {
     case hello = 0x00
     case clip = 0x01
     case clipState = 0x02
+    case imageClip = 0x03
 }
 
 enum FrameError: Error, Equatable {

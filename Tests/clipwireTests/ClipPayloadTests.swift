@@ -73,3 +73,74 @@ final class ClipPayloadTests: XCTestCase {
         XCTAssertEqual(try ClipPayload.decode(ClipPayload(ts: ts, text: "x").encode()).ts, ts)
     }
 }
+
+/// Mirrors Python's `TestImagePayload` in agent/tests/test_clip_payload.py.
+/// `ImagePayload` is a namespace of two static functions, not a value type
+/// like `ClipPayload`: neither caller needs to hold a ts/png pair between
+/// encode and decode, so both directions round-trip through plain `Data`,
+/// matching the free-function shape of encode_image_payload/decode_image_payload.
+final class ImagePayloadTests: XCTestCase {
+    func testRoundTrip() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + Data("body".utf8)
+        let encoded = try ImagePayload.encode(ts: 1785400000.5, png: png)
+        let decoded = try ImagePayload.decode(encoded)
+        XCTAssertEqual(decoded.ts, 1785400000.5)
+        XCTAssertEqual(decoded.png, png)
+    }
+
+    func testLayoutIsTimestampThenBytes() throws {
+        let encoded = try ImagePayload.encode(ts: 1.0, png: Data([0x01, 0x02]))
+        XCTAssertEqual(encoded.count, 8 + 2)
+        // 1.0 as IEEE-754 big-endian is 3F F0 00 00 00 00 00 00
+        XCTAssertEqual([UInt8](encoded.prefix(8)),
+                       [0x3F, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        XCTAssertEqual([UInt8](encoded.suffix(2)), [0x01, 0x02])
+    }
+
+    /// Encode does NOT reject an empty body -- only decode does, mirroring
+    /// Python's test_an_empty_body_is_rejected, which encodes successfully
+    /// and only sees ClipPayloadError on the following decode. The encode
+    /// call is hoisted onto its own line rather than nested inside
+    /// `XCTAssertThrowsError`: nesting it there would let an (unwanted) throw
+    /// from `encode` itself satisfy the assertion without `decode` ever
+    /// running, silently passing this test for the wrong reason.
+    func testAnEmptyBodyIsRejectedOnDecode() throws {
+        let encoded = try ImagePayload.encode(ts: 1.0, png: Data())
+        XCTAssertThrowsError(try ImagePayload.decode(encoded)) { error in
+            guard case ClipPayloadError.emptyBody = error else {
+                return XCTFail("expected .emptyBody, got \(error)")
+            }
+        }
+    }
+
+    func testAPayloadShorterThanTheTimestampIsRejected() {
+        XCTAssertThrowsError(try ImagePayload.decode(Data([0x00, 0x00, 0x00]))) { error in
+            guard case ClipPayloadError.tooShort(3) = error else {
+                return XCTFail("expected .tooShort(3), got \(error)")
+            }
+        }
+    }
+
+    func testANonFiniteTimestampIsRejectedOnBothSides() throws {
+        for ts in [Double.nan, .infinity, -.infinity] {
+            XCTAssertThrowsError(try ImagePayload.encode(ts: ts, png: Data("x".utf8)),
+                                 "encode must reject a non-finite ts: \(ts)") { error in
+                guard case ClipPayloadError.nonFiniteTimestamp = error else {
+                    return XCTFail("expected .nonFiniteTimestamp, got \(error)")
+                }
+            }
+        }
+        // ... and on decode, since the wire is peer-controlled: build the
+        // payload by hand rather than through `encode`, which now refuses
+        // to produce it.
+        var bits = Double.nan.bitPattern.bigEndian
+        var payload = Data()
+        withUnsafeBytes(of: &bits) { payload.append(contentsOf: $0) }
+        payload.append(contentsOf: Array("x".utf8))
+        XCTAssertThrowsError(try ImagePayload.decode(payload)) { error in
+            guard case ClipPayloadError.nonFiniteTimestamp = error else {
+                return XCTFail("expected .nonFiniteTimestamp, got \(error)")
+            }
+        }
+    }
+}

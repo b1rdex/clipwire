@@ -13,6 +13,7 @@ from unittest import mock
 
 from agent_under_test import (
     Agent,
+    KIND_TEXT,
     PROTOCOL_VERSION,
     TYPE_CLIP,
     TYPE_CLIP_STATE,
@@ -246,7 +247,22 @@ class ScriptedClipboard:
     def read(self):
         return None
 
-    def write(self, data):
+    def probe(self):
+        """The poll loop's own entry point, and NOT dead code here:
+        TestClipboardTransitionLogging leaves make_watcher unpatched, so a
+        real PollingWatcher runs against this double. Without probe(), every
+        tick raised AttributeError into _handle_observer_error, which logs
+        and carries on -- so the loop was silently dead for the whole test
+        and its assertions passed on the frames alone. They still
+        discriminate, but any FUTURE assertion about poll behaviour in this
+        file would have passed vacuously.
+
+        None, matching read(): this double is about the phase machine, and
+        a clipboard that reports nothing is what keeps the poll from
+        signalling into assertions that are not about it."""
+        return None
+
+    def write(self, kind, data):
         pass
 
 
@@ -383,10 +399,20 @@ class ScriptedClipboardWithContent:
             self._write_fd = None
 
     def read(self):
-        return self._read_value
+        # Kind-aware since Task 7 -- always KIND_TEXT here, the only kind
+        # this file's own TestClipStateOrderingAcrossRealDispatch constructs
+        # one of these with.
+        return (KIND_TEXT, self._read_value) if self._read_value else None
 
-    def write(self, data):
-        self.written.append(data)
+    def probe(self):
+        """This double's tests DO patch make_watcher, so nothing reaches
+        the poll loop today -- present because both doubles model the same
+        two-method clipboard contract, and the one above was already
+        silently failing every tick for want of it."""
+        return self.read()
+
+    def write(self, kind, data):
+        self.written.append((kind, data))
 
 
 class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
@@ -433,7 +459,7 @@ class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
         clip_state_path = os.path.join(tmp.name, "clip-state.json")
 
         hash_a, ts_a = sha256_hex(b"A"), 100.0
-        save_clip_state(hash_a, ts_a, path=clip_state_path)
+        save_clip_state(hash_a, ts_a, KIND_TEXT, path=clip_state_path)
 
         original_interval = clipwire_agent.CLIPBOARD_RECHECK_SECONDS
         clipwire_agent.CLIPBOARD_RECHECK_SECONDS = 0.01
@@ -448,7 +474,7 @@ class TestClipStateOrderingAcrossRealDispatch(unittest.TestCase):
         # read and dispatched on the very first loop iteration, well before
         # the clipboard is ever checked. False on the first ready() call
         # guarantees _on_clip_state runs while still PHASE_PENDING.
-        peer_announcement = encode_frame(TYPE_CLIP_STATE, encode_clip_state(hash_a, ts_a))
+        peer_announcement = encode_frame(TYPE_CLIP_STATE, encode_clip_state(hash_a, ts_a, KIND_TEXT))
         os.write(write_fd, peer_announcement)
 
         clipboard = ScriptedClipboardWithContent(

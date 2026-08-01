@@ -3,10 +3,28 @@ import XCTest
 @testable import clipwire
 
 final class FreshnessTests: XCTestCase {
+    /// fixtures/freshness.json's `mine`/`peer` rows are (sha256, ts) only --
+    /// deliberately, and permanently: Task 6 confirmed `resolveFreshness`'s
+    /// FORMULA does not read `kind` at all (see its own doc comment), and
+    /// the brief is explicit that no edit to this fixture is ever the right
+    /// fix. Decoded into this lightweight type rather than `ClipState`
+    /// itself, so this fixture stays exempt from `ClipState.init(from:)`'s
+    /// kind/hash equivalence rule -- a rule that exists to catch a REAL
+    /// clip-state payload missing its kind (a v2 store file, or a malformed
+    /// wire frame), not this deliberately kind-less micro-fixture. `asClipState`
+    /// builds the value `resolveFreshness` actually takes, via `ClipState`'s
+    /// plain memberwise init (no validation) rather than its decoder.
+    struct RawState: Decodable {
+        let sha256: String?
+        let ts: Double
+
+        var asClipState: ClipState { ClipState(sha256: sha256, ts: ts, kind: nil) }
+    }
+
     struct Case: Decodable {
         let name: String
-        let mine: ClipState
-        let peer: ClipState
+        let mine: RawState
+        let peer: RawState
         let expect: String
     }
     struct Fixtures: Decodable { let cases: [Case] }
@@ -45,7 +63,7 @@ final class FreshnessTests: XCTestCase {
                 XCTFail("unknown expected decision '\(c.expect)' for \(c.name)")
                 continue
             }
-            let actual = resolveFreshness(mine: c.mine, peer: c.peer)
+            let actual = resolveFreshness(mine: c.mine.asClipState, peer: c.peer.asClipState)
             XCTAssertEqual(actual, expected, "resolveFreshness mismatch for \(c.name)")
         }
     }
@@ -60,8 +78,8 @@ final class FreshnessTests: XCTestCase {
     /// twice, per the brief and the design doc.
     func testDecisionIsComplementaryWhenSidesSwap() throws {
         for c in try loadFixtures() {
-            let mineView = resolveFreshness(mine: c.mine, peer: c.peer)
-            let peerView = resolveFreshness(mine: c.peer, peer: c.mine)
+            let mineView = resolveFreshness(mine: c.mine.asClipState, peer: c.peer.asClipState)
+            let peerView = resolveFreshness(mine: c.peer.asClipState, peer: c.mine.asClipState)
             let expectedPeerView: FreshnessDecision
             switch mineView {
             case .sendMine: expectedPeerView = .waitForPeer
@@ -76,10 +94,10 @@ final class FreshnessTests: XCTestCase {
         // 64 lowercase hex: the only shape `decodePayload` accepts, and the
         // only shape `sha256Hex` -- hence the wire -- ever produces.
         let withHash = ClipState(sha256: String(repeating: "deadbeefcafe0123", count: 4),
-                                 ts: 1785400000.5)
+                                 ts: 1785400000.5, kind: .text)
         XCTAssertEqual(try ClipState.decodePayload(withHash.encodePayload()), withHash)
 
-        let empty = ClipState(sha256: nil, ts: 0)
+        let empty = ClipState(sha256: nil, ts: 0, kind: nil)
         XCTAssertEqual(try ClipState.decodePayload(empty.encodePayload()), empty)
     }
 
@@ -102,7 +120,7 @@ final class FreshnessTests: XCTestCase {
             "A\u{030A}" + String(repeating: "0", count: 62),  // its canonical decomposition
         ]
         for value in bad {
-            let payload = try ClipState(sha256: value, ts: 1).encodePayload()
+            let payload = try ClipState(sha256: value, ts: 1, kind: .text).encodePayload()
             XCTAssertThrowsError(try ClipState.decodePayload(payload),
                                  "must reject a sha256 of \(value.debugDescription)") { error in
                 guard case ClipStateError.malformedSHA256 = error else {
@@ -117,9 +135,9 @@ final class FreshnessTests: XCTestCase {
     /// unreadable clipboard.
     func testDecodePayloadAcceptsARealDigestAndNull() throws {
         let real = sha256Hex(Data("anything at all".utf8))
-        XCTAssertEqual(try ClipState.decodePayload(ClipState(sha256: real, ts: 1).encodePayload()).sha256,
+        XCTAssertEqual(try ClipState.decodePayload(ClipState(sha256: real, ts: 1, kind: .text).encodePayload()).sha256,
                        real)
-        XCTAssertNil(try ClipState.decodePayload(ClipState(sha256: nil, ts: 1).encodePayload()).sha256)
+        XCTAssertNil(try ClipState.decodePayload(ClipState(sha256: nil, ts: 1, kind: nil).encodePayload()).sha256)
     }
 
     /// Why the guard above is not defensive typing. Pinned by execution
@@ -135,8 +153,8 @@ final class FreshnessTests: XCTestCase {
     func testSwiftAndPythonOnlyAgreeOnHashOrderOverHex() {
         XCTAssertEqual("\u{00C5}", "A\u{030A}",
                        "Swift's String is canonically equivalent here; Python's str is not")
-        XCTAssertEqual(resolveFreshness(mine: ClipState(sha256: "A\u{030A}", ts: 1),
-                                        peer: ClipState(sha256: "\u{00C5}", ts: 1)),
+        XCTAssertEqual(resolveFreshness(mine: ClipState(sha256: "A\u{030A}", ts: 1, kind: .text),
+                                        peer: ClipState(sha256: "\u{00C5}", ts: 1, kind: .text)),
                        .doNothing,
                        "this side sees agreement where the PC sees a conflict it expects US to lose")
     }
@@ -155,16 +173,15 @@ final class FreshnessTests: XCTestCase {
     /// cause, before anything reaches the wire.
     func testEncodePayloadThrowsOnNonFiniteTimestamp() {
         for badTs in [Double.nan, .infinity, -.infinity] {
-            XCTAssertThrowsError(try ClipState(sha256: "aa", ts: badTs).encodePayload(),
+            XCTAssertThrowsError(try ClipState(sha256: "aa", ts: badTs, kind: .text).encodePayload(),
                                   "ts=\(badTs) must not silently encode as {}")
         }
     }
 
-    /// Pins `ClipState.decodePayload` against the *existing* `clip-state`
-    /// vector in `fixtures/frames.json`, pinned decode-only back in Task 4
-    /// specifically because this codec did not exist yet ("there is no
-    /// ClipStatePayload codec yet; that lands in a later task" -- this task).
-    /// That vector is the payload this codec must decode through -- checked
+    /// Pins `ClipState.decodePayload` against the type-2 vectors in
+    /// `fixtures/frames.json`: the original null-hash/null-kind vector
+    /// (pinned decode-only back in Task 4, before this codec existed) and
+    /// the real-hash/text-kind vector Task 6 adds alongside it. Checked
     /// directly against the fixture file, not assumed from reading its shape.
     func testClipStateDecodesExistingFrameFixture() throws {
         struct FrameCase: Decodable {
@@ -179,12 +196,70 @@ final class FreshnessTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("fixtures/frames.json"))
         let allCases = try JSONDecoder().decode(FrameFixtures.self, from: data).cases
         let clipStateCases = allCases.filter { $0.type == FrameType.clipState.rawValue }
-        XCTAssertEqual(clipStateCases.count, 1, "expected exactly 1 type-2 fixture case in frames.json")
-        guard let clipState = clipStateCases.first else { return }
+        XCTAssertEqual(clipStateCases.count, 2, "expected exactly 2 type-2 fixture cases in frames.json")
+        let byName = Dictionary(uniqueKeysWithValues: clipStateCases.map { ($0.name, $0) })
 
-        let decoded = try ClipState.decodePayload(hex(clipState.payload_hex))
-        XCTAssertNil(decoded.sha256, "clip-state fixture's sha256 must decode to nil")
-        XCTAssertEqual(decoded.ts, 1.0)
+        guard let empty = byName["clip-state"] else { return XCTFail("clip-state fixture case missing") }
+        let decodedEmpty = try ClipState.decodePayload(hex(empty.payload_hex))
+        XCTAssertNil(decodedEmpty.sha256, "clip-state fixture's sha256 must decode to nil")
+        XCTAssertEqual(decodedEmpty.ts, 1.0)
+        XCTAssertNil(decodedEmpty.kind, "a nil hash must carry a nil kind")
+
+        guard let texted = byName["clip-state-text"] else { return XCTFail("clip-state-text fixture case missing") }
+        let decodedText = try ClipState.decodePayload(hex(texted.payload_hex))
+        XCTAssertEqual(decodedText.sha256, String(repeating: "ab", count: 32))
+        XCTAssertEqual(decodedText.ts, 1.0)
+        XCTAssertEqual(decodedText.kind, .text)
+    }
+
+    // MARK: - Task 6: clip-state carries a kind
+
+    /// A hash alone cannot tell the two sides what they are agreeing about,
+    /// so clip-state now carries a `kind`. This does NOT touch
+    /// `resolveFreshness` itself -- the resolution formula is unchanged and
+    /// still compares only `sha256`/`ts` (see the fixture-driven tests
+    /// above, run unmodified against fixtures/freshness.json); `kind` is for
+    /// the send branch (Task 11) and the log (Task 14).
+    ///
+    /// Two validation rules, enforced at decode -- the wire is peer-
+    /// controlled input: `kind` must be nil exactly when `sha256` is nil,
+    /// and otherwise must be one of the two known values, so an unknown
+    /// kind can never reach the send branch that switches on it.
+
+    func testRoundTripCarriesTheKind() throws {
+        for kind in [ClipKind.text, .image] {
+            let state = ClipState(sha256: String(repeating: "ab", count: 32), ts: 1.5, kind: kind)
+            XCTAssertEqual(try ClipState.decodePayload(state.encodePayload()), state)
+        }
+    }
+
+    func testANullHashCarriesANullKind() throws {
+        let state = ClipState(sha256: nil, ts: 1.5, kind: nil)
+        XCTAssertEqual(try ClipState.decodePayload(state.encodePayload()), state)
+    }
+
+    /// An unknown kind must not reach the send branch, which switches on
+    /// it. Built as raw JSON, not through `ClipState`/`ClipKind`, since
+    /// `ClipKind` cannot represent an unknown value by construction --
+    /// exactly the point: this is peer-controlled input, not something this
+    /// side's own encoder could ever produce.
+    func testAnUnknownKindIsRejected() throws {
+        let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": "video"}"#.utf8)
+        XCTAssertThrowsError(try ClipState.decodePayload(payload))
+    }
+
+    func testAHashWithoutAKindIsRejected() throws {
+        let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": null}"#.utf8)
+        XCTAssertThrowsError(try ClipState.decodePayload(payload))
+    }
+
+    /// The other direction of the same rule: a v2 store file (real hash, no
+    /// kind at all) is the practical case that matters
+    /// (ClipStateStoreTests.swift's testAV2StoreFileIsRejectedNotLoadedAsKindless),
+    /// but the rule itself is symmetric, so both directions are pinned here.
+    func testAKindWithoutAHashIsRejected() throws {
+        let payload = Data(#"{"sha256": null, "ts": 1.5, "kind": "text"}"#.utf8)
+        XCTAssertThrowsError(try ClipState.decodePayload(payload))
     }
 
     private func hex(_ s: String) -> Data {
