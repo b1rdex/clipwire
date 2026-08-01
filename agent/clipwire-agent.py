@@ -251,7 +251,17 @@ def decode_clip_state(payload):
             "malformed clip-state payload: sha256 must be 64 lowercase hex characters"
         )
     ts = parsed.get("ts")
-    if not isinstance(ts, (int, float)):
+    # `bool` is a SUBCLASS of int in Python, so a bare isinstance(ts, (int,
+    # float)) admits JSON `true` and hands back 1.0 -- a real, finite,
+    # comparable timestamp from 1970, manufactured out of a field the peer
+    # controls, on the one input class this decoder exists to police. Swift's
+    # own decoder throws typeMismatch for the same payload, so without this
+    # the two sides disagree about whether a clip-state frame is even
+    # well-formed: this one reconciles against a fabricated age while the Mac
+    # closes on the frame. skew_log_line, further down this file, already
+    # spells the same guard out explicitly for the same reason; this mirrors
+    # its wording rather than inventing a second spelling of one rule.
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
         raise ClipStateError("malformed clip-state payload: ts must be a number")
     try:
         finite = math.isfinite(ts)
@@ -509,10 +519,13 @@ class Agent:
         # under BOTH kinds: KIND_TEXT on its own text path, and KIND_IMAGE
         # through _consume_image_reoffer, which needs it to tell our own
         # write's echo apart from the re-offer that follows it. So the kind
-        # half is load-bearing rather than merely ready: _write_clip,
-        # _consume_image_reoffer, clipboard_became_ready's connect-time seed
-        # and _observe_local_change's own image send all produce a
-        # KIND_IMAGE pair.
+        # half is load-bearing rather than merely ready. FIVE sites produce a
+        # KIND_IMAGE pair: _write_clip (an applied image), _consume_image_reoffer
+        # (GPaste's re-encode of it), clipboard_became_ready's connect-time
+        # seed, _observe_local_change's own image send, and
+        # _resolve_clip_state's SEND_MINE branch, which is the one an earlier
+        # count of "four" missed -- it was added with the send branch's
+        # verification, one task after this comment was written.
         #
         # "Never the content itself" includes text, which Task 9 briefly kept
         # a companion _last_seen_text for, so _resolve_clip_state's SEND_MINE
@@ -948,8 +961,10 @@ class Agent:
         # one: the pump can fire long before that poll's first tick, so the
         # seed here is still what stands between a spurious connect-time
         # signal and a clobber. Read outside the lock, same as _local_change:
-        # clipboard.read() is a wl-paste round trip that can take up to
-        # SUBPROCESS_TIMEOUT=3s.
+        # clipboard.read() is up to TWO wl-paste round trips, and on an image
+        # clipboard that is SUBPROCESS_TIMEOUT (3s, --list-types) plus
+        # IMAGE_SUBPROCESS_TIMEOUT (10s, the body) -- 13 seconds, not the 3
+        # this line claimed while read() was still text-only.
         #
         # Trade-off, accepted deliberately: re-copying on the PC to force a
         # push no longer works as the FIRST action after a connect. That is
@@ -1250,12 +1265,15 @@ class Agent:
 
     def _observe_local_change(self):
         # Snapshot what we expect and the generation it belongs to BEFORE
-        # reading the clipboard. clipboard.read() is a wl-paste round trip
-        # that can take up to SUBPROCESS_TIMEOUT=3s, and _write_clip() can
-        # land on the main thread at any point during that window. Holding
-        # _echo_lock across the read would block _write_clip() for the
-        # whole round trip, so it is released before the read and
-        # re-acquired only to compare afterward.
+        # reading the clipboard. clipboard.read() is up to TWO wl-paste round
+        # trips -- on an image clipboard, SUBPROCESS_TIMEOUT (3s,
+        # --list-types) plus IMAGE_SUBPROCESS_TIMEOUT (10s, the body), so 13
+        # seconds rather than the 3 this line claimed while read() was still
+        # text-only -- and _write_clip() can land on the main thread at any
+        # point during that window. Holding _echo_lock across the read would
+        # block _write_clip() for the whole round trip, so it is released
+        # before the read and re-acquired only to compare afterward. The
+        # longer that window got, the more this mattered, not less.
         #
         # This method is NOT vulnerable to the wl-copy async-write race that
         # clipboard_became_ready's announce step and _on_clip_state's
@@ -1439,8 +1457,9 @@ class Agent:
         # KIND_TEXT (the guard above already returned for any other kind),
         # so the kind half of THIS side is always KIND_TEXT. last_seen's own
         # kind is not fixed at all: an applied image, a re-offer, a locally
-        # sent image and the connect-time seed each put a KIND_IMAGE pair
-        # there. Comparing kind alongside hash, rather than hash alone, is
+        # sent image, the connect-time seed and _resolve_clip_state's own
+        # SEND_MINE branch each put a KIND_IMAGE pair there -- five sites,
+        # enumerated in full at _last_seen's own comment in __init__. Comparing kind alongside hash, rather than hash alone, is
         # what keeps a hash coincidence between two DIFFERENT kinds from
         # silently reading as no-change.
         # Hashed once, here, and reused below for both the persisted state
@@ -2354,7 +2373,17 @@ def parse_gpaste_line(line):
     return "Update" in line and GPASTE_OBJECT_PATH in line
 
 
-import ctypes
+try:
+    import ctypes
+except ImportError:
+    # ctypes is standard library but it is an EXTENSION module, so a
+    # stripped or unusual build can genuinely lack it -- and this file is
+    # copied to whatever Python the PC happens to have. Everything ctypes
+    # buys here is one belt on top of stop()'s existing braces, so an agent
+    # that cannot import it must still start; taking the whole module down
+    # at import over an optional hardening would be far worse than losing
+    # the hardening.
+    ctypes = None
 import signal
 
 PR_SET_PDEATHSIG = 1
@@ -2363,14 +2392,28 @@ PR_SET_PDEATHSIG = 1
 def _load_libc():
     """libc for prctl, or None where it is unavailable.
 
-    ctypes is standard library, so this costs no dependency. Returns None on
-    macOS and anywhere else without a usable libc: the agent only ever runs on
-    the PC, but the test suite runs on both, and an import-time failure would
-    take the whole module down.
+    Returns None on macOS and anywhere else without a usable libc: the agent
+    only ever runs on the PC, but the test suite runs on both, and an
+    import-time failure would take the whole module down.
+
+    The `ctypes is None` check is not defensive typing, it is the other half
+    of the guarded import above -- and the guard that is easy to get wrong.
+    With `ctypes` bound to None, `ctypes.CDLL(...)` raises AttributeError,
+    which is neither ImportError nor OSError: written without this line, the
+    module-level try/except would look like it handled a missing ctypes while
+    actually converting an ImportError into an AttributeError two lines
+    later, and the module would still fail to import.
+
+    OSError alone below, and nothing else: `ctypes.CDLL` reports a library it
+    cannot load as OSError. An unavailable ctypes is handled at the import,
+    which is where that failure actually lives, rather than caught a second
+    time here where it can no longer arrive.
     """
+    if ctypes is None:
+        return None
     try:
         return ctypes.CDLL("libc.so.6", use_errno=True)
-    except (ImportError, OSError):
+    except OSError:
         return None
 
 
@@ -2389,6 +2432,22 @@ def _load_libc():
 # Resolving here means the import already happened before any thread or fork
 # existed, so _pdeathsig_preexec itself touches no lock at all.
 _LIBC = _load_libc()
+# And the SYMBOL, resolved here too, for the same reason and against the same
+# hazard one layer down. ctypes binds a CDLL's symbols LAZILY: `_LIBC.prctl`
+# performs a dlsym on first access and caches the result on the library
+# object, so with the lookup left inside _pdeathsig_preexec the FIRST forked
+# child was the one paying for it -- inside preexec_fn. dlsym takes the
+# dynamic loader's lock; fork() clones only the calling thread and releases
+# nothing another thread holds, so a child forked at the wrong instant
+# inherits that lock held forever and wedges before it ever execs. That is
+# precisely the stuck-gdbus-child symptom this whole mechanism exists to
+# remove, reintroduced by a subtler path than the import _LIBC already
+# closed. Resolved on the only thread that exists at import time, so
+# _pdeathsig_preexec touches no lock at all.
+#
+# None exactly when _LIBC is None, so the function below has one thing to
+# check rather than two.
+_PRCTL = _LIBC.prctl if _LIBC is not None else None
 
 
 def _pdeathsig_preexec():
@@ -2399,10 +2458,14 @@ def _pdeathsig_preexec():
     channel drops and no cleanup path runs. terminate() is also not enough on
     its own -- glib installs SIG_IGN for SIGPIPE, so the orphan survives its
     stdout closing and lingers until the session ends.
+
+    Reads _PRCTL, never `_LIBC.prctl`: every operation in this function has
+    to be one that a forked child of a threaded process can safely perform,
+    and an attribute lookup on a CDLL is not one of them. See _PRCTL.
     """
-    if _LIBC is None:
+    if _PRCTL is None:
         return
-    _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    _PRCTL(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
     # The parent can die between the fork above and the prctl call just made,
     # in which case the signal we just asked for will never be delivered and
     # this child would outlive it anyway. getppid() == 1 means exactly that.
@@ -2715,9 +2778,13 @@ class GPasteWatcher:
             #
             # Counting still happens BEFORE the dispatch, and now cannot be
             # delayed by anything the handler does: on_change is
-            # Agent._local_change, whose wl-paste round trip can take up to
-            # SUBPROCESS_TIMEOUT=3s, and a safety-net tick landing inside that
-            # window must not see an unmoved counter on a live source.
+            # Agent._local_change, whose clipboard read is up to two wl-paste
+            # round trips -- SUBPROCESS_TIMEOUT (3s) for --list-types plus
+            # IMAGE_SUBPROCESS_TIMEOUT (10s) for an image body, so 13 seconds,
+            # not the 3 this line claimed while that read was text-only -- and
+            # a safety-net tick landing inside that window must not see an
+            # unmoved counter on a live source. Thirteen seconds is a large
+            # fraction of a 30-second tick, which is the whole argument.
             for line in self._process.stdout:
                 if self._stop.is_set():
                     return
@@ -2770,8 +2837,12 @@ class GPasteWatcher:
         # thread left parked here can never be reached again and every Wayland
         # flap leaks another one. Deliberately not JOINED, though: stop() runs
         # on the main protocol loop, and waiting on a worker that is inside
-        # _local_change's wl-paste round trip would stall it for up to
-        # SUBPROCESS_TIMEOUT.
+        # _local_change's clipboard read would stall it for up to
+        # SUBPROCESS_TIMEOUT + IMAGE_SUBPROCESS_TIMEOUT -- 13 seconds on an
+        # image clipboard, since that read is --list-types followed by the
+        # body. This is a promise about how long clipboard_lost() can block
+        # the protocol loop, not a passing remark, and 13s of a frozen main
+        # loop is a different proposition from the 3s it used to say.
         self._event.set()
         self._safety_net.stop()
         if self._process:
@@ -2851,8 +2922,9 @@ class PollingWatcher:
                     # AFTER the signal, which used to be load-bearing and is
                     # now merely conventional -- say so rather than leave the
                     # old claim standing. While this loop CALLED on_change,
-                    # that call (a wl-paste round trip of up to
-                    # SUBPROCESS_TIMEOUT=3s, plus the send) was the grace
+                    # that call (a clipboard read of up to SUBPROCESS_TIMEOUT
+                    # + IMAGE_SUBPROCESS_TIMEOUT = 13s on an image clipboard,
+                    # --list-types then the body, plus the send) was the grace
                     # period the event source got to deliver the signal for
                     # this very change before _observe_tick judged it missing.
                     # set() takes microseconds, so that grace is gone and the

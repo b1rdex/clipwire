@@ -198,6 +198,25 @@ class TestClipStateCodec(unittest.TestCase):
         with self.assertRaises(ClipStateError):
             decode_clip_state(('{"sha256": "%s"}' % HASH_A).encode())
 
+    def test_decode_rejects_a_boolean_timestamp(self):
+        """`bool` is a subclass of `int` in Python, so a bare
+        `isinstance(ts, (int, float))` admits JSON `true` and decodes it as
+        1.0 -- a real, finite, comparable timestamp from 1970, silently
+        manufactured out of a field the peer controls. Swift's own decoder
+        throws `typeMismatch` for the same payload, so without this guard
+        the two sides disagree about whether a clip-state frame is even
+        well-formed: this one would reconcile against a fabricated age
+        while the Mac closes on the frame.
+
+        skew_log_line, in this same file, already spells `isinstance(...,
+        bool)` out explicitly for exactly this class of peer-controlled
+        input. This mirrors it rather than inventing a second spelling."""
+        for literal in (b"true", b"false"):
+            with self.subTest(literal=literal):
+                payload = b'{"sha256": null, "ts": ' + literal + b', "kind": null}'
+                with self.assertRaises(ClipStateError):
+                    decode_clip_state(payload)
+
     def test_decode_rejects_non_object_payload(self):
         with self.assertRaises(ClipStateError):
             decode_clip_state(b"[1, 2, 3]")
