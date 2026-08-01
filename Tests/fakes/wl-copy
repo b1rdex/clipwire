@@ -60,7 +60,7 @@ def main(argv):
     stored, how = data, "stored"
     if state.get("substitute"):
         try:
-            stored = fake.reencode_png(data)
+            stored = fake.substitute_png(data)
             how = "substituted"
         except fake.NotAPNG as error:
             # Only images are substituted. GPaste's text mangling is a

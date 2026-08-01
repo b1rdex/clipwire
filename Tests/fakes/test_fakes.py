@@ -55,13 +55,20 @@ def chunk(kind, body):
             + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF))
 
 
-def make_png(width=6, height=4, depth=8, colour=6, phys=True, filters=(0, 1, 2, 3, 4)):
+def make_png(width=6, height=4, depth=8, colour=6, phys=True, palette=True,
+             filters=(0, 1, 2, 3, 4)):
     """A PNG carrying pHYs and sRGB, and using every scanline filter -- so a
-    re-encode that skipped the unfiltering step could not pass.
+    substitution that skipped the unfiltering step could not pass: it would
+    perturb the FILTERED bytes and the samples that came out would not be the
+    original samples plus the keystream, which is what the tests below check.
 
     The scanline bytes are arbitrary rather than a picture. What a decoder
-    gets out of them is still fully determined by the filters, which is the
-    only property being compared.
+    gets out of them is still fully determined by the filters, which is all
+    these tests need.
+
+    Colour type 3 gets a full 256-entry palette, so that indices the loop above
+    can generate (0-255) are all in range and the fixture is a valid PNG before
+    anything is done to it.
     """
     stride = (width * fake.CHANNELS[colour] * depth + 7) // 8
     raw = bytearray()
@@ -70,6 +77,8 @@ def make_png(width=6, height=4, depth=8, colour=6, phys=True, filters=(0, 1, 2, 
         raw += bytes((x * 13 + y * 7) & 0xFF for x in range(stride))
     data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(
         ">IIBBBBB", width, height, depth, colour, 0, 0, 0))
+    if colour == 3 and palette:
+        data += chunk(b"PLTE", bytes((index * 5) & 0xFF for index in range(256 * 3)))
     if phys:
         data += chunk(b"pHYs", struct.pack(">IIB", 5669, 5669, 1))   # 144 dpi
     data += chunk(b"sRGB", b"\x00")
@@ -84,6 +93,14 @@ def kinds_of(data):
         found.append(data[at + 4:at + 8].decode("ascii", "replace"))
         at += 12 + length
     return found
+
+
+def palette_of(data):
+    return next(body for kind, body in fake._chunks(data) if kind == b"PLTE")
+
+
+def header_of(data):
+    return next(body for kind, body in fake._chunks(data) if kind == b"IHDR")
 
 
 def scanlines(data):
@@ -101,63 +118,105 @@ def scanlines(data):
 
 
 class ReencodeTests(unittest.TestCase):
-    def test_the_pixels_survive(self):
-        """The one property the density fix depends on. It compares decoded
-        pixels; a fake that corrupted the image would fail that comparison
-        for the wrong reason and prove nothing."""
-        original = make_png()
-        self.assertEqual(scanlines(fake.reencode_png(original)), scanlines(original))
+    def test_every_pixel_moves(self):
+        """The property that replaced "the pixels survive", and the reason the
+        substitution was rewritten: the sample-preserving version let v3.1's
+        density fix be tuned against a model kinder than the world, and ship
+        inert. See SUBSTITUTION in fake_clipboard.py.
 
-    def test_the_pixels_survive_every_colour_type_and_depth(self):
+        Asserted as the EXACT keystream rather than as mere inequality, so this
+        still pins the unfiltering: a substitution that perturbed the filtered
+        bytes instead of the samples would differ from the original too, and
+        only equality against `_perturb(original samples)` catches it.
+        """
+        original = make_png()
+        moved = scanlines(fake.substitute_png(original))
+        self.assertEqual(moved, fake._perturb(scanlines(original)))
+        self.assertNotEqual(moved, scanlines(original))
+        self.assertTrue(all(a != b for a, b in zip(moved, scanlines(original))),
+                        "a sample that survived is a sample a comparison could match on")
+
+    def test_the_pixels_move_for_every_colour_type_and_depth(self):
+        """And the geometry survives every one of them, because the agent and
+        the harness both decode what comes out: harsher than reality is the
+        point, undecodable is not."""
         for colour in (0, 2, 4, 6):
             for depth in (8, 16):
                 with self.subTest(colour=colour, depth=depth):
                     original = make_png(depth=depth, colour=colour)
-                    self.assertEqual(scanlines(fake.reencode_png(original)),
-                                     scanlines(original))
+                    stored = fake.substitute_png(original)
+                    self.assertEqual(scanlines(stored), fake._perturb(scanlines(original)))
+                    self.assertEqual(header_of(stored), header_of(original))
+
+    def test_a_palette_image_moves_its_palette_or_is_refused(self):
+        """Colour type 3's samples are INDICES, and moving an index points it
+        past the end of PLTE -- an invalid PNG, which is the one thing this
+        substitution must never emit. So the palette moves and the indices do
+        not: every decoded pixel still changes, because every entry does.
+
+        Which makes the palette the only lever there is, so an image that
+        claims colour type 3 and carries no palette is REFUSED rather than
+        handed back. Returning it would return the same picture, silently,
+        which is the failure this substitution was rewritten to remove.
+        """
+        original = make_png(colour=3, depth=8)
+        stored = fake.substitute_png(original)
+        self.assertEqual(scanlines(stored), scanlines(original))
+        self.assertEqual(palette_of(stored), fake._perturb(palette_of(original)))
+        self.assertTrue(all(a != b for a, b in zip(palette_of(stored), palette_of(original))))
+        self.assertEqual(header_of(stored), header_of(original))
+        with self.assertRaises(fake.NotAPNG):
+            fake.substitute_png(make_png(colour=3, depth=8, palette=False))
 
     def test_the_density_is_gone(self):
         self.assertIn("pHYs", kinds_of(make_png()))
-        self.assertNotIn("pHYs", kinds_of(fake.reencode_png(make_png())))
+        self.assertNotIn("pHYs", kinds_of(fake.substitute_png(make_png())))
 
     def test_the_colour_profile_is_gone_too(self):
-        """Faithful -- GPaste drops the ICC profile as well -- and the reason
-        a fixture must not carry a non-sRGB profile: a tagged original against
-        an untagged re-encode decodes to different RGBA for a real reason that
-        looks exactly like the fix failing."""
-        self.assertNotIn("sRGB", kinds_of(fake.reencode_png(make_png())))
+        """Faithful: GPaste drops the ICC profile as well. It used to carry a
+        rule with it -- that a fixture must not be tagged Display P3, because a
+        profile difference would fail the pixel comparison for a real reason
+        that looked like the fix failing. That rule is gone with the premise it
+        protected: the comparison fails by design now."""
+        self.assertNotIn("sRGB", kinds_of(fake.substitute_png(make_png())))
 
     def test_the_geometry_is_untouched(self):
         original = make_png(width=13, height=7)
-        header = next(body for kind, body in fake._chunks(fake.reencode_png(original))
-                      if kind == b"IHDR")
-        self.assertEqual(header, next(body for kind, body in fake._chunks(original)
-                                      if kind == b"IHDR"))
+        self.assertEqual(header_of(fake.substitute_png(original)), header_of(original))
 
     def test_the_bytes_actually_differ(self):
         """A substitution that returned its input would leave the harness
         green and blind."""
         original = make_png()
-        self.assertNotEqual(fake.reencode_png(original), original)
+        self.assertNotEqual(fake.substitute_png(original), original)
 
-    def test_it_differs_even_from_its_own_output(self):
-        """The input already being filter-None at the first attempted level is
-        the case the retry list exists for."""
-        once = fake.reencode_png(make_png())
-        self.assertNotEqual(fake.reencode_png(once), once)
-        self.assertEqual(scanlines(fake.reencode_png(once)), scanlines(once))
+    def test_substituting_twice_never_walks_back_to_the_original(self):
+        """The deltas are odd for this: an involution -- XOR, or an even delta
+        -- would make a second substitution a way BACK to the original picture,
+        and a fake with a route back to the bytes it was given is a fake with a
+        way to be kind by accident."""
+        original = make_png()
+        once = fake.substitute_png(original)
+        twice = fake.substitute_png(once)
+        self.assertNotEqual(twice, once)
+        # Pinned before the `zip`s below, which truncate to the shorter side
+        # and would all pass against an empty buffer.
+        self.assertEqual(len(scanlines(twice)), len(scanlines(original)))
+        for label, other in (("once", scanlines(once)), ("original", scanlines(original))):
+            with self.subTest(against=label):
+                self.assertTrue(all(a != b for a, b in zip(scanlines(twice), other)))
 
     def test_it_refuses_what_it_does_not_model(self):
         for data in (b"not a png at all", make_png()[:20], b""):
             with self.assertRaises(fake.NotAPNG):
-                fake.reencode_png(data)
+                fake.substitute_png(data)
 
     def test_interlaced_is_refused_rather_than_mangled(self):
         header = struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 1)
         data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
                 + chunk(b"IDAT", zlib.compress(b"\x00" * 68)) + chunk(b"IEND", b""))
         with self.assertRaises(fake.NotAPNG):
-            fake.reencode_png(data)
+            fake.substitute_png(data)
 
 
 class ToolTestCase(unittest.TestCase):
@@ -277,14 +336,21 @@ class ClipboardTests(ToolTestCase):
 
 
 class SubstitutionTests(ToolTestCase):
-    def test_a_write_comes_back_as_a_different_encoding(self):
+    def test_a_write_comes_back_as_a_different_picture(self):
+        """End to end through the processes, the contract the harness consumes:
+        the bytes read back are not the bytes written, and neither are the
+        pixels. Same geometry, because both sides decode it."""
         png = make_png()
         self.write_state(substitute=True)
         self.run_fake("wl-copy", "--type", "image/png", stdin=png)
         stored = self.run_fake("wl-paste", "--type", "image/png").stdout
         self.assertNotEqual(stored, png)
         self.assertNotIn("pHYs", kinds_of(stored))
-        self.assertEqual(scanlines(stored), scanlines(png))
+        self.assertEqual(header_of(stored), header_of(png))
+        # Equality against the keystream rather than `all(a != b for ... zip)`:
+        # `zip` truncates to the shorter side, so the loose form would pass
+        # against a `stored` that decoded to nothing at all.
+        self.assertEqual(scanlines(stored), fake._perturb(scanlines(png)))
 
     def test_the_mode_survives_the_agent_writing(self):
         """A fresh state object per write would clear it, and the image half

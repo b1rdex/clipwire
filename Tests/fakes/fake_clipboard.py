@@ -46,31 +46,56 @@ harness has no use for.
 SUBSTITUTION
 ------------
 GPaste does not keep the bytes it is handed. It takes the selection over and
-re-offers a re-encode -- measured on the real PC at 105,700 bytes in and
+re-offers something else -- measured on the real PC at 105,700 bytes in and
 180,287 out -- and that substitution is the direct cause of the density bug
-this release fixes. With `"substitute": true`, `wl-copy` stores a re-encode of
-the PNG it was given instead of the PNG itself, so a read returns a different
-encoding of what was written.
+v3.1 set out to fix. With `"substitute": true`, `wl-copy` stores a re-encode of
+the PNG it was given instead of the PNG itself, so a read returns different
+bytes from the write.
 
-It is a REAL re-encode (see reencode_png): inflate, unfilter to raw scanlines,
-then re-filter and re-deflate, with IHDR/PLTE/tRNS carried over byte for byte.
-The decoded pixels are therefore identical BY CONSTRUCTION, not by test --
-which is the whole point, because the fix compares decoded pixels and a fake
-that corrupted the image would make that comparison fail for the wrong reason
-and prove nothing.
+THIS FAKE IS DELIBERATELY HARSHER THAN THE REAL TRANSFORMATION, and that
+asymmetry is the design rather than a side effect. The substitution (see
+substitute_png) drops every ancillary chunk AND MOVES EVERY PIXEL SAMPLE. Real
+GPaste does not move samples nearly that far: it applies the image's embedded
+ICC profile as it loads it and writes the result untagged, which on a measured
+480x320 screenshot changed 398,267 of 614,400 raw sample bytes, by at most 20.
+This one changes all of them, by a per-byte delta that is never zero.
 
-Every ancillary chunk is dropped, including `pHYs` (the density, which is the
-bug) and `iCCP`/`sRGB`/`gAMA` (the colour profile). Dropping the profile is
-faithful -- GPaste drops it too -- and it has a consequence the harness must
-respect: **an image fixture must not carry a non-sRGB ICC profile**. A
-Display-P3 original against an untagged re-encode decodes to genuinely
-different RGBA once both are normalised to one colour space, and the pixel
-comparison would go red for a real reason that looks exactly like the fix
-failing.
+WHY, WHICH IS THE WHOLE REASON THIS FUNCTION LOOKS LIKE THIS. Until this
+release the substitution PRESERVED the samples -- it unfiltered and re-deflated
+the image so the decoded pixels were identical by construction -- on the theory
+that GPaste only strips metadata. v3.1's density fix compares decoded pixels,
+and it was tuned against this fake until it passed. On the real machines the
+comparison never fires, because the samples do not survive GPaste. A fix
+shipped INERT and a green harness certified it.
 
-Substitution happens at WRITE time, so the stored bytes are the re-encode and
-every later read agrees with them. GPaste's real takeover is a second or two
-after the copy; a delayed mode is deliberately not built here (the design
+So the error here is given a SIGN rather than a magnitude. A fake kinder than
+the world buys false confidence, and by construction the harness cannot see
+it; a fake harsher than the world costs false alarms, which are loud, cheap
+and land on somebody who can read them. Emulating GPaste's colour conversion
+would be another guess at an unspecified box, and a kind guess is exactly what
+just failed. The only contract the next design can safely take from here is
+"the bytes written are not the bytes read back" -- so that is modelled with
+certainty, and nothing else is claimed.
+
+What survives is what a decoder must have: the output is a VALID PNG of the
+same dimensions, colour type and bit depth, because the agent and the harness
+both decode it. Nothing about its CONTENT survives, on purpose. No comparison
+of image content -- byte equality of decoded buffers, a tolerance threshold, a
+subtracted uniform offset -- can pass this fake. That is the point: the
+harness must not be able to certify such a comparison again.
+
+Ancillary chunks are dropped as before, including `pHYs` (the density, which is
+the bug) and `iCCP`/`sRGB`/`gAMA` (the colour profile). Dropping the profile is
+faithful; GPaste drops it too. The rule that used to stand here -- that a
+fixture must not carry a non-sRGB ICC profile, because a Display-P3 original
+against an untagged re-encode would make the pixel comparison go red for a real
+reason that looked like the fix failing -- is gone with the premise it
+protected. The comparison goes red by design now, so a fixture may carry
+whatever profile it likes.
+
+Substitution happens at WRITE time, so the stored bytes are the substitution
+and every later read agrees with them. GPaste's real takeover is a second or
+two after the copy; a delayed mode is deliberately not built here (the design
 defers it), so the harness sees one state change and one `Update` where the
 real machine sees two.
 
@@ -83,12 +108,20 @@ well inside SUBPROCESS_TIMEOUT (3 s), but the first is FORCE-LOGGED by the
 agent, so "clipboard read (--list-types) took 0.8s" in a harness log is
 expected and is not a hang.
 
-A re-encode of a 1024x768 RGBA PNG takes 0.27 s -- the unfiltering is a
-per-byte Python loop -- and it INFLATES: 4.2x on incompressible noise, and
-GPaste's own measured growth was 1.7x. An image close to MAX_IMAGE_BYTES can
-therefore come back over the limit, which the agent handles with a log line
-("the clipboard re-offered an image of N bytes: over the image limit") and
-which is real behaviour rather than an artefact of this fake.
+A substitution of a 1024x768 RGBA PNG costs 0.34-0.39 s -- the unfiltering and
+the perturbation are both per-byte Python loops, and the perturbation is the
+one that always runs -- and it INFLATES, because perturbed samples deflate
+worse than the picture they came from. Measured on one smooth 1024x768
+gradient, 17,691 bytes in: 51,819 out (2.9x, 0.34 s) against 17,090 out (1.0x,
+0.01 s) with the perturbation removed, which is what the sample-preserving
+version used to do. Incompressible noise comes back the size it went in either
+way. GPaste's own measured growth was 1.7x. An image well under
+MAX_IMAGE_BYTES (4 MiB) can therefore come back over the limit here where it
+would not on the real PC, which the agent handles with a log line ("the
+clipboard re-offered an image of N bytes: over the image limit"). That is a
+false alarm this fake can produce and the world will not -- which is the
+direction its errors are supposed to point, and cheap next to the alternative,
+but worth knowing before reading one as a bug.
 
 EXIT CODES
 ----------
@@ -258,26 +291,51 @@ def offered_types_for(mime):
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
-# Carried over into the re-encode. IHDR because the geometry must not change;
-# PLTE because it is critical for colour type 3; tRNS because dropping it
-# would change visible pixels, which is the one thing a re-encode standing in
-# for GPaste must not do. Everything else -- pHYs, iCCP, sRGB, gAMA, cHRM,
-# tEXt, eXIf ... -- is dropped, which is both what GPaste does and the entire
-# point of this function.
+# Carried over into the re-encode. IHDR because the geometry, colour type and
+# bit depth must not change -- the output has to decode as the same shape of
+# picture; PLTE and tRNS because for colour type 3 they are structural rather
+# than decorative, and a dropped palette is not a degraded image but an
+# undecodable file. PLTE is carried but not necessarily unchanged: a palette
+# image is perturbed THROUGH it, see substitute_png. Everything else -- pHYs,
+# iCCP, sRGB, gAMA, cHRM, tEXt, eXIf ... -- is dropped, which is what GPaste
+# does.
 KEPT_CHUNKS = (b"IHDR", b"PLTE", b"tRNS")
 
 # Tried in order until the output differs from the input. The first is the
 # realistic one: filter None on every scanline with maximum deflate is what a
 # fast, naive encoder emits, and against a well-filtered original it GROWS the
-# file the way GPaste's re-encode grew the measured screenshot. The rest exist
-# only so that an input that happens to already be in that exact shape still
-# produces different bytes; a substitution that silently returned its input
-# would leave the harness green and blind.
+# file the way GPaste's re-encode grew the measured screenshot. The rest are a
+# vestigial guard -- perturbed samples cannot reproduce the input -- kept so
+# that the raise at the end of substitute_png stays reachable in principle: a
+# substitution that silently returned its input should say so loudly rather
+# than leave the harness green and blind.
 _ENCODE_ATTEMPTS = (9, 1, 6)
+
+# The deltas the substitution adds to the bytes it moves. Four properties, each
+# load-bearing:
+#
+#   never zero      no sample survives, so "the pixels changed" is a certainty
+#                   about this function rather than a probability over inputs;
+#   never constant  a uniform offset is the one perturbation a comparison could
+#                   see past, by subtracting the mean, and the whole point is
+#                   that no content comparison passes;
+#   always odd      2*odd is never 0 mod 256, so no small number of repeated
+#                   substitutions is a way BACK to the original picture. An
+#                   involution -- XOR, or an even delta applied twice -- would
+#                   quietly restore the samples for anything that got
+#                   substituted an even number of times;
+#   257 long        prime, so the pattern shares no factor with any scanline
+#                   stride and cannot come into step with the pixel grid.
+#
+# Every byte moves, including the high byte of a 16-bit sample -- which is the
+# one that survives being decoded down to eight bits a component. A keystream
+# that only reached the low bytes would let this file's own tests report moved
+# samples while a real decoder saw the same picture.
+_PERTURBATION = bytes(1 + 2 * ((index * 61 + 17) % 128) for index in range(257))
 
 
 class NotAPNG(Exception):
-    """Raised for anything reencode_png does not model: not a PNG at all, an
+    """Raised for anything substitute_png does not model: not a PNG at all, an
     interlaced one, or a truncated one."""
 
 
@@ -357,14 +415,38 @@ def _unfilter(raw, height, stride, step):
 CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
 
 
-def reencode_png(data):
-    """The same pixels, different bytes, no density and no colour profile.
+def _perturb(block, start=0):
+    """`block` with every byte moved by a non-zero delta.
 
-    A genuine re-encode rather than a byte-mangle: the image data is inflated,
-    unfiltered back to raw scanlines, then re-filtered and re-deflated. IHDR
-    is copied byte for byte and the scanlines are reproduced exactly, so what
-    a decoder gets out is identical -- by construction, which is what makes
-    this fake usable as evidence for a fix that compares decoded pixels.
+    `start` is the block's offset into whatever is being walked, so a caller
+    handing over one scanline at a time gets one continuous keystream instead
+    of the same pattern stamped on every row.
+    """
+    return bytes((sample + _PERTURBATION[(start + index) % len(_PERTURBATION)]) & 0xFF
+                 for index, sample in enumerate(block))
+
+
+def _perturb_scanlines(lines):
+    """Every sample in the picture moved, the rows walked as one stream."""
+    moved, at = [], 0
+    for line in lines:
+        moved.append(_perturb(line, at))
+        at += len(line)
+    return moved
+
+
+def substitute_png(data):
+    """A valid PNG of the same shape, with different bytes and DIFFERENT
+    PIXELS. Deliberately harsher than what GPaste really does -- read
+    SUBSTITUTION at the top of this file before touching it, because the
+    harshness is the fix for a green harness that certified an inert one.
+
+    Structurally a genuine re-encode: the image data is inflated, unfiltered
+    back to raw scanlines, then re-filtered and re-deflated, with IHDR copied
+    byte for byte. So the geometry, colour type and bit depth are untouched and
+    anything that decoded the input decodes the output. Between the two, every
+    sample is moved (see _perturb), so nothing a decoder gets out is what went
+    in, and no comparison of image content can call these two the same picture.
 
     Raises NotAPNG for anything it does not model. Interlaced PNGs are the
     real gap: their filtering runs per Adam7 pass, and nothing in this project
@@ -389,10 +471,30 @@ def reencode_png(data):
         raise NotAPNG("interlaced PNGs are not modelled")
     if colour not in CHANNELS:
         raise NotAPNG("unknown colour type %d" % colour)
+    # A palette image is perturbed THROUGH its palette (see below), so without
+    # one there is no lever and the pixels would come back untouched. Refused
+    # rather than returned: a substitution that silently handed back the same
+    # picture is the exact failure this whole function was rewritten to remove,
+    # and NotAPNG is loud -- `wl-copy` logs "stored unsubstituted (...)" and the
+    # harness's wait for a substitution times out by name. (Such a file is not
+    # a legal PNG anyway; this is the honest way to say so.)
+    if colour == 3 and not any(kind == b"PLTE" for kind, _ in kept):
+        raise NotAPNG("colour type 3 without a palette")
 
     bits = CHANNELS[colour] * depth
     stride = (width * bits + 7) // 8
     lines = _unfilter(zlib.decompress(b"".join(compressed)), height, stride, max(1, bits // 8))
+
+    # Colour type 3 is moved through its PALETTE rather than its samples, and
+    # that is a correctness point and not a taste one: its samples are indices
+    # into PLTE, and moving an index points it past the end of the palette --
+    # an invalid PNG, which is the one thing this must never emit. Moving the
+    # entries instead changes every decoded pixel exactly as thoroughly, since
+    # every entry moves, and leaves every index in range.
+    if colour == 3:
+        kept = [(kind, _perturb(body) if kind == b"PLTE" else body) for kind, body in kept]
+    else:
+        lines = _perturb_scanlines(lines)
 
     # Filter None on every scanline: the naive encoder's choice, and the one
     # that makes the output visibly a different encoding rather than a
