@@ -28,27 +28,50 @@ enum ImagePixelConstants {
 /// `handleFrame`'s `.imageClip` case asks before deciding whose bytes to
 /// keep.
 ///
+/// *** MEASURED AGAINST THE REAL GPaste AFTER THIS SHIPPED: THIS COMPARISON
+/// NEVER FIRES IN PRODUCTION, AND THE STRATEGY BELOW IS THE WRONG ONE. ***
+/// Kept, inert, only for the diagnostic it feeds, and removed by the release
+/// that replaces the whole approach with provenance. Read this before touching
+/// anything here, because the reasoning underneath is sound about a
+/// transformation that does not happen.
+///
+/// The premise was that GPaste re-encodes without touching pixel samples. It
+/// does not: on a 480x320 screenshot, with the Mac's original captured before
+/// it travelled, raw samples differed in **398,267 of 614,400 bytes, max delta
+/// 20**. GPaste applies the embedded ICC profile on load and writes untagged --
+/// a colour conversion, not a metadata strip.
+///
+/// Both strategies against that real pair, so the record is complete:
+///
+/// - re-tagging (what this file does): 398,267 of 614,400 differ, max delta 20
+/// - converting (what it replaced): 18,772 of 614,400 differ, **max delta 1**
+///
+/// Converting is four times closer and its max delta of 1 is pure rounding --
+/// it is the right operation for a transformation that genuinely converts
+/// colour. It was replaced because it failed against `Tests/fakes/`'s
+/// re-encoder, which preserves samples by construction. **Production was tuned
+/// to the model rather than to the world**, and the harness could not catch it
+/// because the fake is kinder than reality.
+///
+/// Neither reaches byte equality, so no content comparison fixes the density
+/// bug. Every such comparison *infers* provenance, lossily, from a fact the PC
+/// knew directly and discarded: it wrote the Mac's bytes and read different
+/// ones back, with no user action in between. The replacement is for the PC to
+/// announce the hash it was **given** beside the hash it read.
+///
 /// **Defined operationally, because the loose reading has a trap.** "Identical
 /// pixels" here means byte equality of the two RGBA buffers after decoding both
 /// images into one fixed layout -- one channel order, one alpha layout, eight
 /// bits a component -- with each image **re-tagged** as sRGB rather than
 /// converted into it, so the samples pass through untouched.
 ///
-/// Re-tagging rather than converting is the whole point, and the first version
-/// of this file got it wrong. GPaste does not merely drop `pHYs` when it
-/// re-encodes; it drops the colour profile with it (`iCCP`, `sRGB`, `gAMA`,
-/// `cHRM` -- everything ancillary). So a profile difference is not an edge
-/// case: it is part of the firing CONDITION, present exactly whenever this fix
-/// is needed. Converting both into sRGB made the comparison answer "different"
-/// for every real screenshot on the machine this was written for -- measured,
-/// 12,530 of 76,800 bytes, max delta **2**, which is rounding and not a
-/// picture.
-///
-/// The question being asked is not "are these the same picture" but **"is the
-/// peer's version derived from mine"**. Equal samples are the evidence of
-/// derivation, and the profile is then not a difference to see past -- it is
-/// the thing being rescued. Keeping the local bytes is right because they are
-/// the original, not because the two are interchangeable.
+/// The reasoning for re-tagging, which is correct given its premise: GPaste
+/// does not merely drop `pHYs`; it drops the colour profile with it, so a
+/// profile difference is part of the firing CONDITION rather than an edge case.
+/// The question is not "are these the same picture" but "is the peer's version
+/// derived from mine" -- equal samples being the evidence of derivation, and
+/// the profile then being the thing rescued rather than a difference to see
+/// past. All of that holds. It is simply not what GPaste does.
 ///
 /// Measured on this Mac rather than assumed, because the whole fix rests on
 /// it. Identical, decoded through this exact pipeline:
