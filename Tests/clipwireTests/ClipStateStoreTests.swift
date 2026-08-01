@@ -19,16 +19,6 @@ final class ClipStateStoreTests: XCTestCase {
     // cleanup point that can't leave droppings behind on a failing `try` in
     // the middle of a test -- unlike a cleanup line at the end of a test
     // body, which a thrown error skips entirely.
-    /// The store's record for content whose bytes this machine put on its own
-    /// pasteboard: canonical hash only, no local one. Every path except
-    /// `handleFrame`'s pixel-equivalent image branch writes exactly this, so
-    /// it is what "the store holds this" means in an arrange step -- and
-    /// using it in the assertions too makes each of them pin that no local
-    /// hash was invented. The two-hash tests build their records explicitly.
-    private func record(_ state: ClipState) -> StoredClipState {
-        StoredClipState(state: state, localSHA256: nil)
-    }
-
     override func tearDown() {
         try? FileManager.default.removeItem(at: url)
         try? FileManager.default.removeItem(at: nestedRoot)
@@ -38,16 +28,16 @@ final class ClipStateStoreTests: XCTestCase {
 
     func testRoundTrip() throws {
         let state = ClipState(sha256: "deadbeefcafe", ts: 1785400000.5, kind: .text)
-        try store.save(record(state))
-        XCTAssertEqual(store.load(), record(state))
+        try store.save(state)
+        XCTAssertEqual(store.load(), state)
     }
 
     /// Different kinds on the two saves, not just different hashes: the
     /// second save must overwrite kind too, not only sha256/ts.
     func testSecondSaveOverwritesTheFirst() throws {
-        try store.save(record(ClipState(sha256: "aa", ts: 1, kind: .text)))
-        try store.save(record(ClipState(sha256: "bb", ts: 2, kind: .image)))
-        XCTAssertEqual(store.load(), record(ClipState(sha256: "bb", ts: 2, kind: .image)))
+        try store.save(ClipState(sha256: "aa", ts: 1, kind: .text))
+        try store.save(ClipState(sha256: "bb", ts: 2, kind: .image))
+        XCTAssertEqual(store.load(), ClipState(sha256: "bb", ts: 2, kind: .image))
     }
 
     /// The deliberate asymmetry the final wave introduced, pinned so it is a
@@ -67,22 +57,22 @@ final class ClipStateStoreTests: XCTestCase {
     /// announced is the LOCALLY computed hash, never the stored one.
     func testLoadDoesNotValidateTheStoredHashTheWayTheWireDecoderDoes() throws {
         let malformed = ClipState(sha256: "not a hex digest at all", ts: 100, kind: .text)
-        try store.save(record(malformed))
-        XCTAssertEqual(store.load(), record(malformed), "the store is deliberately lenient")
+        try store.save(malformed)
+        XCTAssertEqual(store.load(), malformed, "the store is deliberately lenient")
 
         XCTAssertThrowsError(try ClipState.decodePayload(malformed.encodePayload()),
                              "the same value must NOT be accepted off the wire")
         XCTAssertEqual(
             resolveStartupState(currentHash: sha256Hex(Data("current".utf8)), currentKind: .text,
-                                stored: record(malformed), now: 999),
-            record(ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999, kind: .text)),
+                                stored: malformed, now: 999),
+            ClipState(sha256: sha256Hex(Data("current".utf8)), ts: 999, kind: .text),
             "a corrupt stored hash resolves to `now`, exactly as nothing-stored does")
     }
 
     func testNilHashRoundTrips() throws {
         let state = ClipState(sha256: nil, ts: 0, kind: nil)
-        try store.save(record(state))
-        XCTAssertEqual(store.load(), record(state))
+        try store.save(state)
+        XCTAssertEqual(store.load(), state)
     }
 
     // MARK: - load() never throws
@@ -114,7 +104,7 @@ final class ClipStateStoreTests: XCTestCase {
     // MARK: - atomic write
 
     func testSaveLeavesNoTempFileBehind() throws {
-        try store.save(record(ClipState(sha256: "aa", ts: 1, kind: .text)))
+        try store.save(ClipState(sha256: "aa", ts: 1, kind: .text))
         let tmp = url.appendingPathExtension("tmp")
         XCTAssertFalse(FileManager.default.fileExists(atPath: tmp.path),
                        "the temp file used for the atomic replace must not linger")
@@ -123,8 +113,8 @@ final class ClipStateStoreTests: XCTestCase {
     func testSaveCreatesIntermediateDirectories() throws {
         let nested = nestedRoot.appendingPathComponent("nested/clip-state.json")
         let nestedStore = ClipStateStore(path: nested.path)
-        try nestedStore.save(record(ClipState(sha256: "aa", ts: 1, kind: .text)))
-        XCTAssertEqual(nestedStore.load(), record(ClipState(sha256: "aa", ts: 1, kind: .text)))
+        try nestedStore.save(ClipState(sha256: "aa", ts: 1, kind: .text))
+        XCTAssertEqual(nestedStore.load(), ClipState(sha256: "aa", ts: 1, kind: .text))
     }
 
     // MARK: - concurrent saves must not corrupt the file
@@ -163,15 +153,10 @@ final class ClipStateStoreTests: XCTestCase {
     func testConcurrentSavesNeverLeaveAFileThatFailsToLoad() {
         let concurrentStore = store!
         DispatchQueue.concurrentPerform(iterations: 200) { i in
-            // The record is built inline rather than through `record(...)`:
-            // that helper is an instance method, so calling it here would
-            // capture `self` -- a non-Sendable XCTestCase -- inside a
-            // `@Sendable` closure, which is a warning this project does not
-            // ship. Only `concurrentStore` crosses into the closure, exactly
-            // as before v3.1.
-            try? concurrentStore.save(
-                StoredClipState(state: ClipState(sha256: "writer-\(i)", ts: Double(i), kind: .text),
-                                localSHA256: nil))
+            // Only `concurrentStore` crosses into the closure: `self` is a
+            // non-Sendable `XCTestCase`, and capturing it inside a `@Sendable`
+            // closure is a warning this project does not ship.
+            try? concurrentStore.save(ClipState(sha256: "writer-\(i)", ts: Double(i), kind: .text))
         }
         XCTAssertNotNil(concurrentStore.load(),
                         "concurrent saves must never leave a file that fails to load")
@@ -209,7 +194,7 @@ final class ClipStateStoreTests: XCTestCase {
     /// stored value is the one this side already announced to the peer,
     /// possibly on an earlier connection.
     func testStoredHashMatchesCurrentReturnsStoredTimestampNotNow() {
-        let stored = record(ClipState(sha256: "aa", ts: 100, kind: .image))
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .image)
         let result = resolveStartupState(currentHash: "aa", currentKind: .text,
                                          stored: stored, now: 999)
         XCTAssertEqual(result, stored)
@@ -232,10 +217,10 @@ final class ClipStateStoreTests: XCTestCase {
     /// itself, which makes dropping the kind a compile error at every call
     /// site rather than a silent wrong answer at one.
     func testStoredHashDiffersReturnsNowAndTheKindThatWasActuallyRead() {
-        let stored = record(ClipState(sha256: "aa", ts: 100, kind: .text))
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
         let result = resolveStartupState(currentHash: "bb", currentKind: .image,
                                          stored: stored, now: 999)
-        XCTAssertEqual(result, record(ClipState(sha256: "bb", ts: 999, kind: .image)),
+        XCTAssertEqual(result, ClipState(sha256: "bb", ts: 999, kind: .image),
                        "the changed-content branch must report the kind it was given, " +
                        "not the stored kind and not a hardcoded .text")
     }
@@ -246,7 +231,7 @@ final class ClipStateStoreTests: XCTestCase {
     func testNothingStoredReturnsNowAndTheKindThatWasActuallyRead() {
         let result = resolveStartupState(currentHash: "aa", currentKind: .image,
                                          stored: nil, now: 999)
-        XCTAssertEqual(result, record(ClipState(sha256: "aa", ts: 999, kind: .image)))
+        XCTAssertEqual(result, ClipState(sha256: "aa", ts: 999, kind: .image))
     }
 
     /// A `nil` current hash always wins over whatever is on disk, and it
@@ -261,20 +246,17 @@ final class ClipStateStoreTests: XCTestCase {
     /// not enforce it, so nothing downstream would catch a leak here before
     /// the peer's decoder rejected the frame.
     func testCurrentHashNilReturnsNilHashRegardlessOfStored() {
-        let stored = record(ClipState(sha256: "aa", ts: 100, kind: .text))
+        let stored = ClipState(sha256: "aa", ts: 100, kind: .text)
         let result = resolveStartupState(currentHash: nil, currentKind: .image,
                                          stored: stored, now: 999)
-        XCTAssertNil(result.state.sha256)
-        XCTAssertEqual(result.state.ts, 999)
-        XCTAssertNil(result.state.kind, "a nil hash must carry a nil kind, whatever the read reported")
-        XCTAssertNil(result.localSHA256,
-                     "and no local hash either: a state announcing nothing has nothing for a "
-                     + "later read to be measured against")
+        XCTAssertNil(result.sha256)
+        XCTAssertEqual(result.ts, 999)
+        XCTAssertNil(result.kind, "a nil hash must carry a nil kind, whatever the read reported")
     }
 
     func testCurrentHashNilAndNothingStoredReturnsNilHash() {
         let result = resolveStartupState(currentHash: nil, currentKind: nil, stored: nil, now: 999)
-        XCTAssertNil(result.state.sha256)
+        XCTAssertNil(result.sha256)
     }
 
     // MARK: - resolveCurrentClipState — the hash and the kind come from ONE read
@@ -294,11 +276,11 @@ final class ClipStateStoreTests: XCTestCase {
         let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01])
         let pasteboard = FakePasteboard()
         pasteboard.setImage(png)
-        let stored = record(ClipState(sha256: String(repeating: "ab", count: 32), ts: 100, kind: .text))
+        let stored = ClipState(sha256: String(repeating: "ab", count: 32), ts: 100, kind: .text)
 
         let result = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: 999, log: nil)
 
-        XCTAssertEqual(result, record(ClipState(sha256: sha256Hex(png), ts: 999, kind: .image)),
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(png), ts: 999, kind: .image),
                        "the hash and the kind must both come from the one read that produced them")
     }
 
@@ -310,7 +292,7 @@ final class ClipStateStoreTests: XCTestCase {
 
         let result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: nil)
 
-        XCTAssertEqual(result, record(ClipState(sha256: sha256Hex(Data("hello".utf8)), ts: 999, kind: .text)))
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(Data("hello".utf8)), ts: 999, kind: .text))
     }
 
     /// An unreadable pasteboard is hashless and kindless -- never hashed,
@@ -318,8 +300,8 @@ final class ClipStateStoreTests: XCTestCase {
     /// clipboard state.
     func testResolveCurrentClipStateReportsNothingForAnEmptyPasteboard() {
         let result = resolveCurrentClipState(pasteboard: FakePasteboard(), stored: nil, now: 999, log: nil)
-        XCTAssertNil(result.state.sha256)
-        XCTAssertNil(result.state.kind)
+        XCTAssertNil(result.sha256)
+        XCTAssertNil(result.kind)
     }
 
     // MARK: - The announce path's own size guard
@@ -359,13 +341,13 @@ final class ClipStateStoreTests: XCTestCase {
         let oversized = Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1)
         let pasteboard = FakePasteboard()
         pasteboard.setImage(oversized)
-        var result: StoredClipState?
+        var result: ClipState?
 
         let lines = loggedLines { log in
             result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
         }
 
-        XCTAssertEqual(result, record(ClipState(sha256: nil, ts: 999, kind: nil)),
+        XCTAssertEqual(result, ClipState(sha256: nil, ts: 999, kind: nil),
                        "content this side can never send must be announced as nothing, "
                        + "not hashed and stamped `now`")
         XCTAssertEqual(lines, ["not announcing an image of \(oversized.count) bytes: over the image limit"],
@@ -380,13 +362,13 @@ final class ClipStateStoreTests: XCTestCase {
         let exact = Data(repeating: 0x89, count: FrameConstants.maxImageBytes)
         let pasteboard = FakePasteboard()
         pasteboard.setImage(exact)
-        var result: StoredClipState?
+        var result: ClipState?
 
         let lines = loggedLines { log in
             result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
         }
 
-        XCTAssertEqual(result, record(ClipState(sha256: sha256Hex(exact), ts: 999, kind: .image)))
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(exact), ts: 999, kind: .image))
         XCTAssertEqual(lines, [], "nothing was skipped, so nothing is worth a line")
     }
 
@@ -396,13 +378,13 @@ final class ClipStateStoreTests: XCTestCase {
     func testOversizedTextResolvesANilHashAndKind() {
         let pasteboard = FakePasteboard()
         pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes))
-        var result: StoredClipState?
+        var result: ClipState?
 
         let lines = loggedLines { log in
             result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
         }
 
-        XCTAssertEqual(result, record(ClipState(sha256: nil, ts: 999, kind: nil)))
+        XCTAssertEqual(result, ClipState(sha256: nil, ts: 999, kind: nil))
         XCTAssertEqual(lines,
                        ["not announcing a clip of \(FrameConstants.maxTextBytes) bytes: over the text limit"])
     }
@@ -412,13 +394,13 @@ final class ClipStateStoreTests: XCTestCase {
                            count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
         let pasteboard = FakePasteboard()
         pasteboard.set(exact)
-        var result: StoredClipState?
+        var result: ClipState?
 
         let lines = loggedLines { log in
             result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
         }
 
-        XCTAssertEqual(result, record(ClipState(sha256: sha256Hex(Data(exact.utf8)), ts: 999, kind: .text)))
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(Data(exact.utf8)), ts: 999, kind: .text))
         XCTAssertEqual(lines, [])
     }
 
@@ -429,14 +411,14 @@ final class ClipStateStoreTests: XCTestCase {
     func testThePeerWinsInsteadOfBeingLockedOut() {
         let pasteboard = FakePasteboard()
         pasteboard.setImage(Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1))
-        var mine = record(ClipState(sha256: nil, ts: 0, kind: nil))
+        var mine = ClipState(sha256: nil, ts: 0, kind: nil)
 
         _ = loggedLines { log in
             mine = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999_999, log: log)
         }
 
         let peer = ClipState(sha256: String(repeating: "aa", count: 32), ts: 100, kind: .text)
-        XCTAssertEqual(resolveFreshness(mine: mine.state, peer: peer), .waitForPeer,
+        XCTAssertEqual(resolveFreshness(mine: mine, peer: peer), .waitForPeer,
                        "a clip we cannot send must never win against one the peer can")
     }
 
@@ -450,7 +432,7 @@ final class ClipStateStoreTests: XCTestCase {
     /// The reconciliation line stays silent, because a nil hash never
     /// reaches a timestamp comparison -- there is no judgement to report.
     func testAnOversizedPasteboardOverwritesTheStoreWithNothing() throws {
-        try store.save(record(ClipState(sha256: String(repeating: "bb", count: 32), ts: 111, kind: .text)))
+        try store.save(ClipState(sha256: String(repeating: "bb", count: 32), ts: 111, kind: .text))
         let pasteboard = FakePasteboard()
         pasteboard.setImage(Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1))
         var sent: [Frame] = []
@@ -460,7 +442,7 @@ final class ClipStateStoreTests: XCTestCase {
                               clipStateStore: store, log: log, now: 999_999)
         }
 
-        XCTAssertEqual(store.load(), record(ClipState(sha256: nil, ts: 999_999, kind: nil)))
+        XCTAssertEqual(store.load(), ClipState(sha256: nil, ts: 999_999, kind: nil))
         XCTAssertEqual(try ClipState.decodePayload(XCTUnwrap(sent.first).payload),
                        ClipState(sha256: nil, ts: 999_999, kind: nil))
         XCTAssertFalse(lines.contains("clipboard changed while apart"))
@@ -491,7 +473,7 @@ final class ClipStateStoreTests: XCTestCase {
                      "a v2 store (real hash, no kind key) must be rejected, not silently treated as a hash of unknown kind")
     }
 
-    // MARK: - v3.1: the store stops being the wire type
+    // MARK: - the file on disk
 
     /// The top-level keys of whatever is on disk right now.
     private func keysOnDisk() throws -> Set<String> {
@@ -500,165 +482,49 @@ final class ClipStateStoreTests: XCTestCase {
         return Set((object ?? [:]).keys)
     }
 
-    /// *** Acceptance item 7, and the reason the encoding is flat. *** The
-    /// owner's `~/.local/state/clipwire/clip-state.json` is a bare
-    /// `ClipState`, written before this field existed. Written literally
+    /// *** Acceptance item 7 of protocol v3. *** The owner's
+    /// `~/.local/state/clipwire/clip-state.json` is a bare `ClipState`, and
+    /// every version of this store has to keep reading one. Written literally
     /// rather than round-tripped, because a round trip passes under a NESTED
     /// encoding too -- and under a nested one this file would fail to decode,
     /// `load()` would report "nothing stored" (its documented answer to a torn
     /// file), and the next announcement would stamp `now` on content that is
     /// actually old and win a reconciliation it should have lost. That is the
-    /// clobber the persistent store exists to prevent, arriving through the
-    /// upgrade itself.
-    func testAPreV31StoreFileStillLoadsWithNoLocalHash() throws {
+    /// clobber the persistent store exists to prevent, arriving through an
+    /// upgrade.
+    ///
+    /// v3.1 wrapped the state in a `StoredClipState` carrying a second hash
+    /// and had to encode it flat for exactly this reason; v3.2 deleted the
+    /// wrapper with the density fix it served, so these bytes are once again
+    /// simply what the store writes. The literal file is the guard that
+    /// survived both moves.
+    func testAStoreFileWrittenAsABareClipStateStillLoads() throws {
         let hash = String(repeating: "ab", count: 32)
         try Data(#"{"sha256":"\#(hash)","ts":1785400000.5,"kind":"text"}"#.utf8).write(to: url)
 
-        let loaded = store.load()
-
-        XCTAssertEqual(loaded?.state, ClipState(sha256: hash, ts: 1785400000.5, kind: .text))
-        XCTAssertNil(loaded?.localSHA256, "the key did not exist when this file was written")
-        XCTAssertEqual(loaded?.localHash, hash,
-                       "and absent must mean today's behaviour -- the canonical hash IS what "
-                       + "this machine's clipboard returns")
+        XCTAssertEqual(store.load(), ClipState(sha256: hash, ts: 1785400000.5, kind: .text))
     }
 
-    /// The same property from the writing side: an ordinary record writes the
-    /// three wire keys and nothing else, so a file written by v3.1 is still a
-    /// file any earlier reader would accept. The new key appears only when
-    /// there is something to say with it.
+    /// A file written by v3.1's two-hash store still loads, with its extra key
+    /// ignored -- and no such file exists anywhere, which is the point. The
+    /// density fix never fired on a real machine, so nothing ever wrote a
+    /// `localSha256`; the removal needs no migration step, and this test is
+    /// what says so in code rather than in a commit message.
+    func testAV31StoreFileWithItsSecondHashStillLoadsAndIgnoresIt() throws {
+        let hash = String(repeating: "ab", count: 32)
+        try Data(#"""
+        {"sha256":"\#(hash)","ts":1785400000.5,"kind":"image","localSha256":"\#(String(repeating: "cd", count: 32))"}
+        """#.utf8).write(to: url)
+
+        XCTAssertEqual(store.load(), ClipState(sha256: hash, ts: 1785400000.5, kind: .image),
+                       "the extra key is one the keyed container never asks for")
+    }
+
+    /// The same property from the writing side: a record writes the three wire
+    /// keys and nothing else, so a file this version writes is a file every
+    /// earlier reader accepts.
     func testAnOrdinaryRecordWritesExactlyTheThreeOldKeys() throws {
-        try store.save(record(ClipState(sha256: "aa", ts: 1, kind: .text)))
+        try store.save(ClipState(sha256: "aa", ts: 1, kind: .text))
         XCTAssertEqual(try keysOnDisk(), ["sha256", "ts", "kind"])
-    }
-
-    /// And the local hash, when there is one, sits FLAT beside them rather
-    /// than wrapping them in a second object.
-    func testTheLocalHashIsWrittenFlatBesideTheWireFieldsAndRoundTrips() throws {
-        let stored = StoredClipState(state: ClipState(sha256: "aa", ts: 1, kind: .image),
-                                     localSHA256: "bb")
-        try store.save(stored)
-
-        XCTAssertEqual(try keysOnDisk(), ["sha256", "ts", "kind", "localSha256"])
-        XCTAssertEqual(store.load(), stored)
-    }
-
-    /// *** The incident this type exists to prevent, as an assertion. ***
-    /// Both sides ignore unknown keys -- Python's `decode_clip_state` returns
-    /// normally, Swift's keyed container never asks -- so a Mac-internal
-    /// field living on `ClipState` would have reached the PC silently rather
-    /// than failing loudly on the first frame. What reaches the wire is
-    /// `state` and only `state`.
-    func testTheLocalHashNeverReachesTheWire() throws {
-        let stored = StoredClipState(state: ClipState(sha256: String(repeating: "aa", count: 32),
-                                                      ts: 1, kind: .image),
-                                     localSHA256: String(repeating: "bb", count: 32))
-
-        let payload = try stored.state.encodePayload()
-
-        XCTAssertFalse(String(decoding: payload, as: UTF8.self).contains("localSha256"))
-        XCTAssertFalse(String(decoding: payload, as: UTF8.self).contains(String(repeating: "bb", count: 32)),
-                       "not under any key name")
-        XCTAssertEqual(try ClipState.decodePayload(payload), stored.state)
-    }
-
-    // MARK: - v3.1: the seed compares against the LOCAL hash
-
-    /// *** The whole reason for two hashes. *** The store is in the state the
-    /// density fix creates -- announcing the peer's hash for an image this
-    /// side is holding its own bytes of -- and the clipboard still holds those
-    /// bytes. Nothing changed, so the record comes back UNCHANGED: same
-    /// canonical hash, same timestamp, same local hash.
-    ///
-    /// Two distinct mistakes fail here and nowhere else in this suite, because
-    /// every other test has one hash where this has two. Comparing against
-    /// `state.sha256` takes the changed branch and stamps `now` on content
-    /// nobody touched, which is the false `clipboard changed while apart` that
-    /// protocol v3 closed. Rebuilding the result around `currentHash` -- what
-    /// the pre-v3.1 body did, harmlessly, when the two hashes were always the
-    /// same value -- announces the LOCAL hash instead of the canonical one,
-    /// so the peer answers with the copy it holds and a frame comes back on
-    /// every reconnect forever rather than only the first.
-    func testTheSeedComparesAgainstTheLocalHashNotTheCanonicalOne() {
-        let stored = StoredClipState(state: ClipState(sha256: "peers-hash", ts: 100, kind: .image),
-                                     localSHA256: "our-own-bytes")
-
-        let result = resolveStartupState(currentHash: "our-own-bytes", currentKind: .image,
-                                         stored: stored, now: 999)
-
-        XCTAssertEqual(result, stored)
-        XCTAssertEqual(result.state.sha256, "peers-hash",
-                       "the canonical hash is what gets announced, and it must survive the seed")
-    }
-
-    /// The same two-hash record, the other way round: the clipboard now holds
-    /// content whose hash happens to equal the CANONICAL one. That is a real
-    /// change -- what this machine returns is not what it returned before --
-    /// and it takes the changed branch, `now` and all, with the divergence
-    /// cleared. A seed comparing canonical hashes would call this "unchanged"
-    /// and keep a local hash describing bytes that are gone.
-    func testTheSeedTreatsAMatchingCanonicalHashAsAChangeWhenTheLocalOneDiffers() {
-        let stored = StoredClipState(state: ClipState(sha256: "peers-hash", ts: 100, kind: .image),
-                                     localSHA256: "our-own-bytes")
-
-        let result = resolveStartupState(currentHash: "peers-hash", currentKind: .image,
-                                         stored: stored, now: 999)
-
-        XCTAssertEqual(result, record(ClipState(sha256: "peers-hash", ts: 999, kind: .image)))
-    }
-
-    // MARK: - v3.1: `clipboard changed while apart` measures the LOCAL hash
-
-    /// The steady state the fix creates, silent as it should be: the store
-    /// announces the peer's hash, the clipboard holds our own bytes, and
-    /// nothing has changed since -- so the line stays quiet and the
-    /// announcement carries the canonical hash.
-    func testNoFalseAlarmWhileHoldingAPixelEquivalentOfThePeersImage() throws {
-        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01])
-        let stored = StoredClipState(state: ClipState(sha256: String(repeating: "aa", count: 32),
-                                                      ts: 100, kind: .image),
-                                     localSHA256: sha256Hex(png))
-        try store.save(stored)
-        let pasteboard = FakePasteboard()
-        pasteboard.setImage(png)
-        var sent: [Frame] = []
-
-        let lines = loggedLines { log in
-            announceClipState(send: { sent.append($0) }, pasteboard: pasteboard,
-                              clipStateStore: store, log: log, now: 999_999)
-        }
-
-        XCTAssertFalse(lines.contains("clipboard changed while apart"), "got: \(lines)")
-        XCTAssertEqual(try ClipState.decodePayload(XCTUnwrap(sent.first).payload), stored.state)
-        XCTAssertEqual(store.load(), stored, "and the record survives the announcement intact")
-    }
-
-    /// *** The other half, and the one a canonical comparison gets wrong. ***
-    /// Same store, but the user has since copied something whose bytes hash to
-    /// the CANONICAL value -- the peer's re-encoded copy, say, pasted back in.
-    /// What this clipboard returns has changed, so the announcement stamps
-    /// `now`, and the line is what explains that to whoever reads the log.
-    /// Comparing `state.sha256` finds no difference and says nothing: an
-    /// unannounced change with a fresh timestamp on it and no record of why,
-    /// which is exactly what this line exists to prevent.
-    func testAChangedClipboardIsStillReportedWhenItMatchesTheCanonicalHash() throws {
-        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x01])
-        let peersCopy = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x02])
-        try store.save(StoredClipState(state: ClipState(sha256: sha256Hex(peersCopy), ts: 100,
-                                                        kind: .image),
-                                       localSHA256: sha256Hex(png)))
-        let pasteboard = FakePasteboard()
-        pasteboard.setImage(peersCopy)
-
-        let lines = loggedLines { log in
-            announceClipState(send: { _ in }, pasteboard: pasteboard,
-                              clipStateStore: store, log: log, now: 999_999)
-        }
-
-        XCTAssertTrue(lines.contains("clipboard changed while apart"), "got: \(lines)")
-        XCTAssertEqual(store.load(),
-                       record(ClipState(sha256: sha256Hex(peersCopy), ts: 999_999, kind: .image)),
-                       "and it is a change: `now`, and no local hash left describing bytes "
-                       + "the clipboard no longer holds")
     }
 }

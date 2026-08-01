@@ -1,0 +1,18 @@
+{
+  "comment": "Provenance table, shared by both implementations: is either side's content descended from the other's? Rows carry only the two fields the rule compares -- sha256 and origin -- exactly as freshness.json carries only sha256 and ts. Hashes are abbreviated but compared as strings, exactly as the real hex hashes are. The null rows are the load-bearing ones: null == null is true in both languages, so a rule written without a present-value guard passes every row below EXCEPT those, and ships an empty clipboard standing down against a peer that has nothing. origins-match-each-other pins the other premise both implementations lean on: two origins equal to one another mean nothing, because every comparison this rule makes is origin-against-sha256 -- which is exactly what lets both sides skip validating an origin's shape, one operand always being a real hexdigest.",
+  "cases": [
+    {"name": "peer-born-from-mine",      "mine": {"sha256": "aa",  "origin": null}, "peer": {"sha256": "a1", "origin": "aa"}, "expect": true},
+    {"name": "mine-born-from-peer",      "mine": {"sha256": "b1",  "origin": "bb"}, "peer": {"sha256": "bb", "origin": null}, "expect": true},
+    {"name": "each-born-from-the-other", "mine": {"sha256": "aa",  "origin": "bb"}, "peer": {"sha256": "bb", "origin": "aa"}, "expect": true},
+    {"name": "origin-names-someone-else","mine": {"sha256": "aa",  "origin": null}, "peer": {"sha256": "a1", "origin": "cc"}, "expect": false},
+    {"name": "stale-origin-both-ways",   "mine": {"sha256": "a1",  "origin": "cc"}, "peer": {"sha256": "b1", "origin": "dd"}, "expect": false},
+    {"name": "origins-match-each-other", "mine": {"sha256": "a1",  "origin": "cc"}, "peer": {"sha256": "b1", "origin": "cc"}, "expect": false},
+    {"name": "unrelated-no-origins",     "mine": {"sha256": "aa",  "origin": null}, "peer": {"sha256": "bb", "origin": null}, "expect": false},
+    {"name": "same-hash-no-origins",     "mine": {"sha256": "aa",  "origin": null}, "peer": {"sha256": "aa", "origin": null}, "expect": false},
+    {"name": "empty-mine-peer-no-origin","mine": {"sha256": null,  "origin": null}, "peer": {"sha256": "bb", "origin": null}, "expect": false},
+    {"name": "empty-peer-mine-no-origin","mine": {"sha256": "aa",  "origin": null}, "peer": {"sha256": null, "origin": null}, "expect": false},
+    {"name": "both-empty-no-origins",    "mine": {"sha256": null,  "origin": null}, "peer": {"sha256": null, "origin": null}, "expect": false},
+    {"name": "empty-peer-mine-has-origin","mine": {"sha256": "a1", "origin": "cc"}, "peer": {"sha256": null, "origin": null}, "expect": false},
+    {"name": "empty-mine-peer-has-origin","mine": {"sha256": null, "origin": null}, "peer": {"sha256": "b1", "origin": "cc"}, "expect": false}
+  ]
+}

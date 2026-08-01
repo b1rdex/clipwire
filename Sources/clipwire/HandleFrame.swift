@@ -167,29 +167,64 @@ func handleFrame(
         // behaviour needed only one, and the local change in question was
         // already sent to the peer by the watcher's own path.
         //
-        // Resolved as a whole RECORD, and reduced to `.state` only for the
-        // comparison itself. The reconciliation is against what the PEER
-        // announced, so only the announceable half can take part in it -- the
-        // peer has never seen the local hash, and a record's two halves answer
-        // two different questions.
-        //
-        // Reducing to `ClipState` here instead, which is what this did until
-        // the v3.1 fix round, is what made the density state disable
-        // `.sendMine` outright. That branch has to verify the live pasteboard
-        // against what THIS side holds, and after the density fix that is
-        // `localHash`: the canonical hash is then deliberately the PEER's,
-        // while the pasteboard holds our own bytes. With only the canonical
-        // hash to compare against, the verification could never match, the
-        // branch sent zero frames, and it logged `clipboard changed before the
-        // send` about a clipboard nobody had touched. That branch exists to
-        // recover a peer whose clipboard is empty -- a locked PC session, or
-        // cleared GPaste history, both routine -- so the loss landed on
-        // exactly the content the fix creates.
-        let mineRecord = clipStateStore.load()
+        let mine = clipStateStore.load()
             ?? clipStateAnnouncement.announced
             ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now, log: log)
-        let mine = mineRecord.state
-        let decision = resolveFreshness(mine: mine, peer: peerState)
+        // PROVENANCE FIRST, and if it fires `resolveFreshness` is not
+        // consulted at all. This is the call site v3.2's first plan draft
+        // left unowned -- the rule, the wire field, the PC's recording, its
+        // persistence and its disarm were all built, and NOTHING invoked
+        // them. A capability built and never connected is this project's
+        // signature planning defect; it has now cost it twice, and the
+        // remedy is that this branch exists rather than that it is tidy.
+        //
+        // What it buys, stated as the bug it closes: the PC applied this
+        // Mac's screenshot, GPaste re-encoded it, and the PC recorded that
+        // re-encode at the peer's own timestamp PLUS a millisecond -- so at
+        // the next reconnect the PC was deterministically fresher and handed
+        // this Mac back its own screenshot with the density gone. No
+        // ordering of two timestamps can say the two sides hold the same
+        // picture, and two attempts to compare image CONTENT both failed
+        // because GPaste applies the embedded ICC profile and the samples
+        // genuinely move. The PC knows the hash it was GIVEN, so neither
+        // side has to deduce anything.
+        let decision: FreshnessDecision
+        if resolveProvenance(mine: mine, peer: peerState) {
+            // A suppression that leaves no trace is indistinguishable from a
+            // bug, and this one fires exactly when the user expects
+            // something to happen: the screenshot does not come back, and
+            // nothing anywhere says why. So the line names WHICH SIDE'S
+            // content descended from which, not merely that something did.
+            //
+            // The direction is read off `mine.origin`, and that is a LABEL
+            // rather than a second copy of the rule: the verdict was already
+            // reached above, and getting this `if` wrong could only ever
+            // mislabel a line. Written as an `if let` anyway, matching
+            // `resolveProvenance`'s own spelling, so nothing here rests on
+            // `Optional`'s `nil == nil` -- the trap the whole rule is built
+            // around.
+            //
+            // Neither sentence interpolates anything, the convention
+            // `clipboard changed before the send` already follows, so this
+            // side and the PC agent's twin in `_resolve_clip_state` cannot
+            // drift apart in formatting -- and in production both land in
+            // the same file, since `Channel.attempt` pipes the agent's
+            // stderr into this log with a `remote: ` prefix.
+            if let mineOrigin = mine.origin, mineOrigin == peerState.sha256 {
+                log.line("what we hold descends from the peer's clipboard: standing down")
+            } else {
+                log.line("the peer's clipboard descends from what we hold: standing down")
+            }
+            // `.doNothing`, flowing through the ordinary reporting and the
+            // `switch` below rather than returning from here: the acceptance
+            // checklist requires EVERY reconciliation outcome in the log,
+            // and the pairing harness reads a connection's decision out of
+            // that one line. An early return would satisfy "sends no frame"
+            // and silently drop the connection's only verdict.
+            decision = .doNothing
+        } else {
+            decision = resolveFreshness(mine: mine, peer: peerState)
+        }
         // Every reconciliation outcome is reported, not only the interesting
         // ones. Acceptance item 2 requires the conflict to appear in the log,
         // and the design's accepted trade-off -- with both clipboards changed
@@ -219,27 +254,23 @@ func handleFrame(
         switch decision {
         case .sendMine:
             // Verify before sending: read the pasteboard, hash what came
-            // back, and require it to match the record on BOTH halves -- the
-            // kind it records and the hash of what this side's clipboard
-            // actually hands back -- before a single byte of it goes out.
+            // back, and require it to match the announced state on BOTH halves
+            // -- the kind it records and the hash of what this side's
+            // clipboard actually hands back -- before a single byte of it goes
+            // out.
             //
-            // `mineRecord.localHash`, never `mine.sha256`, and the two are the
-            // same string in every case but one. In the state the density fix
-            // creates they are not: the canonical hash is the PEER's copy of
-            // the picture, adopted on purpose so the next reconciliation
-            // settles, while the pasteboard holds this side's own bytes with
-            // the density still on them. `localHash` is the store's answer to
-            // "what does this clipboard return", which is the only thing a
-            // live read can be checked against. Comparing the canonical hash
-            // there cannot match, so the branch sent nothing and blamed a
-            // change that had not happened.
+            // `mine.sha256` is that hash, because one hash is all a record on
+            // this side carries. v3.1 briefly compared against a second,
+            // Mac-internal one; that field is gone with the density fix it
+            // served, and with it the state in which the announced hash and
+            // the clipboard's own could legitimately differ.
             //
-            // The check itself is the older half of this. `mine` is an
+            // The check itself is older than any of that. `mine` is an
             // ANNOUNCEMENT, made at some earlier moment; the pasteboard is
             // free to have moved on since, and this branch is the one place
             // that sends content it did not itself observe changing. Without
-            // the check it sends whatever
-            // it happens to find under the announced timestamp: the wrong
+            // the check it sends whatever it happens to find under the
+            // announced timestamp: the wrong
             // kind, or the right kind at a stale age. Either is a clobber the
             // receiver cannot detect, because everything it can see about the
             // frame is well-formed and consistent -- the PC agent applies any
@@ -271,7 +302,7 @@ func handleFrame(
             // log with a `remote: ` prefix.
             guard let read = pasteboard.read(),
                   read.kind == mine.kind,
-                  sha256Hex(read.data) == mineRecord.localHash else {
+                  sha256Hex(read.data) == mine.sha256 else {
                 log.line("clipboard changed before the send")
                 return
             }
@@ -286,17 +317,8 @@ func handleFrame(
             // the codec from the kind now, and the verification above is
             // exactly what licenses trusting that kind: it proved the live
             // pasteboard agrees with `mine.kind` as well as with
-            // `mineRecord.localHash`. The PC agent's `_resolve_clip_state` is
+            // `mine.sha256`. The PC agent's `_resolve_clip_state` is
             // the worked example, from Task 12.
-            //
-            // What goes out from the density state is this side's own bytes --
-            // the ones carrying the density -- under the canonical `ts`, and
-            // their hash is deliberately not the canonical hash. That is the
-            // right frame: the peer announced an empty clipboard, so what it
-            // needs is the picture, and the best copy of it is the one that
-            // never lost its metadata. The two sides then diverge by a
-            // re-encode again, which is the ordinary state the density fix
-            // already handles on the next reconnect.
             //
             // The empty guard is defensive rather than reachable:
             // `resolveCurrentClipState` records a nil hash for an empty
@@ -428,13 +450,10 @@ func handleFrame(
         // (type 0x01) exclusively. An image applied from the peer arrives
         // as `.imageClip` instead, which does not reach this branch.
         //
-        // `localSHA256: nil`: we wrote these exact bytes, and `NSPasteboard`
-        // hands back what it was given, so the canonical hash is also what a
-        // later read will produce. The image branch below is the one place
-        // that is not true.
-        persistClipState(StoredClipState(state: ClipState(sha256: sha256Hex(textData),
-                                                          ts: decoded.ts, kind: .text),
-                                         localSHA256: nil),
+        // The hash is of what we WROTE, which on this side is also what a
+        // later read produces: `NSPasteboard` hands back the bytes it was
+        // given.
+        persistClipState(ClipState(sha256: sha256Hex(textData), ts: decoded.ts, kind: .text),
                          to: clipStateStore, log: log)
         status.recordReceived()
     case .imageClip:
@@ -462,68 +481,19 @@ func handleFrame(
             log.line("could not decode an image clip from the peer: \(error)")
             return
         }
-        // The density fix (v3.1). A retina screenshot copied here goes to the
-        // PC, GPaste takes the selection over and re-encodes it -- dropping
-        // `pHYs`, the pixel density -- and the PC correctly hashes what it
-        // READ BACK, so it holds a different hash with a later timestamp,
-        // wins the next reconnect, and hands this Mac a copy of its own
-        // screenshot that pastes at double size. Measured: 259 bytes in,
-        // 632 back, 100x100 pixels displaying at 100x100 instead of 50x50.
+        // The incoming image is applied, unconditionally and without reading
+        // the pasteboard first. v3.1 read it here and kept the local bytes
+        // whenever the two decoded to the same pixels, to stop a retina
+        // screenshot coming back from the PC without its `pHYs` and pasting at
+        // double size. That never fired on real hardware: GPaste applies the
+        // image's embedded ICC profile as it loads it and writes the result
+        // untagged, so the samples genuinely move -- 398,267 of 614,400 bytes
+        // on a measured 480x320 screenshot -- and no comparison of content
+        // reaches equality. v3.2 answers the same bug where the evidence
+        // actually is, on the PC, which knows what bytes it was handed and now
+        // announces that hash as `origin`; see the provenance design. So this
+        // branch is the `.clip` case's twin again, one codec over.
         //
-        // So: if this pasteboard already holds an image whose PIXELS are the
-        // incoming one's, keep the local bytes -- they are the ones carrying
-        // the metadata -- and adopt the peer's hash as the canonical one, so
-        // the next reconciliation resolves `doNothing` rather than pulling
-        // the degraded copy across again. The bytes' own hash goes in the
-        // store's local field, which is what keeps the store describing what
-        // this clipboard returns; see `StoredClipState`.
-        //
-        // Nothing is written and nothing is armed, and the second follows
-        // from the first: `EchoGuard` is a ONE-SHOT consumed by the next
-        // observation, so arming it here -- with no write to suppress --
-        // would spend it on whatever the user copies next and swallow a
-        // genuine change. No write also means no `changeCount` bump, so
-        // `PasteboardWatcher` never sees this frame at all and there is
-        // nothing to suppress in the first place.
-        //
-        // The peer's timestamp, exactly as the applying branch below uses
-        // it, and `.image` for the same reason: this is the image codec.
-        // `status.recordReceived()` fires too -- the frame arrived and was
-        // resolved, and this is the steady state the fix creates, so
-        // suppressing it would make a working sync look dead in
-        // `clipwire status` precisely when it is working.
-        //
-        // Only the Mac can do this: comparing pixels needs a real PNG
-        // decoder, and the PC's clipboard will carry no `pHYs` regardless
-        // because GPaste re-encodes whatever it is handed.
-        //
-        // ONE read, held for both questions below. Written as two `if let
-        // local = pasteboard.read()` conditions this read the board twice, and
-        // on `SystemPasteboard` a read is not a cheap accessor: an image read
-        // pulls the TIFF representation and converts it to PNG (see
-        // `SystemPasteboard.read`), so the second one re-converted a
-        // multi-megabyte screenshot on the channel's decode thread to ask a
-        // second question about bytes it already had.
-        let local = pasteboard.read()
-        if let local, local.kind == .image {
-            if imagePixelsIdentical(local.data, decoded.png) {
-                log.line("the peer's image has the same pixels: keeping the local bytes")
-                persistClipState(
-                    StoredClipState(state: ClipState(sha256: sha256Hex(decoded.png), ts: decoded.ts,
-                                                     kind: .image),
-                                    localSHA256: sha256Hex(local.data)),
-                    to: clipStateStore, log: log)
-                status.recordReceived()
-                return
-            }
-            // Only when a local image existed and lost the comparison. The
-            // fix's whole premise -- that a re-encode leaves the samples
-            // alone -- is unmeasured against the real GPaste, so the first
-            // real reconnect logs the evidence rather than us guessing.
-            if let why = imagePixelDifference(local.data, decoded.png) {
-                log.line("the peer's image differs from the local one: \(why)")
-            }
-        }
         // Arm suppression BEFORE writing, with the PNG bytes alone -- not
         // `frame.payload`, which carries the 8-byte timestamp prefix.
         // `PasteboardWatcher` hashes the body `pasteboard.read()` returns,
@@ -550,15 +520,7 @@ func handleFrame(
         // GPaste takes over the selection and re-encodes the image; see
         // `SystemPasteboard.write`'s doc comment for why no read-back belongs
         // here.
-        //
-        // `localSHA256: nil`, unlike the pixel-equivalent branch above: these
-        // are the bytes that went onto the pasteboard, so the canonical hash
-        // is also the one a later read produces. It clears any divergence an
-        // earlier record held, too -- this write replaced whatever the
-        // clipboard was holding.
-        persistClipState(StoredClipState(state: ClipState(sha256: sha256Hex(decoded.png),
-                                                          ts: decoded.ts, kind: .image),
-                                         localSHA256: nil),
+        persistClipState(ClipState(sha256: sha256Hex(decoded.png), ts: decoded.ts, kind: .image),
                          to: clipStateStore, log: log)
         status.recordReceived()
     }

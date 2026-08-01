@@ -75,10 +75,11 @@ final class FixtureTests: XCTestCase {
     /// really 2, not just that some payload was found) and then parses each
     /// payload's JSON directly, asserting the full (sha256, ts, kind) triple
     /// for both the null-hash/null-kind row and the real-hash/text-kind row
-    /// Task 6 added alongside it.
+    /// Task 6 added alongside it -- and, since v3.2, the origin each row
+    /// does or does not carry.
     func testClipStatePayloadDecodesGolden() throws {
         let cases = try loadFixtures().filter { $0.type == FrameType.clipState.rawValue }
-        XCTAssertEqual(cases.count, 2, "expected exactly 2 type-2 fixture cases")
+        XCTAssertEqual(cases.count, 3, "expected exactly 3 type-2 fixture cases")
         let byName = Dictionary(uniqueKeysWithValues: cases.map { ($0.name, $0) })
 
         guard let empty = byName["clip-state"] else { return XCTFail("clip-state fixture case missing") }
@@ -93,6 +94,7 @@ final class FixtureTests: XCTestCase {
         XCTAssertTrue(emptyJSON["sha256"] is NSNull, "sha256 must parse to null")
         XCTAssertEqual(emptyJSON["ts"] as? Double, 1.0)
         XCTAssertTrue(emptyJSON["kind"] is NSNull, "a null hash must carry a null kind")
+        XCTAssertNil(emptyJSON["origin"], "a pre-v3.2 vector carries no origin key at all")
 
         guard let texted = byName["clip-state-text"] else { return XCTFail("clip-state-text fixture case missing") }
         var textedBuffer = hex(texted.frame_hex)
@@ -106,6 +108,27 @@ final class FixtureTests: XCTestCase {
         XCTAssertEqual(textedJSON["sha256"] as? String, String(repeating: "ab", count: 32))
         XCTAssertEqual(textedJSON["ts"] as? Double, 1.0)
         XCTAssertEqual(textedJSON["kind"] as? String, "text")
+        XCTAssertNil(textedJSON["origin"], "a pre-v3.2 vector carries no origin key at all")
+
+        // v3.2's row. The two above it are the "without" half of the pair:
+        // their bytes did not move when the field was added, which is what
+        // an OPTIONAL field means at the wire level rather than only in
+        // prose.
+        guard let originated = byName["clip-state-origin"] else {
+            return XCTFail("clip-state-origin fixture case missing")
+        }
+        var originatedBuffer = hex(originated.frame_hex)
+        let originatedFrame = try Frame.decode(from: &originatedBuffer)
+        XCTAssertEqual(originatedFrame?.type, .clipState, "clip-state-origin fixture must decode as type 2")
+        XCTAssertTrue(originatedBuffer.isEmpty, "leftover bytes for \(originated.name)")
+        guard let originatedPayload = originatedFrame?.payload,
+              let originatedJSON = try JSONSerialization.jsonObject(with: originatedPayload) as? [String: Any] else {
+            return XCTFail("clip-state-origin payload must parse as a JSON object")
+        }
+        XCTAssertEqual(originatedJSON["sha256"] as? String, String(repeating: "cd", count: 32))
+        XCTAssertEqual(originatedJSON["ts"] as? Double, 1.0)
+        XCTAssertEqual(originatedJSON["kind"] as? String, "image")
+        XCTAssertEqual(originatedJSON["origin"] as? String, String(repeating: "ef", count: 32))
     }
 
     /// Pins the fixtures' type-3 payload against the *image* payload codec

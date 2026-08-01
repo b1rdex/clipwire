@@ -63,9 +63,10 @@ class TestFixtures(unittest.TestCase):
         really 2, not just that some payload was found) and then parses each
         payload's JSON directly, asserting the full (sha256, ts, kind) triple
         for both the null-hash/null-kind row and the real-hash/text-kind row
-        Task 6 added alongside it."""
+        Task 6 added alongside it -- and, since v3.2, the origin each row
+        does or does not carry."""
         clip_state_cases = [c for c in self.cases if c["type"] == TYPE_CLIP_STATE]
-        self.assertEqual(len(clip_state_cases), 2, "expected exactly 2 type-2 fixture cases")
+        self.assertEqual(len(clip_state_cases), 3, "expected exactly 3 type-2 fixture cases")
         by_name = {c["name"]: c for c in clip_state_cases}
 
         empty = by_name["clip-state"]
@@ -77,6 +78,7 @@ class TestFixtures(unittest.TestCase):
         self.assertIsNone(parsed["sha256"], "sha256 must parse to null")
         self.assertEqual(parsed["ts"], 1.0)
         self.assertIsNone(parsed["kind"], "a null hash must carry a null kind")
+        self.assertNotIn("origin", parsed, "a pre-v3.2 vector carries no origin key at all")
 
         texted = by_name["clip-state-text"]
         buffer = bytearray(bytes.fromhex(texted["frame_hex"]))
@@ -87,6 +89,22 @@ class TestFixtures(unittest.TestCase):
         self.assertEqual(parsed["sha256"], "ab" * 32)
         self.assertEqual(parsed["ts"], 1.0)
         self.assertEqual(parsed["kind"], "text")
+        self.assertNotIn("origin", parsed, "a pre-v3.2 vector carries no origin key at all")
+
+        # v3.2's row. The two above it are the "without" half of the pair:
+        # their bytes did not move when the field was added, which is what
+        # an OPTIONAL field means at the wire level rather than only in
+        # prose.
+        originated = by_name["clip-state-origin"]
+        buffer = bytearray(bytes.fromhex(originated["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state-origin fixture must decode as type 2")
+        self.assertEqual(len(buffer), 0)
+        parsed = json.loads(payload.decode())
+        self.assertEqual(parsed["sha256"], "cd" * 32)
+        self.assertEqual(parsed["ts"], 1.0)
+        self.assertEqual(parsed["kind"], "image")
+        self.assertEqual(parsed["origin"], "ef" * 32)
 
     def test_image_payload_decodes_golden(self):
         """Pins the fixtures' type-3 payload against the image payload codec

@@ -196,7 +196,7 @@ final class FreshnessTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("fixtures/frames.json"))
         let allCases = try JSONDecoder().decode(FrameFixtures.self, from: data).cases
         let clipStateCases = allCases.filter { $0.type == FrameType.clipState.rawValue }
-        XCTAssertEqual(clipStateCases.count, 2, "expected exactly 2 type-2 fixture cases in frames.json")
+        XCTAssertEqual(clipStateCases.count, 3, "expected exactly 3 type-2 fixture cases in frames.json")
         let byName = Dictionary(uniqueKeysWithValues: clipStateCases.map { ($0.name, $0) })
 
         guard let empty = byName["clip-state"] else { return XCTFail("clip-state fixture case missing") }
@@ -204,12 +204,27 @@ final class FreshnessTests: XCTestCase {
         XCTAssertNil(decodedEmpty.sha256, "clip-state fixture's sha256 must decode to nil")
         XCTAssertEqual(decodedEmpty.ts, 1.0)
         XCTAssertNil(decodedEmpty.kind, "a nil hash must carry a nil kind")
+        XCTAssertNil(decodedEmpty.origin, "a vector written before v3.2 has no origin key, and must decode to nil")
 
         guard let texted = byName["clip-state-text"] else { return XCTFail("clip-state-text fixture case missing") }
         let decodedText = try ClipState.decodePayload(hex(texted.payload_hex))
         XCTAssertEqual(decodedText.sha256, String(repeating: "ab", count: 32))
         XCTAssertEqual(decodedText.ts, 1.0)
         XCTAssertEqual(decodedText.kind, .text)
+        XCTAssertNil(decodedText.origin, "a vector written before v3.2 has no origin key, and must decode to nil")
+
+        // The other half of "absent means today's behaviour": the vector
+        // that carries one. Pinned as a golden frame rather than only as a
+        // round trip, so both languages are held to the same bytes for the
+        // one field they could still disagree about.
+        guard let originated = byName["clip-state-origin"] else {
+            return XCTFail("clip-state-origin fixture case missing")
+        }
+        let decodedOrigin = try ClipState.decodePayload(hex(originated.payload_hex))
+        XCTAssertEqual(decodedOrigin.sha256, String(repeating: "cd", count: 32))
+        XCTAssertEqual(decodedOrigin.ts, 1.0)
+        XCTAssertEqual(decodedOrigin.kind, .image)
+        XCTAssertEqual(decodedOrigin.origin, String(repeating: "ef", count: 32))
     }
 
     // MARK: - Task 6: clip-state carries a kind
@@ -260,6 +275,220 @@ final class FreshnessTests: XCTestCase {
     func testAKindWithoutAHashIsRejected() throws {
         let payload = Data(#"{"sha256": null, "ts": 1.5, "kind": "text"}"#.utf8)
         XCTAssertThrowsError(try ClipState.decodePayload(payload))
+    }
+
+    // MARK: - v3.2: clip-state carries an origin
+
+    /// One field, one rule at decode, and absence meaning exactly what it
+    /// meant before -- so a v3.2 side and a v3.1 peer degrade to today's
+    /// behaviour in both directions instead of failing. Read by
+    /// `resolveProvenance`, and only BEFORE `resolveFreshness`, which v3.2
+    /// leaves exactly as it was (the fixture-driven tests at the top of this
+    /// file run unmodified against an unmodified fixtures/freshness.json).
+
+    func testRoundTripCarriesTheOrigin() throws {
+        let state = ClipState(sha256: String(repeating: "ab", count: 32), ts: 1.5, kind: .image,
+                              origin: String(repeating: "cd", count: 32))
+        XCTAssertEqual(try ClipState.decodePayload(state.encodePayload()), state)
+    }
+
+    /// Absence has to be absence at the BYTE level, not merely in meaning.
+    /// `Codable` synthesis uses `encodeIfPresent` for an `Optional`
+    /// property, so a nil origin's key is omitted rather than written as an
+    /// explicit null -- asserted here by execution rather than assumed from
+    /// the documentation, because it is what keeps every clip-state without
+    /// an origin byte-for-byte what it was before v3.2, including the golden
+    /// vectors in fixtures/frames.json, and it is the shape the PC agent's
+    /// `encode_clip_state` was told to match.
+    func testAStateWithoutAnOriginOmitsTheKeyEntirely() throws {
+        let payload = try ClipState(sha256: String(repeating: "ab", count: 32), ts: 1.5, kind: .text)
+            .encodePayload()
+        guard let json = String(data: payload, encoding: .utf8) else {
+            return XCTFail("payload must be UTF-8")
+        }
+        XCTAssertFalse(json.contains("origin"), "a nil origin must not reach the wire at all, got \(json)")
+    }
+
+    /// Absent and null must be indistinguishable on the way in, even though
+    /// neither side ever writes the null: a peer is free to spell it either
+    /// way and the two must not come to mean different things.
+    func testAnExplicitNullOriginDecodesAsNoOrigin() throws {
+        let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": "text", "origin": null}"#.utf8)
+        XCTAssertNil(try ClipState.decodePayload(payload).origin)
+    }
+
+    /// The rule is NOT the nil-iff-nil pairing `kind` gets. Copying that
+    /// shape would reject every ordinary announcement this protocol sends,
+    /// since a hash with no origin is the normal case and an origin is the
+    /// rare one. Pinned in its own test because a one-directional rule that
+    /// has quietly become symmetric still passes every rejection test.
+    func testAHashWithoutAnOriginIsAccepted() throws {
+        let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": "text"}"#.utf8)
+        let decoded = try ClipState.decodePayload(payload)
+        XCTAssertEqual(decoded.sha256, String(repeating: "ab", count: 32))
+        XCTAssertNil(decoded.origin)
+    }
+
+    /// The one direction that IS an error, and peer-controlled input. An
+    /// origin says "what I hold was born from this hash", so it needs
+    /// content of its own to describe; beside a null `sha256` it claims an
+    /// ancestor for a clipboard holding nothing, which `resolveProvenance`
+    /// could only ever compare against nothing. Built as raw JSON, since
+    /// this side's own encoder is free to produce the pairing -- the
+    /// memberwise init deliberately validates nothing -- and the boundary is
+    /// where it must be caught.
+    func testAnOriginWithoutAHashIsRejected() throws {
+        let payload = Data(#"{"sha256": null, "ts": 1.5, "kind": null, "origin": "\#(String(repeating: "cd", count: 32))"}"#.utf8)
+        XCTAssertThrowsError(try ClipState.decodePayload(payload)) { error in
+            guard case ClipStateError.originWithoutHash = error else {
+                return XCTFail("expected .originWithoutHash, got \(error)")
+            }
+        }
+    }
+
+    /// The same guard on the path that bypasses `decodePayload` entirely.
+    /// `ClipStateStore.load()` calls `JSONDecoder().decode(ClipState.self,
+    /// from:)` directly, which is exactly why this rule lives in
+    /// `init(from:)` beside `kind`'s rather than in `decodePayload` beside
+    /// the sha256 shape check.
+    func testAnOriginWithoutAHashIsRejectedByTheBareDecoderToo() throws {
+        let payload = Data(#"{"sha256": null, "ts": 1.5, "kind": null, "origin": "\#(String(repeating: "cd", count: 32))"}"#.utf8)
+        XCTAssertThrowsError(try JSONDecoder().decode(ClipState.self, from: payload))
+    }
+
+    /// Same class as the sha256 type check: the wire is peer-controlled, and
+    /// a number reaching `resolveProvenance` would compare unequal to every
+    /// hash forever rather than failing where the fault is. `JSONDecoder`'s
+    /// own `typeMismatch` is left to speak for itself, the way it already is
+    /// for an unknown kind.
+    func testANonStringOriginIsRejected() throws {
+        for literal in ["5", "1.5", "true", "[]", "{}"] {
+            let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": "text", "origin": \#(literal)}"#.utf8)
+            XCTAssertThrowsError(try ClipState.decodePayload(payload), "must reject an origin of \(literal)")
+        }
+    }
+
+    /// The upgrade path, in both of its shapes: a v3.1 peer's frame and a
+    /// v3.1 store file are the same bytes -- a well-formed clip-state with
+    /// no "origin" key at all -- and both must load, not fail. That is the
+    /// whole meaning of "optional" here.
+    func testAStateWrittenBeforeV32DecodesWithNoOrigin() throws {
+        let payload = Data(#"{"sha256": "\#(String(repeating: "ab", count: 32))", "ts": 1.5, "kind": "image"}"#.utf8)
+        XCTAssertEqual(try ClipState.decodePayload(payload),
+                       ClipState(sha256: String(repeating: "ab", count: 32), ts: 1.5, kind: .image))
+    }
+
+    // MARK: - v3.2: provenance, the rule and its shared table
+
+    /// fixtures/provenance.json's rows carry only the two fields the rule
+    /// compares -- `sha256` and `origin` -- exactly as freshness.json's
+    /// carry only its own two. `ts` and `kind` are filled in here with
+    /// values `resolveProvenance` never reads, through `ClipState`'s plain
+    /// memberwise init (no validation) rather than its decoder, the same way
+    /// `RawState` above builds a deliberately kind-less state: this
+    /// micro-fixture is exempt from the wire's pairing rules by design, and
+    /// the PC agent's `_record` helper fills the same two the same way.
+    struct RawProvenanceState: Decodable {
+        let sha256: String?
+        let origin: String?
+
+        var asClipState: ClipState { ClipState(sha256: sha256, ts: 0, kind: nil, origin: origin) }
+    }
+
+    struct ProvenanceCase: Decodable {
+        let name: String
+        let mine: RawProvenanceState
+        let peer: RawProvenanceState
+        let expect: Bool
+    }
+    struct ProvenanceFixtures: Decodable { let cases: [ProvenanceCase] }
+
+    func loadProvenanceFixtures() throws -> [ProvenanceCase] {
+        // Tests/clipwireTests/ -> repo root -> fixtures/provenance.json
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(contentsOf: root.appendingPathComponent("fixtures/provenance.json"))
+        let cases = try JSONDecoder().decode(ProvenanceFixtures.self, from: data).cases
+        XCTAssertFalse(cases.isEmpty, "fixtures/provenance.json must not be empty")
+        return cases
+    }
+
+    /// A dedicated, explicit non-vacuousness check, distinct from the
+    /// assertion folded into `loadProvenanceFixtures()` above. Pins the
+    /// exact row count too, so a truncated file -- or one that quietly loses
+    /// its nil rows, the only ones that discriminate against the bug below
+    /// -- still fails.
+    func testProvenanceFixtureFileIsNotEmpty() throws {
+        let cases = try loadProvenanceFixtures()
+        XCTAssertFalse(cases.isEmpty, "fixtures/provenance.json must not be empty")
+        XCTAssertEqual(cases.count, 13, "expected exactly 13 provenance fixture cases")
+    }
+
+    /// Drives every row of the table shared with the PC agent's
+    /// `TestProvenanceFixture` through `resolveProvenance` -- the same file,
+    /// the same rule. Each row maps to exactly one verdict, so flipping any
+    /// single row's `expect` fails that row alone, not the suite in general.
+    func testResolveProvenanceMatchesFixtureTable() throws {
+        for c in try loadProvenanceFixtures() {
+            XCTAssertEqual(resolveProvenance(mine: c.mine.asClipState, peer: c.peer.asClipState),
+                           c.expect,
+                           "resolveProvenance mismatch for \(c.name)")
+        }
+    }
+
+    /// The fixture's real job, checked rather than assumed. `nil == nil` is
+    /// `true` for a Swift `Optional` exactly as `None == None` is `True` in
+    /// Python, so the naive spelling of this rule -- equality with no
+    /// present-value guard -- fires on an empty clipboard against a peer
+    /// with no origin, stands both sides down, and kills
+    /// `resolveFreshness`'s `(_, nil) -> .sendMine` recovery for every kind
+    /// of content. A table built only from present values would pass with
+    /// exactly that bug in it.
+    ///
+    /// So the naive rule is written out here and run over the same table,
+    /// and the table is required to catch it. This is the break-and-observe
+    /// check made permanent, and it has to exist in BOTH languages: a
+    /// Python-only version proves nothing about the `Optional` comparison
+    /// that would ship here.
+    func testTheTableWouldCatchPlainEquality() throws {
+        func naive(mine: ClipState, peer: ClipState) -> Bool {
+            peer.origin == mine.sha256 || mine.origin == peer.sha256
+        }
+        let caught = try loadProvenanceFixtures().filter {
+            naive(mine: $0.mine.asClipState, peer: $0.peer.asClipState) != $0.expect
+        }
+        XCTAssertFalse(caught.isEmpty,
+                       "no row in fixtures/provenance.json distinguishes the real rule from plain "
+                        + "equality -- the table cannot catch the one bug it exists to catch")
+    }
+
+    /// The property that makes one function correct for both machines:
+    /// provenance is symmetric, so the Mac and the PC reach the SAME verdict
+    /// from opposite viewpoints and stand down together. An asymmetric
+    /// implementation -- "the Mac's rule" and "the PC's rule", which is what
+    /// a per-side split grows into -- would leave one machine waiting for a
+    /// clip the other has already decided not to send, which is v1's silent
+    /// loss reintroduced one layer up.
+    func testProvenanceVerdictIsTheSameWhenSidesSwap() throws {
+        for c in try loadProvenanceFixtures() {
+            let mineView = resolveProvenance(mine: c.mine.asClipState, peer: c.peer.asClipState)
+            let peerView = resolveProvenance(mine: c.peer.asClipState, peer: c.mine.asClipState)
+            XCTAssertEqual(peerView, mineView, "not symmetric for \(c.name)")
+        }
+    }
+
+    /// The daily case, pinned literally rather than only as a fixture row,
+    /// because it is the one this rule must never break: a Mac holding a
+    /// clip against a locked PC whose clipboard reads as nothing. Provenance
+    /// must stay out of the way so `resolveFreshness` can hand the peer its
+    /// clipboard back.
+    func testAnEmptyPeerWithNoOriginStillRecovers() {
+        let mine = ClipState(sha256: String(repeating: "aa", count: 32), ts: 5, kind: .text)
+        let peer = ClipState(sha256: nil, ts: 1, kind: nil)
+        XCTAssertFalse(resolveProvenance(mine: mine, peer: peer),
+                       "two absent origins must not compare equal")
+        XCTAssertEqual(resolveFreshness(mine: mine, peer: peer), .sendMine,
+                       "and the recovery this protects must still fire")
     }
 
     private func hex(_ s: String) -> Data {

@@ -15,10 +15,12 @@ from agent_under_test import (
     decode_frame,
     encode_clip_state,
     resolve_freshness,
+    resolve_provenance,
 )
 
 FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "freshness.json"
 FRAMES_FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "frames.json"
+PROVENANCE_FIXTURES = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "provenance.json"
 
 # 64 lowercase hex characters: the only shape decode_clip_state accepts,
 # and the only shape hashlib.sha256(...).hexdigest() -- hence the wire --
@@ -37,6 +39,22 @@ def _pair(state):
     stays a 2-tuple, matching fixtures/freshness.json's rows, which are
     (and must remain) kind-less by design."""
     return state["sha256"], state["ts"]
+
+
+def _record(state):
+    """The (sha256, ts, kind, origin) record resolve_provenance takes -- the
+    WHOLE record, not the (sha256, ts) pair its neighbour takes, and
+    deliberately so: `resolve_provenance(mine[:2], peer[:2])`, copied from
+    the resolve_freshness call one line above it in the agent, would compare
+    a timestamp against a hash and answer False forever without failing
+    anything. See resolve_provenance's own docstring.
+
+    fixtures/provenance.json's rows carry only the two fields the rule
+    compares, exactly as freshness.json's carry only its own two, so ts and
+    kind are filled in here with values the rule never reads.
+    FreshnessTests.swift's own provenance section fills the same two the
+    same way, against the same file."""
+    return state["sha256"], 0.0, None, state["origin"]
 
 
 class TestFreshnessFixture(unittest.TestCase):
@@ -89,25 +107,115 @@ class TestFreshnessFixture(unittest.TestCase):
                 self.assertEqual(peer_view, opposite[mine_view], "not complementary for %s" % c["name"])
 
 
+class TestProvenanceFixture(unittest.TestCase):
+    """v3.2. The question resolve_freshness cannot answer: is either side's
+    content descended from the other's? Same shape as TestFreshnessFixture
+    above, deliberately -- one rule, two languages, one golden file, because
+    two implementations of one idea drifting apart is this project's
+    recorded defect shape.
+
+    fixtures/freshness.json is NOT touched by any of this. Provenance runs
+    before that formula and must not perturb it."""
+
+    def setUp(self):
+        self.cases = json.loads(PROVENANCE_FIXTURES.read_text())["cases"]
+        # Asserted here too, not only in the dedicated test below, so that
+        # EVERY test in this class -- not just one -- is protected from
+        # passing vacuously on a truncated or missing fixture file. Mirrors
+        # TestFreshnessFixture's setUp.
+        self.assertTrue(self.cases, "fixtures/provenance.json must not be empty")
+
+    def test_fixture_file_is_not_empty(self):
+        """A dedicated, explicit non-vacuousness check, distinct from the
+        assertion folded into setUp() above. Pins the exact row count too,
+        so a partially-truncated file (non-empty, but short) still fails --
+        and so does a file that quietly loses its null rows, which are the
+        only ones that discriminate against the bug below."""
+        self.assertTrue(self.cases, "fixtures/provenance.json must not be empty")
+        self.assertEqual(len(self.cases), 13, "expected exactly 13 provenance fixture cases")
+
+    def test_resolve_provenance_matches_fixture_table(self):
+        """Drives every row of the table shared with FreshnessTests.swift's
+        provenance section through resolve_provenance -- the same file, the
+        same rule. Each row maps to exactly one verdict, so flipping any
+        single row's `expect` fails that row alone, not the suite in
+        general."""
+        for c in self.cases:
+            with self.subTest(c["name"]):
+                actual = resolve_provenance(_record(c["mine"]), _record(c["peer"]))
+                self.assertEqual(actual, c["expect"], "resolve_provenance mismatch for %s" % c["name"])
+
+    def test_the_table_would_catch_plain_equality(self):
+        """The fixture's real job, checked rather than assumed. `None ==
+        None` is True in Python and `nil == nil` is true for a Swift
+        Optional, so the naive spelling of this rule -- equality with no
+        present-value guard -- fires on an empty clipboard against a peer
+        with no origin, stands both sides down, and kills
+        resolve_freshness's (_, None) -> SEND_MINE recovery for every kind
+        of content. A provenance table built only from present values would
+        pass with exactly that bug in it.
+
+        So the naive rule is written out here and run over the same table,
+        and the table is required to catch it. This is the break-and-observe
+        check made permanent: it fails if a later edit removes the rows that
+        do the discriminating, at the moment those rows go, rather than when
+        someone eventually simplifies the guard away."""
+        def naive(mine, peer):
+            return bool(peer[3] == mine[0] or mine[3] == peer[0])
+
+        caught = [c["name"] for c in self.cases
+                  if naive(_record(c["mine"]), _record(c["peer"])) != c["expect"]]
+        self.assertTrue(
+            caught,
+            "no row in fixtures/provenance.json distinguishes the real rule from plain "
+            "equality -- the table cannot catch the one bug it exists to catch",
+        )
+
+    def test_verdict_is_the_same_when_sides_swap(self):
+        """The property that makes one function correct for both machines:
+        provenance is symmetric, so the Mac and the PC reach the SAME
+        verdict from opposite viewpoints and stand down together. An
+        asymmetric implementation -- "the Mac's rule" and "the PC's rule",
+        which is what a per-side split would grow into -- would leave one
+        machine waiting for a clip the other has decided not to send, which
+        is v1's silent loss reintroduced one layer up."""
+        for c in self.cases:
+            with self.subTest(c["name"]):
+                mine_view = resolve_provenance(_record(c["mine"]), _record(c["peer"]))
+                peer_view = resolve_provenance(_record(c["peer"]), _record(c["mine"]))
+                self.assertEqual(peer_view, mine_view, "not symmetric for %s" % c["name"])
+
+    def test_a_truncated_record_is_refused_loudly(self):
+        """Why this takes the whole record where resolve_freshness takes a
+        pair. The hazard is a call site copying the `mine[:2]` slice from
+        the resolve_freshness line directly above it: with a pair-shaped
+        signature that would compare a timestamp against a hash, answer
+        False forever, and never fail anything. Unpacking a fixed-arity
+        record raises instead."""
+        with self.assertRaises(ValueError):
+            resolve_provenance((HASH_A, 1.0), (HASH_B, 2.0))
+
+
 class TestClipStateCodec(unittest.TestCase):
     def test_round_trip(self):
         digest = "deadbeefcafe0123" * 4
         encoded = encode_clip_state(digest, 1785400000.5, KIND_TEXT)
-        self.assertEqual(decode_clip_state(encoded), (digest, 1785400000.5, KIND_TEXT))
+        self.assertEqual(decode_clip_state(encoded), (digest, 1785400000.5, KIND_TEXT, None))
 
     def test_round_trip_empty_hash(self):
         encoded = encode_clip_state(None, 0, None)
-        self.assertEqual(decode_clip_state(encoded), (None, 0.0, None))
+        self.assertEqual(decode_clip_state(encoded), (None, 0.0, None, None))
 
     def test_decodes_existing_frames_fixture(self):
         """Pins decode_clip_state against the type-2 vectors in
         fixtures/frames.json: the original null-hash/null-kind vector
-        (decode-only since an earlier task, before this codec existed) and
-        the real-hash/text-kind vector this task adds alongside it. Checked
-        directly against the fixture file, not assumed from its shape."""
+        (decode-only since an earlier task, before this codec existed), the
+        real-hash/text-kind vector added beside it, and v3.2's
+        origin-carrying vector. Checked directly against the fixture file,
+        not assumed from its shape."""
         cases = json.loads(FRAMES_FIXTURES.read_text())["cases"]
         clip_state_cases = [c for c in cases if c["type"] == TYPE_CLIP_STATE]
-        self.assertEqual(len(clip_state_cases), 2, "expected exactly 2 type-2 fixture cases in frames.json")
+        self.assertEqual(len(clip_state_cases), 3, "expected exactly 3 type-2 fixture cases in frames.json")
 
         by_name = {c["name"]: c for c in clip_state_cases}
         empty = by_name["clip-state"]
@@ -115,17 +223,30 @@ class TestClipStateCodec(unittest.TestCase):
         frame_type, payload = decode_frame(buffer)
         self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state fixture must decode as type 2")
         self.assertEqual(len(buffer), 0)
-        self.assertEqual(decode_clip_state(payload), (None, 1.0, None))
+        self.assertEqual(decode_clip_state(payload), (None, 1.0, None, None))
 
         texted = by_name["clip-state-text"]
         buffer = bytearray(bytes.fromhex(texted["frame_hex"]))
         frame_type, payload = decode_frame(buffer)
         self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state-text fixture must decode as type 2")
         self.assertEqual(len(buffer), 0)
-        sha256, ts, kind = decode_clip_state(payload)
+        sha256, ts, kind, origin = decode_clip_state(payload)
         self.assertEqual(sha256, "ab" * 32)
         self.assertEqual(ts, 1.0)
         self.assertEqual(kind, KIND_TEXT)
+        self.assertIsNone(origin, "a vector written before v3.2 has no origin key, and must decode as None")
+
+        # The other half of "absent means today's behaviour": a vector that
+        # carries one. Pinned as a golden frame rather than only as a round
+        # trip, so the two languages are held to the same bytes for the
+        # field they will actually disagree about if either ever writes it
+        # differently.
+        originated = by_name["clip-state-origin"]
+        buffer = bytearray(bytes.fromhex(originated["frame_hex"]))
+        frame_type, payload = decode_frame(buffer)
+        self.assertEqual(frame_type, TYPE_CLIP_STATE, "clip-state-origin fixture must decode as type 2")
+        self.assertEqual(len(buffer), 0)
+        self.assertEqual(decode_clip_state(payload), ("cd" * 32, 1.0, KIND_IMAGE, "ef" * 32))
 
     def test_decode_rejects_non_finite_timestamp(self):
         """json.loads, unlike Swift's JSONDecoder, accepts a bare NaN /
@@ -191,8 +312,8 @@ class TestClipStateCodec(unittest.TestCase):
         actually carries. A real hexdigest, and the null that means an empty
         or unreadable clipboard."""
         real = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        self.assertEqual(decode_clip_state(encode_clip_state(real, 1.0, KIND_TEXT)), (real, 1.0, KIND_TEXT))
-        self.assertEqual(decode_clip_state(encode_clip_state(None, 1.0, None)), (None, 1.0, None))
+        self.assertEqual(decode_clip_state(encode_clip_state(real, 1.0, KIND_TEXT)), (real, 1.0, KIND_TEXT, None))
+        self.assertEqual(decode_clip_state(encode_clip_state(None, 1.0, None)), (None, 1.0, None, None))
 
     def test_decode_rejects_missing_ts(self):
         with self.assertRaises(ClipStateError):
@@ -271,11 +392,11 @@ class TestClipStateKind(unittest.TestCase):
         for kind in (KIND_TEXT, KIND_IMAGE):
             with self.subTest(kind=kind):
                 payload = encode_clip_state("ab" * 32, 1.5, kind)
-                self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, kind))
+                self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, kind, None))
 
     def test_a_null_hash_carries_a_null_kind(self):
         payload = encode_clip_state(None, 1.5, None)
-        self.assertEqual(decode_clip_state(payload), (None, 1.5, None))
+        self.assertEqual(decode_clip_state(payload), (None, 1.5, None, None))
 
     def test_an_unknown_kind_is_rejected(self):
         """Peer-controlled input. An unknown kind must not reach the send
@@ -297,6 +418,84 @@ class TestClipStateKind(unittest.TestCase):
         payload = json.dumps({"sha256": None, "ts": 1.5, "kind": "text"}).encode()
         with self.assertRaises(ClipStateError):
             decode_clip_state(payload)
+
+
+class TestClipStateOrigin(unittest.TestCase):
+    """v3.2: clip-state carries an optional `origin`, the hash the content
+    was born from. One field, one rule at decode, and absence meaning
+    exactly what it meant before -- so a v3.2 agent and a v3.1 peer degrade
+    to today's behaviour in both directions instead of failing.
+
+    This does NOT touch resolve_freshness (TestFreshnessFixture above runs
+    unmodified against fixtures/freshness.json, which v3.2 must not edit);
+    the origin is read by resolve_provenance, and only before that formula.
+    """
+
+    def test_round_trip_carries_the_origin(self):
+        payload = encode_clip_state("ab" * 32, 1.5, KIND_IMAGE, "cd" * 32)
+        self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, KIND_IMAGE, "cd" * 32))
+
+    def test_a_state_without_an_origin_omits_the_key_entirely(self):
+        """Absence has to be absence at the BYTE level, not merely at the
+        meaning level, because this same encoder writes the store file: a
+        payload that gained `"origin": null` would move bytes for every
+        clip-state this protocol has ever produced, including the golden
+        vectors in fixtures/frames.json, for a field carrying no
+        information. It also matches what Swift's synthesized encoder does
+        with a nil Optional, which is the shape the other side emits."""
+        payload = encode_clip_state("ab" * 32, 1.5, KIND_TEXT)
+        self.assertNotIn("origin", json.loads(payload.decode()))
+        self.assertNotIn(b"origin", payload)
+
+    def test_an_explicit_null_origin_decodes_as_no_origin(self):
+        """Absent and null must be indistinguishable on the way in, even
+        though this side never writes the null: Swift omits a nil Optional
+        and Python omits it too, but a peer is free to spell it either way
+        and the two must not mean different things."""
+        payload = json.dumps({"sha256": "ab" * 32, "ts": 1.5, "kind": "text", "origin": None}).encode()
+        self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, KIND_TEXT, None))
+
+    def test_a_hash_without_an_origin_is_accepted(self):
+        """The rule is NOT the null-iff-null pairing `kind` gets. Copying
+        that shape would reject every ordinary announcement this protocol
+        sends -- content with a hash and no origin is the normal case, and
+        an origin is the rare one. Pinned in its own test because a
+        one-directional rule that has quietly become symmetric still passes
+        every rejection test below."""
+        payload = encode_clip_state("ab" * 32, 1.5, KIND_TEXT)
+        self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, KIND_TEXT, None))
+
+    def test_an_origin_without_a_hash_is_rejected(self):
+        """The one direction that IS an error, and peer-controlled input.
+        An origin says "what I hold was born from this hash", so it needs
+        content of its own to describe; beside a null sha256 it claims an
+        ancestor for a clipboard holding nothing, which resolve_provenance
+        could only ever compare against nothing."""
+        payload = json.dumps({"sha256": None, "ts": 1.5, "kind": None, "origin": "cd" * 32}).encode()
+        with self.assertRaises(ClipStateError):
+            decode_clip_state(payload)
+
+    def test_a_non_string_origin_is_rejected(self):
+        """Same class as the sha256 type check above: the wire is
+        peer-controlled, and a number or an object reaching
+        resolve_provenance would compare unequal to every hash forever
+        rather than failing where the fault is."""
+        for bad in (1, 1.5, True, [], {}, ["cd" * 32]):
+            with self.subTest(bad=bad):
+                payload = json.dumps({"sha256": "ab" * 32, "ts": 1.5, "kind": "text", "origin": bad}).encode()
+                with self.assertRaises(ClipStateError):
+                    decode_clip_state(payload)
+
+    def test_a_state_written_before_v3_2_decodes_with_no_origin(self):
+        """The upgrade path, in both of its shapes: a v3.1 peer's frame and
+        a v3.1 store file are the same bytes -- a well-formed clip-state
+        with no "origin" key at all -- and both must load, not fail. This is
+        the whole meaning of "optional": TestV2StoreIsRejected in
+        test_clip_state_store.py is what the OTHER answer looks like, and it
+        was the right answer there because a kind-less hash is genuinely
+        ambiguous while an origin-less hash is not."""
+        payload = json.dumps({"sha256": "ab" * 32, "ts": 1.5, "kind": "text"}).encode()
+        self.assertEqual(decode_clip_state(payload), ("ab" * 32, 1.5, KIND_TEXT, None))
 
 
 if __name__ == "__main__":

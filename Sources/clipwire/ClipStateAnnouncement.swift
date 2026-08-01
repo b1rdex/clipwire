@@ -64,14 +64,8 @@ func sha256Hex(_ data: Data) -> String {
 /// applies to `currentKind`. `nil` is legal and is what tests that assert
 /// only on the resolved state pass; both production callers pass the real
 /// one.
-///
-/// Returns a `StoredClipState` since v3.1 -- the store's record, not the
-/// wire's state -- because the value it resolves is exactly what the caller
-/// persists, and the local hash has to survive that round trip or the store
-/// stops describing what the clipboard returns after one announcement. A
-/// caller that wants only the announceable half takes `.state`.
-func resolveCurrentClipState(pasteboard: PasteboardReading, stored: StoredClipState?, now: Double,
-                             log: Log?) -> StoredClipState {
+func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double,
+                             log: Log?) -> ClipState {
     var currentHash: String? = nil
     var currentKind: ClipKind? = nil
     if let read = pasteboard.read(), !read.data.isEmpty {
@@ -115,25 +109,19 @@ func resolveCurrentClipState(pasteboard: PasteboardReading, stored: StoredClipSt
 final class ClipStateAnnouncement {
     private(set) var sent = false
 
-    /// What THIS connection actually put on the wire, as the whole record it
-    /// came from. Kept because the store is not a reliable way to read it
-    /// back: `announceClipState`'s save is best-effort and, like every save
-    /// site, its failure is only logged. See the `.clipState` case for what
-    /// depends on it.
-    ///
-    /// The record rather than the `ClipState` that travelled, which is what
-    /// this held until the v3.1 fix round, and the difference is the same one
-    /// `persistClipState` warns about: the `.clipState` case reconciles
-    /// against `.state` but VERIFIES its send against `localHash`, and after
-    /// the density fix those are two different hashes. Reduced to its wire
-    /// half here, a fallback through this property would compare the peer's
-    /// hash against this side's own bytes and send nothing at all.
+    /// What THIS connection actually put on the wire. Kept because the store
+    /// is not a reliable way to read it back: `announceClipState`'s save is
+    /// best-effort and, like every save site, its failure is only logged. See
+    /// the `.clipState` case for what depends on it -- both halves of what it
+    /// does there, the reconciliation and the send verification, read this one
+    /// state, which is why dropping a field on the way in here would be felt
+    /// only on the path that exists for when the store has already failed.
     ///
     /// Cleared by `reset()` along with `sent`, so a value announced on one
     /// connection can never be resolved against on the next -- by then it
     /// describes an older reading of the pasteboard than the reconciliation
     /// that connection is about to perform for itself.
-    private(set) var announced: StoredClipState?
+    private(set) var announced: ClipState?
 
     func reset() {
         sent = false
@@ -144,7 +132,7 @@ final class ClipStateAnnouncement {
     /// `markSent()` because that call has to happen BEFORE the announcement
     /// is built (it is what claims the one-shot), and the value only exists
     /// afterwards.
-    func record(announced record: StoredClipState) {
+    func record(announced record: ClipState) {
         announced = record
     }
 
@@ -159,12 +147,11 @@ final class ClipStateAnnouncement {
 }
 
 /// Saves, and logs rather than swallowing if it cannot. Every
-/// `clipStateStore.save` call in the target goes through here -- five of them
-/// now: `announceClipState`, `handleLocalChange`, `handleFrame`'s `.clip`
-/// case, and BOTH of `handleFrame`'s `.imageClip` branches, the one that
-/// applies the peer's image and the pixel-equivalent one the density fix
-/// added beside it. Counting them here rather than naming a number alone,
-/// since the number has already changed twice.
+/// `clipStateStore.save` call in the target goes through here -- four of them:
+/// `announceClipState`, `handleLocalChange`, and `handleFrame`'s `.clip` and
+/// `.imageClip` cases. Counting them here rather than naming a number alone,
+/// since the number has already changed three times -- v3.1's density fix
+/// added a fifth and v3.2's removal took it away again.
 ///
 /// The line matches the text every one of `agent/clipwire-agent.py`'s own
 /// `save_clip_state` call sites already logs (`could not persist clip state:
@@ -179,34 +166,16 @@ final class ClipStateAnnouncement {
 /// One function rather than a copy of the same `do/catch` per site:
 /// identical literals repeated across the target is exactly the drift this project
 /// has already been bitten by, and `ClipStateStore.save` deliberately throws
-/// so that a CALLER can log -- it just should not be five callers writing the
+/// so that a CALLER can log -- it just should not be four callers writing the
 /// string out independently.
 ///
-/// Takes the store's whole record rather than a `ClipState` plus a separate
-/// local hash, and that is deliberate: a two-argument shape would let a call
-/// site rebuild the pair from parts and drop the local half silently, which
-/// is the failure mode `resolveStartupState`'s own comment records from Task
-/// 6 (a same-arity caller changing its body is invisible to every test that
-/// checks only the callee). Four of the five sites CONSTRUCT the record they
-/// pass, right at the call. Three of those four hold content whose bytes this
-/// machine put on its own pasteboard -- `handleLocalChange`, `handleFrame`'s
-/// `.clip` case, and the `.imageClip` branch that applies the peer's image --
-/// so they pass `localSHA256: nil` and each says why; the fourth,
-/// `handleFrame`'s pixel-equivalent image branch, is the one place that
-/// passes a real one.
-///
-/// `announceClipState`, the fifth, constructs nothing: it FORWARDS the record
-/// `resolveCurrentClipState` resolved, local hash and all. That forwarding is
-/// load-bearing, and this paragraph is here so nobody "corrects" it into the
-/// three-of-four shape above. `resolveStartupState` returns the STORED record
-/// unchanged whenever the clipboard still matches it, so after the density
-/// fix the record it hands back is the divergent pair -- the peer's hash as
-/// canonical, ours as local. A `localSHA256: nil` inserted here would erase
-/// that divergence on the first announcement of the very next connection, and
-/// the connection after it would find a stored hash the clipboard does not
-/// hold, stamp `now`, and log a false `clipboard changed while apart`: the
-/// two-hash mechanism undone by a tidy-up, one save after it started working.
-func persistClipState(_ record: StoredClipState, to store: ClipStateStore, log: Log) {
+/// Three of the four CONSTRUCT the state they pass, right at the call, from
+/// bytes this machine put on its own pasteboard: `handleLocalChange` and
+/// `handleFrame`'s `.clip` and `.imageClip` cases. `announceClipState`
+/// constructs nothing and FORWARDS what `resolveCurrentClipState` resolved,
+/// which is what keeps the stored `ts` from being restamped on content that
+/// has not changed.
+func persistClipState(_ record: ClipState, to store: ClipStateStore, log: Log) {
     do {
         try store.save(record)
     } catch {
@@ -232,7 +201,7 @@ func announceClipState(
     clipStateStore: ClipStateStore,
     log: Log,
     now: Double
-) -> StoredClipState? {
+) -> ClipState? {
     let stored = clipStateStore.load()
     let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now, log: log)
     // The line the design spec mandates by name for exactly this branch --
@@ -260,34 +229,18 @@ func announceClipState(
     // nothing changed at all. The spec ties this line to startup
     // reconciliation, which is this function. Byte-identical to
     // `announce_clip_state`'s own line on the PC side.
-    //
-    // `localHash` on BOTH sides, never `state.sha256`, and for a sharper
-    // reason than the seed's: in the state the density fix creates, the
-    // canonical hash is the peer's and the clipboard holds this side's own
-    // bytes. If the user then copies something whose bytes hash to that same
-    // canonical value, the canonical comparison sees no difference and stays
-    // silent about a clipboard that genuinely changed -- an unannounced
-    // change with `now` stamped on it and no line to explain it, which is
-    // this line's entire job. `localHash` measures what the clipboard
-    // returns, which is the thing that either changed or did not.
-    if let hash = resolved.localHash, stored?.localHash != hash {
+    if let hash = resolved.sha256, stored?.sha256 != hash {
         log.line("clipboard changed while apart")
     }
     persistClipState(resolved, to: clipStateStore, log: log)
     // Returns nothing unless something actually reached the wire: a payload
     // that failed to encode was never announced, so there is nothing for a
-    // later reconciliation to be consistent WITH.
-    //
-    // What it returns is the whole RECORD, though only `.state` was encoded --
-    // the local hash is this machine's business and has never been on the
-    // wire. The caller stores this in `ClipStateAnnouncement.announced`, which
-    // the `.clipState` case falls back to when the store cannot be read, and
-    // that fallback feeds both the reconciliation (which takes `.state`) and
-    // the send verification (which takes `localHash`). Returning `.state`
-    // alone -- as this did until the v3.1 fix round -- silently drops the half
-    // the verification needs, on the one path that exists for when the store
-    // has already failed.
-    guard let payload = try? resolved.state.encodePayload() else { return nil }
+    // later reconciliation to be consistent WITH. The caller stores what it
+    // gets in `ClipStateAnnouncement.announced`, which the `.clipState` case
+    // falls back to when the store cannot be read -- feeding both the
+    // reconciliation and the send verification from the one value that was
+    // actually put on the wire.
+    guard let payload = try? resolved.encodePayload() else { return nil }
     send(Frame(type: .clipState, payload: payload))
     return resolved
 }

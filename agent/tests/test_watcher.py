@@ -876,6 +876,83 @@ class TestPollingWatcher(unittest.TestCase):
 
         self.assertEqual(changes, [b"b", b"c"])
 
+    def test_an_unchanged_token_still_signals_when_on_idle_tick_says_so(self):
+        """v3.2's no-change branch, and the whole reason it exists.
+
+        A clipboard that never changes again is not the same thing as
+        nothing worth looking at. After this side applies an image from the
+        peer, an expectation is armed waiting for GPaste to re-offer it --
+        and on a machine with no GPaste that re-offer never comes and the
+        selection never moves again. Without this branch nothing observes
+        the clipboard a second time, _consume_image_reoffer never runs, and
+        the disarm is a branch nothing reaches: the user's next image copy,
+        whenever it happens, is absorbed as the re-offer instead. Under
+        v3.2 that clip is not late, it is gone.
+
+        The script never changes, so every signal here comes from the
+        predicate rather than from the token."""
+        clipboard = ScriptedReadClipboard([b"unmoving"])
+        observations = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005,
+                                 on_idle_tick=lambda: True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observations.append(1))
+
+        self.wait_until(lambda: len(observations) >= 2)
+        watcher.stop()
+        self.assertGreaterEqual(
+            len(observations), 2,
+            "a static clipboard must still be observed while the predicate asks for it",
+        )
+
+    def test_an_unchanged_token_signals_nothing_when_the_predicate_declines(self):
+        """The control, and the one that keeps the branch from being 'poll the
+        clipboard on every tick forever'. With no expectation armed the
+        predicate says no and the loop behaves exactly as it did before v3.2
+        -- which is what bounds the extra read to at most one detection
+        budget's worth of ticks per applied image, and to none at all once
+        the re-offer arrives.
+
+        Deliberately paired with the test above rather than folded into it:
+        a branch that signalled unconditionally would pass that one."""
+        clipboard = ScriptedReadClipboard([b"unmoving"])
+        observations = []
+        asked = []
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.002,
+            on_idle_tick=lambda: asked.append(1) or False)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observations.append(1))
+
+        self.wait_until(lambda: len(asked) >= 3)
+        watcher.stop()
+        self.assertGreaterEqual(len(asked), 3, "the predicate must actually be asked")
+        self.assertEqual(observations, [],
+                         "an unchanged clipboard nobody is waiting on is not an observation")
+
+    def test_a_real_change_still_reaches_the_tick_observer_when_the_predicate_is_wired(self):
+        """Health accounting outranks absorption. The no-change branch must
+        be an `elif` under the real-change branch and must not skip past
+        on_tick: _observe_tick is the safety net's whole judgement, and a
+        tick that returned early to service an expectation would leave a
+        dead event source undiagnosed for another full cycle -- the safety
+        net blinded by the very mechanism that proves it was needed."""
+        ticks = []
+        clipboard = ScriptedReadClipboard([b"a", b"b", b"b", b"b"])
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.002,
+            on_tick=lambda previous, current: ticks.append((previous, current)),
+            on_idle_tick=lambda: True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        watcher.stop()
+        self.assertGreaterEqual(len(ticks), 3,
+                                "every tick must still reach the verdict, changed or not")
+        self.assertIn((b"a", b"b"), ticks,
+                      "and the real change must still be reported as one")
+
     def test_stop_ends_the_poll_loop_promptly(self):
         clipboard = ScriptedReadClipboard([b"x"] * 10000)
         watcher = PollingWatcher(clipboard, interval_seconds=0.02)
@@ -1712,6 +1789,34 @@ class TestMakeWatcher(unittest.TestCase):
             "and a watcher rebuilt already degraded must come up polling at it",
         )
 
+    def test_the_idle_tick_predicate_reaches_both_watcher_shapes(self):
+        """And the plain poller is the branch that matters, which is why
+        both are asserted here rather than only the interesting-looking one.
+
+        A machine with no GPaste gets the fallback below, and it is exactly
+        the machine whose applied image is never re-offered -- so a hook
+        wired only into the GPaste watcher would be inert in the one
+        installation Task 5 exists for. That is the shape of the two fixes
+        this bug has already outlived: correct code that no production path
+        reaches."""
+        predicate = object()
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            gpaste = make_watcher(clipboard=object(), on_idle_tick=predicate)
+        self.assertIs(
+            gpaste._safety_net._on_idle_tick, predicate,
+            "the GPaste watcher must hand it to the safety-net poll it composes",
+        )
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            plain = make_watcher(clipboard=object(), on_idle_tick=predicate)
+        self.assertIs(
+            plain._on_idle_tick, predicate,
+            "and the no-GPaste fallback must get it too: that is the machine whose "
+            "re-offer never comes, so a hook it never receives is a fix that is inert "
+            "exactly where it is needed",
+        )
+
 
 class QueueClipboard:
     """A clipboard double whose read() replays a queue of scripted values --
@@ -1769,9 +1874,15 @@ class FlapRecordingWatcher:
     the diagnosis on demand -- standing in for a real safety-net verdict
     without any thread or subprocess."""
 
-    def __init__(self, degraded=False, on_degrade=None):
+    def __init__(self, degraded=False, on_degrade=None, on_idle_tick=None):
         self.degraded = degraded
         self._on_degrade = on_degrade
+        # Recorded rather than ignored: the disarm that keeps a re-offer
+        # expectation from swallowing the user's next image copy is reached
+        # only through this hook, so a rebuild that quietly dropped it would
+        # leave every connection after the first Wayland flap with an
+        # expectation nothing can ever disarm.
+        self.on_idle_tick = on_idle_tick
         self.started_with = None
         self.stopped = False
 
@@ -1884,6 +1995,12 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
         self.assertEqual(
             built[1].started_with, agent._local_change,
             "and it must still be wired to the one observation funnel",
+        )
+        self.assertEqual(
+            built[1].on_idle_tick, agent._reoffer_pending,
+            "and to the predicate that lets a static clipboard still disarm a "
+            "re-offer expectation -- a rebuild that dropped it would leave the "
+            "user's next image copy to be absorbed as a re-offer that never came",
         )
 
 
@@ -2340,7 +2457,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
         decoded = decode_clip_state(announced[0][1])
         self.assertEqual(
-            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
+            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE, None),
             "the announced kind must be the real one, not a fabricated KIND_TEXT",
         )
 
@@ -2482,7 +2599,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         agent._write_clip(encode_clip_payload(peers_ts, b"peer's clip"))
 
         stored = load_clip_state(path=self.clip_state_path)
-        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts, KIND_TEXT),
+        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts, KIND_TEXT, None),
                          "must store the PEER's ts, never now")
 
     def test_stores_the_literal_known_hash_for_a_pinned_vector(self):
@@ -2501,7 +2618,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         stored = load_clip_state(path=self.clip_state_path)
         self.assertEqual(
             stored,
-            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0, KIND_TEXT),
+            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0, KIND_TEXT, None),
         )
 
     def test_a_malformed_too_short_payload_touches_neither_suppression_nor_the_clipboard(self):
@@ -2955,7 +3072,7 @@ class TestIncomingClipState(unittest.TestCase):
 
         agent.on_frame(TYPE_CLIP, encode_clip_payload(applied_ts, applied_text))
         self.assertEqual(
-            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT),
+            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT, None),
             "test setup must actually apply and persist the clip, or this test proves nothing",
         )
         self.assertEqual(
@@ -3332,7 +3449,7 @@ class TestIncomingClipState(unittest.TestCase):
 
         self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
         self.assertEqual(
-            agent._pending_peer_clip_state, (HASH_B, 42.0, KIND_TEXT),
+            agent._pending_peer_clip_state, (HASH_B, 42.0, KIND_TEXT, None),
             "the peer's own decoded state must be stashed, not silently dropped",
         )
 
@@ -3502,13 +3619,22 @@ class TestIncomingClipState(unittest.TestCase):
         log. The decision word alone cannot say it -- see this class's other
         reconciliation tests, which never once ask what kind either side
         held. Mirrors HandleFrameTests.swift's
-        testTheReconciliationLineNamesBothKinds."""
+        testTheReconciliationLineNamesBothKinds.
+
+        FOUR elements in each hand-built record since v3.2, when this method
+        began asking resolve_provenance first -- which takes WHOLE records
+        and raises ValueError on a short one rather than silently comparing
+        a timestamp against a hash. Widening two synthetic tuples is not
+        defeating that guard: every production producer of `mine`
+        (load_clip_state, resolve_current_clip_state, announce_clip_state's
+        return, _write_clip's) was already a quadruple, and these two
+        literals were the only records in the suite that were not."""
         log_lines = self.capture_log()
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_image_read(b"\x89P")  # the send branch's own verification read
         agent = self.build(clipboard=clipboard)
-        mine = (sha256_hex(b"\x89P"), 5000.0, KIND_IMAGE)
-        peer = (HASH_B, 1000.0, KIND_TEXT)
+        mine = (sha256_hex(b"\x89P"), 5000.0, KIND_IMAGE, None)
+        peer = (HASH_B, 1000.0, KIND_TEXT, None)
 
         agent._resolve_clip_state(peer, mine=mine)
 
@@ -3527,11 +3653,20 @@ class TestIncomingClipState(unittest.TestCase):
 
     def test_the_line_says_none_when_a_side_holds_nothing(self):
         """The complement: neither side's hash implies neither side's kind,
-        and the line must say so rather than omit it or print "None"."""
+        and the line must say so rather than omit it or print "None".
+
+        Also the shape provenance must NOT fire on, which is why the two
+        null origins here are load-bearing rather than padding: `None ==
+        None` is True in Python, so a rule that compared without checking
+        presence would stand both sides down on two empty clipboards and
+        kill resolve_freshness's (_, None) -> SEND_MINE recovery. Asserting
+        a doNothing line here would not catch that (both spellings agree on
+        this row); the kinds suffix is what this test is for, and
+        test_freshness.py's nil rows are what pin the rule."""
         log_lines = self.capture_log()
         agent = self.build()
 
-        agent._resolve_clip_state((None, 1000.0, None), mine=(None, 5000.0, None))
+        agent._resolve_clip_state((None, 1000.0, None, None), mine=(None, 5000.0, None, None))
 
         line = next(l for l in log_lines if "reconciled with the peer" in l)
         self.assertIn(" (mine=none peer=none)", line)
@@ -3601,6 +3736,130 @@ class TestIncomingClipState(unittest.TestCase):
         )
 
 
+class TestProvenanceIsConsultedAtTheReconciliation(unittest.TestCase):
+    """v3.2, Task 6b: the rule is actually CALLED.
+
+    Tasks 1-6 built resolve_provenance, put `origin` on the wire, taught
+    _consume_image_reoffer to record it, made it survive the agent's death
+    and disarmed the expectation that could poison it -- and nothing
+    invoked any of it. A capability built and never connected is this
+    project's signature planning defect, and this class is what makes the
+    connection observable from the Python side alone: the pairing harness
+    proves it end to end, but it is a SWIFT test, so with only that test a
+    break in this file's rule and a break in the Mac's are the same red.
+
+    THE BUG, at the size a unit test can hold it. The Mac copies a retina
+    screenshot; the PC applies it, GPaste re-encodes the selection, and
+    _consume_image_reoffer records the re-encode at the peer's own
+    timestamp PLUS REOFFER_TS_NUDGE_SECONDS -- deliberately, so the first
+    reconnect resolves deterministically instead of by hex tie-break. That
+    determinism is exactly what hands the Mac back its own screenshot with
+    the density gone: 1 ms is enough for the PC to win freshness forever.
+    Two attempts to compare image CONTENT both failed, measured, because
+    GPaste applies the embedded ICC profile and the samples genuinely move.
+    The PC knows the hash it was GIVEN, so neither side deduces anything."""
+
+    ORIGINAL = b"\x89PNG-the-mac's-own-screenshot"
+    REENCODED = b"\x89PNG-what-gpaste-handed-back"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.clip_state_path = os.path.join(self._tmp.name, "clip-state.json")
+        self.logged = []
+        original_log = clipwire_agent.log
+        clipwire_agent.log = self.logged.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def build(self, clipboard):
+        agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(),
+                      clipboard=clipboard, clip_state_path=self.clip_state_path)
+        agent._clip_state_sent = True
+        self.sent = []
+        agent.send = lambda t, p: self.sent.append((t, p))
+        return agent
+
+    def decision(self):
+        line = next(l for l in self.logged if "reconciled with the peer" in l)
+        return line.split("reconciled with the peer: ")[1].split(" ")[0]
+
+    def test_our_own_derivative_is_never_sent_back_to_its_ancestor(self):
+        """THE FIX, in the direction that produced the reported defect.
+
+        We are fresher by a millisecond and we hold different bytes, so
+        resolve_freshness alone says SEND_MINE -- and the Mac applies any
+        incoming clip unconditionally, so the send IS the degraded paste.
+        The clipboard genuinely holds the re-encode here, and the store's
+        hash genuinely matches it, so a wrongly-resolved SEND_MINE would
+        reach the wire rather than dying at the send branch's own
+        verification and passing this for the wrong reason."""
+        save_clip_state(sha256_hex(self.REENCODED), 1000.001, KIND_IMAGE,
+                        origin=sha256_hex(self.ORIGINAL), path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(self.REENCODED)
+        agent = self.build(clipboard)
+
+        agent.on_frame(TYPE_CLIP_STATE,
+                       encode_clip_state(sha256_hex(self.ORIGINAL), 1000.0, KIND_IMAGE))
+
+        self.assertEqual(self.sent, [],
+                         "the peer holds the ancestor of what we hold; sending our "
+                         "re-encode back is the density bug, delivered")
+        self.assertEqual(self.decision(), "doNothing",
+                         "provenance resolves doNothing outright -- the freshness "
+                         "formula is not consulted at all")
+        self.assertIn("what we hold descends from the peer's clipboard: standing down",
+                      self.logged,
+                      "a suppression that leaves no trace is indistinguishable from a "
+                      "bug, and it fires exactly when the user expects something")
+
+    def test_a_peer_holding_our_descendant_is_not_waited_for(self):
+        """The mirror, from the side that is NOT sending anyway -- so
+        "nothing was sent" cannot tell the two apart and the log is the
+        whole evidence. Freshness alone reads waitForPeer here: the peer is
+        a millisecond newer and we would sit waiting for a clip it has
+        already decided never to send. Provenance stands BOTH sides down
+        together, which is the point of one symmetric rule."""
+        save_clip_state(sha256_hex(self.ORIGINAL), 1000.0, KIND_IMAGE,
+                        path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(self.ORIGINAL)
+        agent = self.build(clipboard)
+
+        agent.on_frame(TYPE_CLIP_STATE,
+                       encode_clip_state(sha256_hex(self.REENCODED), 1000.001, KIND_IMAGE,
+                                         sha256_hex(self.ORIGINAL)))
+
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.decision(), "doNothing",
+                         "waitForPeer here is waiting forever: the peer's provenance "
+                         "check stood it down at the same instant")
+        self.assertIn("the peer's clipboard descends from what we hold: standing down",
+                      self.logged)
+
+    def test_an_empty_peer_is_still_handed_back_what_it_lost(self):
+        """The nil trap, pinned AT THE CALL SITE rather than only in the
+        rule. `None == None` is True in Python, so the naive spelling of
+        provenance fires on our own origin-less record against a peer that
+        announced nothing -- a locked PC against an ordinary Mac, which
+        happens daily -- and would kill resolve_freshness's (_, None) ->
+        SEND_MINE recovery for EVERY kind of content, not merely for
+        images. fixtures/provenance.json's nil rows pin the rule; this pins
+        that wiring it in did not reintroduce the trap one layer up."""
+        save_clip_state(sha256_hex(b"the clip the peer lost"), 777, KIND_TEXT,
+                        path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"the clip the peer lost")
+        agent = self.build(clipboard)
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
+
+        self.assertEqual([t for t, _ in self.sent], [TYPE_CLIP],
+                         "a peer with nothing gets its clipboard back; suppressing "
+                         "this is v1's silent loss, restored by a rule about images")
+        self.assertEqual(self.decision(), "sendMine")
+
+
 class TestModuleDefinitionOrder(unittest.TestCase):
     """The file ends with `if __name__ == "__main__": sys.exit(main(...))`.
     main() is only CALLED on that line, so any def/class placed AFTER it in
@@ -3667,6 +3926,12 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def _is_sha256_hex",
             "def decode_clip_state",
             "def resolve_freshness",
+            # v3.2: the provenance rule, defined immediately after the
+            # freshness one it runs before. A top-level definition that
+            # drifted below the guard would still import fine for every
+            # test in this suite and NameError only in production, which
+            # is the whole reason this check exists.
+            "def resolve_provenance",
             'SEND_MINE = "sendMine"',
             'WAIT_FOR_PEER = "waitForPeer"',
             'DO_NOTHING = "doNothing"',

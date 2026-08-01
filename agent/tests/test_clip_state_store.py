@@ -20,6 +20,7 @@ from agent_under_test import (
     load_clip_state,
     resolve_current_clip_state,
     resolve_freshness,
+    resolve_provenance,
     resolve_startup_state,
     save_clip_state,
     sha256_hex,
@@ -82,22 +83,47 @@ class TestRoundTrip(_TempPathCase):
     def test_round_trip(self):
         digest = "deadbeefcafe0123" * 4
         save_clip_state(digest, 1785400000.5, KIND_TEXT, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (digest, 1785400000.5, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=self.path), (digest, 1785400000.5, KIND_TEXT, None))
 
     def test_second_save_overwrites_the_first(self):
         """Different kinds on the two saves, not just different hashes: the
         second save must overwrite kind too, not only sha256/ts."""
         save_clip_state(HASH_A, 1, KIND_TEXT, path=self.path)
         save_clip_state(HASH_B, 2, KIND_IMAGE, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (HASH_B, 2.0, KIND_IMAGE))
+        self.assertEqual(load_clip_state(path=self.path), (HASH_B, 2.0, KIND_IMAGE, None))
 
     def test_none_hash_round_trips(self):
         save_clip_state(None, 0, None, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (None, 0.0, None))
+        self.assertEqual(load_clip_state(path=self.path), (None, 0.0, None, None))
 
     def test_the_store_round_trips_the_kind(self):
         save_clip_state("cd" * 32, 9.0, KIND_IMAGE, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), ("cd" * 32, 9.0, KIND_IMAGE))
+        self.assertEqual(load_clip_state(path=self.path), ("cd" * 32, 9.0, KIND_IMAGE, None))
+
+    def test_the_store_round_trips_the_origin(self):
+        """v3.2. The store is the ONLY place an origin outlives the process
+        that witnessed the substitution: sshd spawns a fresh agent per
+        connection, so by the announce that has to declare the ancestry,
+        the agent that discovered it is already dead. An origin the encoder
+        accepted and the store dropped would leave the whole release inert
+        while every test about the wire stayed green."""
+        save_clip_state(HASH_A, 9.0, KIND_IMAGE, origin=HASH_B, path=self.path)
+        self.assertEqual(load_clip_state(path=self.path), (HASH_A, 9.0, KIND_IMAGE, HASH_B))
+
+    def test_a_store_file_with_no_origin_key_loads_as_none(self):
+        """Every store file written before v3.2 is this shape, and so is
+        every one written since by the four call sites that have no origin
+        to record -- encode_clip_state OMITS the key rather than writing an
+        explicit null. Absent means what it meant before, which is the same
+        rule the wire follows, through the single decoder both share.
+
+        The precedent is TestV2StoreIsRejected below, which pins the
+        opposite outcome for a missing `kind` -- and the difference is the
+        point: `kind` is null-iff-null with sha256, so its absence is a
+        shape error, while an origin's absence is the ordinary case."""
+        with open(self.path, "wb") as handle:
+            handle.write(('{"sha256": "%s", "ts": 100, "kind": "text"}' % HASH_A).encode())
+        self.assertEqual(load_clip_state(path=self.path), (HASH_A, 100.0, KIND_TEXT, None))
 
 
 class TestLoadNeverRaises(_TempPathCase):
@@ -162,7 +188,7 @@ class TestSaveIsAtomic(_TempPathCase):
     def test_save_creates_intermediate_directories(self):
         nested = os.path.join(self._tmp.name, "nested", "clip-state.json")
         save_clip_state(HASH_A, 1, KIND_TEXT, path=nested)
-        self.assertEqual(load_clip_state(path=nested), (HASH_A, 1.0, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=nested), (HASH_A, 1.0, KIND_TEXT, None))
 
 
 class TestSaveIsSerialized(_TempPathCase):
@@ -267,10 +293,23 @@ class TestResolveStartupState(unittest.TestCase):
         happen to coincide; this one actually fails it. current_kind is
         passed as KIND_TEXT, the wrong answer for this stored row, so a
         bug that returned current_kind instead of the stored one cannot
-        pass by coincidence either."""
-        stored = ("aa", 100, KIND_IMAGE)
+        pass by coincidence either.
+
+        `stored` carries an ORIGIN too (v3.2), and it is what makes this
+        row a real test of the matched branch rather than of three of its
+        four fields. The store is the only place an origin survives the
+        agent that recorded it -- sshd spawns a new process per connection
+        -- so a matched branch that rebuilt the record around
+        `current_hash` would drop it here, look right on every field
+        anyone thinks to assert, and let the suppression die on the SECOND
+        reconnect. A four-element `stored` and a four-element assertion is
+        the whole difference between catching that and not."""
+        stored = ("aa", 100, KIND_IMAGE, "cc")
         result = resolve_startup_state("aa", KIND_TEXT, stored, 999)
-        self.assertEqual(result, ("aa", 100, KIND_IMAGE))
+        self.assertEqual(result, ("aa", 100, KIND_IMAGE, "cc"))
+        self.assertEqual(result[3], "cc",
+                         "the stored record is returned WHOLE: an origin rebuilt away "
+                         "here is a fix that works once and dies on the next reconnect")
 
     def test_stored_hash_differs_returns_the_reads_own_kind(self):
         """Content that changed while apart is read fresh, and Task 7 made
@@ -281,18 +320,28 @@ class TestResolveStartupState(unittest.TestCase):
         test_clip_state_store.py::TestResolveCurrentClipState::test_content_differing_from_the_store_uses_the_reads_own_kind).
         KIND_IMAGE here, against a stored KIND_TEXT, is what makes this
         assertion distinguish "threaded through" from "copied from
-        stored"."""
-        stored = ("aa", 100, KIND_TEXT)
+        stored".
+
+        The stored origin is deliberately non-null and the expected one is
+        None: content that changed while apart is not descended from
+        whatever the old entry named, and carrying that origin forward is
+        the silent-loss direction of a stale origin -- the PC holding new
+        user content that the Mac still matches by ancestry, and never
+        sending it."""
+        stored = ("aa", 100, KIND_TEXT, "cc")
         result = resolve_startup_state("bb", KIND_IMAGE, stored, 999)
-        self.assertEqual(result, ("bb", 999, KIND_IMAGE))
+        self.assertEqual(result, ("bb", 999, KIND_IMAGE, None))
 
     def test_nothing_stored_returns_the_reads_own_kind(self):
         """Same rule as the row above, for the OTHER branch that reaches
-        `return current_hash, now, current_kind`: nothing on disk is not
-        distinguishable, from this function's point of view, from stored
-        content that no longer matches -- both mean "trust the read"."""
+        `return current_hash, now, current_kind, None`: nothing on disk is
+        not distinguishable, from this function's point of view, from
+        stored content that no longer matches -- both mean "trust the
+        read". The trailing None is asserted rather than sliced off: every
+        branch owes four elements, and resolve_provenance raises ValueError
+        rather than quietly comparing a short one."""
         result = resolve_startup_state("aa", KIND_IMAGE, None, 999)
-        self.assertEqual(result, ("aa", 999, KIND_IMAGE))
+        self.assertEqual(result, ("aa", 999, KIND_IMAGE, None))
 
     def test_current_hash_none_returns_none_hash_and_none_kind_regardless_of_stored_or_current_kind(self):
         """A None current hash always wins over whatever is on disk, and
@@ -303,16 +352,49 @@ class TestResolveStartupState(unittest.TestCase):
         current_kind is passed as KIND_TEXT -- not None -- specifically to
         prove the returned kind is a literal None, not current_kind passed
         through: an empty/unreadable clipboard has no real kind to report,
-        whatever a caller mistakenly supplied for it."""
-        stored = ("aa", 100, KIND_TEXT)
+        whatever a caller mistakenly supplied for it. The stored origin is
+        non-null for the same reason: a clipboard with nothing on it has no
+        content for an ancestor to describe, which is exactly why
+        decode_clip_state refuses an origin beside a null sha256 on the
+        wire."""
+        stored = ("aa", 100, KIND_TEXT, "cc")
         result = resolve_startup_state(None, KIND_TEXT, stored, 999)
         self.assertIsNone(result[0])
         self.assertEqual(result[1], 999)
         self.assertIsNone(result[2], "a null hash must carry a null kind")
+        self.assertIsNone(result[3], "and a null origin, which encode_clip_state "
+                                     "would otherwise emit beside a null sha256")
 
     def test_current_hash_none_and_nothing_stored_returns_none_hash(self):
         result = resolve_startup_state(None, None, None, 999)
         self.assertIsNone(result[0])
+
+    def test_every_branch_returns_a_four_element_record(self):
+        """The arity itself, pinned across all three branches, because
+        nothing else in this suite can pin it yet: resolve_provenance has no
+        production call site until the reconciliation paths are wired, so a
+        branch quietly returning a triple would fail nothing today and
+        raise ValueError in production on the release after this one.
+
+        A record is what this function returns, and a record has four
+        elements -- matched, changed and null alike. resolve_provenance
+        deliberately refuses a short one rather than comparing whatever
+        happens to be in slot two, because `resolve_provenance(mine[:2],
+        peer[:2])` -- copied from the resolve_freshness call one line above
+        it -- would compare a timestamp against a hash and answer False
+        forever."""
+        for label, record in (
+            ("matched", resolve_startup_state("aa", KIND_TEXT, ("aa", 100, KIND_IMAGE, "cc"), 999)),
+            ("changed", resolve_startup_state("bb", KIND_TEXT, ("aa", 100, KIND_IMAGE, "cc"), 999)),
+            ("nothing stored", resolve_startup_state("aa", KIND_TEXT, None, 999)),
+            ("null hash", resolve_startup_state(None, None, None, 999)),
+        ):
+            with self.subTest(branch=label):
+                self.assertEqual(len(record), 4)
+                # The real consumer, not a length check standing in for it:
+                # this is the call that raises on a short record, and it is
+                # the one the reconciliation paths make.
+                resolve_provenance(record, ("dd", 1, KIND_TEXT, None))
 
 
 class FixedReadClipboard:
@@ -378,9 +460,11 @@ class TestResolveCurrentClipState(unittest.TestCase):
         cannot pass by coincidence either."""
         text = b"unchanged clip"
         clipboard = FixedReadClipboard((KIND_TEXT, text))
-        stored = (hashlib.sha256(text).hexdigest(), 100, KIND_IMAGE)
+        stored = (hashlib.sha256(text).hexdigest(), 100, KIND_IMAGE, "cc")
         result = resolve_current_clip_state(clipboard, stored, now=999)
-        self.assertEqual(result, (stored[0], 100, KIND_IMAGE))
+        self.assertEqual(result, (stored[0], 100, KIND_IMAGE, "cc"),
+                         "unchanged content keeps its recorded ancestry too: the store "
+                         "is the only place an origin outlives the process that saw it")
 
     def test_content_differing_from_the_store_uses_now(self):
         """New content observed here comes from clipboard.read(), which
@@ -390,11 +474,11 @@ class TestResolveCurrentClipState(unittest.TestCase):
         immediately below for the case that actually distinguishes the
         two (this one uses KIND_TEXT for both, so it cannot)."""
         clipboard = FixedReadClipboard((KIND_TEXT, b"brand new content"))
-        stored = ("some-other-hash-entirely", 100, KIND_TEXT)
+        stored = ("some-other-hash-entirely", 100, KIND_TEXT, "cc")
         result = resolve_current_clip_state(clipboard, stored, now=999)
         self.assertEqual(
             result,
-            (hashlib.sha256(b"brand new content").hexdigest(), 999, KIND_TEXT),
+            (hashlib.sha256(b"brand new content").hexdigest(), 999, KIND_TEXT, None),
         )
 
     def test_content_differing_from_the_store_uses_the_reads_own_kind(self):
@@ -408,16 +492,16 @@ class TestResolveCurrentClipState(unittest.TestCase):
         kind, or hardcoded KIND_TEXT, cannot pass by coincidence either."""
         png = b"\x89PNG-a-screenshot"
         clipboard = FixedReadClipboard((KIND_IMAGE, png))
-        stored = ("some-other-hash-entirely", 100, KIND_TEXT)
+        stored = ("some-other-hash-entirely", 100, KIND_TEXT, "cc")
         result = resolve_current_clip_state(clipboard, stored, now=999)
-        self.assertEqual(result, (sha256_hex(png), 999, KIND_IMAGE))
+        self.assertEqual(result, (sha256_hex(png), 999, KIND_IMAGE, None))
 
     def test_nothing_stored_uses_now(self):
         clipboard = FixedReadClipboard((KIND_TEXT, b"first time seeing this"))
         result = resolve_current_clip_state(clipboard, stored=None, now=999)
         self.assertEqual(
             result,
-            (hashlib.sha256(b"first time seeing this").hexdigest(), 999, KIND_TEXT),
+            (hashlib.sha256(b"first time seeing this").hexdigest(), 999, KIND_TEXT, None),
         )
 
 
@@ -464,7 +548,7 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
         result = resolve_current_clip_state(
             FixedReadClipboard((KIND_IMAGE, oversized)), stored=None, now=999)
 
-        self.assertEqual(result, (None, 999, None),
+        self.assertEqual(result, (None, 999, None, None),
                          "content this side can never send must be announced as nothing, "
                          "not hashed and stamped `now`")
         self.assertIn(
@@ -483,7 +567,7 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
         result = resolve_current_clip_state(
             FixedReadClipboard((KIND_IMAGE, exact)), stored=None, now=999)
 
-        self.assertEqual(result, (sha256_hex(exact), 999, KIND_IMAGE))
+        self.assertEqual(result, (sha256_hex(exact), 999, KIND_IMAGE, None))
         self.assertEqual(lines, [], "nothing was skipped, so nothing is worth a line")
 
     def test_oversized_text_resolves_a_null_hash_and_kind(self):
@@ -496,7 +580,7 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
         result = resolve_current_clip_state(
             FixedReadClipboard((KIND_TEXT, oversized)), stored=None, now=999)
 
-        self.assertEqual(result, (None, 999, None))
+        self.assertEqual(result, (None, 999, None, None))
         self.assertIn(
             "not announcing a clip of %d bytes: over the text limit" % len(oversized),
             lines)
@@ -508,7 +592,7 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
         result = resolve_current_clip_state(
             FixedReadClipboard((KIND_TEXT, exact)), stored=None, now=999)
 
-        self.assertEqual(result, (sha256_hex(exact), 999, KIND_TEXT))
+        self.assertEqual(result, (sha256_hex(exact), 999, KIND_TEXT, None))
         self.assertEqual(lines, [])
 
     def test_the_peer_wins_instead_of_being_locked_out(self):
@@ -548,8 +632,8 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
             FixedReadClipboard((KIND_IMAGE, b"\x89" * (MAX_IMAGE_BYTES + 1))),
             now=999999, path=path)
 
-        self.assertEqual(load_clip_state(path=path), (None, 999999, None))
-        self.assertEqual(decode_clip_state(sent[0][1]), (None, 999999, None))
+        self.assertEqual(load_clip_state(path=path), (None, 999999, None, None))
+        self.assertEqual(decode_clip_state(sent[0][1]), (None, 999999, None, None))
         self.assertNotIn("clipboard changed while apart", lines)
 
 
@@ -648,6 +732,56 @@ class TestAnnounceClipState(unittest.TestCase):
         decoded = decode_clip_state(sent[0][1])
         self.assertEqual(decoded[1], 999999, "content changed while apart -- only now is honest")
 
+    def test_announces_and_re_persists_a_stored_origin_when_content_is_unchanged(self):
+        """The whole delivery path for v3.2, and the reason the announce is
+        where an origin finally does something: the agent that recorded it
+        is gone, and this is the connection that has to speak for it.
+
+        Both halves are asserted because both are needed. The wire half is
+        what makes the Mac stand down; the store half is what makes the
+        reconnect AFTER this one work, since every announce persists what
+        it resolved -- an announce that sent the origin and saved a record
+        without it would pass a wire-only test and fail on the next
+        connection."""
+        png = b"\x89PNG-the-re-encode-this-side-holds"
+        save_clip_state(sha256_hex(png), 555, KIND_IMAGE, origin=HASH_B, path=self.path)
+        sent = []
+
+        announce_clip_state(lambda t, p: sent.append((t, p)),
+                            FixedReadClipboard((KIND_IMAGE, png)),
+                            now=999999, path=self.path)
+
+        self.assertEqual(decode_clip_state(sent[0][1])[3], HASH_B)
+        self.assertEqual(load_clip_state(path=self.path)[3], HASH_B)
+
+    def test_a_stored_origin_is_dropped_when_the_content_changed(self):
+        """A STALE ORIGIN IS NOT HARMLESS, and this is the direction that
+        loses a clip rather than merely failing to help. The safe direction
+        is easy to picture -- an origin naming a hash the peer no longer
+        holds simply never matches. The mirror is a silent loss: the PC
+        holds new user content U under a stale origin M while the Mac still
+        holds M, provenance fires on `mine.origin == peer.sha256`, and the
+        PC NEVER SENDS U. A clip the user copied, gone, on an entirely
+        routine path.
+
+        So the announce that reports new content must report it as
+        nobody's descendant -- and must persist it that way too, or the
+        next connection resurrects the stale claim from disk."""
+        save_clip_state(HASH_A, 555, KIND_TEXT, origin=HASH_B, path=self.path)
+        sent = []
+
+        announce_clip_state(lambda t, p: sent.append((t, p)),
+                            FixedReadClipboard((KIND_TEXT, b"what the user just copied")),
+                            now=999999, path=self.path)
+
+        decoded = decode_clip_state(sent[0][1])
+        self.assertEqual(decoded[0], sha256_hex(b"what the user just copied"))
+        self.assertIsNone(decoded[3],
+                          "new content is not descended from what the store used to hold")
+        self.assertIsNone(load_clip_state(path=self.path)[3],
+                          "and the stale claim must not survive on disk to be "
+                          "re-announced by the next connection")
+
     def test_persists_the_resolved_value(self):
         """So a later .clipState comparison (or a crash immediately
         afterward) sees the reconciled value, not whatever was on disk
@@ -656,7 +790,7 @@ class TestAnnounceClipState(unittest.TestCase):
         announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, b"fresh content")),
                             now=42, path=self.path)
 
-        self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0, KIND_TEXT, None))
 
     def test_still_sends_when_the_store_cannot_be_saved(self):
         """A local disk failure is not the peer's fault, and must not
@@ -700,9 +834,9 @@ class TestAnnounceClipState(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], TYPE_CLIP_STATE)
         decoded = decode_clip_state(sent[0][1])
-        self.assertEqual(decoded, (sha256_hex(png), 42.0, KIND_IMAGE))
+        self.assertEqual(decoded, (sha256_hex(png), 42.0, KIND_IMAGE, None))
         self.assertEqual(
-            load_clip_state(path=self.path), (sha256_hex(png), 42.0, KIND_IMAGE),
+            load_clip_state(path=self.path), (sha256_hex(png), 42.0, KIND_IMAGE, None),
             "the persisted store must carry the real kind too, not just the sent frame",
         )
 
