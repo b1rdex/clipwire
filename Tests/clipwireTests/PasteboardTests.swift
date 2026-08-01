@@ -269,9 +269,11 @@ final class PasteboardTests: XCTestCase {
 
 // MARK: - Race coverage (added beyond the brief; see task-13-report.md)
 //
-// Task 11 found that on the PC side, the watcher thread and the main thread
-// shared echo-suppression state with no lock, and the watcher read the
-// clipboard *before* consuming the suppression. Two back-to-back incoming
+// The v2 plan's Task 11 (not v3's, which is the send branch's verification --
+// the two plans number independently) found that on the PC side, the watcher
+// thread and the main thread shared echo-suppression state with no lock, and
+// the watcher read the clipboard *before* consuming the suppression. Two
+// back-to-back incoming
 // clips then made it compare a stale value and send our own clip back to the
 // peer; fixed with a generation counter that let the watcher detect and
 // discard a comparison made stale by a write racing its slow (up to 3s,

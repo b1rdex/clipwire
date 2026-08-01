@@ -1372,18 +1372,26 @@ final class HandleFrameTests: XCTestCase {
     /// pipes the agent's stderr into this log with a `remote: ` prefix, so
     /// one file shows the conflict and which side won it.
     func testEveryReconciliationOutcomeIsLogged() throws {
+        // The stored hash is the real digest of what the pasteboard double
+        // returns, as in every other `sendMine` fixture in this file: the
+        // decision line under test is logged BEFORE Task 11's verification,
+        // so a placeholder would not break this test -- it would merely make
+        // the `sendMine` case emit a stray "clipboard changed before the
+        // send" and diverge from its siblings for no reason.
+        let held = Data("whatever we hold".utf8)
+        let heldHash = sha256Hex(held)
         let cases: [(storedTs: Double, peer: ClipState, expected: String)] = [
             (5, ClipState(sha256: Self.hashB, ts: 9, kind: .text), "waitForPeer"),
-            (5, ClipState(sha256: Self.hashA, ts: 999, kind: .text), "doNothing"),
+            (5, ClipState(sha256: heldHash, ts: 999, kind: .text), "doNothing"),
             (777, ClipState(sha256: nil, ts: 0, kind: nil), "sendMine"),
         ]
         for c in cases {
             let path = tempLogPath()
             let log = Log(path: path)
             let store = tempClipStateStore()
-            try store.save(ClipState(sha256: Self.hashA, ts: c.storedTs, kind: .text))
+            try store.save(ClipState(sha256: heldHash, ts: c.storedTs, kind: .text))
             let pasteboard = RecordingPasteboard()
-            pasteboard.textToRead = Data("whatever we hold".utf8)
+            pasteboard.textToRead = held
 
             handleFrame(Frame(type: .clipState, payload: try c.peer.encodePayload()),
                         send: { _ in }, noteWrittenLocally: { _, _ in },

@@ -233,11 +233,14 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// Two actors touch this watcher's state: its own `poll()`, invoked on the
 /// timer's background queue, and `noteWrittenLocally(kind:payload:)`, called by the
 /// channel's frame handler (a later task) from a different thread when it
-/// writes an incoming clip to the pasteboard. Task 11 found the PC analogue
-/// of this — the watcher thread and the main thread shared echo-suppression
-/// state with no lock, and the watcher read the clipboard *before* consuming
-/// the suppression, so two back-to-back incoming clips made it compare a
-/// stale value and echo one of them back to the peer.
+/// writes an incoming clip to the pasteboard. The v2 plan's Task 11 found the
+/// PC analogue of this — the watcher thread and the main thread shared
+/// echo-suppression state with no lock, and the watcher read the clipboard
+/// *before* consuming the suppression, so two back-to-back incoming clips
+/// made it compare a stale value and echo one of them back to the peer.
+/// (The v2 plan's, not this one's: v3's Task 11 is the send branch's
+/// verification, named by number a few dozen lines below. The two plans
+/// number independently.)
 ///
 /// `stateLock` guards `echo` *and* `lastChangeCount` together, and covers the
 /// entire [read changeCount -> compare -> read text -> consult echo] sequence

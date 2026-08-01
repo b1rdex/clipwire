@@ -3116,17 +3116,25 @@ class TestIncomingClipState(unittest.TestCase):
         skew lines already follow. Both sides' lines land in the SAME file
         in production: Channel.attempt pipes this agent's stderr into the
         Mac's log with a `remote: ` prefix."""
+        # The stored hash is the real digest of what the clipboard double
+        # returns, as in every other sendMine fixture in this class: the
+        # decision line under test is logged BEFORE Task 11's verification,
+        # so a placeholder would not break this test -- it would merely make
+        # the sendMine case emit a stray "clipboard changed before the send"
+        # and diverge from its siblings for no reason.
+        held = b"whatever we hold"
+        held_hash = sha256_hex(held)
         cases = [
             # (stored ts, peer state, expected decision)
-            (5, (HASH_B, 9, KIND_TEXT), "waitForPeer"),   # peer fresher
-            (5, (HASH_A, 999, KIND_TEXT), "doNothing"),   # same hash
-            (777, (None, 0, None), "sendMine"),           # peer has nothing
+            (5, (HASH_B, 9, KIND_TEXT), "waitForPeer"),     # peer fresher
+            (5, (held_hash, 999, KIND_TEXT), "doNothing"),  # same hash
+            (777, (None, 0, None), "sendMine"),             # peer has nothing
         ]
         for stored_ts, peer, expected in cases:
             with self.subTest(expected):
-                save_clip_state(HASH_A, stored_ts, KIND_TEXT, path=self.clip_state_path)
+                save_clip_state(held_hash, stored_ts, KIND_TEXT, path=self.clip_state_path)
                 clipboard = QueueClipboard(ready=True)
-                clipboard.queue_read(b"whatever we hold")
+                clipboard.queue_read(held)
                 agent = self.build(clipboard=clipboard)
                 agent.send = lambda t, p: None
 
@@ -3158,9 +3166,24 @@ class TestIncomingClipState(unittest.TestCase):
         The harm is bounded (noteWrittenLocally is armed before the write,
         EchoGuard suppresses, content converges), which is exactly why it
         needs a test: nothing about the end state is wrong, so only the
-        redundant frame itself is observable."""
+        redundant frame itself is observable.
+
+        Which makes the SECOND queued read load-bearing rather than
+        housekeeping. With the supersede-drop removed, the drain resolves
+        SEND_MINE and reaches Task 11's verification read; an exhausted
+        QueueClipboard returns None there, which reads as "the clipboard
+        changed" and produces exactly the silence this test asserts. The
+        defect would pass. Queuing what the applied clip actually put on
+        the clipboard lets the verification succeed, so the bug sends the
+        redundant frame and is caught -- the discriminator the fast path
+        used to supply for free, when _write_clip's remembered bytes were
+        what this branch sent."""
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"whatever the PC held")  # the connect-time seed
+        # What the clipboard holds AFTER the pending clip below is applied --
+        # consumed only by the send branch's verification read, and only if
+        # the supersede-drop is missing. See the docstring.
+        clipboard.queue_read(b"the mac's newer clip")
         agent = self.build(clipboard=clipboard, already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))

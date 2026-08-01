@@ -675,6 +675,16 @@ func handleFrame(
             // rather than as a special case: an emptied pasteboard genuinely
             // no longer holds what we announced.
             //
+            // That promise is unqualified HERE and deliberately qualified in
+            // the PC agent's twin, which is not drift. There, a read can race
+            // `wl-copy`'s detached, asynchronous handoff and disagree with a
+            // pasteboard that did not actually change -- and the watcher then
+            // carries nothing, because the eventual GPaste `Update` for our
+            // own write is (correctly) suppressed as an echo. `NSPasteboard`
+            // writes are synchronous, so no such window exists on this side:
+            // a mismatch here means the pasteboard really did change, and a
+            // real change is exactly what `PasteboardWatcher` reports.
+            //
             // The line is byte-identical to the PC agent's own in
             // `_resolve_clip_state`, the convention the frame-cap and skew
             // lines already follow: no interpolated values, so the two cannot
