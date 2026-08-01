@@ -77,7 +77,7 @@ def at(rev, path):
 
 def main(argv):
     if len(argv) < 3:
-        raise SystemExit("usage: strip_comments.py <rev-before> <rev-after> <path>...")
+        raise SystemExit("usage: comment_only.py <rev-before> <rev-after> <path>...")
     before, after, paths = argv[0], argv[1], argv[2:]
     # Refuse anything that is not source. Handed a markdown file, the Swift
     # scanner happily reports "2 executable lines differ" -- a confident,
