@@ -3667,6 +3667,12 @@ class TestModuleDefinitionOrder(unittest.TestCase):
             "def _is_sha256_hex",
             "def decode_clip_state",
             "def resolve_freshness",
+            # v3.2: the provenance rule, defined immediately after the
+            # freshness one it runs before. A top-level definition that
+            # drifted below the guard would still import fine for every
+            # test in this suite and NameError only in production, which
+            # is the whole reason this check exists.
+            "def resolve_provenance",
             'SEND_MINE = "sendMine"',
             'WAIT_FOR_PEER = "waitForPeer"',
             'DO_NOTHING = "doNothing"',
