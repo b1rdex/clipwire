@@ -82,22 +82,22 @@ class TestRoundTrip(_TempPathCase):
     def test_round_trip(self):
         digest = "deadbeefcafe0123" * 4
         save_clip_state(digest, 1785400000.5, KIND_TEXT, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (digest, 1785400000.5, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=self.path), (digest, 1785400000.5, KIND_TEXT, None))
 
     def test_second_save_overwrites_the_first(self):
         """Different kinds on the two saves, not just different hashes: the
         second save must overwrite kind too, not only sha256/ts."""
         save_clip_state(HASH_A, 1, KIND_TEXT, path=self.path)
         save_clip_state(HASH_B, 2, KIND_IMAGE, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (HASH_B, 2.0, KIND_IMAGE))
+        self.assertEqual(load_clip_state(path=self.path), (HASH_B, 2.0, KIND_IMAGE, None))
 
     def test_none_hash_round_trips(self):
         save_clip_state(None, 0, None, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), (None, 0.0, None))
+        self.assertEqual(load_clip_state(path=self.path), (None, 0.0, None, None))
 
     def test_the_store_round_trips_the_kind(self):
         save_clip_state("cd" * 32, 9.0, KIND_IMAGE, path=self.path)
-        self.assertEqual(load_clip_state(path=self.path), ("cd" * 32, 9.0, KIND_IMAGE))
+        self.assertEqual(load_clip_state(path=self.path), ("cd" * 32, 9.0, KIND_IMAGE, None))
 
 
 class TestLoadNeverRaises(_TempPathCase):
@@ -162,7 +162,7 @@ class TestSaveIsAtomic(_TempPathCase):
     def test_save_creates_intermediate_directories(self):
         nested = os.path.join(self._tmp.name, "nested", "clip-state.json")
         save_clip_state(HASH_A, 1, KIND_TEXT, path=nested)
-        self.assertEqual(load_clip_state(path=nested), (HASH_A, 1.0, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=nested), (HASH_A, 1.0, KIND_TEXT, None))
 
 
 class TestSaveIsSerialized(_TempPathCase):
@@ -548,8 +548,8 @@ class TestOversizedContentIsNotAnnounced(unittest.TestCase):
             FixedReadClipboard((KIND_IMAGE, b"\x89" * (MAX_IMAGE_BYTES + 1))),
             now=999999, path=path)
 
-        self.assertEqual(load_clip_state(path=path), (None, 999999, None))
-        self.assertEqual(decode_clip_state(sent[0][1]), (None, 999999, None))
+        self.assertEqual(load_clip_state(path=path), (None, 999999, None, None))
+        self.assertEqual(decode_clip_state(sent[0][1]), (None, 999999, None, None))
         self.assertNotIn("clipboard changed while apart", lines)
 
 
@@ -656,7 +656,7 @@ class TestAnnounceClipState(unittest.TestCase):
         announce_clip_state(lambda t, p: sent.append((t, p)), FixedReadClipboard((KIND_TEXT, b"fresh content")),
                             now=42, path=self.path)
 
-        self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0, KIND_TEXT))
+        self.assertEqual(load_clip_state(path=self.path), (sha256_hex(b"fresh content"), 42.0, KIND_TEXT, None))
 
     def test_still_sends_when_the_store_cannot_be_saved(self):
         """A local disk failure is not the peer's fault, and must not
@@ -700,9 +700,9 @@ class TestAnnounceClipState(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], TYPE_CLIP_STATE)
         decoded = decode_clip_state(sent[0][1])
-        self.assertEqual(decoded, (sha256_hex(png), 42.0, KIND_IMAGE))
+        self.assertEqual(decoded, (sha256_hex(png), 42.0, KIND_IMAGE, None))
         self.assertEqual(
-            load_clip_state(path=self.path), (sha256_hex(png), 42.0, KIND_IMAGE),
+            load_clip_state(path=self.path), (sha256_hex(png), 42.0, KIND_IMAGE, None),
             "the persisted store must carry the real kind too, not just the sent frame",
         )
 

@@ -339,7 +339,7 @@ class TestLifecycle(unittest.TestCase):
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=_NoOpWatcher()):
             agent.clipboard_became_ready()
 
-        expected = (sha256_hex(b"the peer's pending clip"), peers_ts, KIND_TEXT)
+        expected = (sha256_hex(b"the peer's pending clip"), peers_ts, KIND_TEXT, None)
         self.assertEqual(
             load_clip_state(path=self.clip_state_path), expected,
             "the pending clip's own correct, just-persisted state must survive "
@@ -633,7 +633,7 @@ class TestImageReofferIsOurOwnWrite(ImageAgentTestCase):
                          "an image the peer now holds is recorded as synced")
         self.assertEqual(
             load_clip_state(path=self.clip_state_path),
-            (sha256_hex(png), 4242.0, KIND_IMAGE),
+            (sha256_hex(png), 4242.0, KIND_IMAGE, None),
             "stamped with the moment it was observed here, not a peer timestamp: "
             "this clip was born on the PC",
         )
@@ -728,7 +728,7 @@ class TestImagesEndToEndOnThePC(ImageAgentTestCase):
         self.assertEqual(clip.written, [(KIND_IMAGE, png)])
         self.assertEqual(
             load_clip_state(path=self.clip_state_path),
-            (sha256_hex(png), 1000.0, KIND_IMAGE),
+            (sha256_hex(png), 1000.0, KIND_IMAGE, None),
             "the PEER's timestamp, never now: applied content that looked freshly "
             "copied here would win the next reconciliation against the machine it "
             "came from",

@@ -169,7 +169,7 @@ def decode_image_payload(payload):
 
 
 # ============================================================================
-# 3. Freshness — decisions, kinds, clip-state codec, resolve_freshness
+# 3. Freshness — decisions, kinds, clip-state codec, the two resolvers
 # ============================================================================
 
 import json
@@ -193,9 +193,9 @@ class ClipStateError(FrameError):
     pass
 
 
-def encode_clip_state(sha256, ts, kind):
+def encode_clip_state(sha256, ts, kind, origin=None):
     """type-0x02 payload: {"sha256": <hex or null>, "ts": <float>, "kind":
-    <"text" | "image" | null>}.
+    <"text" | "image" | null>} plus, when there is one, "origin": <hex>.
 
     Refuses a non-finite ts (nan/inf/-inf) rather than emitting one: Python's
     json.dumps would otherwise happily write a bare NaN/Infinity token that
@@ -203,16 +203,38 @@ def encode_clip_state(sha256, ts, kind):
     non-finite ts stored locally would silently break the *peer's* handshake
     instead of failing here, on the side that produced it.
 
-    `kind` is not validated here: the two decode-side rules (null iff
-    sha256 is null, otherwise one of the known kinds -- see
-    decode_clip_state) exist to police PEER-controlled input arriving off
-    the wire. Every caller here is this agent's own code, already holding a
-    (sha256, ts, kind) triple it derived correctly a moment earlier; there
-    is no peer to protect against on this side of the codec.
+    `origin` (v3.2) names the hash THIS content was born from: the peer's
+    own hash, recorded when this side wrote the peer's bytes to the
+    clipboard and read different ones back. It is announced, never deduced
+    -- see resolve_provenance below for what reads it, and the v3.2 design
+    for why every attempt to infer the same fact from content is dead.
+
+    The key is OMITTED when there is no origin, rather than written as an
+    explicit null. Absent and null already mean the same thing to both
+    decoders (dict.get returns None for either; Swift's decodeIfPresent
+    returns nil for either), so omitting costs nothing in meaning and buys
+    two things: every payload this side produces without an origin -- wire
+    frame AND store file, since save_clip_state shares this encoder -- stays
+    byte-for-byte what it was before v3.2, and the shape matches what
+    Swift's synthesized encoder does with a nil Optional. `kind` writing an
+    explicit null is not a precedent against this: `kind` is null-iff-null
+    with sha256, so its absence would be a shape error rather than a
+    default.
+
+    Neither `kind` nor `origin` is validated here: the decode-side rules
+    (kind null iff sha256 is null and otherwise one of the known kinds; an
+    origin only ever beside a non-null sha256 -- see decode_clip_state)
+    exist to police PEER-controlled input arriving off the wire. Every
+    caller here is this agent's own code, already holding a state it
+    derived correctly a moment earlier; there is no peer to protect against
+    on this side of the codec.
     """
     if not math.isfinite(ts):
         raise ClipStateError("refusing to encode a non-finite ts: %r" % ts)
-    return json.dumps({"sha256": sha256, "ts": ts, "kind": kind}).encode()
+    state = {"sha256": sha256, "ts": ts, "kind": kind}
+    if origin is not None:
+        state["origin"] = origin
+    return json.dumps(state).encode()
 
 
 def _is_sha256_hex(value):
@@ -243,7 +265,14 @@ def decode_clip_state(payload):
     so main()'s existing `except FrameError` closes the connection exactly
     as a malformed hello does — on anything that is not a well-formed
     {"sha256": <str or null>, "ts": <finite number>, "kind": <"text" |
-    "image" | null>} object.
+    "image" | null>} object, optionally carrying an "origin".
+
+    Returns a (sha256, ts, kind, origin) QUADRUPLE as of v3.2, where every
+    caller before it took a triple. An absent "origin" key decodes as None,
+    which is what a pre-v3.2 peer's announcement and a pre-v3.2 store file
+    both are: the field is optional in the only sense that matters, so a
+    mismatched pair degrades to exactly what shipped before rather than
+    failing.
 
     The finiteness check is the load-bearing part: json.loads, unlike
     Swift's JSONDecoder, accepts a bare NaN/Infinity/-Infinity and hands
@@ -325,7 +354,36 @@ def decode_clip_state(payload):
         )
     if kind is not None and kind not in _KNOWN_KINDS:
         raise ClipStateError("malformed clip-state payload: unknown kind %r" % kind)
-    return sha256, float(ts), kind
+    origin = parsed.get("origin")
+    if origin is not None and not isinstance(origin, str):
+        raise ClipStateError("malformed clip-state payload: origin must be a string or null")
+    # NOT the null-iff-null rule `kind` gets one line above, and copying that
+    # shape here would reject every ordinary announcement this protocol has
+    # ever sent: content with a hash and no origin is the normal case -- an
+    # origin is the rare one. The rule is one-directional. An origin says
+    # "what I hold was born from this hash", so it needs something of ours
+    # for it to describe; a peer announcing an origin beside a null sha256
+    # is claiming an ancestor for content it does not have, which
+    # resolve_provenance could only ever compare against nothing.
+    if origin is not None and sha256 is None:
+        raise ClipStateError(
+            "malformed clip-state payload: origin is only admissible beside a sha256"
+        )
+    # Deliberately NOT run through _is_sha256_hex, unlike sha256 above, and
+    # the asymmetry is reasoned rather than overlooked. That check exists
+    # because the two sides do not order or compare strings the same way
+    # (Python by code point, Swift by canonical equivalence), and both sides
+    # must reach the same verdict. Provenance never compares an origin
+    # against another origin: every comparison resolve_provenance makes puts
+    # an origin beside a sha256, and every sha256 in the comparison is
+    # either this side's own sha256_hex output or a peer hash this decoder
+    # has already forced through _is_sha256_hex. Canonical equivalence
+    # cannot equate a pure-ASCII string with any other sequence -- nothing
+    # decomposes to ASCII -- so with one operand guaranteed hex, Swift's ==
+    # and Python's == cannot disagree, whatever the other operand is. Should
+    # a later rule ever compare an origin against an origin, this reasoning
+    # expires and the check has to be added.
+    return sha256, float(ts), kind, origin
 
 
 def resolve_freshness(mine, peer):
@@ -364,6 +422,56 @@ def resolve_freshness(mine, peer):
     if mine_ts < peer_ts:
         return WAIT_FOR_PEER
     return SEND_MINE if mine_hash > peer_hash else WAIT_FOR_PEER
+
+
+def resolve_provenance(mine, peer):
+    """Is either side's content descended from the other's? True when it is.
+
+    `mine` and `peer` are whole (sha256, ts, kind, origin) records --
+    decode_clip_state's output shape -- NOT the (sha256, ts) pairs
+    resolve_freshness takes one function above. That difference is
+    deliberate and load-bearing: `resolve_provenance(mine[:2], peer[:2])`,
+    copied from the call one line above it, would compare a timestamp
+    against a hash, return False forever, and never fail a test. Passing
+    a truncated record here raises ValueError instead, loudly, at the
+    call site.
+
+    Runs BEFORE resolve_freshness, never inside it. The freshness formula
+    is exactly what it has been since v2, pinned by fixtures/freshness.json,
+    and this release does not perturb it -- provenance is a separate
+    question asked first: two machines can hold the same picture in
+    different bytes, and no ordering of two timestamps can say so.
+
+    ONE function holding BOTH comparisons, not one per side. "The Mac's
+    rule" and "the PC's rule" is fine as prose and fatal as code: two
+    implementations of one idea drifting apart is this project's recorded
+    defect shape, which is why this shares fixtures/provenance.json with
+    Sources/clipwire/Freshness.swift's resolveProvenance, the way
+    resolve_freshness shares fixtures/freshness.json with resolveFreshness.
+    Note the rule is symmetric -- swapping mine and peer cannot change the
+    answer -- which is the point: both sides stand down together, and
+    neither waits for a clip the other has already decided not to send.
+
+    EQUALITY COUNTS ONLY BETWEEN TWO VALUES THAT ARE BOTH PRESENT. `None ==
+    None` is True in Python, and nil == nil is true for a Swift Optional,
+    so the naive spelling of this rule fires on an empty clipboard against
+    a peer with no origin -- a locked PC against an ordinary Mac, which
+    happens daily -- and stands both sides down. That would kill
+    resolve_freshness's (_, None) -> SEND_MINE recovery, the one that hands
+    a peer back the clipboard it lost, for EVERY kind of content rather
+    than for images. Hence `is not None` on both operands of both
+    comparisons: the hash half is redundant in Python (a str never equals
+    None) and it is written out anyway, so the rule the fixture's nil rows
+    exercise is stated here rather than inferred, and so this reads line
+    for line as the same rule Swift's `if let ... let ...` spells out.
+    """
+    mine_hash, _mine_ts, _mine_kind, mine_origin = mine
+    peer_hash, _peer_ts, _peer_kind, peer_origin = peer
+    if peer_origin is not None and mine_hash is not None and peer_origin == mine_hash:
+        return True
+    if mine_origin is not None and peer_hash is not None and mine_origin == peer_hash:
+        return True
+    return False
 
 
 # ============================================================================
@@ -776,7 +884,7 @@ class Agent:
         itself (a clip-state that arrived before it and was stashed).
 
         `mine` is that second caller's own just-computed (sha256, ts, kind)
-        triple, passed in rather than re-derived. It is the authoritative value by
+        state, passed in rather than re-derived. It is the authoritative value by
         construction: clipboard_became_ready computed it one line earlier
         and ANNOUNCED IT TO THIS VERY PEER. Re-loading the store instead
         only diverges when the store cannot be read back -- and since every
@@ -805,7 +913,13 @@ class Agent:
             mine = resolve_current_clip_state(self.clipboard, None, time.time())
         # resolve_freshness's formula is unchanged by Task 6 and takes only
         # (sha256, ts) -- kind plays no part in the comparison (see its own
-        # docstring) -- so only the first two elements of each triple go in.
+        # docstring) -- so only the first two elements of each record go in.
+        # Unchanged by v3.2 as well: `peer` is now a (sha256, ts, kind,
+        # origin) quadruple off the wire and `mine` is whichever shape its
+        # source produced, and this slice reads the same two elements from
+        # either. resolve_provenance, which does read the fourth, takes the
+        # WHOLE record for exactly that reason -- see its own docstring on
+        # why a [:2] here and a [:2] there would not mean the same thing.
         decision = resolve_freshness(mine[:2], peer[:2])
         # Every reconciliation outcome is reported, not only the interesting
         # ones. Acceptance item 2 requires the conflict to appear in the log,
@@ -1856,7 +1970,16 @@ def clip_state_path(env=None):
 
 
 def load_clip_state(path=None):
-    """(sha256, ts, kind) last persisted by save_clip_state, or None.
+    """(sha256, ts, kind, origin) last persisted by save_clip_state, or None.
+
+    The record is decode_clip_state's own shape, because this IS
+    decode_clip_state -- so it grew the fourth element with the wire in
+    v3.2. Every file this side writes today decodes with origin None: a
+    v3.1 store has no "origin" key at all, and save_clip_state has no
+    origin to pass, so a missing key reading as None is what makes an
+    existing store load rather than fail. That is the same "absent means
+    what it meant before" rule the wire follows, applied to disk by the
+    single decoder both share.
 
     None covers three distinct failure reasons identically, on purpose: no
     file has ever been written, the file exists but cannot be opened as a
@@ -1946,8 +2069,10 @@ def resolve_startup_state(current_hash, current_kind, stored, now):
     `current_kind` are the clipboard's hash and kind *right now*, at
     startup -- both produced by the same clipboard.read() call, never
     derived independently; `stored` is whatever load_clip_state() last
-    returned (a (sha256, ts, kind) triple, or None); `now` is the caller's
-    clock. Returns a (sha256, ts, kind) triple.
+    returned (a (sha256, ts, kind, origin) record since v3.2, or None);
+    `now` is the caller's clock. Returns a (sha256, ts, kind) triple, and
+    reads only the first three elements of `stored` -- what a stored origin
+    means to this judgement is not a question this task answers.
 
     A timestamp can come from three places, in precedence order: a local
     change this process watched happen, a clip received from the peer

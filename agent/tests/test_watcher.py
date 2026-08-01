@@ -2340,7 +2340,7 @@ class TestEchoBookkeeping(unittest.TestCase):
         self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
         decoded = decode_clip_state(announced[0][1])
         self.assertEqual(
-            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE),
+            decoded, (sha256_hex(png), decoded[1], KIND_IMAGE, None),
             "the announced kind must be the real one, not a fabricated KIND_TEXT",
         )
 
@@ -2482,7 +2482,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         agent._write_clip(encode_clip_payload(peers_ts, b"peer's clip"))
 
         stored = load_clip_state(path=self.clip_state_path)
-        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts, KIND_TEXT),
+        self.assertEqual(stored, (sha256_hex(b"peer's clip"), peers_ts, KIND_TEXT, None),
                          "must store the PEER's ts, never now")
 
     def test_stores_the_literal_known_hash_for_a_pinned_vector(self):
@@ -2501,7 +2501,7 @@ class TestWriteClipDecodesTheWirePayload(unittest.TestCase):
         stored = load_clip_state(path=self.clip_state_path)
         self.assertEqual(
             stored,
-            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0, KIND_TEXT),
+            ("8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4", 1.0, KIND_TEXT, None),
         )
 
     def test_a_malformed_too_short_payload_touches_neither_suppression_nor_the_clipboard(self):
@@ -2955,7 +2955,7 @@ class TestIncomingClipState(unittest.TestCase):
 
         agent.on_frame(TYPE_CLIP, encode_clip_payload(applied_ts, applied_text))
         self.assertEqual(
-            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT),
+            load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT, None),
             "test setup must actually apply and persist the clip, or this test proves nothing",
         )
         self.assertEqual(
@@ -3332,7 +3332,7 @@ class TestIncomingClipState(unittest.TestCase):
 
         self.assertEqual(sent, [], "must not resolve before our own side has reconciled")
         self.assertEqual(
-            agent._pending_peer_clip_state, (HASH_B, 42.0, KIND_TEXT),
+            agent._pending_peer_clip_state, (HASH_B, 42.0, KIND_TEXT, None),
             "the peer's own decoded state must be stashed, not silently dropped",
         )
 
