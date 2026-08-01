@@ -449,7 +449,12 @@ The v2 checklist still applies in full. New items:
    written is what reads back; the measurement in this document disproved that premise, so the
    clause was rewritten rather than defended. Same discipline as the one-tick verdict: a
    criterion is attached to its premise, and a dead premise retires the criterion.
-3. **A retina screenshot survives the round trip at the right display size.** Copy a retina
+3. **The safety net polls a token, not the body.** With a screenshot sitting on the PC's
+   clipboard, watch `wl-paste` in `top` or `pidstat` for two minutes: there must be **one**
+   fork per tick, not two, and no 4 MiB transfer. Then disable the GPaste shell extension to
+   force degraded mode and confirm the same holds at the faster interval. Nothing in either
+   suite forks a real `wl-paste`, so this is the only place the cost is visible.
+4. **A retina screenshot survives the round trip at the right display size.** Copy a retina
    screenshot on the Mac, let it reach the PC, reconnect, and paste back on the Mac. After
    convergence the Mac holds GPaste's re-encode of its *own* screenshot, and a pixbuf re-encode
    can drop metadata — `pHYs` above all, which carries the 2× DPI, and the ICC profile. If
@@ -457,23 +462,23 @@ The v2 checklist still applies in full. New items:
    convergence could cost something real, and it is a measurement, not a prediction: if it
    degrades, that is either a trade-off to accept knowingly or the motivation for carrying
    content lineage on the wire in a later version.
-3. **Spreadsheet copy.** Select cells in a spreadsheet and copy: **text** must arrive, not a
+5. **Spreadsheet copy.** Select cells in a spreadsheet and copy: **text** must arrive, not a
    picture of the table. This is the case that reversed the priority decision.
-4. **Re-copying the same screenshot sends nothing.** Copy one screenshot on the Mac twice. If
+6. **Re-copying the same screenshot sends nothing.** Copy one screenshot on the Mac twice. If
    `NSBitmapImageRep`'s PNG encoding is not deterministic, this is the only place it surfaces.
-5. **Mixed-kind reconciliation.** With the channel dead, put an image on one machine and text
+7. **Mixed-kind reconciliation.** With the channel dead, put an image on one machine and text
    on the other, then reconnect. The fresher side must win, and the log line must name both
    kinds.
-6. **Wake flow with an image.** Copy a screenshot on the PC with the Mac's agent stopped, then
+8. **Wake flow with an image.** Copy a screenshot on the PC with the Mac's agent stopped, then
    start it. The screenshot must arrive — the v2 wake-flow test, now with the new kind.
-7. **Oversized image.** An image above 4 MiB is skipped, and the log names the size. Note that
+9. **Oversized image.** An image above 4 MiB is skipped, and the log names the size. Note that
    re-encoding inflates: a source image comfortably under the limit can cross it.
-8. **No false degrade after large transfers.** Send several images in succession and confirm
+10. **No false degrade after large transfers.** Send several images in succession and confirm
    the safety net does not declare the event source dead — the defect this release fixes, made
    more likely by large payloads.
-9. **No orphaned children.** After several agent restarts,
+11. **No orphaned children.** After several agent restarts,
    `pgrep -f 'gdbus monitor.*GPaste'` returns exactly one process, owned by the live agent.
-10. **Degraded-mode image latency.** With the event path forced to polling, confirm an image
+12. **Degraded-mode image latency.** With the event path forced to polling, confirm an image
     still arrives and note how long it takes.
 
 ## What is deliberately unchanged
