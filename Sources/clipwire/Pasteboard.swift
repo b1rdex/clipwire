@@ -279,17 +279,15 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// image-read latency ever becomes a problem, the fix is to read outside the
 /// lock and re-validate, not to reach for a counter.
 ///
-/// (The converted PNG is then discarded, because `pollLocked()` keeps text
-/// only — see its own comment. That waste ends with Task 13, "images end to
-/// end on the Mac", which is what makes an image observation worth sending.
-/// Not Task 11: that one taught `handleFrame`'s `.sendMine` branch to VERIFY
-/// the pasteboard against what was announced before sending it, which changes
-/// nothing about which kinds this watcher emits.)
+/// (Between Tasks 8 and 13 the converted PNG was then discarded, because
+/// `pollLocked()` kept text only. That waste is gone: `onChange` carries the
+/// kind and an image observation is now sent, so the conversion this read
+/// pays for is the one whose bytes go on the wire.)
 ///
 /// This lock is still not a complete contract on its own: it says nothing
-/// about the ORDER in which the future frame handler writes to the
-/// pasteboard versus calling `noteWrittenLocally`, because `PasteboardWatcher`
-/// does not perform that write. For the suppression to be armed before its
+/// about the ORDER in which the frame handler writes to the pasteboard
+/// versus calling `noteWrittenLocally`, because `PasteboardWatcher` does not
+/// perform that write. For the suppression to be armed before its
 /// own change becomes observable, that caller must call `noteWrittenLocally`
 /// *before* writing to the pasteboard, not after — arm-then-write, which is
 /// also already the convention the Python agent's `_write_clip` follows on
@@ -297,10 +295,18 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// `noteWrittenLocally` itself is not atomic with `poll()`'s read; this lock
 /// alone (with the wrong order) would still let a poll observe a
 /// written-but-unarmed change and echo it. Both are required together; the
-/// second is this class's responsibility, the first belongs to the task
-/// that builds the frame handler.
+/// second is this class's responsibility, the first belongs to the frame
+/// handler -- `handleFrame`'s `.clip` and `.imageClip` cases, each pinned by
+/// its own arm-before-write test in HandleFrameTests.swift.
 final class PasteboardWatcher {
-    var onChange: ((Data, Double) -> Void)?
+    /// `(kind, body, observedAt)`. The kind travels with the body rather than
+    /// being re-derived by the consumer: it comes from the same
+    /// `pasteboard.read()` pair the body did, so the two cannot be paired up
+    /// wrong -- the same rule `resolveCurrentClipState` follows on the
+    /// announce path. `wireAgent`'s closure picks the codec and the frame
+    /// type from it (`outgoingClipFrame`), so a dropped kind would send a PNG
+    /// through the text codec.
+    var onChange: ((ClipKind, Data, Double) -> Void)?
 
     private let pasteboard: PasteboardReading
     private let pollInterval: TimeInterval
@@ -333,12 +339,12 @@ final class PasteboardWatcher {
     }
 
     func poll() {
-        guard let (toSend, observedAt) = pollLocked() else { return }
+        guard let (kind, toSend, observedAt) = pollLocked() else { return }
         // Invoked after the lock is released, both because it can be slow
         // (it hands off to the channel) and because a callback that
         // re-entered the watcher while the lock was still held would
         // deadlock against a non-reentrant NSLock.
-        onChange?(toSend, observedAt)
+        onChange?(kind, toSend, observedAt)
     }
 
     /// The entire read-and-decide sequence, as one critical section shared
@@ -353,7 +359,7 @@ final class PasteboardWatcher {
     /// timestamp becomes the outgoing clip's `ts`; a receiving peer stores
     /// it unchanged (see `handleFrame`'s `.clip` case), so inflating it here
     /// would misstate how old the content actually is everywhere downstream.
-    private func pollLocked() -> (Data, Double)? {
+    private func pollLocked() -> (ClipKind, Data, Double)? {
         stateLock.lock()
         defer { stateLock.unlock() }
 
@@ -366,42 +372,83 @@ final class PasteboardWatcher {
         // observed earlier and now stale.
         lastChangeCount = current
 
-        // Text or nothing. Since Task 8 made the read kind-aware, an image
-        // on the pasteboard comes back as a real `(.image, bytes)` pair
-        // instead of nil, and `onChange`'s consumer (`wireAgent`) wraps
-        // whatever it is handed in a `ClipPayload` — the TEXT codec — via
-        // `String(decoding:as:UTF8.self)`. Emitting an image here would
-        // therefore put a mojibake transliteration of a PNG on the wire and
-        // into both persistent stores. Keeping this text-only is a scope
-        // boundary, not an oversight: syncing a local image change is later
-        // work (Task 13, "images end to end on the Mac"), which needs the
-        // image send, apply and announce wiring together rather than one call
-        // site at a time. Until then an
-        // image observation is skipped exactly as it always was — the
-        // difference is that it is now skipped on purpose, pinned by
-        // `testAnImageOnThePasteboardIsNotEmittedAsText`. The PC agent's
-        // `_local_change` carries the same guard for the same reason.
-        guard let read = pasteboard.read(), read.kind == .text, !read.data.isEmpty else { return nil }
-        let text = read.data
-        // `wireAgent` wraps this text in `ClipPayload(ts:text:)` before it
-        // ever reaches the wire, adding an 8-byte prefix -- so the bound
-        // here must leave room for it. Checking `text.count` alone (exact
-        // before Task 9, when this text WAS the frame payload) would let
-        // text at exactly the cap encode to a payload 8 bytes over the
-        // TEXT limit. `maxTextBytes`, not the (larger) `maxPayloadBytes`
-        // the decoder enforces: since Task 4 the two are separate
-        // constants, and content between the two would still fit inside a
-        // frame -- this guard is the text-specific policy limit, not a
-        // wire-safety necessity.
-        guard text.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
-            // Logged so a user whose large local copy never reaches the
-            // peer has something to look at, matching the Python agent's
-            // existing "skipping a clip of N bytes" line for the same limit.
-            log?.line("skipping a clip of \(text.count) bytes: over the text limit")
-            return nil
+        // Either kind, since Task 13. Task 8 had already made the read
+        // kind-aware -- an image comes back as a real `(.image, bytes)` pair
+        // rather than nil -- but this guard stayed `read.kind == .text`,
+        // because `onChange`'s consumer (`wireAgent`) wrapped whatever it was
+        // handed in a `ClipPayload`, the TEXT codec, via
+        // `String(decoding:as:UTF8.self)`: emitting an image would have put a
+        // mojibake transliteration of a PNG on the wire and into both
+        // persistent stores. `onChange` now carries the kind and
+        // `outgoingClipFrame` (main.swift) picks the codec from it, so the
+        // scope boundary is gone. The PC agent's `_observe_local_change` made
+        // the same move in Task 12.
+        //
+        // The emptiness half of this guard stays, and stays load-bearing:
+        // `SystemPasteboard.read()` already declines to report an empty body,
+        // but this is the last check before an observation becomes a frame,
+        // and neither codec has anything to say about zero bytes --
+        // `ImagePayload.decode` refuses an empty body outright on the far
+        // side. Pinned for BOTH kinds by
+        // `testAnEmptyBodyIsNotEmittedUnderEitherKind`, because until this
+        // task it rode along on the `.text` clause above and generalising
+        // that clause is exactly what could have unpinned it.
+        guard let read = pasteboard.read(), !read.data.isEmpty else { return nil }
+        let body = read.data
+        // One limit per kind, checked before the echo guard so an oversized
+        // body cannot consume a suppression it is never going to use.
+        switch read.kind {
+        case .text:
+            // `wireAgent` wraps this text in `ClipPayload(ts:text:)` before it
+            // ever reaches the wire, adding an 8-byte prefix -- so the bound
+            // here must leave room for it. Checking `body.count` alone (exact
+            // before Task 9, when this text WAS the frame payload) would let
+            // text at exactly the cap encode to a payload 8 bytes over the
+            // TEXT limit. `maxTextBytes`, not the (larger) `maxPayloadBytes`
+            // the decoder enforces: since Task 4 the two are separate
+            // constants, and content between the two would still fit inside a
+            // frame -- this guard is the text-specific policy limit, not a
+            // wire-safety necessity.
+            guard body.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
+                // Logged so a user whose large local copy never reaches the
+                // peer has something to look at, matching the Python agent's
+                // existing "skipping a clip of N bytes" line for the same limit.
+                log?.line("skipping a clip of \(body.count) bytes: over the text limit")
+                return nil
+            }
+        case .image:
+            // Compared against the BARE body, unlike the text branch above,
+            // and the difference is load-bearing rather than stylistic:
+            // `maxImageBytes` bounds the image, so an image at exactly the
+            // limit is legal and encodes to a payload eight bytes over it --
+            // 4,194,312, which still fits `maxPayloadBytes` (8,388,608) with
+            // 4 MiB to spare. Written in the text guard's shape it would
+            // refuse exactly the maximum-size screenshot the three separated
+            // caps exist to permit. The PC agent's two local-observation and
+            // re-offer sites carry the identical note.
+            //
+            // The verdict clause `over the image limit` is byte-identical
+            // across all five sites that report this limit -- three on the PC
+            // (`_observe_local_change`, `_resolve_clip_state`,
+            // `_consume_image_reoffer`) and two here (this one and
+            // `handleFrame`'s `.sendMine` branch). Four of them share the
+            // whole `skipping an image of N bytes:` sentence; the PC's
+            // re-offer site reports a different EVENT about the same limit
+            // and says so, which is exactly why the shared thing is the
+            // clause rather than the sentence. The convention the frame-cap
+            // and skew lines already follow, which has caught drift twice.
+            guard body.count <= FrameConstants.maxImageBytes else {
+                log?.line("skipping an image of \(body.count) bytes: over the image limit")
+                return nil
+            }
         }
-        guard echo.shouldSend(kind: .text, payload: text) else { return nil }
-        return (text, Date().timeIntervalSince1970)
+        // `read.kind`, not `.text`: `EchoGuard` has compared `(kind, digest)`
+        // since Task 9, but every call site passed `.text` until now, so the
+        // kind half was inert. It is a live discriminator from here on -- an
+        // applied image whose arm and check disagreed about the kind would
+        // bounce straight back to the peer that sent it.
+        guard echo.shouldSend(kind: read.kind, payload: body) else { return nil }
+        return (read.kind, body, Date().timeIntervalSince1970)
     }
 
     func start() {

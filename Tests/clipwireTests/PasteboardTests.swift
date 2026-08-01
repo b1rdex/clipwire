@@ -64,12 +64,30 @@ final class FakePasteboard: PasteboardReading, PasteboardWriting {
     }
 }
 
+/// A board that reports content of a given kind and hands back ZERO bytes for
+/// it -- a state `FakePasteboard` cannot express, because its `read()`
+/// deliberately mirrors `SystemPasteboard`'s and reports nothing at all for an
+/// empty body. That mirroring is what makes it unable to exercise
+/// `pollLocked`'s own emptiness guard: with the production read already
+/// filtering empties, the guard would look tested while nothing reached it.
+final class EmptyBodyPasteboard: PasteboardReading {
+    var changeCount = 0
+    var kind: ClipKind = .text
+
+    func bump(_ kind: ClipKind) {
+        self.kind = kind
+        changeCount += 1
+    }
+
+    func read() -> (kind: ClipKind, data: Data)? { (kind, Data()) }
+}
+
 final class PasteboardTests: XCTestCase {
     func testEmitsOnChange() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
 
         watcher.poll()            // establishes the baseline, emits nothing
         pasteboard.set("hello")
@@ -83,7 +101,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seenTimestamps: [Double] = []
-        watcher.onChange = { _, observedAt in seenTimestamps.append(observedAt) }
+        watcher.onChange = { _, _, observedAt in seenTimestamps.append(observedAt) }
 
         watcher.poll()
         let before = Date().timeIntervalSince1970
@@ -101,7 +119,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         pasteboard.set("hello")
         watcher.poll()
         watcher.poll()
@@ -113,9 +131,12 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
-        pasteboard.setNonText()   // e.g. an image
+        // A board offering something this agent syncs neither kind of -- an
+        // RTF-only or file-URL copy. NOT an image: since Task 13 an image is
+        // emitted rather than skipped, which is
+        // `testAnImageOnThePasteboardIsEmittedAsAnImage`'s business.
         watcher.poll()
         watcher.poll()
         XCTAssertTrue(seen.isEmpty)
@@ -125,54 +146,193 @@ final class PasteboardTests: XCTestCase {
                        "the image must not have wedged the watcher")
     }
 
-    /// The test above cannot see this one: `setNonText()` leaves the double
-    /// with nothing to read at all, so a watcher that had stopped checking
-    /// the KIND would still emit nothing there. Here the pasteboard holds a
-    /// real image, which since Task 8 reads back as a genuine
-    /// `(.image, bytes)` pair rather than nil -- so only the kind check
-    /// stands between those PNG bytes and `onChange`, whose consumer wraps
-    /// whatever it is handed in a `ClipPayload` via
-    /// `String(decoding:as:UTF8.self)` and sends it as a TEXT clip. Dropping
-    /// the check would put a mojibake transliteration of a PNG on the wire
-    /// and into both persistent stores. Syncing a local image change is
-    /// later work (Task 13); until then an image observation is skipped
-    /// exactly as it has always been, and this test is what keeps "skipped"
-    /// from quietly becoming "sent as text".
-    func testAnImageOnThePasteboardIsNotEmittedAsText() {
+    /// Replaces `testAnImageOnThePasteboardIsNotEmittedAsText`, which pinned
+    /// the scope boundary this task removes: until now `pollLocked` guarded
+    /// `read.kind == .text`, because `onChange`'s only consumer wrapped
+    /// whatever it was handed in a `ClipPayload` -- the TEXT codec -- so an
+    /// emitted image would have reached the wire as a mojibake
+    /// transliteration of a PNG. `onChange` now carries the kind, and
+    /// `outgoingClipFrame` picks the codec from it.
+    ///
+    /// `setNonText()` cannot stand in for this: it leaves the double with
+    /// nothing to read at all, so a watcher that emitted images would still
+    /// emit nothing there. This one holds a real image, which since Task 8
+    /// reads back as a genuine `(.image, bytes)` pair.
+    func testAnImageOnThePasteboardIsEmittedAsAnImage() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
-        var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        var seen: [(kind: ClipKind, data: Data)] = []
+        watcher.onChange = { kind, data, _ in seen.append((kind, data)) }
         watcher.poll()
 
         let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         pasteboard.setImage(png)
         watcher.poll()
-        XCTAssertTrue(seen.isEmpty, "an image must not be emitted as a text clip")
+        XCTAssertEqual(seen.map(\.kind), [.image],
+                       "an image must be emitted, and emitted AS an image")
+        XCTAssertEqual(seen.first?.data, png)
 
         watcher.poll()
         pasteboard.set("after the image")
         watcher.poll()
-        XCTAssertEqual(seen, [Data("after the image".utf8)],
+        XCTAssertEqual(seen.map(\.kind), [.image, .text])
+        XCTAssertEqual(seen.last?.data, Data("after the image".utf8),
                        "and the image must not have wedged the watcher either")
+    }
+
+    /// The echo half, for images. `EchoGuard` has compared `(kind, digest)`
+    /// since Task 9, but every call site armed and checked `.text` until now,
+    /// so the kind was a no-op in practice. An applied image that bounced
+    /// back would ping-pong against a peer that applies any incoming clip
+    /// unconditionally.
+    func testOurOwnImageWriteIsNotEchoed() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        var seen: [(kind: ClipKind, data: Data)] = []
+        watcher.onChange = { kind, data, _ in seen.append((kind, data)) }
+        watcher.poll()
+
+        watcher.noteWrittenLocally(kind: .image, payload: png)
+        pasteboard.setImage(png)            // the write we just made
+        watcher.poll()
+        XCTAssertTrue(seen.isEmpty, "our own image write must not bounce back")
+
+        let copied = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x99])
+        pasteboard.setImage(copied)
+        watcher.poll()
+        XCTAssertEqual(seen.map(\.data), [copied],
+                       "a genuine later image copy must still be emitted")
+    }
+
+    /// The image twin of `testOversizedClipIsSkipped`/`testOversizedClipIsLoggedWithItsSize`,
+    /// with the size in the line for the same reason: a user whose large
+    /// screenshot silently never reaches the peer has nothing to look at
+    /// otherwise. The verdict clause is byte-identical to the PC agent's own
+    /// three image skips and to `handleFrame`'s `.sendMine` branch.
+    func testAnOversizedImageIsSkippedAndLoggedWithItsSize() {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-pasteboard-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4, log: log)
+        var seen: [Data] = []
+        watcher.onChange = { _, data, _ in seen.append(data) }
+        watcher.poll()
+
+        let oversized = FrameConstants.maxImageBytes + 1
+        pasteboard.setImage(Data(repeating: 0x89, count: oversized))
+        watcher.poll()
+        log.flush()
+
+        XCTAssertTrue(seen.isEmpty)
+        let contents = try? String(contentsOfFile: logPath, encoding: .utf8)
+        XCTAssertEqual(contents?.contains("skipping an image of \(oversized) bytes: over the image limit"),
+                       true,
+                       "expected the skip to be logged with its size; got: \(contents ?? "<unreadable>")")
+    }
+
+    /// The skip must be logged ONCE per clipboard change, not once per tick.
+    /// `pollLocked` records `lastChangeCount` before any early return, so an
+    /// unsendable item cannot wedge the watcher into rescanning it forever --
+    /// and a regression there is not merely wasteful, it is a log a user
+    /// cannot read: the poll interval is 400ms by default, so an oversized
+    /// screenshot left on the pasteboard would write over 200,000 identical
+    /// lines a day.
+    ///
+    /// Written against the image guard because this task added it, but the
+    /// property is the whole function's. Nothing in this suite pinned it
+    /// before -- verified by moving the `lastChangeCount` assignment below
+    /// every early return, which left all 232 tests green.
+    func testAnUnsendableItemIsLoggedOncePerChangeNotOncePerPoll() {
+        let logPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-pasteboard-test-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: logPath)
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4, log: log)
+
+        pasteboard.setImage(Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1))
+        watcher.poll()
+        watcher.poll()
+        watcher.poll()
+        log.flush()
+
+        let contents = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        XCTAssertEqual(contents.components(separatedBy: "over the image limit").count - 1, 1,
+                       "one line per clipboard change, not one per tick; got: \(contents)")
+    }
+
+    /// The other half of the image boundary, and deliberately NOT the shape
+    /// its text sibling
+    /// (`testTextAtExactlyTheCapIsSkippedBecauseTheEncodedFrameWouldExceedIt`)
+    /// takes: an image at exactly `maxImageBytes` is EMITTED, where text at
+    /// exactly `maxTextBytes` is skipped. `maxImageBytes` bounds the image
+    /// itself, so this encodes to a payload eight bytes over it -- 4,194,312
+    /// -- which is still comfortably inside `maxPayloadBytes` (8,388,608).
+    /// Writing the image guard the way the text one is written would refuse
+    /// exactly the maximum-size screenshot the three separated caps exist to
+    /// permit.
+    func testAnImageAtExactlyTheImageLimitIsStillEmitted() {
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        var seen: [Data] = []
+        watcher.onChange = { _, data, _ in seen.append(data) }
+        watcher.poll()
+
+        let png = Data(repeating: 0x89, count: FrameConstants.maxImageBytes)
+        pasteboard.setImage(png)
+        watcher.poll()
+
+        XCTAssertEqual(seen.count, 1,
+                       "an image of exactly the cap is what the separated caps exist to permit")
+        XCTAssertEqual(try? ImagePayload.encode(ts: 1, png: png).count,
+                       FrameConstants.maxImageBytes + ClipPayloadConstants.timestampBytes,
+                       "sanity check on the boundary itself")
     }
 
     func testEmptyClipIsNotEmitted() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.set("")
         watcher.poll()
         XCTAssertTrue(seen.isEmpty)
     }
 
+    /// The guard the test above cannot reach. `pollLocked` refuses an empty
+    /// body under EITHER kind, and until this task that clause rode along on
+    /// the same `guard` as the text-only kind check -- so generalising the
+    /// kind check is exactly the edit that could unpin it, silently, for
+    /// images. The PC agent had this same guard become unpinned when its own
+    /// read was generalised, which is why it is now explicit and tested on
+    /// both sides.
+    ///
+    /// Zero bytes has nothing to say under either codec: `ImagePayload.decode`
+    /// refuses an empty body outright (`ClipPayloadError.emptyBody`), and an
+    /// empty text clip is applied as a silent no-op by both agents -- so
+    /// either would be a frame sent for no effect.
+    func testAnEmptyBodyIsNotEmittedUnderEitherKind() {
+        for kind in [ClipKind.text, .image] {
+            let pasteboard = EmptyBodyPasteboard()
+            let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+            var seen: [Data] = []
+            watcher.onChange = { _, data, _ in seen.append(data) }
+            watcher.poll()
+            pasteboard.bump(kind)
+            watcher.poll()
+            XCTAssertTrue(seen.isEmpty, "an empty \(kind.rawValue) body must not be emitted")
+        }
+    }
+
     func testOurOwnWriteIsNotEchoed() {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
 
         watcher.noteWrittenLocally(kind: .text, payload: Data("from the peer".utf8))
@@ -189,7 +349,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes + 1))
         watcher.poll()
@@ -214,7 +374,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
         pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes))
         watcher.poll()
@@ -231,7 +391,7 @@ final class PasteboardTests: XCTestCase {
         let pasteboard = FakePasteboard()
         let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
-        watcher.onChange = { data, _ in seen.append(data) }
+        watcher.onChange = { _, data, _ in seen.append(data) }
         watcher.poll()
         let text = String(repeating: "x",
                           count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
@@ -342,7 +502,7 @@ final class PasteboardConcurrencyTests: XCTestCase {
         nonisolated(unsafe) let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
         let seenLock = NSLock()
-        watcher.onChange = { data, _ in
+        watcher.onChange = { _, data, _ in
             seenLock.lock(); seen.append(data); seenLock.unlock()
         }
 
@@ -475,7 +635,7 @@ final class PasteboardGenerationTests: XCTestCase {
         nonisolated(unsafe) let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
         var seen: [Data] = []
         let seenLock = NSLock()
-        watcher.onChange = { data, _ in
+        watcher.onChange = { _, data, _ in
             seenLock.lock(); seen.append(data); seenLock.unlock()
         }
 

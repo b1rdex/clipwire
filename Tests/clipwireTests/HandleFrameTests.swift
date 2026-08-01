@@ -35,8 +35,9 @@ final class HandleFrameTests: XCTestCase {
         var textToRead: Data?
         /// Only read when `textToRead` is nil, so the double applies the
         /// same text-wins rule the real board does -- and so a test can put
-        /// an image on the pasteboard and see what a path that only ever
-        /// expected text does with it.
+        /// an image on the pasteboard and drive the paths that now build an
+        /// `.imageClip` frame from one (`handleFrame`'s `.sendMine` branch,
+        /// and `announceClipState`).
         var imageToRead: Data?
 
         /// What was written as TEXT, decoded -- the shape most of this
@@ -646,25 +647,26 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(decoded.text, "current clip text")
     }
 
-    /// This branch became REACHABLE for an image only because of Task 8: an
-    /// image-only pasteboard used to read back as nothing, so it resolved a
-    /// nil hash and could never win a reconciliation; now it resolves a real
-    /// `(hash, ts, .image)` state and `sendMine` is a live outcome for it.
-    /// The branch itself still builds a `ClipPayload` -- the TEXT codec --
-    /// from whatever it reads, so without a kind check it would send PNG
-    /// bytes run through `String(decoding:as:UTF8.self)` as a text clip, and
-    /// the peer would apply that mojibake to its clipboard. Not sending is
-    /// the correct behaviour until Task 13 teaches this branch to send an
-    /// `.imageClip` frame; this connection simply does not sync the image,
-    /// exactly as it did not before. The PC agent's `_resolve_clip_state`
-    /// carries the same guard, for the same reason.
+    /// Replaces `testWinningClipStateWithAnImageOnThePasteboardProducesNoSend`,
+    /// which asserted the opposite: until this task the branch built only a
+    /// `ClipPayload` -- the TEXT codec -- so a verified image had to fall out
+    /// silently rather than reach the wire as mojibake. It now has the image
+    /// codec, and the PC agent's `_resolve_clip_state` is the worked example
+    /// this mirrors.
     ///
-    /// The stored hash is the image's REAL digest, so Task 11's verification
-    /// passes and the silence is the kind guard's own doing -- asserted
-    /// directly by the absence of the verification's log line. With a
-    /// placeholder hash this test would pass on the verification instead,
-    /// and the guard Task 13 exists to replace would rot untested.
-    func testWinningClipStateWithAnImageOnThePasteboardProducesNoSend() throws {
+    /// This branch is REACHABLE for an image only because of Task 8: an
+    /// image-only pasteboard used to read back as nothing, so it resolved a
+    /// nil hash and could never win a reconciliation; it now resolves a real
+    /// `(hash, ts, .image)` state.
+    ///
+    /// `mine.ts`, not `now` -- and this is the property Task 11's
+    /// verification exists to make safe: the content has not changed, only
+    /// been re-announced, so re-stamping it would let it win every future
+    /// reconciliation regardless of what happens next. The stored hash is
+    /// the image's REAL digest, so the send is the branch's own doing rather
+    /// than the verification's -- asserted directly by the absence of the
+    /// verification's log line.
+    func testWinningClipStateWithAnImageSendsAnImageClipCarryingOurStoredTimestamp() throws {
         let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         let store = tempClipStateStore()
         try store.save(ClipState(sha256: sha256Hex(png), ts: 777, kind: .image))
@@ -681,12 +683,74 @@ final class HandleFrameTests: XCTestCase {
                     log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
         log.flush()
 
-        XCTAssertTrue(sent.isEmpty,
-                      "an image must not be sent as a text clip just because we won the " +
-                      "reconciliation -- the peer would apply mojibake to its clipboard")
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.type, .imageClip,
+                       "an image must go out under the image codec, never as a text clip")
+        guard let first = sent.first else { return }
+        let decoded = try ImagePayload.decode(first.payload)
+        XCTAssertEqual(decoded.ts, 777, "must carry OUR stored ts, not now")
+        XCTAssertEqual(decoded.png, png)
         XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed before the send"),
-                       "the pasteboard holds exactly what we announced -- this silence is the " +
-                       "kind guard's, and Task 13 replaces it with a real image send")
+                       "the pasteboard holds exactly what we announced")
+    }
+
+    /// The image half of the size boundary, and it is deliberately NOT shaped
+    /// like the text half above: an image at exactly `maxImageBytes` is SENT,
+    /// where text at exactly `maxTextBytes` is skipped. That asymmetry is the
+    /// whole reason the three caps were separated. `maxImageBytes` bounds the
+    /// IMAGE, so an image at exactly the limit encodes to a payload eight
+    /// bytes over it -- 4,194,312 -- which still fits `maxPayloadBytes`
+    /// (8,388,608) with 4 MiB to spare. Adding the timestamp to this guard,
+    /// as the text guard correctly does, would refuse the maximum-size
+    /// screenshot the protocol explicitly makes room for.
+    func testWinningClipStateWithAnImageAtExactlyTheImageLimitStillSends() throws {
+        let png = Data(repeating: 0x89, count: FrameConstants.maxImageBytes)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(png), ts: 777, kind: .image))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = png
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.payload.count,
+                       FrameConstants.maxImageBytes + ClipPayloadConstants.timestampBytes,
+                       "sanity check on the boundary itself -- over maxImageBytes, well under the frame cap")
+    }
+
+    /// The image twin of `testWinningClipStateWithOversizedContentIsLoggedWithItsSize`.
+    /// The verdict clause is byte-identical to the PC agent's own three image
+    /// skips: one sentence per limit, so the sites cannot drift into several
+    /// names for it -- the convention the frame-cap and skew lines already
+    /// follow, which has caught drift twice on this project.
+    func testWinningClipStateWithAnOversizedImageIsLoggedWithItsSize() throws {
+        let oversized = FrameConstants.maxImageBytes + 1
+        let png = Data(repeating: 0x89, count: oversized)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(png), ts: 777, kind: .image))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = png
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertTrue(loggedMessages(at: path)
+                        .contains("skipping an image of \(oversized) bytes: over the image limit"),
+                      "got: \(loggedMessages(at: path))")
     }
 
     // MARK: - Task 11: the send branch verifies before it sends
@@ -909,6 +973,120 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(try ClipPayload.decode(first.payload).text, "what we actually hold")
     }
 
+    // MARK: - Task 13: one function turns a kind into a frame
+
+    /// The kind-to-codec mapping, pinned where it lives rather than at each
+    /// of its two call sites. Both of them -- `handleLocalChange` (a local
+    /// observation) and `handleFrame`'s `.sendMine` branch (a reconciliation
+    /// win) -- previously built a `ClipPayload` inline, which is how the
+    /// second one came to send only text: two inline copies of "which codec
+    /// goes with which kind" is exactly the drift this project has already
+    /// been bitten by twice across the two languages, and here it would be
+    /// within one file.
+    func testOutgoingFrameUsesTheClipCodecForTextAndTheImageCodecForAnImage() throws {
+        let text = try outgoingClipFrame(kind: .text, body: Data("hello".utf8), ts: 1000)
+        XCTAssertEqual(text.type, .clip)
+        XCTAssertEqual(try ClipPayload.decode(text.payload), ClipPayload(ts: 1000, text: "hello"))
+
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let image = try outgoingClipFrame(kind: .image, body: png, ts: 2000)
+        XCTAssertEqual(image.type, .imageClip)
+        let decoded = try ImagePayload.decode(image.payload)
+        XCTAssertEqual(decoded.ts, 2000)
+        XCTAssertEqual(decoded.png, png)
+    }
+
+    /// PNG bytes are not valid UTF-8, so the text codec would not merely
+    /// mislabel them -- `String(decoding:as:UTF8.self)` substitutes U+FFFD
+    /// for every byte it cannot read, and the peer would apply that
+    /// substituted text to its clipboard as a text clip. Pinned as bytes
+    /// rather than as a frame type so a future change that kept the
+    /// `.imageClip` type but routed the body through the wrong codec still
+    /// fails here.
+    func testAnImageBodySurvivesTheOutgoingFrameByteForByte() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0xFF, 0xFE, 0x00, 0x80, 0x1A, 0x0A])
+        let frame = try outgoingClipFrame(kind: .image, body: png, ts: 1)
+        XCTAssertEqual(try ImagePayload.decode(frame.payload).png, png)
+    }
+
+    // MARK: - Task 13: the local-change path, with a send spy
+
+    /// `wireAgent`'s `watcher.onChange` used to build its frame inline and
+    /// hand it straight to `channel.send`, which has no test-observable hook
+    /// at all -- `Channel` is `final`, its `stdinPipe` is private and set
+    /// only inside `attempt()`, so a send with no live ssh process reports
+    /// `onSent(false)` and leaves nothing behind. The entire outbound half
+    /// could have been wired to the text codec for both kinds and every
+    /// other test in this suite would still pass. Pulled out for the same
+    /// reason `handleFrame` and `announceClipState` were, and documented
+    /// there: a `send` spy can verify the exact frame.
+    func testALocalImageChangeSendsAnImageClipCarryingTheObservationTimestamp() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        var sent: [Frame] = []
+
+        handleLocalChange(kind: .image, body: png, observedAt: 4242,
+                          send: { sent.append($0) },
+                          clipStateStore: tempClipStateStore(), log: tempLog())
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.type, .imageClip)
+        guard let first = sent.first else { return }
+        let decoded = try ImagePayload.decode(first.payload)
+        XCTAssertEqual(decoded.ts, 4242, "the moment of OBSERVATION, not of the send")
+        XCTAssertEqual(decoded.png, png)
+    }
+
+    /// The text half, unchanged in behaviour by this task and asserted so it
+    /// stays that way: generalising this path to both kinds is exactly the
+    /// edit that could quietly change the frame type of every text clip.
+    func testALocalTextChangeStillSendsAPlainClipFrame() throws {
+        var sent: [Frame] = []
+
+        handleLocalChange(kind: .text, body: Data("typed by the user".utf8), observedAt: 4242,
+                          send: { sent.append($0) },
+                          clipStateStore: tempClipStateStore(), log: tempLog())
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.type, .clip)
+        guard let first = sent.first else { return }
+        XCTAssertEqual(try ClipPayload.decode(first.payload),
+                       ClipPayload(ts: 4242, text: "typed by the user"))
+    }
+
+    /// The store must record what we hold and how old it is, under the kind
+    /// it actually is -- independent of whether the send below it ever
+    /// reaches the peer. A hardcoded `.text` here would announce a PNG's
+    /// digest as text on the next reconnect, and the peer believes it:
+    /// `decode_clip_state` accepts both kinds, so nothing rejects it on
+    /// arrival.
+    func testALocalImageChangePersistsTheImageKindAndItsObservationTimestamp() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let store = tempClipStateStore()
+
+        handleLocalChange(kind: .image, body: png, observedAt: 4242,
+                          send: { _ in }, clipStateStore: store, log: tempLog())
+
+        XCTAssertEqual(store.load(), ClipState(sha256: sha256Hex(png), ts: 4242, kind: .image))
+    }
+
+    /// The save is best-effort and the send must not depend on it: a local
+    /// disk failure is not the peer's fault, and gating the send behind it
+    /// would silently disable Mac-to-PC sync for as long as the state
+    /// directory is unwritable. Same rule `announceClipState` follows.
+    func testALocalChangeStillSendsWhenTheStoreCannotBeSaved() throws {
+        var sent: [Frame] = []
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleLocalChange(kind: .image, body: Data([0x89, 0x50]), observedAt: 1,
+                          send: { sent.append($0) },
+                          clipStateStore: try unsaveableStore(), log: log)
+        log.flush()
+
+        XCTAssertEqual(sent.count, 1, "a disk failure must not stop the frame")
+        XCTAssertEqual(persistFailures(at: path).count, 1, "and must not be silent either")
+    }
+
     // MARK: - Cross-language hash contract
 
     /// Pins the exact format `resolveStartupState`'s `sha256` field must use:
@@ -1022,7 +1200,7 @@ final class HandleFrameTests: XCTestCase {
 
     /// The `.clipState` case re-derived `mine` from the live pasteboard
     /// whenever `clipStateStore.load()` came back nil, stamping `now` on it.
-    /// Since all three save sites swallow their failure, an unwritable state
+    /// Since every save site swallows its failure, an unwritable state
     /// directory reaches that path silently -- and the re-derived value is
     /// not the one this connection ANNOUNCED to this same peer moments
     /// earlier. It is strictly newer, because `now` has moved on, so a peer
@@ -1405,7 +1583,7 @@ final class HandleFrameTests: XCTestCase {
         }
     }
 
-    // MARK: - Final wave: a failed save is logged, on all three Swift sites
+    // MARK: - Final wave: a failed save is logged, at every Swift save site
 
     /// A plain file occupying the name where the store needs a directory,
     /// so `save()`'s very first step (`createDirectory`) throws for real
@@ -1426,12 +1604,17 @@ final class HandleFrameTests: XCTestCase {
         loggedMessages(at: path).filter { $0.hasPrefix("could not persist clip state: ") }
     }
 
-    /// All three of `agent/clipwire-agent.py`'s own `save_clip_state` call
-    /// sites log `could not persist clip state: %r`; all three Swift ones
-    /// were bare `try?`. The asymmetry matters because the silent side is
+    /// Every one of `agent/clipwire-agent.py`'s own `save_clip_state` call
+    /// sites logs `could not persist clip state: %r`; the Swift ones were all
+    /// bare `try?`. The asymmetry matters because the silent side is
     /// the one whose disk failure is the PRECONDITION for a store-goes-stale
     /// clobber: with nothing on disk, the next reconciliation re-derives an
     /// age from `now` and wins a comparison it should have lost.
+    ///
+    /// One test per Swift site, and the sites are enumerated on
+    /// `persistClipState` in main.swift -- four now, since Task 13 gave
+    /// `.imageClip` an apply path of its own. Both counts have moved once
+    /// already, which is why neither is written as a number here.
     func testAnnounceClipStateLogsAFailedSave() throws {
         let path = tempLogPath()
         let log = Log(path: path)
@@ -1461,30 +1644,151 @@ final class HandleFrameTests: XCTestCase {
                        "an applied clip whose state cannot be persisted must not be silent")
     }
 
-    // MARK: - Task 4: FrameType.imageClip is a compiler-forced case, not a feature
-
-    /// Adding `.imageClip` to `FrameType` (Task 4) makes this function's
-    /// switch over `frame.type` non-exhaustive unless a case is added for
-    /// it -- a compiler requirement, not a feature request. Image sync
-    /// itself is Task 5+'s job. This pins only the minimal legal body
-    /// added here: the frame is received and logged, and produces no other
-    /// effect -- no reply, no echo-suppression arm, no pasteboard write.
-    func testImageClipFrameIsReceivedAndLoggedButNotYetHandled() {
+    /// The fourth site, added with the `.imageClip` apply path. Its own
+    /// failure is the more consequential of the two apply sites: with nothing
+    /// on disk, the next reconnect's `announceClipState` resolves "clipboard
+    /// changed while apart" for an image this side applied correctly, stamps
+    /// `now` on it, and wins a comparison against the peer that actually sent
+    /// it. The PC agent's `_write_clip` logs the same line for the same save.
+    func testAnAppliedImageClipLogsAFailedSave() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         let pasteboard = RecordingPasteboard()
-        var sent: [Frame] = []
-        let logPath = tempLogPath()
-        let log = Log(path: logPath)
 
-        handleFrame(Frame(type: .imageClip, payload: Data("not yet a real image".utf8)),
-                    send: { sent.append($0) },
-                    noteWrittenLocally: { _, _ in XCTFail("must not arm echo suppression for an unhandled type") },
-                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()), log: log,
-                    clipStateStore: tempClipStateStore(), clipStateAnnouncement: ClipStateAnnouncement())
+        handleFrame(Frame(type: .imageClip, payload: try ImagePayload.encode(ts: 424242, png: png)),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: try unsaveableStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
         log.flush()
+        XCTAssertEqual(persistFailures(at: path).count, 1,
+                       "an applied image whose state cannot be persisted must not be silent")
+        XCTAssertEqual(pasteboard.writes.map(\.kind), [.image],
+                       "and the write must have happened anyway -- a local disk failure is not " +
+                       "the peer's fault and must not undo the clip it sent")
+    }
 
-        XCTAssertTrue(sent.isEmpty, "must not reply to or forward an image clip yet")
-        XCTAssertTrue(pasteboard.writtenTexts.isEmpty, "must not write anything to the pasteboard yet")
-        XCTAssertTrue(loggedMessages(at: logPath).contains { $0.contains("image clip") },
-                     "expected the receipt to be logged; got: \(loggedMessages(at: logPath))")
+    // MARK: - Task 13: an image clip from the peer is applied
+
+    /// Replaces `testImageClipFrameIsReceivedAndLoggedButNotYetHandled`,
+    /// which pinned Task 4's placeholder body (log the receipt, do nothing
+    /// else) and would now pass vacuously against the real handler for the
+    /// wrong reason -- its payload, `Data("not yet a real image".utf8)`, is
+    /// 20 bytes with a finite leading ts and a non-empty body, so it decodes
+    /// and is APPLIED rather than ignored.
+    ///
+    /// The kind is where a mistake would do the damage: written as `.text`,
+    /// the PNG would land under `public.utf8-plain-text`, where
+    /// `SystemPasteboard.read()` refuses it as invalid UTF-8 (see
+    /// `PasteboardBackend`'s doc comment) -- the peer's image would vanish on
+    /// arrival with nothing logged anywhere.
+    func testAnImageClipIsAppliedToThePasteboardAsAnImage() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x07])
+        let pasteboard = RecordingPasteboard()
+        let status = AgentStatus(pid: 1, url: tempStatusURL())
+
+        handleFrame(Frame(type: .imageClip, payload: try ImagePayload.encode(ts: 1000, png: png)),
+                    send: { _ in XCTFail("an image clip must never trigger a reply") },
+                    noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: status, log: tempLog(),
+                    clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 2000)
+
+        XCTAssertEqual(pasteboard.writes.map(\.kind), [.image])
+        XCTAssertEqual(pasteboard.writes.first?.data, png)
+        XCTAssertNotNil(status.snapshot().lastReceivedAt,
+                        "an applied image is a received clip, exactly as an applied text one is")
+    }
+
+    /// The image twin of `testIncomingClipArmsSuppressionBeforeWritingToThePasteboard`.
+    /// `PasteboardWatcher` now EMITS images, so this ordering is load-bearing
+    /// for images for the first time: a write observed before its suppression
+    /// exists is echoed straight back to the peer it came from.
+    ///
+    /// Also pins WHICH bytes are armed -- the PNG alone, not `frame.payload`,
+    /// which carries the 8-byte timestamp prefix. The watcher hashes what
+    /// `pasteboard.read()` returns, which is the PNG; arming with the prefixed
+    /// payload would make `EchoGuard`'s digest never match and every applied
+    /// image bounce back.
+    func testAnIncomingImageClipArmsSuppressionBeforeWritingToThePasteboard() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x07])
+        var order: [String] = []
+        var armed: [(kind: ClipKind, data: Data)] = []
+        let pasteboard = RecordingPasteboard()
+        pasteboard.onWrite = { order.append("write") }
+
+        handleFrame(Frame(type: .imageClip, payload: try ImagePayload.encode(ts: 1000, png: png)),
+                    send: { _ in },
+                    noteWrittenLocally: { kind, data in
+                        order.append("arm")
+                        armed.append((kind, data))
+                    },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 2000)
+
+        XCTAssertEqual(order, ["arm", "write"],
+                       "suppression must be armed BEFORE the write becomes observable")
+        XCTAssertEqual(armed.map(\.kind), [.image],
+                       "armed under the kind the watcher will observe, or the digests never meet")
+        XCTAssertEqual(armed.first?.data, png,
+                       "the PNG alone -- the timestamp-prefixed payload would never match a read")
+    }
+
+    /// The peer's timestamp, never `now`: the entire reason it travels in the
+    /// frame. Stamping `now` would make an applied image look freshly copied
+    /// here and win the next reconciliation against the machine it came from.
+    /// The kind is `.image` for the same reason `.clip` stores `.text` --
+    /// this case decoded the image codec, so there is nothing else it could
+    /// be, and a wrong kind here is believed by the peer rather than rejected
+    /// (`decode_clip_state` accepts both).
+    func testAnIncomingImageClipStoresThePeersTimestampAndTheImageKind() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x07])
+        let store = tempClipStateStore()
+
+        handleFrame(Frame(type: .imageClip, payload: try ImagePayload.encode(ts: 424242, png: png)),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 999_999)
+
+        XCTAssertEqual(store.load(), ClipState(sha256: sha256Hex(png), ts: 424242, kind: .image))
+    }
+
+    /// The image twin of `testAnUndecodableClipIsLogged`, and a deliberate
+    /// divergence from the PC agent, whose `_write_clip` returns silently on
+    /// a `ClipPayloadError` -- the same divergence the text path already
+    /// carries, for the same reason: a drop nobody can see is how a
+    /// permanent, mutual desync becomes invisible on both machines at once.
+    ///
+    /// Both cases the image codec rejects on top of a well-formed frame are
+    /// covered, since they are reached by different guards: a payload too
+    /// short to hold a timestamp, and one that is a timestamp and nothing
+    /// else. The second is why `ClipPayloadError.emptyBody` exists at all --
+    /// an empty clip TEXT is legal and applies in silence, an image clip
+    /// carrying no image is not representable.
+    func testAnUndecodableImageClipIsLogged() {
+        for payload in [Data(), Data([0x00]), Data(repeating: 0, count: 8)] {
+            let pasteboard = RecordingPasteboard()
+            let path = tempLogPath()
+            let log = Log(path: path)
+
+            handleFrame(Frame(type: .imageClip, payload: payload),
+                        send: { _ in },
+                        noteWrittenLocally: { _, _ in
+                            XCTFail("nothing was applied, so nothing may be suppressed")
+                        },
+                        pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                        log: log, clipStateStore: tempClipStateStore(),
+                        clipStateAnnouncement: ClipStateAnnouncement())
+            log.flush()
+
+            XCTAssertTrue(pasteboard.writes.isEmpty, "nothing decoded, so nothing may be written")
+            XCTAssertTrue(loggedMessages(at: path).contains {
+                $0.hasPrefix("could not decode an image clip from the peer: ")
+            }, "got: \(loggedMessages(at: path))")
+        }
     }
 }

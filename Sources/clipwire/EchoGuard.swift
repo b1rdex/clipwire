@@ -13,11 +13,18 @@ import Foundation
 /// maintained implementations of clipboard identity are exactly the kind of
 /// drift between the two sides of this project that has already caused real
 /// bugs twice, and matching their shape here closes that off for this
-/// concept too. Every call site today only ever arms and checks `.text` --
-/// `PasteboardWatcher`'s own read path is still text-only (see its class doc
-/// comment) -- so `kind` is currently a no-op in practice, not yet a live
-/// discriminator; it is here so a later task that starts syncing local image
-/// changes only has to pass `.image` through, not touch this comparison.
+/// concept too. `kind` was a no-op in practice when it was added, since every
+/// call site then armed and checked `.text`: `PasteboardWatcher`'s read path
+/// was text-only, and no image ever reached this comparison. Task 13 made it
+/// a live discriminator by teaching that path to emit images and
+/// `handleFrame`'s `.imageClip` case to apply them, and it needed no change
+/// here -- passing `.image` through was the whole of it, which is what
+/// adding the field early bought.
+///
+/// It is load-bearing now rather than merely populated: an image applied from
+/// the peer is armed as `(.image, digest)` and observed as `(.image, digest)`
+/// a poll later, and a mismatch on either half sends it straight back to the
+/// machine it came from -- which applies any incoming clip unconditionally.
 struct EchoGuard {
     private var lastWritten: (kind: ClipKind, digest: SHA256.Digest)?
 

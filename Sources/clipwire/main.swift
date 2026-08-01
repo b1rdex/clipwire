@@ -143,10 +143,13 @@ func skewLogLine(peerSentAt: Double?, now: Double) -> String? {
 /// unsynchronized threads can mutate different fields of the same struct
 /// with no ordering guarantee, and two concurrent `Status.write(to:)`
 /// calls would race the same temp-file-then-replace pair. This class
-/// applies the same fix, to the same class of hazard, that Task 13 already
-/// applied to `PasteboardWatcher` (a `stateLock` around `changeCount`/
-/// `echo`) and Task 14 to `Channel` (a serial `writeQueue` around pipe
-/// writes).
+/// applies the same fix, to the same class of hazard, that the v2 plan's
+/// Task 13 already applied to `PasteboardWatcher` (a `stateLock` around
+/// `changeCount`/`echo`) and its Task 14 to `Channel` (a serial `writeQueue`
+/// around pipe writes). The v2 plan's, not this one's: v3's Task 13 is the
+/// Mac's image path, and touched none of these locks. The two plans number
+/// independently -- `PasteboardWatcher`'s own class comment carries the same
+/// warning about the same collision.
 final class AgentStatus: @unchecked Sendable {
     private let lock = NSLock()
     private let url: URL
@@ -354,8 +357,8 @@ final class ClipStateAnnouncement {
 
     /// What THIS connection actually put on the wire. Kept because the store
     /// is not a reliable way to read it back: `announceClipState`'s save is
-    /// best-effort and, like all three save sites, its failure is only
-    /// logged. See the `.clipState` case for what depends on it.
+    /// best-effort and, like every save site, its failure is only logged.
+    /// See the `.clipState` case for what depends on it.
     ///
     /// Cleared by `reset()` along with `sent`, so a value announced on one
     /// connection can never be resolved against on the next -- by then it
@@ -387,22 +390,25 @@ final class ClipStateAnnouncement {
 }
 
 /// Saves, and logs rather than swallowing if it cannot. Every one of this
-/// file's three `clipStateStore.save` calls goes through here.
+/// file's `clipStateStore.save` calls goes through here -- four of them now:
+/// `announceClipState`, `handleLocalChange`, and `handleFrame`'s `.clip` and
+/// `.imageClip` cases. Counting them here rather than naming a number alone,
+/// since the number has already changed once.
 ///
-/// The line matches the text all three of `agent/clipwire-agent.py`'s own
-/// `save_clip_state` call sites already log (`could not persist clip state:
+/// The line matches the text every one of `agent/clipwire-agent.py`'s own
+/// `save_clip_state` call sites already logs (`could not persist clip state:
 /// %r`), the way the two "over the text limit" lines and the two skew lines
-/// already match. All three Swift sites were bare `try?`, which mattered
-/// specifically because the silent side is the one whose disk failure is the
-/// PRECONDITION for a store-goes-stale clobber: with nothing readable on
-/// disk, the next reconciliation re-derives an age from `now` and wins a
-/// comparison it should have lost, which is the failure the persistent store
-/// exists to prevent.
+/// already match. The Swift sites were all bare `try?` before this was
+/// introduced, which mattered specifically because the silent side is the one
+/// whose disk failure is the PRECONDITION for a store-goes-stale clobber:
+/// with nothing readable on disk, the next reconciliation re-derives an age
+/// from `now` and wins a comparison it should have lost, which is the failure
+/// the persistent store exists to prevent.
 ///
-/// One function rather than three copies of the same `do/catch`: three
-/// identical literals in one file is exactly the drift this project has
-/// already been bitten by, and `ClipStateStore.save` deliberately throws so
-/// that a CALLER can log -- it just should not be three callers writing the
+/// One function rather than a copy of the same `do/catch` per site:
+/// identical literals repeated in one file is exactly the drift this project
+/// has already been bitten by, and `ClipStateStore.save` deliberately throws
+/// so that a CALLER can log -- it just should not be four callers writing the
 /// string out independently.
 func persistClipState(_ state: ClipState, to store: ClipStateStore, log: Log) {
     do {
@@ -466,6 +472,103 @@ func announceClipState(
     guard let payload = try? resolved.encodePayload() else { return nil }
     send(Frame(type: .clipState, payload: payload))
     return resolved
+}
+
+/// The one place a clip's kind becomes a frame: `.text` goes out as a
+/// `.clip` frame carrying a `ClipPayload`, `.image` as an `.imageClip` frame
+/// carrying an `ImagePayload`.
+///
+/// One function rather than the mapping written out at each of its two call
+/// sites (`handleLocalChange` below, and `handleFrame`'s `.sendMine` branch).
+/// Two inline copies is how the second one came to send text only: this file
+/// carried the text codec in both places, so `.sendMine` had to decline an
+/// image it had otherwise verified. Two copies of one rule in one file is the
+/// same drift the two "over the text limit" lines and the three-word
+/// reconciliation vocabulary already guard against across the two languages.
+///
+/// Throws only what `ImagePayload.encode` throws -- a non-finite `ts`, which
+/// it rejects on encode as well as decode. No caller can currently supply
+/// one: `handleLocalChange`'s comes from `Date().timeIntervalSince1970`, and
+/// `.sendMine`'s from a `ClipState` that was JSON-decoded (a format with no
+/// literal for NaN or infinity) or resolved from the same clock. Left
+/// throwing rather than made unfailable anyway, so the finiteness rule keeps
+/// living in one place -- the codec -- for both directions.
+func outgoingClipFrame(kind: ClipKind, body: Data, ts: Double) throws -> Frame {
+    switch kind {
+    case .text:
+        // `String(decoding:as:UTF8.self)` is lossy for bytes that are not
+        // valid UTF-8, which is why `SystemPasteboard`'s text read goes
+        // through `string(forType:)` rather than `data(forType:)` -- see
+        // `PasteboardBackend`'s doc comment. By the time a body reaches this
+        // function under `.text` it has already come back from that read, so
+        // there is nothing here for the substitution to damage.
+        return Frame(type: .clip,
+                     payload: ClipPayload(ts: ts, text: String(decoding: body, as: UTF8.self)).encode())
+    case .image:
+        return Frame(type: .imageClip, payload: try ImagePayload.encode(ts: ts, png: body))
+    }
+}
+
+/// Everything a clipboard change this agent OBSERVED locally does: record
+/// what we now hold and how old it is, then put it on the wire.
+///
+/// Pulled out of `wireAgent`'s `watcher.onChange` closure for the same
+/// reason `handleFrame` and `announceClipState` were pulled out of
+/// `runAgent()`, and it matters more here than it looks: `channel.send` has
+/// no test-observable hook whatsoever -- `Channel` is `final`, its
+/// `stdinPipe` is private and assigned only inside `attempt()`, so a send
+/// with no live ssh process reports `onSent(false)` and leaves nothing
+/// behind. While this logic lived inside that closure, the entire outbound
+/// path could have been wired to the text codec for both kinds with no test
+/// in either suite able to see it. A `send` spy can now verify the exact
+/// frame; see `Tests/clipwireTests/HandleFrameTests.swift`.
+///
+/// `send` is the one-argument shape rather than `Channel.send(_:onSent:)`:
+/// the `onSent` callback exists to keep `clipwire status` from reporting a
+/// clip that never left the machine, which is `wireAgent`'s business and not
+/// this function's. `wireAgent` closes over it.
+///
+/// No size guard here, deliberately: `PasteboardWatcher.pollLocked` applies
+/// the per-kind limit at the moment of observation, where the skip can be
+/// logged next to the read that produced it. The `.sendMine` branch needs
+/// its own copy because it reads the pasteboard independently; this path
+/// does not.
+func handleLocalChange(
+    kind: ClipKind,
+    body: Data,
+    observedAt: Double,
+    send: (Frame) -> Void,
+    clipStateStore: ClipStateStore,
+    log: Log
+) {
+    // `observedAt` -- the moment `PasteboardWatcher` actually read it, not
+    // whenever this runs -- is the timestamp both for what we persist and for
+    // what we send. The save happens regardless of whether the send below
+    // ever reaches the peer (no channel yet, or the write fails): the store's
+    // job is "what do we hold and how old is it", independent of delivery.
+    //
+    // `kind` is the one the watcher observed, threaded through from the same
+    // `pasteboard.read()` pair the body came from. A hardcoded `.text` here
+    // would announce a PNG's digest as text on the next reconnect, and the
+    // peer believes it -- `decode_clip_state` accepts both kinds, so nothing
+    // rejects it on arrival.
+    persistClipState(ClipState(sha256: sha256Hex(body), ts: observedAt, kind: kind),
+                     to: clipStateStore, log: log)
+    let frame: Frame
+    do {
+        frame = try outgoingClipFrame(kind: kind, body: body, ts: observedAt)
+    } catch {
+        // Logged rather than swallowed by `try?`. A `try?` here is the exact
+        // shape of the v2 defect this branch's whole design reacts to: a
+        // clip that cannot be encoded is not sent, which is right, but a
+        // silent drop is how a user concludes the tool is broken with
+        // nothing anywhere to look at. The line is shared byte-for-byte with
+        // the `.sendMine` branch's own catch -- one sentence per condition,
+        // two sites.
+        log.line("could not encode a clip for the peer: \(error)")
+        return
+    }
+    send(frame)
 }
 
 /// Handles one decoded frame. Pulled out of `runAgent()`'s inline closure
@@ -600,8 +703,8 @@ func handleFrame(
         //
         // The store should already be current -- from this connection's own
         // announcement, or an ordinary local-change/applied-clip save since --
-        // so the rest only matters once a save has failed, which every one of
-        // the three sites merely logs. The old code went straight to the
+        // so the rest only matters once a save has failed, which every save
+        // site merely logs. The old code went straight to the
         // re-derivation there, and that is a clobber, not a fallback: it
         // stamps `now` on content whose age this connection already ANNOUNCED
         // to this same peer, so a peer that is genuinely fresher than what we
@@ -697,58 +800,93 @@ func handleFrame(
                 log.line("clipboard changed before the send")
                 return
             }
-            // The verification says nothing about which kinds this branch can
-            // actually SEND. Task 8 made `sendMine` REACHABLE for an image
-            // for the first time: an image-only pasteboard used to read back
-            // as nothing, so it resolved a `nil` hash and could never win a
-            // reconciliation; it now resolves a real `(hash, ts, .image)`
-            // state. The verification passes for an image the pasteboard
-            // really does still hold -- but the only frame this branch builds
-            // is a `ClipPayload`, the TEXT codec, so sending those bytes
-            // would put a mojibake transliteration of a PNG on the wire,
-            // which is a worse outcome than not sending at all. A verified
-            // image therefore falls out here silently, precisely as it
-            // silently does today; sending it properly, as an `.imageClip`
-            // frame, is Task 13's job -- "images end to end on the Mac",
-            // which needs this send, the `.imageClip` apply and the announce
-            // wired together rather than one call site at a time.
+            // Either kind, since Task 13. Task 8 had already made `sendMine`
+            // REACHABLE for an image -- an image-only pasteboard used to read
+            // back as nothing, so it resolved a `nil` hash and could never
+            // win a reconciliation; it now resolves a real
+            // `(hash, ts, .image)` state -- but the only frame this branch
+            // could build was a `ClipPayload`, the TEXT codec, so a verified
+            // image had to fall out silently rather than reach the wire as a
+            // mojibake transliteration of a PNG. `outgoingClipFrame` picks
+            // the codec from the kind now, and the verification above is
+            // exactly what licenses trusting that kind: it proved the live
+            // pasteboard agrees with `mine.kind` as well as with
+            // `mine.sha256`. The PC agent's `_resolve_clip_state` is the
+            // worked example, from Task 12.
             //
-            // The PC agent's `_resolve_clip_state` IS the worked example:
-            // Task 12 gave that branch the image codec, so the PC sends a
-            // verified image from here and this side does not yet. Until
-            // Task 13 closes it, a reconnect where the MAC's image is the
-            // fresher of the two states keeps it on the Mac.
-            //
-            // Silent, unlike the mismatch above, and deliberately: nothing
-            // went wrong here -- this is a known gap, not a race -- and it
-            // would log on every reconnect for as long as an image sits on
-            // the pasteboard.
-            guard read.kind == .text, !read.data.isEmpty else { return }
-            let data = read.data
-            // The size bound matches PasteboardWatcher's own send-side guard
-            // (Pasteboard.swift): this branch reads the live pasteboard
-            // independently, and without it, winning a reconciliation over
-            // content at or beyond the TEXT limit would build a `ClipPayload`
-            // whose encoded frame exceeds `FrameConstants.maxTextBytes`. This
-            // is the text-content limit, not the (larger)
-            // `FrameConstants.maxPayloadBytes` wire cap `Frame.decode`
-            // enforces -- since Task 4 the two are separate, and a send this
-            // size would still fit inside the frame cap; it is refused here
-            // purely as a matter of the policy text clips are held to.
-            // Logged (unlike a merely-empty pasteboard, which is not a skip
-            // at all) so a user whose large paste never syncs has something
-            // to look at, matching the Python agent's existing "skipping a
-            // clip of N bytes" line for the same limit.
-            guard data.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
-                log.line("skipping a clip of \(data.count) bytes: over the text limit")
-                return
+            // The empty guard is defensive rather than reachable:
+            // `resolveCurrentClipState` records a nil hash for an empty
+            // pasteboard, and `SystemPasteboard.read()` reports nothing for
+            // an empty body, so `mine` could only carry the empty string's
+            // digest if something else wrote the store. Refused anyway --
+            // neither codec has anything to say about zero bytes. The PC's
+            // twin carries the identical note.
+            guard !read.data.isEmpty else { return }
+            let body = read.data
+            // Both bounds match `PasteboardWatcher.pollLocked`'s own
+            // send-side guards (Pasteboard.swift): this branch reads the live
+            // pasteboard independently, so the limits have to be applied
+            // again here rather than inherited from an observation that never
+            // happened. Logged (unlike a merely-empty pasteboard, which is
+            // not a skip at all) so a user whose large content never syncs
+            // has something to look at.
+            switch read.kind {
+            case .text:
+                // Content at or beyond the TEXT limit would build a
+                // `ClipPayload` whose encoded frame exceeds
+                // `FrameConstants.maxTextBytes`. That is the text-content
+                // limit, not the (larger) `FrameConstants.maxPayloadBytes`
+                // wire cap `Frame.decode` enforces -- since Task 4 the two
+                // are separate, and a send this size would still fit inside
+                // the frame cap; it is refused here purely as a matter of the
+                // policy text clips are held to.
+                guard body.count + ClipPayloadConstants.timestampBytes <= FrameConstants.maxTextBytes else {
+                    log.line("skipping a clip of \(body.count) bytes: over the text limit")
+                    return
+                }
+            case .image:
+                // The bare body, unlike the text branch above, and the
+                // difference is load-bearing: `maxImageBytes` bounds the
+                // image, so an image at exactly the limit is legal and
+                // encodes to a payload eight bytes over it -- 4,194,312,
+                // which still fits `maxPayloadBytes` (8,388,608) with 4 MiB
+                // to spare. Written in the text guard's shape it would refuse
+                // exactly the maximum-size screenshot the three separated
+                // caps exist to permit. Same verdict clause as
+                // `PasteboardWatcher.pollLocked`'s, which enumerates all five
+                // sites that report this limit and why the shared thing is
+                // the clause rather than the whole sentence.
+                guard body.count <= FrameConstants.maxImageBytes else {
+                    log.line("skipping an image of \(body.count) bytes: over the image limit")
+                    return
+                }
             }
-            let text = String(decoding: data, as: UTF8.self)
-            // `mine.ts`, not `now`: the content has not changed, only been
-            // re-announced, so its recorded age must be preserved. Sending
-            // with `now` would perpetually refresh it and let it win every
-            // future reconciliation regardless of what happens next.
-            send(Frame(type: .clip, payload: ClipPayload(ts: mine.ts, text: text).encode()))
+            do {
+                // `mine.ts`, not `now`: the content has not changed, only
+                // been re-announced, so its recorded age must be preserved.
+                // Sending with `now` would perpetually refresh it and let it
+                // win every future reconciliation regardless of what happens
+                // next. Carrying the announced timestamp rather than
+                // re-deriving one is the property Task 11's verification
+                // above exists to make safe.
+                //
+                // No `EchoGuard` arm to go with this send, unlike the PC
+                // agent's twin, which updates `_last_seen` here. Not drift:
+                // that field exists because the GPaste watcher fires on
+                // non-changes (a history deletion emits Update too), so a
+                // later spurious signal could see the clipboard still holding
+                // `body` and resend it. `PasteboardWatcher` is
+                // `changeCount`-driven and cannot fire without an actual
+                // change, and `EchoGuard` is a ONE-SHOT consumed by the next
+                // observation -- arming it here would spend it on whatever
+                // the user copies next, swallowing a genuine change.
+                send(try outgoingClipFrame(kind: read.kind, body: body, ts: mine.ts))
+            } catch {
+                // Logged rather than swallowed by `try?`, and byte-identical
+                // to `handleLocalChange`'s own catch -- one sentence per
+                // condition, two sites.
+                log.line("could not encode a clip for the peer: \(error)")
+            }
         case .waitForPeer, .doNothing:
             // Hashes equal means we agree -- not a signal to resend. A
             // peer that is fresher means we wait. Conflating either with
@@ -809,17 +947,59 @@ func handleFrame(
                          to: clipStateStore, log: log)
         status.recordReceived()
     case .imageClip:
-        // Task 4 adds this case to `FrameType`, which makes this switch
-        // non-exhaustive without a branch for it -- a compiler requirement,
-        // not a feature request. Image sync itself is out of scope here
-        // (Task 5+ wires real handling); this is deliberately the smallest
-        // legal body. A silent no-op would break with this file's own
-        // convention (stated above, at `.clip`): not-yet-handled input is
-        // logged, never swallowed invisibly. `default:` would satisfy the
-        // compiler too, but would also hide the NEXT unhandled case the
-        // same way -- an explicit case here means adding a fifth frame type
-        // later fails to compile again instead of silently falling through.
-        log.line("received an image clip — image sync is not implemented yet")
+        // The `.clip` case above, one codec over. Task 4 added this case as
+        // the smallest legal body the compiler would accept (log the receipt,
+        // do nothing); it applies the image now.
+        //
+        // Logged rather than swallowed by `try?`, for the reason spelled out
+        // at `.clip`: a drop nobody can see is what makes a mutual desync
+        // permanent and invisible on both machines at once. A deliberate
+        // divergence from the PC agent, whose `_write_clip` returns silently
+        // on a `ClipPayloadError` -- the same divergence, with the same
+        // justification, that the text path already carries.
+        //
+        // No separate empty-body guard, unlike `.clip`'s `!decoded.text.isEmpty`:
+        // `ImagePayload.decode` refuses a body of zero bytes itself
+        // (`ClipPayloadError.emptyBody`), so that case arrives here as a
+        // throw and is logged. The asymmetry is the codecs': an empty clip
+        // TEXT is legal and applying it is a correct, uneventful no-op, while
+        // an image clip carrying no image has no representable meaning.
+        let decoded: (ts: Double, png: Data)
+        do {
+            decoded = try ImagePayload.decode(frame.payload)
+        } catch {
+            log.line("could not decode an image clip from the peer: \(error)")
+            return
+        }
+        // Arm suppression BEFORE writing, with the PNG bytes alone -- not
+        // `frame.payload`, which carries the 8-byte timestamp prefix.
+        // `PasteboardWatcher` hashes the body `pasteboard.read()` returns,
+        // which is this PNG; arming with the prefixed payload would make
+        // `EchoGuard`'s digest never match and every applied image bounce
+        // straight back to the peer it came from. That ordering became
+        // load-bearing for images only with this task, which is what makes
+        // the watcher emit them at all.
+        //
+        // `.image`, and the same bytes that were armed: this case decoded an
+        // `.imageClip` (type 0x03) payload, so there is nothing else it could
+        // be, and `EchoGuard` compares the kind alongside the digest.
+        noteWrittenLocally(.image, decoded.png)
+        pasteboard.write(kind: .image, data: decoded.png)
+        // The peer's timestamp, never `now` -- this is the entire reason it
+        // travels in the frame. Stamping `now` would make applied content
+        // look freshly copied here and win the next reconciliation against
+        // the machine it actually came from.
+        //
+        // The hash is of what we WROTE, and on this side that is also what
+        // the pasteboard will read back: `NSPasteboard` returns the bytes it
+        // was given and nothing here re-encodes them. The PC agent has to
+        // correct its own store afterwards (`_consume_image_reoffer`) because
+        // GPaste takes over the selection and re-encodes the image; see
+        // `SystemPasteboard.write`'s doc comment for why no read-back belongs
+        // here.
+        persistClipState(ClipState(sha256: sha256Hex(decoded.png), ts: decoded.ts, kind: .image),
+                         to: clipStateStore, log: log)
+        status.recordReceived()
     }
 }
 
@@ -838,22 +1018,29 @@ func wireAgent(
     channel: Channel, watcher: PasteboardWatcher, pasteboard: PasteboardReading & PasteboardWriting,
     status: AgentStatus, log: Log, clipStateStore: ClipStateStore, clipStateAnnouncement: ClipStateAnnouncement
 ) {
-    watcher.onChange = { payload, observedAt in
-        // A genuine local change: `observedAt` -- the moment PasteboardWatcher
-        // actually read it, not whenever this closure happens to run -- is
-        // the timestamp both for what we persist and for what we send. The
-        // save must happen regardless of whether the send below ever reaches
-        // the peer (no channel yet, or the write fails): the store's job is
-        // "what do we hold and how old is it", independent of delivery.
-        // `.text`: `payload` above is `PasteboardWatcher`'s own observed
-        // text bytes -- there is no image-watching call site here yet.
-        persistClipState(ClipState(sha256: sha256Hex(payload), ts: observedAt, kind: .text),
-                         to: clipStateStore, log: log)
-        let text = String(decoding: payload, as: UTF8.self)
-        let framePayload = ClipPayload(ts: observedAt, text: text).encode()
-        channel.send(Frame(type: .clip, payload: framePayload), onSent: { sent in
-            if sent { status.recordSent() }
-        })
+    // The kind the watcher observed is passed straight through, never
+    // re-derived: it comes from the same `pasteboard.read()` pair the body
+    // did (see `PasteboardWatcher.onChange`). Dropping it here would compile
+    // clean and pass both the watcher's and `handleLocalChange`'s own suites,
+    // and the damage would surface only on the wire, where `channel.send` is
+    // not observable at all -- so `AgentWiringTests` catches it through the
+    // store instead.
+    //
+    // `status.recordSent()` stays here rather than moving into
+    // `handleLocalChange`: it is only called once `channel.send` reports the
+    // frame actually reached the pipe (`onSent(true)`), because a send
+    // attempted before any channel is established (`stdinPipe` still nil)
+    // must not make `clipwire status` claim a clip that never left the
+    // machine. That is this wiring's business, not the handler's.
+    watcher.onChange = { kind, payload, observedAt in
+        handleLocalChange(
+            kind: kind, body: payload, observedAt: observedAt,
+            send: { frame in
+                channel.send(frame, onSent: { sent in
+                    if sent { status.recordSent() }
+                })
+            },
+            clipStateStore: clipStateStore, log: log)
     }
 
     channel.onFrame = { frame in

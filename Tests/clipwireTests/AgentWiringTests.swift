@@ -66,9 +66,9 @@ final class AgentWiringTests: XCTestCase {
         // replacing what it does -- it must still forward to channel.send
         // exactly as wireAgent set it up.
         var onChangeFireCount = 0
-        watcher.onChange = { data, observedAt in
+        watcher.onChange = { kind, data, observedAt in
             onChangeFireCount += 1
-            wiredOnChange(data, observedAt)
+            wiredOnChange(kind, data, observedAt)
         }
 
         watcher.poll() // establishes the baseline changeCount, emits nothing
@@ -163,6 +163,35 @@ final class AgentWiringTests: XCTestCase {
                        "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4")
     }
 
+    /// The last link of the outbound image path: `PasteboardWatcher` emits
+    /// `(kind, body, observedAt)` and `handleLocalChange` turns a kind into a
+    /// frame, but nothing until here proves `wireAgent` passes the OBSERVED
+    /// kind between them rather than a hardcoded `.text`. A closure that
+    /// dropped it would compile clean and pass both of those suites, and the
+    /// damage would only appear on the wire, where `channel.send` is not
+    /// observable at all -- so the store is where it is caught: a hardcoded
+    /// `.text` records a PNG's digest as text, which the peer's
+    /// `decode_clip_state` accepts and believes.
+    func testALocalImageChangeReachesTheStoreAsAnImageThroughTheWiring() {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        let pasteboard = FakePasteboard()
+        let watcher = PasteboardWatcher(pasteboard: pasteboard, pollInterval: 0.4)
+        let clipStateStore = tempClipStateStore()
+
+        wireAgent(channel: Channel(config: config(), log: tempLog()), watcher: watcher,
+                  pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                  log: tempLog(), clipStateStore: clipStateStore,
+                  clipStateAnnouncement: ClipStateAnnouncement())
+
+        watcher.poll() // baseline
+        pasteboard.setImage(png)
+        watcher.poll()
+
+        XCTAssertEqual(clipStateStore.load()?.kind, .image,
+                       "the kind the watcher observed must survive the wiring")
+        XCTAssertEqual(clipStateStore.load()?.sha256, sha256Hex(png))
+    }
+
     /// The property that makes the whole feature work across the case it
     /// exists for: reconnects happen on every Mac sleep/wake cycle, not just
     /// reboots, and `wireAgent` is wired exactly once at process start, so
@@ -202,13 +231,18 @@ final class AgentWiringTests: XCTestCase {
                      "connection is about to perform for itself")
     }
 
-    /// The third of the three Swift `clipStateStore.save` sites, and the
-    /// only one that lives in `wireAgent` rather than `handleFrame` (the
-    /// other two are pinned in HandleFrameTests). All three of the PC
-    /// agent's own `save_clip_state` calls already log
-    /// `could not persist clip state: %r`; these three were bare `try?`.
-    /// The asymmetry matters because the silent side is the one whose disk
-    /// failure is the precondition for a store-goes-stale clobber.
+    /// The local-change save site, reached the way production reaches it --
+    /// through the closure `wireAgent` actually installed. The site itself
+    /// moved into `handleLocalChange` with Task 13 and is pinned there too
+    /// (`testALocalChangeStillSendsWhenTheStoreCannotBeSaved`), so what this
+    /// test uniquely proves is the WIRING: that the closure routes through
+    /// something that logs rather than swallowing, which is what it did
+    /// inline before.
+    ///
+    /// Every one of the PC agent's own `save_clip_state` calls already logs
+    /// `could not persist clip state: %r`; the Swift ones were all bare
+    /// `try?`. The asymmetry matters because the silent side is the one whose
+    /// disk failure is the precondition for a store-goes-stale clobber.
     func testALocalChangeLogsAFailedSave() throws {
         let logPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-wiring-test-\(UUID().uuidString)")
@@ -232,7 +266,7 @@ final class AgentWiringTests: XCTestCase {
         // Drives the closure `wireAgent` actually installed, rather than a
         // stand-in -- the point is that THIS wiring logs, not that some
         // equivalent code would.
-        watcher.onChange?(Data("a local copy".utf8), 5)
+        watcher.onChange?(.text, Data("a local copy".utf8), 5)
 
         log.flush()
         let contents = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
