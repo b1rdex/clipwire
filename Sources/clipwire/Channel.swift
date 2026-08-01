@@ -79,8 +79,10 @@ final class Channel: @unchecked Sendable {
     ///
     /// Internal rather than `private` only so a test can pin the defaults:
     /// once the command stopped being a literal at its call site, nothing else
-    /// guaranteed that production still spawns ssh (`attempt()` is private and
-    /// `run()` never returns, so neither can observe it).
+    /// guaranteed that production still spawns ssh. `run()` never returns, and
+    /// the pairing harness — the only caller of `attempt(host:)` outside
+    /// `run()`, and the reason that method is no longer private — always
+    /// injects, so neither of them observes what the defaults actually are.
     let executablePath: String
     let makeArguments: (Config, String) -> [String]
     private let writeQueue = DispatchQueue(label: "dev.b1rdex.clipwire.write")
@@ -139,6 +141,31 @@ final class Channel: @unchecked Sendable {
         }
     }
 
+    /// Closes this side's write end, which the far side sees as EOF on its
+    /// stdin — the same thing a dropped ssh gives the agent, and the agent's
+    /// own ordinary way out (`Agent.run()` logs "stdin closed, exiting" and
+    /// returns 0).
+    ///
+    /// Nothing in production calls this, and nothing should: `run()`
+    /// reconnects forever and the ssh process only ever dies on its own. It
+    /// exists for v3.1's pairing harness, which spawns a real agent per
+    /// connection — as sshd does, one process per connection — and therefore
+    /// has to be able to END one. Without it every harness test would leave a
+    /// python3 (and the gdbus child it forked) alive for the rest of the test
+    /// binary's life, still polling a fake clipboard whose temp directory had
+    /// been deleted underneath it.
+    ///
+    /// Goes through `writeQueue`, the one queue `stdinPipe` is ever touched
+    /// from, so it cannot close the handle out from under an in-flight
+    /// `send`; and `sync`, so a caller may rely on the close having happened
+    /// by the time this returns.
+    func hangUp() {
+        writeQueue.sync { [self] in
+            try? stdinPipe?.fileHandleForWriting.close()
+            stdinPipe = nil
+        }
+    }
+
     /// SIGPIPE's default disposition terminates the process the instant a
     /// write lands on a pipe with no reader on the other end — exactly what
     /// `send()` can hit when it races `ssh` dying (`stdinPipe` is only niled
@@ -191,8 +218,18 @@ final class Channel: @unchecked Sendable {
         }
     }
 
-    /// Returns true when the channel was established before it dropped.
-    private func attempt(host: String) -> Bool {
+    /// One connection: spawn the command, pump frames until it dies, and
+    /// report whether it was ever established before it dropped.
+    ///
+    /// Internal rather than `private` for v3.1's pairing harness, which drives
+    /// connections one at a time instead of through `run()`. `run()` is an
+    /// infinite reconnect loop that never returns, so a test calling it would
+    /// leave a thread respawning agents for the rest of the binary's life —
+    /// and it offers no way to say "now reconnect", which is precisely the
+    /// event freshness reconciliation exists for and the one the harness has
+    /// to be able to stage. Production still reaches this only through
+    /// `run()`, which is the only caller in `Sources/`.
+    func attempt(host: String) -> Bool {
         // Cleared unconditionally, before anything else, including before
         // the early `return false` below if `task.run()` throws — so no
         // path through this function can ever leave a previous attempt's

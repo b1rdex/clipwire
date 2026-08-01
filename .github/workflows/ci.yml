@@ -5,12 +5,34 @@ on:
   pull_request:
 
 jobs:
+  # Also the job that runs the pairing harness, and the only one that can:
+  # `swift test` picks it up with no wiring of its own, and it needs BOTH
+  # halves of the project on one machine -- the Swift side links AppKit and
+  # does not build on Linux, and the agent is `python3 agent/clipwire-agent.py`
+  # spawned from the test, forking the fakes in Tests/fakes by name through
+  # PATH. python3 is preinstalled on the GitHub macOS images; the harness
+  # resolves it through `/usr/bin/env` rather than assuming a path, because
+  # there is no fixed one on macOS.
   swift:
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - run: swift --version
+      - name: The fakes' own tests
+        # Before `swift test`, deliberately. These pin what a fake can get
+        # wrong SILENTLY -- an Update line the agent's parser rejects, a
+        # substitution that returns its input -- and every one of those
+        # leaves the harness green while it tests nothing. Run first, a
+        # broken fake is diagnosed as a broken fake; run after (or not at
+        # all, which is where they were until this task), it arrives as a
+        # mysterious harness timeout, or as no failure whatsoever.
+        #
+        # Here rather than in the Python matrix below: the fakes exist to
+        # serve the harness, so they belong on the machine the harness runs
+        # on, and the matrix is about the interpreter versions the PC
+        # actually has.
+        run: python3 Tests/fakes/test_fakes.py
       - run: swift build
       - run: swift test
 

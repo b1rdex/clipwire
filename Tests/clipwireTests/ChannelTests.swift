@@ -65,7 +65,8 @@ final class ChannelTests: XCTestCase {
     // The same change stopped the production spawn from being a literal at its
     // call site: `Commands.swift` constructs `Channel(config:log:)` with no
     // command at all, so the initializer's DEFAULTS are what ships. Nothing
-    // else observes them — `attempt()` is private and `run()` never returns —
+    // else observes them — `run()` never returns, and the pairing harness,
+    // which is why `attempt(host:)` stopped being private, always injects —
     // so a regression that repointed a default would leave the entire suite
     // green while the agent stopped speaking ssh, and the harness (which
     // injects, and therefore never touches the defaults) would not catch it
