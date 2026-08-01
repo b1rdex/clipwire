@@ -41,7 +41,8 @@ gpaste-client delete-history
 **The same is true of screenshots, which may hold more than the person copying them
 intended.** GPaste writes image items to its on-disk history exactly as it writes text —
 verified: `images-support` is `true`, `~/.local/share/gpaste/images` holds them, and a
-screenshot copied on the Mac was confirmed to appear in the history listing.
+screenshot taken on the PC was confirmed to appear in the history listing. As with the text
+case above, anything that reaches the PC's clipboard as an image lands in that history too.
 
 ## Installing
 
@@ -179,6 +180,8 @@ one that was copied.
 
 This is the same disease as `trim-items` above: the clipboard does not necessarily hold
 what you put in it. clipwire is built around that rather than surprised by it: the re-encode
-does not confuse the two machines into re-sending the same screenshot forever. The picture
-that lands is still GPaste's re-encoding, though, not a byte-identical copy of what was on
-the Mac's pasteboard.
+does not confuse the two machines into re-sending the same screenshot forever, though a
+screenshot copied directly on the PC does currently cost two frames to the Mac — the
+original, then the re-encode, back to back — before it settles. The picture that lands is
+still GPaste's re-encoding, though, not a byte-identical copy of what was on the Mac's
+pasteboard.

@@ -1616,8 +1616,11 @@ final class HandleFrameTests: XCTestCase {
         // One literal, not two independent substrings: pins the separator and
         // the spacing too, the same shape as the "over the image limit" lines
         // elsewhere in this suite, so a change that reordered the pair or
-        // dropped the space still goes red here.
-        XCTAssertTrue(line.contains("(mine=image peer=text)"), "got: \(line)")
+        // dropped the space still goes red here. The leading space matters
+        // specifically: production builds this line from two concatenated
+        // string literals (main.swift), with the space on the FIRST one, so
+        // a literal starting at "(" would miss that one being dropped.
+        XCTAssertTrue(line.contains(" (mine=image peer=text)"), "got: \(line)")
     }
 
     /// The complement: neither side's hash implies neither side's kind, and
@@ -1638,7 +1641,7 @@ final class HandleFrameTests: XCTestCase {
         guard let line = loggedMessages(at: path).first(where: { $0.contains("reconciled with the peer") }) else {
             return XCTFail("no reconciliation line logged; got: \(loggedMessages(at: path))")
         }
-        XCTAssertTrue(line.contains("(mine=none peer=none)"), "got: \(line)")
+        XCTAssertTrue(line.contains(" (mine=none peer=none)"), "got: \(line)")
     }
 
     // MARK: - Final wave: a failed save is logged, at every Swift save site

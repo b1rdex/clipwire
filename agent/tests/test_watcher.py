@@ -3313,8 +3313,14 @@ class TestIncomingClipState(unittest.TestCase):
         # One literal, not two independent substrings: pins the separator and
         # the spacing too, the same shape as the "over the image limit" lines
         # elsewhere in this suite, so a change that reordered the pair or
-        # dropped the space still goes red here.
-        self.assertIn("(mine=image peer=text)", line)
+        # dropped the space still goes red here. The leading space is part of
+        # the literal deliberately, not decorative: the Swift twin of this
+        # line is built from two concatenated string literals with the space
+        # on the FIRST one, so a literal starting at "(" would miss a dropped
+        # space there. Python's own line is one literal today, but asserting
+        # the same leading space here keeps the two tests -- and what they
+        # actually pin -- symmetric.
+        self.assertIn(" (mine=image peer=text)", line)
 
     def test_the_line_says_none_when_a_side_holds_nothing(self):
         """The complement: neither side's hash implies neither side's kind,
@@ -3325,7 +3331,7 @@ class TestIncomingClipState(unittest.TestCase):
         agent._resolve_clip_state((None, 1000.0, None), mine=(None, 5000.0, None))
 
         line = next(l for l in log_lines if "reconciled with the peer" in l)
-        self.assertIn("(mine=none peer=none)", line)
+        self.assertIn(" (mine=none peer=none)", line)
 
     def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
         """The reboot flow (acceptance item 5), where the stash is stale by
