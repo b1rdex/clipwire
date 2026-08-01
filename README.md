@@ -178,8 +178,7 @@ written. The read-back value is stable after that, but it is never byte-identica
 one that was copied.
 
 This is the same disease as `trim-items` above: the clipboard does not necessarily hold
-what you put in it. clipwire is built around that rather than surprised by it — every hash
-it stores, announces or compares is the hash of what a clipboard read actually returned,
-never of what was written — so the re-encode does not confuse the two machines into
-re-sending the same screenshot forever. The picture that lands is still GPaste's
-re-encoding, though, not a byte-identical copy of what was on the Mac's pasteboard.
+what you put in it. clipwire is built around that rather than surprised by it: the re-encode
+does not confuse the two machines into re-sending the same screenshot forever. The picture
+that lands is still GPaste's re-encoding, though, not a byte-identical copy of what was on
+the Mac's pasteboard.
