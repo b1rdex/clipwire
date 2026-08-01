@@ -36,6 +36,19 @@
 // one failure mode this file exists to remove.
 // `testTheHarnessRefusesAnAgentOnThePollingFallback` keeps that measurement
 // as a test rather than as a memory.
+//
+// IT ALSO STAGES RECONNECTS, since v3.1 task 7. A reconnect is the event
+// freshness reconciliation exists for, and the only way to observe the density
+// bug's convergence: `reconnect()` drops the channel and dials again, which
+// spawns a brand-new agent exactly as sshd does. Every precondition above is
+// re-asserted for each connection, and each is a COUNT against a baseline
+// rather than a `contains` -- the agent's log and the fakes' invocation log
+// both accumulate, so a search that was right for the first connection answers
+// instantly, on the previous agent's output, for the second. Measured, with the
+// second dial removed on purpose: the counted form refuses in 15s at "a HELLO
+// from the agent", naming what is missing; the `contains` form satisfies all
+// four preconditions on the dead connection's output and fails 41s later at a
+// clip assertion that can only report a symptom.
 import XCTest
 @testable import clipwire
 
@@ -51,9 +64,10 @@ final class PairingHarnessTests: XCTestCase {
         super.tearDown()
     }
 
-    private func connected(eventSource: PairingHarness.EventSource = .gpaste)
+    private func connected(eventSource: PairingHarness.EventSource = .gpaste,
+                           substituting: Bool = false)
     throws -> PairingHarness {
-        let harness = try PairingHarness(eventSource: eventSource)
+        let harness = try PairingHarness(eventSource: eventSource, substituting: substituting)
         self.harness = harness
         try harness.start()
         return harness
@@ -120,6 +134,124 @@ final class PairingHarnessTests: XCTestCase {
         try harness.copyOnThePC(png: PairingHarness.png)
 
         try harness.waitForTheMacsPasteboard(toHold: .image, PairingHarness.png)
+    }
+
+    // MARK: - the density fix, in the loop that produced the bug
+
+    /// v3.1's user-visible defect, reproduced and then shown fixed by the two
+    /// implementations actually running against each other.
+    ///
+    /// WHAT USED TO HAPPEN. A retina screenshot copied on the Mac carries
+    /// `pHYs` -- 160x120 pixels that `NSImage` displays at 80x60. It reaches
+    /// the PC, GPaste takes the selection over and re-offers a re-encode with
+    /// every ancillary chunk gone, and the PC hashes WHAT IT READ BACK, which
+    /// is correct and is not what this test questions. The PC therefore holds
+    /// a different hash at a later timestamp, wins the next reconnect, and
+    /// hands the Mac back a copy of its own screenshot with the density gone
+    /// -- which then pastes at 160x120. Measured on the owner's machines: 259
+    /// bytes in, 632 back, displaying at double size after one reconnect.
+    ///
+    /// WHAT THE HARNESS STAGES. The fake clipboard's substituting mode, wired
+    /// in for the first time here (task 4 left it deliberately unwired, with
+    /// `writeClipboardState` already preserving the flag). It is a REAL
+    /// re-encode -- inflate, unfilter, re-filter, re-deflate, `IHDR` carried
+    /// over byte for byte -- so the decoded pixels are identical BY
+    /// CONSTRUCTION and the comparison the fix rests on cannot fail for the
+    /// wrong reason. Measured on this fixture: 95 bytes in, 74 out,
+    /// `IHDR pHYs IDAT IEND` becoming `IHDR IDAT IEND`, samples equal.
+    ///
+    /// WHY TWO RECONNECTS, WHICH IS ALSO WHY THE THIRD ASSERTION HAS TEETH.
+    /// The PC stamps its re-offer at `peer_ts + REOFFER_TS_NUDGE_SECONDS`
+    /// (1 ms) precisely so the first reconnect resolves DETERMINISTICALLY
+    /// rather than falling to the hex tie-break -- see
+    /// `_consume_image_reoffer`'s own account of what that buys and what it
+    /// costs. So convergence is one frame back on the first reconnect and
+    /// `doNothing` from then on, and it is the SECOND reconnect that runs the
+    /// startup seed against a store whose two hashes differ. With only one
+    /// reconnect, a fix that kept the local bytes but recorded no
+    /// `localSHA256` would still pass everything here: the false
+    /// `clipboard changed while apart` it produces needs a later startup to
+    /// compare the store against a clipboard it no longer describes.
+    ///
+    /// SO THE THREE ASSERTIONS GUARD THREE SEPARATE HALVES OF THE FIX:
+    ///
+    /// - the Mac still holds its ORIGINAL bytes -> it did not apply the
+    ///   peer's re-encode;
+    /// - the second reconnect resolves `doNothing` -> it adopted the peer's
+    ///   hash as canonical, so the two sides agree instead of trading frames
+    ///   forever;
+    /// - no `clipboard changed while apart` anywhere -> it recorded its own
+    ///   bytes' hash in `localSHA256`, so the seed still sees unchanged
+    ///   content as unchanged.
+    ///
+    /// A `waitForPeer` on the first reconnect is asserted too, and it is
+    /// diagnostic rather than decorative: it is the only place the 1 ms nudge
+    /// is observable end to end. If it ever reads `sendMine`, or flips between
+    /// runs, the nudge was lost somewhere between Python's `json` and Swift's
+    /// `JSONDecoder` (0.001 on a ~1.75e9 unix timestamp) and the tie-break is
+    /// deciding -- which would look like a flaky harness rather than the
+    /// precision loss it is.
+    func testARetinaScreenshotDoesNotComeBackFromThePCAtDoubleSize() throws {
+        let harness = try connected(substituting: true)
+
+        // The Mac's user copies a screenshot: a PNG carrying `pHYs`.
+        harness.pasteboard.setImage(PairingHarness.png)
+        // GPaste's substitution, read from the fakes' own invocation log
+        // rather than inferred -- a run where the mode was armed and somehow
+        // did not fire would otherwise assert the fix against a clipboard
+        // that never re-encoded anything, and pass.
+        let reEncoded = try harness.waitForThePCToReEncodeTheImageItWasSent()
+        XCTAssertNotEqual(reEncoded, PairingHarness.png,
+                          "the fake stored the bytes it was handed; there is no substitution " +
+                          "here to reconcile and the rest of this test proves nothing")
+        // And the PC's agent absorbing that re-offer into its own store, at
+        // the nudged timestamp. THIS is the state the reconnect runs against,
+        // and waiting for it is not politeness: hang up before it lands and
+        // the PC's next startup finds a clipboard its store does not describe
+        // and logs a perfectly correct `clipboard changed while apart`, which
+        // would fail the third assertion below for a timing reason.
+        try harness.waitForThePCsAgentToRecord(sha256Hex(reEncoded))
+
+        // --- the first reconnect: one frame back, by design ---------------
+        try harness.reconnect()
+        XCTAssertEqual(try harness.decisionOnThisConnection(), "waitForPeer",
+                       "the PC's re-offer is stamped 1ms after the Mac's copy, so this side must " +
+                       "lose deterministically rather than by hex tie-break")
+        // Settles on the canonical hash, which is what BOTH a fixed and a
+        // broken `.imageClip` case end up storing -- so the assertions below
+        // are what fails when the fix is gone, not this wait.
+        try harness.waitForTheMacsStoreToRecord(sha256Hex(reEncoded))
+
+        XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
+                       "the Mac applied the PC's re-encode over its own screenshot: `pHYs` is " +
+                       "gone and the image now pastes at double size")
+        XCTAssertEqual(harness.macsClipState()?.state.sha256, sha256Hex(reEncoded),
+                       "the Mac must adopt the PEER's hash as canonical, or the two sides never " +
+                       "agree and a frame comes back on every reconnect forever")
+        XCTAssertEqual(harness.macsClipState()?.localSHA256, sha256Hex(PairingHarness.png),
+                       "the Mac must record ITS OWN bytes' hash locally, or the next startup " +
+                       "seed measures the clipboard against content it does not hold")
+
+        // --- the second reconnect: converged ------------------------------
+        try harness.reconnect()
+        XCTAssertEqual(try harness.decisionOnThisConnection(), "doNothing",
+                       "both sides now hold the same hash at the same ts; anything else here is " +
+                       "a frame this loop will keep exchanging forever")
+        XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
+                       "the Mac's original bytes must survive the converged reconnect too")
+
+        // Last, and deliberately so. `agentLog()` flushes this side's queue,
+        // but a line the PC has written to its stderr reaches that file only
+        // once `attempt()`'s readability handler has read it -- a small window
+        // in which a negative assertion could pass for the wrong reason.
+        // Waiting for the PC's OWN reconciliation line closes it: that line is
+        // written to the same stream after its announcement, so once it is in
+        // the file, a false `clipboard changed while apart` from this
+        // connection would be too.
+        try harness.waitForThePCToReconcileOnThisConnection()
+        XCTAssertFalse(harness.logHolds("clipboard changed while apart"),
+                       "nothing changed on either clipboard across these reconnects, so this " +
+                       "line is the two-hash store failing to describe what a clipboard returns")
     }
 
     // MARK: - the harness refuses a world it cannot honestly test
@@ -222,6 +354,19 @@ private final class PairingHarness {
     let agentURL: URL
     let pasteboard = HarnessPasteboard()
 
+    /// What the agent's own log says when it built the watcher this harness
+    /// requires. A PREFIX of the real line, deliberately: the rest of it
+    /// interpolates SAFETY_NET_POLL_SECONDS, and pinning that here would make
+    /// a tuning change to the agent look like a broken harness.
+    private static let liveWatcherLine = "watching the clipboard through GPaste"
+    /// The one line both implementations log for a reconciliation, byte for
+    /// byte -- `FreshnessDecision`'s raw values ARE the PC agent's SEND_MINE /
+    /// WAIT_FOR_PEER / DO_NOTHING constants. Which is exactly why reading a
+    /// decision out of this log has to filter on the `remote: ` prefix
+    /// `Channel.attempt` gives the agent's stderr: the two sides' lines are
+    /// otherwise indistinguishable.
+    private static let reconciliation = "reconciled with the peer: "
+
     private let fakesURL: URL
     /// Which `gdbus` this configuration put on `PATH` — the fake, or the
     /// monitor-only shim the refusal test sabotages it with.
@@ -229,6 +374,13 @@ private final class PairingHarness {
     private let directory: URL
     private let statePath: String
     private let logPath: String
+    /// The two clip-state stores, one per side, both inside this run's temp
+    /// directory. They are what a reconnect actually reconciles -- each side's
+    /// answer to "what do I hold and how old is it" -- and the density fix is
+    /// visible in the Mac's as two hashes that differ, so the test reads them
+    /// directly rather than inferring their contents from behaviour.
+    private let macClipStatePath: String
+    private let agentClipStatePath: String
     private let log: Log
     private let watcher: PasteboardWatcher
     private let channel: Channel
@@ -236,11 +388,16 @@ private final class PairingHarness {
     private var restoreEnvironment: [String: String?] = [:]
     private var connectionStarted = false
     private var stopped = false
+    /// How many reconciliation lines each side had logged when the CURRENT
+    /// connection was dialed, so that a line from an earlier one can never
+    /// answer for this one. Every connection produces exactly one per side.
+    private var macsReconciliationsAtConnect = 0
+    private var pcsReconciliationsAtConnect = 0
 
     private let framesLock = NSLock()
     private var received: [Frame] = []
 
-    init(eventSource: EventSource = .gpaste) throws {
+    init(eventSource: EventSource = .gpaste, substituting: Bool = false) throws {
         // Tests/clipwireTests/ -> Tests/ -> the repo root. The same walk
         // FixtureTests and ChannelTests already do; `#filePath` is the only
         // thing in a test binary that knows where the source tree is.
@@ -252,9 +409,13 @@ private final class PairingHarness {
             .appendingPathComponent("clipwire-pairing-\(UUID().uuidString)")
         statePath = directory.appendingPathComponent("clipboard.json").path
         logPath = directory.appendingPathComponent("clipwire.log").path
+        macClipStatePath = directory.appendingPathComponent("clip-state.json").path
 
         let runtime = directory.appendingPathComponent("runtime")
         let stateHome = directory.appendingPathComponent("state")
+        // `clip_state_path()`'s own layout: `$XDG_STATE_HOME/clipwire/clip-state.json`.
+        agentClipStatePath = stateHome
+            .appendingPathComponent("clipwire/clip-state.json").path
         try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stateHome, withIntermediateDirectories: true)
         // `WaylandClipboard.ready()` is `os.path.exists($XDG_RUNTIME_DIR/wayland-0)`
@@ -312,8 +473,7 @@ private final class PairingHarness {
                   status: AgentStatus(pid: ProcessInfo.processInfo.processIdentifier,
                                       url: directory.appendingPathComponent("status.json")),
                   log: log,
-                  clipStateStore: ClipStateStore(
-                      path: directory.appendingPathComponent("clip-state.json").path),
+                  clipStateStore: ClipStateStore(path: macClipStatePath),
                   clipStateAnnouncement: ClipStateAnnouncement())
 
         // Observe every inbound frame without replacing what the real wiring
@@ -327,6 +487,15 @@ private final class PairingHarness {
             self?.framesLock.unlock()
             wired?(frame)
         }
+
+        // Armed HERE, in the initializer, and not from a test body: the fake
+        // `gdbus monitor` digests this whole file once at startup and treats
+        // any later difference as a clipboard change, so a write made after
+        // the agent is up would raise a spurious `Update` for a selection
+        // nobody copied to. Before `start()` there is no monitor to fool.
+        if substituting {
+            try mutateClipboardState { $0["substitute"] = true }
+        }
     }
 
     private var invocationLogPath: String { statePath + ".log" }
@@ -339,6 +508,56 @@ private final class PairingHarness {
         try assertTheFakesOnPathAreTheOnesInThisTree()
         try assertTheAgentExistsInThisTree()
 
+        dialAgain()
+        try assertTheWorldIsTheOneWeCanTestIn(after: Marks())
+
+        // `runAgent()` does this too, and separately from `wireAgent` --
+        // wiring `onChange` is not the same as arming the timer that calls
+        // it. Started only once the world has been asserted, so that the
+        // Mac's first observation is of something a test deliberately
+        // copied, and after the agent's own seed has been taken.
+        watcher.start()
+    }
+
+    /// Drops the channel and dials again, which spawns a BRAND NEW agent --
+    /// exactly what sshd gives the real one, one process per connection, and
+    /// the event that freshness reconciliation exists for. `run()` offers no
+    /// way to say "now reconnect", which is why `attempt(host:)` is driven
+    /// directly here.
+    ///
+    /// The current connection's reconciliation is waited for BEFORE the drop,
+    /// not out of politeness: the baselines recorded below are what keep an
+    /// earlier connection's line from answering for the next one, and a line
+    /// still in flight would make them wrong by one.
+    ///
+    /// Then every precondition `start()` asserts is asserted again, against
+    /// those baselines. The stale-read hazard is the whole reason they are
+    /// counts rather than `contains`: the agent's log and the fakes'
+    /// invocation log both ACCUMULATE across connections, so a second
+    /// connection would satisfy every one of them on the first connection's
+    /// output and return instantly, having confirmed nothing about the agent
+    /// now running. That is the degrade-rather-than-refuse this whole file
+    /// exists to make impossible.
+    func reconnect() throws {
+        try decisionOnThisConnection()
+        try waitForThePCToReconcileOnThisConnection()
+        let marks = Marks(self)
+        channel.hangUp()
+        guard connectionEnded.wait(timeout: .now() + 10) != .timedOut else {
+            throw Refusal.timedOut("the agent to exit after the channel hung up — a leaked " +
+                                   "python3 would go on to fail a later test instead of this one",
+                                   diagnostics: diagnostics())
+        }
+        // After the old agent has exited and its stderr handler has been
+        // torn down (`attempt()` does both before returning), so nothing can
+        // still be appending to either log as these are taken.
+        macsReconciliationsAtConnect = reconciliations(remote: false).count
+        pcsReconciliationsAtConnect = reconciliations(remote: true).count
+        dialAgain()
+        try assertTheWorldIsTheOneWeCanTestIn(after: marks)
+    }
+
+    private func dialAgain() {
         let channel = self.channel
         let ended = connectionEnded
         let thread = Thread {
@@ -352,17 +571,35 @@ private final class PairingHarness {
         thread.name = "clipwire pairing harness"
         thread.start()
         connectionStarted = true
+    }
 
-        try assertTheAgentTalkingToUsIsTheOneInThisTree()
-        try assertTheAgentIsOnTheEventPath()
-        try assertTheAgentActuallyForkedOurFakes()
+    private func assertTheWorldIsTheOneWeCanTestIn(after marks: Marks) throws {
+        try assertTheAgentTalkingToUsIsTheOneInThisTree(after: marks)
+        try assertTheAgentIsOnTheEventPath(after: marks)
+        try assertTheAgentActuallyForkedOurFakes(after: marks)
+    }
 
-        // `runAgent()` does this too, and separately from `wireAgent` --
-        // wiring `onChange` is not the same as arming the timer that calls
-        // it. Started only once the world has been asserted, so that the
-        // Mac's first observation is of something a test deliberately
-        // copied, and after the agent's own seed has been taken.
-        watcher.start()
+    /// What each per-connection signal stood at before a connection was
+    /// dialed. Zero for the first one, which is what makes `start()` and
+    /// `reconnect()` share one set of assertions rather than two that can
+    /// drift apart.
+    private struct Marks {
+        var hellos = 0
+        var watcherReports = 0
+        var monitorStarts = 0
+        var introspects = 0
+        var pastes = 0
+
+        init() {}
+
+        init(_ harness: PairingHarness) {
+            hellos = harness.frames(ofType: .hello).count
+            watcherReports = harness.agentLog().occurrences(of: PairingHarness.liveWatcherLine)
+            let invocations = harness.invocationLog()
+            monitorStarts = invocations.occurrences(of: "monitor started")
+            introspects = invocations.occurrences(of: "gdbus introspect -> available")
+            pastes = invocations.occurrences(of: " wl-paste ")
+        }
     }
 
     /// The three tools the agent forks by name resolve to `Tests/fakes`.
@@ -411,9 +648,15 @@ private final class PairingHarness {
     /// `clipwire install` puts on the PC and which a future harness could
     /// reach by accident) fails here instead of quietly testing last week's
     /// protocol.
-    private func assertTheAgentTalkingToUsIsTheOneInThisTree() throws {
-        try wait(for: "a HELLO from the agent") { self.frame(ofType: .hello) != nil }
-        guard let hello = frame(ofType: .hello),
+    private func assertTheAgentTalkingToUsIsTheOneInThisTree(after marks: Marks) throws {
+        // Against the mark, and the NEWEST hello rather than the first one:
+        // `received` accumulates across connections, so `first` would hand
+        // back the previous agent's handshake, pass every check below, and
+        // return before this connection had said anything at all.
+        try wait(for: "a HELLO from the agent") {
+            self.frames(ofType: .hello).count > marks.hellos
+        }
+        guard let hello = frames(ofType: .hello).last,
               let payload = try? JSONSerialization.jsonObject(with: hello.payload) as? [String: Any]
         else {
             throw Refusal.wrongWorld("the agent's HELLO payload is not JSON",
@@ -459,14 +702,19 @@ private final class PairingHarness {
     /// `live` is deliberately a PREFIX and not the whole line: the rest of it
     /// interpolates SAFETY_NET_POLL_SECONDS, and pinning that here would make
     /// a tuning change to the agent look like a broken harness.
-    private func assertTheAgentIsOnTheEventPath() throws {
-        let live = "watching the clipboard through GPaste"
+    private func assertTheAgentIsOnTheEventPath(after marks: Marks) throws {
+        let live = PairingHarness.liveWatcherLine
         let dead = "GPaste unavailable, falling back to polling"
         let givenUp = "already diagnosed as silent"
         do {
+            // The live line is counted against the mark (see `reconnect()`);
+            // the two refusals stay whole-log `contains`, which is strictly
+            // more conservative -- once either has been seen on ANY
+            // connection of this run, nothing measured afterwards is worth
+            // believing.
             try wait(for: "the agent to report which watcher it built") {
                 let text = self.agentLog()
-                return text.contains(live) || text.contains(dead)
+                return text.occurrences(of: live) > marks.watcherReports || text.contains(dead)
             }
         } catch {
             // A timeout here means neither line ever appeared: the agent
@@ -497,7 +745,7 @@ private final class PairingHarness {
         // is absorbed into the baseline, no `Update` follows, and the PC->Mac
         // direction silently does not happen.
         try wait(for: "the fake gdbus monitor to start") {
-            self.invocationLog().contains("monitor started")
+            self.invocationLog().occurrences(of: "monitor started") > marks.monitorStarts
         }
         // ... and the monitor logs that line immediately BEFORE taking the
         // digest, so a few of its 0.05s poll intervals close the last gap.
@@ -511,10 +759,11 @@ private final class PairingHarness {
     /// never called us at all" is otherwise indistinguishable from "the
     /// clipboard was empty". A PATH check alone proves what would be found;
     /// this proves what ran.
-    private func assertTheAgentActuallyForkedOurFakes() throws {
+    private func assertTheAgentActuallyForkedOurFakes(after marks: Marks) throws {
         try wait(for: "the agent to fork our wl-paste and gdbus") {
             let text = self.invocationLog()
-            return text.contains("wl-paste") && text.contains("gdbus introspect -> available")
+            return text.occurrences(of: " wl-paste ") > marks.pastes
+                && text.occurrences(of: "gdbus introspect -> available") > marks.introspects
         }
     }
 
@@ -547,6 +796,119 @@ private final class PairingHarness {
         try wait(for: "the Mac's pasteboard to hold \(describe(body)) as \(kind)") {
             guard let read = self.pasteboard.read() else { return false }
             return read.kind == kind && read.data == body
+        }
+    }
+
+    // MARK: - watching the substitution, and the two stores
+
+    /// Waits until the fake clipboard has actually SUBSTITUTED an image the
+    /// agent wrote -- GPaste taking the selection over and re-offering a
+    /// re-encode -- and hands back the bytes it stored instead.
+    ///
+    /// Read from the fakes' own invocation log (`... 95 bytes substituted as
+    /// 74 bytes`) rather than inferred from the stored body differing. The two
+    /// are not the same claim: `wl-copy` falls back to storing what it was
+    /// given whenever `reencode_png` raises, and says so in that same line, so
+    /// a fixture the re-encoder could not model would leave the clipboard
+    /// holding the original and every assertion afterwards passing against a
+    /// substitution that never happened.
+    func waitForThePCToReEncodeTheImageItWasSent() throws -> Data {
+        try wait(for: "the fake clipboard to re-encode the image the agent wrote") {
+            self.invocationLog().contains("bytes substituted as")
+        }
+        guard let state = pcClipboard(), state.types.contains("image/png"), !state.body.isEmpty
+        else {
+            throw Refusal.wrongWorld(
+                "the fake clipboard re-encoded an image but is not offering one",
+                diagnostics: diagnostics())
+        }
+        return state.body
+    }
+
+    /// Waits for the PC's agent to record a hash in its own clip-state store.
+    ///
+    /// For the re-offer that is not merely a settle, it is the precondition of
+    /// the reconnect: `_consume_image_reoffer` is what replaces the hash of
+    /// what was HANDED to `wl-copy` with the hash of what the clipboard
+    /// actually offers, at `peer_ts + REOFFER_TS_NUDGE_SECONDS`. Reconnect
+    /// before it lands and the PC's next startup finds a clipboard its store
+    /// does not describe -- and correctly says so.
+    func waitForThePCsAgentToRecord(_ sha256: String) throws {
+        try wait(for: "the PC's agent to record \(sha256.prefix(12))… in its clip-state store") {
+            self.pcsClipState()?["sha256"] as? String == sha256
+        }
+    }
+
+    func waitForTheMacsStoreToRecord(_ sha256: String) throws {
+        try wait(for: "the Mac's store to record \(sha256.prefix(12))… as its canonical hash") {
+            self.macsClipState()?.state.sha256 == sha256
+        }
+    }
+
+    /// The Mac's persisted record -- both hashes. `StoredClipState` is the
+    /// type the density fix exists inside, so the test reads it as a record
+    /// rather than as JSON: a future encoding change should break the
+    /// dedicated store tests, not this one.
+    func macsClipState() -> StoredClipState? {
+        ClipStateStore(path: macClipStatePath).load()
+    }
+
+    /// The PC's, as raw JSON. Deliberately not decoded through `ClipState`:
+    /// this is the Python side's file, and reading it with this side's decoder
+    /// would quietly assert the two agree about the format at a point where
+    /// the test only wants to know what the agent wrote.
+    func pcsClipState() -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: agentClipStatePath) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    // MARK: - reading a decision back out of the log
+
+    /// The decision THIS connection's reconciliation reached on the Mac,
+    /// waiting for it if it has not happened yet.
+    ///
+    /// Indexed from the baseline `reconnect()` records rather than taking the
+    /// last line, so a connection that somehow logged two would still be read
+    /// as its own first decision instead of silently reporting a later one.
+    @discardableResult
+    func decisionOnThisConnection() throws -> String {
+        try wait(for: "the Mac to reconcile with the peer on this connection") {
+            self.reconciliations(remote: false).count > self.macsReconciliationsAtConnect
+        }
+        return reconciliations(remote: false)[macsReconciliationsAtConnect]
+    }
+
+    /// The same for the PC, and used only as an ordering guarantee: its
+    /// reconciliation line is written to the stderr this side pipes into the
+    /// shared log, AFTER its own startup announcement. So once this returns,
+    /// anything that announcement would have logged is already in the file.
+    func waitForThePCToReconcileOnThisConnection() throws {
+        try wait(for: "the PC to reconcile with us on this connection") {
+            self.reconciliations(remote: true).count > self.pcsReconciliationsAtConnect
+        }
+    }
+
+    /// Whether the shared log holds a line. Both sides' lines land in it --
+    /// `Channel.attempt` pipes the agent's stderr in with a `remote: ` prefix
+    /// -- so a search without one covers the PC too, which is what
+    /// `clipboard changed while apart` needs: v3's false one was found there.
+    func logHolds(_ line: String) -> Bool {
+        agentLog().contains(line)
+    }
+
+    /// The decision word from each reconciliation line one side logged, oldest
+    /// first. `remote:` is the whole discriminator: the two implementations
+    /// share this sentence byte for byte, on purpose, so nothing in the text
+    /// after the prefix says which machine wrote it.
+    private func reconciliations(remote: Bool) -> [String] {
+        agentLog().split(separator: "\n").compactMap { line -> String? in
+            guard line.contains(PairingHarness.reconciliation),
+                  line.contains("remote: ") == remote,
+                  let start = line.range(of: PairingHarness.reconciliation)
+            else { return nil }
+            let rest = line[start.upperBound...]
+            guard let end = rest.firstIndex(of: " ") else { return String(rest) }
+            return String(rest[..<end])
         }
     }
 
@@ -586,10 +948,13 @@ private final class PairingHarness {
 
     // MARK: - the plumbing
 
-    private func frame(ofType type: FrameType) -> Frame? {
+    /// Every frame of a kind, in arrival order -- across ALL connections this
+    /// harness has made. A caller after "this connection's" one takes the
+    /// count as a baseline first; see `Marks`.
+    private func frames(ofType type: FrameType) -> [Frame] {
         framesLock.lock()
         defer { framesLock.unlock() }
-        return received.first { $0.type == type }
+        return received.filter { $0.type == type }
     }
 
     /// Blocks the test thread until `condition` holds. The channel runs on
@@ -627,30 +992,36 @@ private final class PairingHarness {
         return (types, body)
     }
 
-    /// Replaces the shared state, atomically -- the fake `gdbus` digests the
+    private func writeClipboardState(types: [String], body: Data) throws {
+        try mutateClipboardState { state in
+            state["types"] = types
+            state["body"] = body.base64EncodedString()
+            // Opaque, and equality is the only operation on it. It exists so
+            // that re-copying identical bytes still counts as a change, the
+            // way it does on a real clipboard.
+            state["generation"] = UUID().uuidString
+        }
+    }
+
+    /// Changes the shared state, atomically -- the fake `gdbus` digests the
     /// whole file every 50ms and `wl-paste` parses it, so a torn write would
     /// produce both a spurious `Update` and a fake that cannot read its own
     /// state.
     ///
-    /// Every other key is carried over rather than rebuilt, which is the same
-    /// rule `set_body` follows on the Python side and for the same reason:
-    /// `substitute` belongs to whoever armed it, and a fresh object here would
-    /// silently disarm substitution mode on the first write a test made. That
-    /// mode is what the density half of this release needs; disarming it would
-    /// leave those tests passing while proving nothing.
-    private func writeClipboardState(types: [String], body: Data) throws {
+    /// Every key not touched by `mutate` is carried over rather than rebuilt,
+    /// which is the same rule `set_body` follows on the Python side and for
+    /// the same reason: `substitute` belongs to whoever armed it, and a fresh
+    /// object here would silently disarm substitution mode on the first write
+    /// a test made. That mode is what the density half of this release needs;
+    /// disarming it would leave those tests passing while proving nothing.
+    private func mutateClipboardState(_ mutate: (inout [String: Any]) -> Void) throws {
         var state: [String: Any] = [:]
         if let data = FileManager.default.contents(atPath: statePath),
            let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
             state = existing
         }
-        state["types"] = types
-        state["body"] = body.base64EncodedString()
-        // Opaque, and equality is the only operation on it. It exists so that
-        // re-copying identical bytes still counts as a change, the way it
-        // does on a real clipboard.
-        state["generation"] = UUID().uuidString
         state["substitute"] = state["substitute"] ?? false
+        mutate(&state)
         try JSONSerialization.data(withJSONObject: state)
             .write(to: URL(fileURLWithPath: statePath), options: .atomic)
     }
@@ -748,6 +1119,21 @@ private final class PairingHarness {
         let rest = source[assignment.upperBound...]
         guard let end = rest.firstIndex(of: "\"") else { return nil }
         return String(rest[..<end])
+    }
+}
+
+/// How many times a needle appears, non-overlapping.
+///
+/// Every per-connection signal this harness waits on is counted rather than
+/// searched for, because both logs it reads ACCUMULATE across connections: a
+/// `contains` that was exactly right for the first connection answers instantly
+/// -- and wrongly -- for the second, on evidence the previous agent produced.
+/// That is the degrade-rather-than-refuse failure this file exists to make
+/// impossible, so it must not arrive through the harness's own plumbing.
+private extension String {
+    func occurrences(of needle: String) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        return components(separatedBy: needle).count - 1
     }
 }
 
