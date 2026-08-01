@@ -636,6 +636,32 @@ class TestPdeathsigPreexec(unittest.TestCase):
             clipwire_agent._pdeathsig_preexec()   # must not raise
 
 
+def _reject_image_shaped(script):
+    """Guards the `probe = read` aliases below, at construction, on the
+    test's own thread.
+
+    The poll loop asks its clipboard for a change TOKEN, not content -- see
+    WaylandClipboard.probe -- and those doubles answer probe() with their
+    read() because their scripts are opaque comparable values with no image
+    body behind them. Script one with a real (KIND_IMAGE, bytes) pair and the
+    equivalence silently becomes a LIE: the loop would compare image bodies,
+    which production never does, and every test built on that double would
+    pass for behaviour the agent does not have. ProbeOnlyClipboard catches
+    the loop reverting to read(); nothing catches this.
+
+    Checked here rather than inside probe() because the poll loop wraps every
+    tick in _handle_observer_error, which would swallow an AssertionError
+    raised on that thread into a log line nobody asserts on.
+    """
+    for value in script:
+        if isinstance(value, tuple) and value and value[0] == KIND_IMAGE:
+            raise AssertionError(
+                "%r is image-shaped: this double answers probe() with read(), so "
+                "an image BODY here would be compared as a token. Give it a "
+                "probe() of its own instead." % (value,))
+    return list(script)
+
+
 class ScriptedReadClipboard:
     """read() replays a fixed script, then repeats its last value forever --
     so a poll tick that lands after the test stops watching cannot raise
@@ -660,7 +686,7 @@ class ScriptedReadClipboard:
     hanging the suite."""
 
     def __init__(self, script, paced=False):
-        self._script = list(script)
+        self._script = _reject_image_shaped(script)
         self.calls = 0
         self.last = None
         self._paced = paced
@@ -978,6 +1004,7 @@ class SignallingClipboard:
     untested rather than pinned by a test that would pass most of the time."""
 
     def __init__(self, before, after):
+        _reject_image_shaped((before, after))
         self.process = None       # set by start_watcher, before anything reads
         self.delivered = threading.Event()
         self.reports = 0
@@ -1030,6 +1057,7 @@ class ArmThenSignalClipboard:
     count."""
 
     def __init__(self, before, after):
+        _reject_image_shaped((before, after))
         self.watcher = None       # set by start_watcher, before anything reads
         self.calls = 0
         self.last = None
