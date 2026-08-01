@@ -131,8 +131,8 @@ final class AgentWiringTests: XCTestCase {
         let after = Date().timeIntervalSince1970
 
         let stored = clipStateStore.load()
-        XCTAssertEqual(stored?.state.sha256, sha256Hex(Data("typed by the user".utf8)))
-        guard let ts = stored?.state.ts else { return XCTFail("expected a stored timestamp") }
+        XCTAssertEqual(stored?.sha256, sha256Hex(Data("typed by the user".utf8)))
+        guard let ts = stored?.ts else { return XCTFail("expected a stored timestamp") }
         XCTAssertTrue(ts >= before && ts <= after,
                       "expected \(ts) to fall within [\(before), \(after)] -- the moment of observation")
     }
@@ -159,7 +159,7 @@ final class AgentWiringTests: XCTestCase {
         pasteboard.set("hi")
         watcher.poll()
 
-        XCTAssertEqual(clipStateStore.load()?.state.sha256,
+        XCTAssertEqual(clipStateStore.load()?.sha256,
                        "8f434346648f6b96df89dda901c5176b10a6d83961dd3c1ac88b59b2dc327aa4")
     }
 
@@ -187,9 +187,9 @@ final class AgentWiringTests: XCTestCase {
         pasteboard.setImage(png)
         watcher.poll()
 
-        XCTAssertEqual(clipStateStore.load()?.state.kind, .image,
+        XCTAssertEqual(clipStateStore.load()?.kind, .image,
                        "the kind the watcher observed must survive the wiring")
-        XCTAssertEqual(clipStateStore.load()?.state.sha256, sha256Hex(png))
+        XCTAssertEqual(clipStateStore.load()?.sha256, sha256Hex(png))
     }
 
     /// The property that makes the whole feature work across the case it
@@ -254,8 +254,7 @@ final class AgentWiringTests: XCTestCase {
         // A plain file where the store needs a directory, so `save()`'s own
         // first step throws for real instead of being mocked.
         let store = ClipStateStore(path: blockingFile.appendingPathComponent("clip-state.json").path)
-        XCTAssertThrowsError(try store.save(StoredClipState(state: ClipState(sha256: "aa", ts: 1, kind: .text),
-                                                            localSHA256: nil)),
+        XCTAssertThrowsError(try store.save(ClipState(sha256: "aa", ts: 1, kind: .text)),
                              "test setup must actually force a save failure, or this test proves nothing")
 
         let pasteboard = FakePasteboard()

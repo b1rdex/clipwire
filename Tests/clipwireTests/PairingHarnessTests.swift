@@ -161,21 +161,27 @@ final class PairingHarnessTests: XCTestCase {
     /// the real machines it never fires -- GPaste applies the image's embedded
     /// ICC profile as it loads it and writes the result untagged, so the
     /// samples move: 398,267 of 614,400 bytes, max delta 20, on a 480x320
-    /// screenshot with the Mac's original captured before it travelled. See
-    /// `ImagePixels.swift`, which records that measurement and both strategies
-    /// tried against it. The fix is inert in production and inert here.
+    /// screenshot with the Mac's original captured before it travelled. Both
+    /// strategies and their measurements are tabulated in the v3.2 provenance
+    /// design. The fix was inert in production and inert here, and v3.2 has now
+    /// deleted it: the PC announces the `origin` of the bytes it holds instead
+    /// of the Mac deducing it from content it cannot compare.
     ///
     /// WHAT THE HARNESS STAGES NOW. The fake clipboard's substituting mode,
     /// deliberately HARSHER than the real transformation: it drops the
     /// ancillary chunks AND moves every pixel sample, so no comparison of image
     /// content can pass it. Measured on this fixture: 95 bytes in, 84 out,
     /// `IHDR pHYs IDAT IEND` becoming `IHDR IDAT IEND`, and all 16 bytes of the
-    /// decoded 2x2 RGBA differing with a max delta of 236 -- which is this
-    /// test's own log line, not a separate calculation. That asymmetry is
+    /// decoded 2x2 RGBA differing with a max delta of 236. That asymmetry is
     /// the design and not an accident -- a fake KINDER than the world is
     /// precisely what let the fix ship inert while this file stayed green, and
     /// a fake harsher than it costs only false alarms. See SUBSTITUTION in
-    /// `Tests/fakes/fake_clipboard.py`.
+    /// `Tests/fakes/fake_clipboard.py`, which is where that property is now
+    /// pinned: this side used to read it off `imagePixelDifference`'s log line,
+    /// and that decoder went with the comparison it served, so nothing in the
+    /// Swift suite witnesses the sample movement any more. What this test can
+    /// still see is that the bytes came back different at all, asserted below
+    /// against the fakes' own invocation log.
     ///
     /// WHY TWO RECONNECTS. The PC stamps its re-offer at
     /// `peer_ts + REOFFER_TS_NUDGE_SECONDS` (1 ms) precisely so the first
@@ -193,14 +199,8 @@ final class PairingHarnessTests: XCTestCase {
     ///
     /// - the Mac ends up holding the PEER's bytes -> the density is gone and
     ///   the image pastes at double size. THE BUG, live, unfixed;
-    /// - it adopts the peer's hash as canonical, with no `localSHA256` ->
-    ///   which is right for the applying branch, because it wrote exactly the
-    ///   bytes it hashed and there is no divergence to record;
-    /// - the pixel comparison ran and reported a difference -> direct evidence
-    ///   from `ImageIO`, the decoder production uses, that the fake really did
-    ///   move the samples. Without it, a substitution that quietly stopped
-    ///   perturbing would leave this test asserting the old fix's failure mode
-    ///   against a world where it would have worked;
+    /// - it records the hash of the bytes it wrote, because that is what its
+    ///   clipboard now returns;
     /// - the second reconnect resolves `doNothing`, and no
     ///   `clipboard changed while apart` appears -> the loop CONVERGES. The
     ///   bug costs one degraded image, not an endless exchange of frames, and
@@ -252,23 +252,9 @@ final class PairingHarnessTests: XCTestCase {
                        "the Mac kept its own screenshot, which is the fixed behaviour and not " +
                        "the measured one -- if this passes, either the fake stopped perturbing " +
                        "or the density bug was actually fixed, and the comment above is stale")
-        XCTAssertEqual(harness.macsClipState()?.state.sha256, sha256Hex(reEncoded),
-                       "the Mac must adopt the PEER's hash as canonical, or the two sides never " +
-                       "agree and a frame comes back on every reconnect forever")
-        XCTAssertNil(harness.macsClipState()?.localSHA256,
-                     "the applying branch wrote the bytes it hashed, so there is no local " +
-                     "divergence to record; a hash here would send the next startup seed " +
-                     "looking for content this clipboard does not hold")
-        // Direct evidence from `ImageIO` -- the decoder `imagePixelsIdentical`
-        // itself uses -- that the fake moved the samples, rather than an
-        // inference from the bytes differing. `imagePixelDifference` writes
-        // this line from inside the comparison, and only on the branch where
-        // a local image existed and lost, so its presence says both that the
-        // comparison ran and that it said no.
-        XCTAssertTrue(harness.logHolds("the peer's image differs from the local one"),
-                      "the pixel comparison did not report a difference, so the fake's " +
-                      "substitution is no harsher than the re-encode that made this bug " +
-                      "invisible -- everything below is being asserted against a kind world")
+        XCTAssertEqual(harness.macsClipState()?.sha256, sha256Hex(reEncoded),
+                       "the Mac must record the hash of the bytes it wrote, or the two sides " +
+                       "never agree and a frame comes back on every reconnect forever")
 
         // --- the second reconnect: converged ------------------------------
         try harness.reconnect()
@@ -883,15 +869,14 @@ private final class PairingHarness {
 
     func waitForTheMacsStoreToRecord(_ sha256: String) throws {
         try wait(for: "the Mac's store to record \(sha256.prefix(12))… as its canonical hash") {
-            self.macsClipState()?.state.sha256 == sha256
+            self.macsClipState()?.sha256 == sha256
         }
     }
 
-    /// The Mac's persisted record -- both hashes. `StoredClipState` is the
-    /// type the density fix exists inside, so the test reads it as a record
-    /// rather than as JSON: a future encoding change should break the
-    /// dedicated store tests, not this one.
-    func macsClipState() -> StoredClipState? {
+    /// The Mac's persisted state, read through this side's own store rather
+    /// than as JSON: a future encoding change should break the dedicated store
+    /// tests, not this one.
+    func macsClipState() -> ClipState? {
         ClipStateStore(path: macClipStatePath).load()
     }
 
