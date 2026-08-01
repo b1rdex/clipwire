@@ -264,6 +264,19 @@ final class PairingHarnessTests: XCTestCase {
                        "and nothing goes the other way either -- one rule, both sides, standing " +
                        "down together rather than one waiting on the other")
 
+        // BOTH sentences, in one file, from one connection. The two sides
+        // take DIFFERENT branches of the same rule -- the PC holds the
+        // derivative, this Mac holds the ancestor -- so a log carrying only
+        // one of them means only one implementation stood down and the other
+        // reached doNothing some other way. `Channel.attempt` prefixes the
+        // agent's stderr with `remote: `, which is what puts the PC's line
+        // here at all; nothing else in the text says which machine wrote it,
+        // and that is deliberate.
+        XCTAssertTrue(harness.logHolds("what we hold descends from the peer's clipboard: standing down"),
+                      "the PC's own suppression must be visible, not inferred from its verdict")
+        XCTAssertTrue(harness.logHolds("the peer's clipboard descends from what we hold: standing down"),
+                      "and this side's, in the same file, from the same connection")
+
         XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
                        "the Mac keeps its own screenshot, `pHYs` and all -- if this holds the " +
                        "re-encoded bytes the density is gone and the image pastes at double size")
