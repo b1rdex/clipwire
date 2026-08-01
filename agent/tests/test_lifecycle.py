@@ -939,20 +939,37 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
             "a clip born on the PC carries the PC's timestamp and no ancestry",
         )
 
-    def test_the_poll_is_told_whether_an_expectation_is_still_armed(self):
+    def test_the_poll_only_looks_once_the_expectation_is_overdue(self):
         """The predicate the poll's no-change branch asks, and the only
         thing that gets the disarm observed at all on a machine whose
-        clipboard never moves again. It answers a bare flag test -- no
-        clipboard read, no decision -- so the file keeps one place that
-        decides what a local change means and one thread inside it."""
+        clipboard never moves again. It reads no clipboard and decides
+        nothing, so the file keeps one place that decides what a local
+        change means and one thread inside it.
+
+        OVERDUE, not merely armed. Every True here costs the worker a full
+        read -- --list-types plus the entire image body -- and in degraded
+        mode the ticks are a second apart, so "armed" would pipe up to
+        MAX_IMAGE_BYTES thirty times per applied image, which is exactly
+        the expense probe() exists to have deleted. Waiting costs nothing:
+        a real re-offer changes the offered type list and arrives through
+        the poll's CHANGE branch, and the disarm needs one look."""
         agent_obj, clip = self.armed()
-        self.assertTrue(agent_obj._reoffer_pending())
+
+        with mock.patch("time.time", return_value=1000.0 + 1):
+            self.assertFalse(agent_obj._reoffer_pending(),
+                             "a re-offer that is merely awaited is not worth a "
+                             "4 MiB read every second")
+        with mock.patch("time.time", return_value=1000.0 + SAFETY_NET_POLL_SECONDS):
+            self.assertTrue(agent_obj._reoffer_pending(),
+                            "and one that is overdue must be looked at, or the disarm "
+                            "is a branch nothing ever reaches")
 
         self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
                      at=1000.0 + SAFETY_NET_POLL_SECONDS)
-        self.assertFalse(agent_obj._reoffer_pending(),
-                         "and it must stop asking once there is nothing to wait for, "
-                         "or the poll observes a static clipboard forever")
+        with mock.patch("time.time", return_value=9999.0):
+            self.assertFalse(agent_obj._reoffer_pending(),
+                             "and it must stop asking once there is nothing to wait "
+                             "for, or the poll observes a static clipboard forever")
 
 
 class RacyImageClipboard:

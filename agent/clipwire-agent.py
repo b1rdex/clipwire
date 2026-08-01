@@ -1267,10 +1267,32 @@ class Agent:
             )
             self._watcher.start(self._local_change)
 
+    @staticmethod
+    def _reoffer_is_overdue(expectation):
+        """Has an armed expectation waited longer than the detection budget?
+        THE one place that rule is written, read by both sides of it: the
+        poll's no-change branch, which asks whether an observation is worth
+        signalling at all, and _consume_image_reoffer's disarm, which spends
+        the answer. Two spellings of one threshold drifting apart is this
+        project's recorded defect shape, and this one would drift in the
+        direction where the poll stops looking before the disarm can fire.
+
+        A static method taking the record rather than reading the field,
+        because its two callers hold _echo_lock differently: _reoffer_pending
+        takes it here, _consume_image_reoffer is already inside it, and
+        _echo_lock is not reentrant.
+
+        SAFETY_NET_POLL_SECONDS is the CONSTANT, never the interval the poll
+        is running at -- see the disarm's own comment for the mode where the
+        difference decides the outcome.
+        """
+        return (expectation is not None
+                and time.time() - expectation[2] >= SAFETY_NET_POLL_SECONDS)
+
     def _reoffer_pending(self):
-        """Is an image re-offer still expected? Asked by the poll on every
-        tick that saw NO change, and answering True makes it signal an
-        observation anyway.
+        """Is there an image re-offer whose absence is now worth looking at?
+        Asked by the poll on every tick that saw NO change, and answering
+        True makes it signal an observation anyway.
 
         This is what keeps the disarm honest on the machine it exists for.
         The poll signals on a change to its probe() TOKEN, and on an
@@ -1289,18 +1311,25 @@ class Agent:
         with its own copy of the echo rules, which this file has already
         fixed two races in.
 
-        Bounded by construction, which is what makes an extra read per tick
-        affordable: it can only return True while an expectation is armed,
-        and the disarm it enables is what ends that -- at most one detection
-        budget's worth of ticks per applied image, and none at all once the
-        re-offer arrives (the ordinary case, within four seconds).
+        OVERDUE, not merely armed, and the difference is a cost the file
+        already ruled on. An observation means a full clipboard.read() --
+        --list-types plus the whole image body -- and "armed" stays true from
+        the write until the disarm, which in degraded mode is thirty ticks a
+        second apart: up to MAX_IMAGE_BYTES down a pipe thirty times per
+        applied image, which is precisely the expense probe() was introduced
+        to delete. Nothing is lost by waiting: a real re-offer changes the
+        offered type list, so it arrives through the CHANGE branch and never
+        needed this one, and the disarm needs exactly one look -- the first
+        tick past the budget. The only case that shifts is a re-offer whose
+        type list happens to match, absorbed at the budget rather than a few
+        seconds in; still absorbed, still decided by content.
 
         Runs on the poll thread and takes _echo_lock, which is held across
         nothing that blocks; it acquires no other lock, so the file's
         _observe_lock -> _echo_lock -> _write_lock order is untouched.
         """
         with self._echo_lock:
-            return self._expect_reoffer is not None
+            return self._reoffer_is_overdue(self._expect_reoffer)
 
     def _note_event_source_degraded(self):
         """Called once by the watcher when it diagnoses a dead event source, so
@@ -1908,8 +1937,7 @@ class Agent:
                 # first observed after the threshold -- the phase case, and
                 # the exact failure a wall-clock deadline produces.
                 expectation = self._expect_reoffer
-                if (expectation is not None
-                        and time.time() - expectation[2] >= SAFETY_NET_POLL_SECONDS):
+                if self._reoffer_is_overdue(expectation):
                     # SAFETY_NET_POLL_SECONDS, the CONSTANT, never whatever
                     # interval the poll happens to be running at. After the
                     # dead-source verdict that interval is
