@@ -1036,13 +1036,13 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
         self.assertIsNone(agent_obj._expect_reoffer)
 
     def test_a_body_less_read_of_another_kind_is_looked_at_once(self):
-        """The THIRD early return, and the one no brief named: the kind
-        guard on the text path, reached by an empty text body today and by
-        any kind read() learns to return later. Covered because the rule is
-        about the INVARIANT -- no path out of _observe_local_change may
-        leave an overdue expectation armed -- not about the two paths that
-        happened to be measured. A fourth early return added later without
-        this call is the same defect again."""
+        """The early return no review named: the kind guard on the text
+        path, reached by an empty text body today and by any kind read()
+        learns to return later. Covered because the rule is about the
+        INVARIANT -- no path out of _observe_local_change may leave an
+        overdue expectation armed -- not about the paths that happened to be
+        measured. Another added later without the call is the same defect
+        again."""
         agent_obj, _ = self.armed()
         clip = SilentClipboard(value=(KIND_TEXT, b""))
         agent_obj.clipboard = clip
@@ -1074,20 +1074,36 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
                              "about whether a re-offer is coming")
 
     def test_a_newer_write_is_not_disarmed_by_an_older_reads_failure(self):
-        """The generation check, which is this file's recorded defect shape
-        rather than a hypothetical: the read is in flight for two wl-paste
-        round trips, and a _write_clip on the main thread inside that window
-        arms a BRAND-NEW expectation. Giving up on it would disarm an
-        image applied microseconds ago, and the re-offer it is still waiting
-        for would then go to the Mac as a local change."""
+        """The generation check: an observation is judged against the
+        expectation that was armed when it STARTED, and a _write_clip
+        landing on run()'s thread while the read is in flight arms a
+        different one. Spending that one would disarm an image applied
+        moments ago, and the re-offer it is still waiting for would then go
+        to the Mac as a local change with no origin recorded.
+
+        THE CLOCK BELOW IS THE TEST, and it is placed deliberately. Under
+        today's constants the overdue gate alone would refuse the newer
+        expectation -- a read cannot outlive SUBPROCESS_TIMEOUT +
+        IMAGE_SUBPROCESS_TIMEOUT, 13s against a 30s budget, so anything
+        armed DURING one is necessarily younger than the budget -- and a
+        test that let the two constants do the work would name the `gen`
+        check while pinning nothing. Verified by deleting the check: with
+        the newer write placed a full budget before this observation it goes
+        red, and without that arrangement it does not.
+
+        So the check is defence against a re-tuning of those constants
+        rather than against today's timings, and it stays because
+        _consume_image_reoffer carries the identical check at the identical
+        spot, where it guards a store write and IS reachable. One of a
+        matched pair being tidied away is how this file earned the rule."""
         agent_obj, _ = self.armed()
-        agent_obj.clipboard = RacyImageClipboard(
+        agent_obj.clipboard = InterleavingSilentClipboard(
             agent_obj,
-            value_read=b"",
-            interleaved_write=encode_image_payload(2.0, b"\x89PNG-newer-from-the-peer"),
+            encode_image_payload(2.0, b"\x89PNG-newer-from-the-peer"),
+            write_at=1000.0 + SAFETY_NET_POLL_SECONDS,
         )
 
-        with mock.patch("time.time", return_value=1000.0 + SAFETY_NET_POLL_SECONDS):
+        with mock.patch("time.time", return_value=1000.0 + SAFETY_NET_POLL_SECONDS * 3):
             agent_obj._local_change()
 
         self.assertIsNotNone(agent_obj._expect_reoffer,
@@ -1115,6 +1131,31 @@ class SilentClipboard(ReofferingClipboard):
     def read(self):
         self.reads += 1
         return self._value
+
+
+class InterleavingSilentClipboard(SilentClipboard):
+    """A read that drives a newer _write_clip on the way past and only then
+    comes back unjudgeable -- the real window being two wl-paste round trips,
+    reproduced from one thread rather than by racing two.
+
+    `write_at` is when the newer write arms ITS expectation, and it is a
+    parameter rather than "whatever the clock says" for the reason the test
+    using it explains: the new expectation has to be overdue in its own right
+    before anything except the generation check can save it. RacyImageClipboard
+    above models the same interleaving for the branches that judge CONTENT, so
+    it always returns a body; this one returns nothing, which is the whole
+    input class."""
+
+    def __init__(self, agent_obj, payload, write_at):
+        super().__init__()
+        self._agent = agent_obj
+        self._payload = payload
+        self._write_at = write_at
+
+    def read(self):
+        with mock.patch("time.time", return_value=self._write_at):
+            self._agent._write_clip(self._payload, kind=KIND_IMAGE)
+        return super().read()
 
 
 class RacyImageClipboard:

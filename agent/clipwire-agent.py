@@ -1390,9 +1390,9 @@ class Agent:
         What makes the sentence above true is that EVERY path out of
         _observe_local_change now spends an overdue expectation: the disarm
         and the consume in _consume_image_reoffer, the text path's outright
-        clear, and _give_up_on_reoffer on the three that reach no decision
-        at all. Whoever adds a fourth early return there owes this predicate
-        the same call.
+        clear, and _give_up_on_reoffer on every early return that reaches no
+        decision at all. Whoever adds another owes this predicate the same
+        call.
 
         Runs on the poll thread and takes _echo_lock, which is held across
         nothing that blocks; it acquires no other lock, so the file's
@@ -1753,7 +1753,7 @@ class Agent:
             # TYPE_IMAGE_CLIP frame for a verified image rather than
             # declining to send it.
             #
-            # The THIRD early return that must spend an overdue expectation,
+            # Another early return that must spend an overdue expectation,
             # and the one it is easiest to miss because it is not obviously
             # a failed read: this branch never reaches the clearing block
             # below, so without this call an empty text body -- or whatever
@@ -1879,9 +1879,9 @@ class Agent:
         for the life of the connection: bounded (one process per SSH
         connection) and lossless, but it is the exact expense probe() was
         introduced to delete, arriving through the one branch that bypasses
-        it. Three early returns above reach here -- a read that failed, an
-        image type offered with no bytes, and the kind guard on the text
-        path -- and a fourth added later without this call is the same
+        it. The early returns above reach here by name -- a read that
+        failed, an image type offered with no bytes, and the kind guard on
+        the text path -- and one added later without this call is the same
         defect again.
 
         GIVING UP IS A DISARM, not a deferral, and that is the file's own
