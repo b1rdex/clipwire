@@ -13,7 +13,7 @@ import Foundation
 //
 // Three separate bounds, and they must stay separate even while two of them
 // hold the same number. maxPayloadBytes is what Frame.decode enforces; the
-// two content limits are what senders (Pasteboard.swift, main.swift) enforce
+// two content limits are what senders (Pasteboard.swift, HandleFrame.swift) enforce
 // BEFORE wrapping a body in its 8-byte timestamp (ClipPayloadConstants.
 // timestampBytes). v2 used one constant for all of it, which made a
 // maximum-size image unsendable while looking like it was within the limit:

@@ -20,7 +20,7 @@ protocol PasteboardReading {
 /// `PasteboardReading` (rather than folded into one protocol) because the
 /// two sides are consumed by different owners: `PasteboardWatcher` only
 /// ever reads, and the frame handler that applies an incoming clip
-/// (`handleFrame` in main.swift) only ever writes. Splitting them means a
+/// (`handleFrame`, in HandleFrame.swift) only ever writes. Splitting them means a
 /// test can substitute a recording spy for the write side alone, without
 /// needing to fake `changeCount`/`read` too — see `HandleFrameTests.swift`.
 protocol PasteboardWriting {
@@ -52,8 +52,8 @@ protocol PasteboardWriting {
 /// A raw `data(forType: .string)` read would instead sync them WRONG, and
 /// permanently. The bytes would be hashed as-is by `sha256Hex` for the
 /// clip-state we store and announce, while the clip that actually goes out
-/// is built by `String(decoding:as:UTF8.self)` (main.swift, in both
-/// `wireAgent`'s `onChange` and `handleFrame`'s `.sendMine` branch), which
+/// is built by `String(decoding:as:UTF8.self)` in `outgoingClipFrame`
+/// (LocalChange.swift), which both send paths go through, and which
 /// substitutes U+FFFD. The peer would then store the hash of the SUBSTITUTED
 /// text, the two stores would disagree about the same clip forever, and
 /// every subsequent reconnect would resolve `sendMine` and re-send it — an
@@ -396,7 +396,7 @@ final class PasteboardWatcher {
         // `String(decoding:as:UTF8.self)`: emitting an image would have put a
         // mojibake transliteration of a PNG on the wire and into both
         // persistent stores. `onChange` now carries the kind and
-        // `outgoingClipFrame` (main.swift) picks the codec from it, so the
+        // `outgoingClipFrame` (LocalChange.swift) picks the codec from it, so the
         // scope boundary is gone. The PC agent's `_observe_local_change` made
         // the same move in Task 12.
         //
