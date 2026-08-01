@@ -54,7 +54,7 @@ bytes from the write.
 
 THIS FAKE IS DELIBERATELY HARSHER THAN THE REAL TRANSFORMATION, and that
 asymmetry is the design rather than a side effect. The substitution (see
-reencode_png) drops every ancillary chunk AND MOVES EVERY PIXEL SAMPLE. Real
+substitute_png) drops every ancillary chunk AND MOVES EVERY PIXEL SAMPLE. Real
 GPaste does not move samples nearly that far: it applies the image's embedded
 ICC profile as it loads it and writes the result untagged, which on a measured
 480x320 screenshot changed 398,267 of 614,400 raw sample bytes, by at most 20.
@@ -296,7 +296,7 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 # picture; PLTE and tRNS because for colour type 3 they are structural rather
 # than decorative, and a dropped palette is not a degraded image but an
 # undecodable file. PLTE is carried but not necessarily unchanged: a palette
-# image is perturbed THROUGH it, see reencode_png. Everything else -- pHYs,
+# image is perturbed THROUGH it, see substitute_png. Everything else -- pHYs,
 # iCCP, sRGB, gAMA, cHRM, tEXt, eXIf ... -- is dropped, which is what GPaste
 # does.
 KEPT_CHUNKS = (b"IHDR", b"PLTE", b"tRNS")
@@ -306,7 +306,7 @@ KEPT_CHUNKS = (b"IHDR", b"PLTE", b"tRNS")
 # fast, naive encoder emits, and against a well-filtered original it GROWS the
 # file the way GPaste's re-encode grew the measured screenshot. The rest are a
 # vestigial guard -- perturbed samples cannot reproduce the input -- kept so
-# that the raise at the end of reencode_png stays reachable in principle: a
+# that the raise at the end of substitute_png stays reachable in principle: a
 # substitution that silently returned its input should say so loudly rather
 # than leave the harness green and blind.
 _ENCODE_ATTEMPTS = (9, 1, 6)
@@ -335,7 +335,7 @@ _PERTURBATION = bytes(1 + 2 * ((index * 61 + 17) % 128) for index in range(257))
 
 
 class NotAPNG(Exception):
-    """Raised for anything reencode_png does not model: not a PNG at all, an
+    """Raised for anything substitute_png does not model: not a PNG at all, an
     interlaced one, or a truncated one."""
 
 
@@ -435,7 +435,7 @@ def _perturb_scanlines(lines):
     return moved
 
 
-def reencode_png(data):
+def substitute_png(data):
     """A valid PNG of the same shape, with different bytes and DIFFERENT
     PIXELS. Deliberately harsher than what GPaste really does -- read
     SUBSTITUTION at the top of this file before touching it, because the

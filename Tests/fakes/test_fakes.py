@@ -130,7 +130,7 @@ class ReencodeTests(unittest.TestCase):
         only equality against `_perturb(original samples)` catches it.
         """
         original = make_png()
-        moved = scanlines(fake.reencode_png(original))
+        moved = scanlines(fake.substitute_png(original))
         self.assertEqual(moved, fake._perturb(scanlines(original)))
         self.assertNotEqual(moved, scanlines(original))
         self.assertTrue(all(a != b for a, b in zip(moved, scanlines(original))),
@@ -144,7 +144,7 @@ class ReencodeTests(unittest.TestCase):
             for depth in (8, 16):
                 with self.subTest(colour=colour, depth=depth):
                     original = make_png(depth=depth, colour=colour)
-                    stored = fake.reencode_png(original)
+                    stored = fake.substitute_png(original)
                     self.assertEqual(scanlines(stored), fake._perturb(scanlines(original)))
                     self.assertEqual(header_of(stored), header_of(original))
 
@@ -160,17 +160,17 @@ class ReencodeTests(unittest.TestCase):
         which is the failure this substitution was rewritten to remove.
         """
         original = make_png(colour=3, depth=8)
-        stored = fake.reencode_png(original)
+        stored = fake.substitute_png(original)
         self.assertEqual(scanlines(stored), scanlines(original))
         self.assertEqual(palette_of(stored), fake._perturb(palette_of(original)))
         self.assertTrue(all(a != b for a, b in zip(palette_of(stored), palette_of(original))))
         self.assertEqual(header_of(stored), header_of(original))
         with self.assertRaises(fake.NotAPNG):
-            fake.reencode_png(make_png(colour=3, depth=8, palette=False))
+            fake.substitute_png(make_png(colour=3, depth=8, palette=False))
 
     def test_the_density_is_gone(self):
         self.assertIn("pHYs", kinds_of(make_png()))
-        self.assertNotIn("pHYs", kinds_of(fake.reencode_png(make_png())))
+        self.assertNotIn("pHYs", kinds_of(fake.substitute_png(make_png())))
 
     def test_the_colour_profile_is_gone_too(self):
         """Faithful: GPaste drops the ICC profile as well. It used to carry a
@@ -178,17 +178,17 @@ class ReencodeTests(unittest.TestCase):
         profile difference would fail the pixel comparison for a real reason
         that looked like the fix failing. That rule is gone with the premise it
         protected: the comparison fails by design now."""
-        self.assertNotIn("sRGB", kinds_of(fake.reencode_png(make_png())))
+        self.assertNotIn("sRGB", kinds_of(fake.substitute_png(make_png())))
 
     def test_the_geometry_is_untouched(self):
         original = make_png(width=13, height=7)
-        self.assertEqual(header_of(fake.reencode_png(original)), header_of(original))
+        self.assertEqual(header_of(fake.substitute_png(original)), header_of(original))
 
     def test_the_bytes_actually_differ(self):
         """A substitution that returned its input would leave the harness
         green and blind."""
         original = make_png()
-        self.assertNotEqual(fake.reencode_png(original), original)
+        self.assertNotEqual(fake.substitute_png(original), original)
 
     def test_substituting_twice_never_walks_back_to_the_original(self):
         """The deltas are odd for this: an involution -- XOR, or an even delta
@@ -196,8 +196,8 @@ class ReencodeTests(unittest.TestCase):
         and a fake with a route back to the bytes it was given is a fake with a
         way to be kind by accident."""
         original = make_png()
-        once = fake.reencode_png(original)
-        twice = fake.reencode_png(once)
+        once = fake.substitute_png(original)
+        twice = fake.substitute_png(once)
         self.assertNotEqual(twice, once)
         # Pinned before the `zip`s below, which truncate to the shorter side
         # and would all pass against an empty buffer.
@@ -209,14 +209,14 @@ class ReencodeTests(unittest.TestCase):
     def test_it_refuses_what_it_does_not_model(self):
         for data in (b"not a png at all", make_png()[:20], b""):
             with self.assertRaises(fake.NotAPNG):
-                fake.reencode_png(data)
+                fake.substitute_png(data)
 
     def test_interlaced_is_refused_rather_than_mangled(self):
         header = struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 1)
         data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header)
                 + chunk(b"IDAT", zlib.compress(b"\x00" * 68)) + chunk(b"IEND", b""))
         with self.assertRaises(fake.NotAPNG):
-            fake.reencode_png(data)
+            fake.substitute_png(data)
 
 
 class ToolTestCase(unittest.TestCase):

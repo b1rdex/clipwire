@@ -850,7 +850,7 @@ private final class PairingHarness {
     /// Read from the fakes' own invocation log (`... 95 bytes substituted as
     /// 84 bytes`) rather than inferred from the stored body differing. The two
     /// are not the same claim: `wl-copy` falls back to storing what it was
-    /// given whenever `reencode_png` raises, and says so in that same line, so
+    /// given whenever `substitute_png` raises, and says so in that same line, so
     /// a fixture the re-encoder could not model would leave the clipboard
     /// holding the original and every assertion afterwards passing against a
     /// substitution that never happened.
