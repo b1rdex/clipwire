@@ -30,6 +30,57 @@ final class ChannelTests: XCTestCase {
         XCTAssertEqual(args.last, "~/.local/share/clipwire/clipwire-agent.py")
     }
 
+    // v3.1 task 1. The spawned command became injectable so the pairing
+    // harness can point `Channel` at `python3 agent/clipwire-agent.py` and run
+    // the two halves of this project against each other. That leaves
+    // `sshArguments` as the one part of the connect path the harness never
+    // executes, so it is pinned here on its exact output — every element, in
+    // order, and nothing else. The three `contains`-style tests around this
+    // one all stay green if the order scrambles, if a flag is duplicated, if
+    // an option loses its value, or if an extra argument appears between `-i`
+    // and the key path; a pure function from config to strings can be covered
+    // completely, and this is what completely looks like.
+    //
+    // The home directory is computed rather than written out: `expandTilde`
+    // calls `NSHomeDirectory()`, so a literal `/Users/<someone>/…` would pass
+    // on the author's Mac and fail on the macOS CI runner this suite is about
+    // to start running on. `remoteAgentPath` keeps its `~` on purpose — ssh
+    // runs the command through the remote user's shell, which expands it
+    // there; expanding it here would send the Mac's home path to the PC.
+    func testSSHArgumentsAreExactlyThisListInThisOrder() {
+        XCTAssertEqual(
+            sshArguments(for: config(), host: "pc"),
+            [
+                "-i", NSHomeDirectory() + "/.ssh/id_ed25519",
+                "-o", "IdentitiesOnly=yes",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=5",
+                "-o", "ServerAliveCountMax=2",
+                "me@pc",
+                "~/.local/share/clipwire/clipwire-agent.py",
+            ])
+    }
+
+    // The same change stopped the production spawn from being a literal at its
+    // call site: `Commands.swift` constructs `Channel(config:log:)` with no
+    // command at all, so the initializer's DEFAULTS are what ships. Nothing
+    // else observes them — `run()` never returns, and the pairing harness,
+    // which is why `attempt(host:)` stopped being private, always injects —
+    // so a regression that repointed a default would leave the entire suite
+    // green while the agent stopped speaking ssh, and the harness (which
+    // injects, and therefore never touches the defaults) would not catch it
+    // either. Behavioural rather than identity comparison on the argv builder,
+    // paired with the exact-output test above: together they pin that the
+    // default builds today's argv, and that today's argv is today's argv.
+    func testTheDefaultCommandIsStillSSHWithTheProductionArguments() {
+        let channel = Channel(config: config(), log: tempLog())
+        XCTAssertEqual(channel.executablePath, "/usr/bin/ssh")
+        XCTAssertEqual(channel.makeArguments(config(), "pc"),
+                       sshArguments(for: config(), host: "pc"),
+                       "the default argv builder must still be sshArguments(for:host:)")
+    }
+
     func testIdentityPathIsExpanded() {
         let args = sshArguments(for: config(), host: "pc")
         guard let index = args.firstIndex(of: "-i") else { return XCTFail("no -i") }

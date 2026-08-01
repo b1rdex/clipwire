@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""A fake wl-copy. See fake_clipboard.py for the shared state file and why
+these exist at all.
+
+    wl-copy --type <mime>        stores stdin as the selection
+
+STDIN IS DRAINED FULLY, FIRST, before anything else happens. That is what the
+real one does -- measured on the PC, a 4 MiB write returns in 3 ms even
+against a locked session -- and the agent depends on it: WaylandClipboard.write
+spawns this detached, writes the whole clip into the pipe and closes it
+without ever waiting, so a fake that exited early would hand the agent a
+BrokenPipeError that the real tool never produces.
+
+DELIBERATELY DIFFERENT FROM THE REAL ONE IN ONE WAY: the real wl-copy does not
+exit, because it stays resident as the selection owner. This exits as soon as
+the clip is stored. The agent cannot tell -- it never waits on the process and
+never reads its status -- and a resident fake would leak a process per write
+on a Mac, which has no PR_SET_PDEATHSIG to reap it.
+
+The agent puts this process's stderr on /dev/null, so nothing said there is
+ever seen. Everything worth knowing goes to the invocation log instead.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fake_clipboard as fake                                   # noqa: E402
+
+PROGRAM = "wl-copy"
+
+
+def parse(argv):
+    mime = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument.startswith("--type="):
+            mime = argument.split("=", 1)[1]
+        elif argument in ("--type", "-t"):
+            index += 1
+            if index >= len(argv):
+                fake.die(PROGRAM, "--type wants a MIME type")
+            mime = argv[index]
+        else:
+            # Loud, not ignored. If the agent ever grows a new flag here, a
+            # fake that silently accepted it would keep the harness green
+            # while modelling something the agent no longer does.
+            fake.die(PROGRAM, "unmodelled argument %r" % argument)
+        index += 1
+    if mime is None:
+        fake.die(PROGRAM, "no --type; the agent always passes one")
+    return mime
+
+
+def main(argv):
+    mime = parse(argv)
+    data = sys.stdin.buffer.read()      # first, and to EOF: see the docstring
+    path = fake.state_path(PROGRAM)
+    state = fake.load(path)
+    stored, how = data, "stored"
+    if state.get("substitute"):
+        try:
+            stored = fake.reencode_png(data)
+            how = "substituted"
+        except fake.NotAPNG as error:
+            # Only images are substituted. GPaste's text mangling is a
+            # different, already-fixed defect and is not modelled here.
+            how = "stored unsubstituted (%s)" % error
+    fake.save(path, fake.set_body(state, fake.offered_types_for(mime), stored))
+    fake.note(PROGRAM, "--type %s <- %d bytes %s as %d bytes"
+              % (mime, len(data), how, len(stored)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

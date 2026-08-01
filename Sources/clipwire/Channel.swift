@@ -45,6 +45,46 @@ final class Channel: @unchecked Sendable {
 
     private let config: Config
     private let log: Log
+    /// The command `attempt()` spawns. These default to exactly the production
+    /// values, so `Commands.swift`'s `Channel(config:log:)` — the only
+    /// construction site outside tests — keeps spawning `/usr/bin/ssh` with
+    /// `sshArguments(for:host:)`, and nothing in production passes or depends
+    /// on either of them.
+    ///
+    /// They exist for v3.1's pairing harness, which points this at
+    /// `python3 agent/clipwire-agent.py` and runs the Swift and Python halves
+    /// of this project against each other — something they had never once
+    /// done, while every defect this project ever shipped was found by running
+    /// it rather than by a test. Substituting the *command* and not the
+    /// transport is the whole point: it keeps the real spawn, the real pipes,
+    /// real EOF and real SIGPIPE, which is where this channel's actual defect
+    /// history lives (see `ignoreSIGPIPE()` below, and `attempt()`'s labeled
+    /// `outer:` loop).
+    ///
+    /// Three alternatives were rejected on the record, so a later tidying pass
+    /// need not re-litigate them:
+    ///
+    /// - **An environment variable.** It would put "exec an arbitrary command"
+    ///   into a tool that lives beside the owner's ssh keys, in a public
+    ///   repository — a permanent surface to document and defend, bought for a
+    ///   testing convenience. Nothing here reads the environment; the test
+    ///   target injects through this initializer instead.
+    /// - **A mock, or a protocol over `Process`/`Pipe`.** That substitutes a
+    ///   drawing of the transport for the transport, and the transport is
+    ///   precisely the part with the defect history.
+    /// - **Storing already-built argv.** `host` varies per attempt — `run()`
+    ///   flips to `config.fallbackIP` after a dial that never established — so
+    ///   argv has to be a function of the host, evaluated inside `attempt()`,
+    ///   not a value fixed at init.
+    ///
+    /// Internal rather than `private` only so a test can pin the defaults:
+    /// once the command stopped being a literal at its call site, nothing else
+    /// guaranteed that production still spawns ssh. `run()` never returns, and
+    /// the pairing harness — the only caller of `attempt(host:)` outside
+    /// `run()`, and the reason that method is no longer private — always
+    /// injects, so neither of them observes what the defaults actually are.
+    let executablePath: String
+    let makeArguments: (Config, String) -> [String]
     private let writeQueue = DispatchQueue(label: "dev.b1rdex.clipwire.write")
     private var process: Process?
     private var stdinPipe: Pipe?
@@ -56,9 +96,13 @@ final class Channel: @unchecked Sendable {
     private var establishedAt: Date?
     private(set) var reconnects = 0
 
-    init(config: Config, log: Log) {
+    init(config: Config, log: Log,
+         executablePath: String = "/usr/bin/ssh",
+         arguments: @escaping (Config, String) -> [String] = sshArguments(for:host:)) {
         self.config = config
         self.log = log
+        self.executablePath = executablePath
+        self.makeArguments = arguments
     }
 
     func send(_ frame: Frame) {
@@ -94,6 +138,31 @@ final class Channel: @unchecked Sendable {
                 log.line("write failed: \(error)")
                 onSent?(false)
             }
+        }
+    }
+
+    /// Closes this side's write end, which the far side sees as EOF on its
+    /// stdin — the same thing a dropped ssh gives the agent, and the agent's
+    /// own ordinary way out (`Agent.run()` logs "stdin closed, exiting" and
+    /// returns 0).
+    ///
+    /// Nothing in production calls this, and nothing should: `run()`
+    /// reconnects forever and the ssh process only ever dies on its own. It
+    /// exists for v3.1's pairing harness, which spawns a real agent per
+    /// connection — as sshd does, one process per connection — and therefore
+    /// has to be able to END one. Without it every harness test would leave a
+    /// python3 (and the gdbus child it forked) alive for the rest of the test
+    /// binary's life, still polling a fake clipboard whose temp directory had
+    /// been deleted underneath it.
+    ///
+    /// Goes through `writeQueue`, the one queue `stdinPipe` is ever touched
+    /// from, so it cannot close the handle out from under an in-flight
+    /// `send`; and `sync`, so a caller may rely on the close having happened
+    /// by the time this returns.
+    func hangUp() {
+        writeQueue.sync { [self] in
+            try? stdinPipe?.fileHandleForWriting.close()
+            stdinPipe = nil
         }
     }
 
@@ -149,8 +218,18 @@ final class Channel: @unchecked Sendable {
         }
     }
 
-    /// Returns true when the channel was established before it dropped.
-    private func attempt(host: String) -> Bool {
+    /// One connection: spawn the command, pump frames until it dies, and
+    /// report whether it was ever established before it dropped.
+    ///
+    /// Internal rather than `private` for v3.1's pairing harness, which drives
+    /// connections one at a time instead of through `run()`. `run()` is an
+    /// infinite reconnect loop that never returns, so a test calling it would
+    /// leave a thread respawning agents for the rest of the binary's life —
+    /// and it offers no way to say "now reconnect", which is precisely the
+    /// event freshness reconciliation exists for and the one the harness has
+    /// to be able to stage. Production still reaches this only through
+    /// `run()`, which is the only caller in `Sources/`.
+    func attempt(host: String) -> Bool {
         // Cleared unconditionally, before anything else, including before
         // the early `return false` below if `task.run()` throws — so no
         // path through this function can ever leave a previous attempt's
@@ -159,8 +238,8 @@ final class Channel: @unchecked Sendable {
 
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        task.arguments = sshArguments(for: config, host: host)
+        task.executableURL = URL(fileURLWithPath: executablePath)
+        task.arguments = makeArguments(config, host)
         task.standardInput = stdin
         task.standardOutput = stdout
         task.standardError = stderr

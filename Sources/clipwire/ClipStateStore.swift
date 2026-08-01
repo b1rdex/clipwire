@@ -7,14 +7,122 @@ enum ClipStateStoreConstants {
     static let defaultPath = "~/.local/state/clipwire/clip-state.json"
 }
 
+/// What this machine PERSISTS, as against what the two machines AGREE on --
+/// and they are two different contracts, which is the whole reason this type
+/// exists.
+///
+/// `ClipState` is the WIRE type: `ClipState.decodePayload` (Freshness.swift)
+/// decodes exactly it off the wire, and until v3.1 this store loaded and
+/// saved that same type. That was an accident of early work rather than a
+/// decision, and it came within one review of leaking. The density fix needs
+/// a second, Mac-internal hash (`localSHA256` below), and the obvious place
+/// to put it was `ClipState` itself -- where it would have compiled, passed
+/// the whole suite, and shipped. Both sides ignore unknown keys, re-verified
+/// by execution for this task rather than taken on trust: Python's
+/// `decode_clip_state` returns a normal `(sha256, ts, kind)` triple for a
+/// payload carrying a fourth key, and `ClipState.init(from:)` here asks its
+/// keyed container for three names and never for what else is there. So a
+/// value that means something only on this Mac would have travelled to the PC
+/// *silently*, rather than failing loudly on the first frame.
+///
+/// The two have different lifetimes as well as different audiences: this file
+/// outlives agent versions on one machine, while the wire is what two
+/// machines agree on in a single moment. Keeping them apart is what makes
+/// "this field never reaches the peer" a fact about the types rather than a
+/// promise about the code. If a later tidying pass sees a one-field wrapper
+/// and moves to collapse it back into `ClipState`, this paragraph is the
+/// reason not to; `ClipStateStoreTests.testTheLocalHashNeverReachesTheWire`
+/// is the same reason as an assertion.
+struct StoredClipState: Equatable {
+    /// The canonical state: exactly what this side ANNOUNCES to the peer, and
+    /// the only half of this record that ever reaches the wire. After the
+    /// density fix it can hold the PEER's hash for content this side is
+    /// holding its own bytes of -- see `localSHA256`.
+    let state: ClipState
+
+    /// The hash of what THIS machine's clipboard actually hands back, when
+    /// that is not `state.sha256`. `nil` means "the same as `state.sha256`".
+    ///
+    /// Optional rather than required-and-defaulted so that a store file
+    /// written before v3.1 -- which cannot have the key, because it did not
+    /// exist -- keeps loading and keeps behaving exactly as it did: absent is
+    /// today's behaviour, and no migration step runs anywhere.
+    ///
+    /// The two hashes differ in exactly one state, and it is the one the
+    /// density fix creates: this side received an image from the peer whose
+    /// PIXELS matched what it already held, kept its own bytes (they carry
+    /// the density and the colour profile GPaste dropped), and adopted the
+    /// peer's hash as the canonical one so the next reconciliation resolves
+    /// `doNothing` instead of pulling the degraded copy back across. The
+    /// store then no longer describes what the clipboard returns -- which is
+    /// precisely what this field repairs, since `resolveStartupState` below
+    /// compares against `localHash` and so still sees unchanged content as
+    /// unchanged. Without it, the next startup would find a hash the
+    /// clipboard does not hold, stamp `now`, and log a false `clipboard
+    /// changed while apart`: the defect protocol v3 closed, reopened by its
+    /// own fix.
+    ///
+    /// Compare `localHash`, not this, against anything read from the
+    /// pasteboard: this is the raw stored field and is `nil` in every
+    /// ordinary case.
+    let localSHA256: String?
+
+    /// The hash of what this machine's clipboard returns -- the one to
+    /// compare a fresh `pasteboard.read()` against. Falls back to the
+    /// canonical hash, which is what "the store and the clipboard agree"
+    /// means and what every pre-v3.1 file recorded.
+    var localHash: String? { localSHA256 ?? state.sha256 }
+}
+
+/// Flat on disk -- `{"sha256": ..., "ts": ..., "kind": ..., "localSha256": ...}`
+/// -- rather than the nested shape a synthesized conformance would produce
+/// (`{"state": {...}, "localSHA256": ...}`). That is not cosmetic: the owner's
+/// existing `clip-state.json` is a bare `ClipState`, and under a nested
+/// encoding it would fail to decode, `load()` would report "nothing stored"
+/// (its documented answer to a torn file), and the next announcement would
+/// stamp `now` on content that is actually old and win a reconciliation it
+/// should have lost -- the exact clobber the persistent store exists to
+/// prevent, arriving through the migration. Pinned by
+/// `testAPreV31StoreFileStillLoadsWithNoLocalHash`, which writes the old bytes
+/// literally rather than round-tripping -- a round trip passes under either
+/// shape, verified by making the encoding nested on both sides and watching
+/// only the three flat-file tests go red while every round trip stayed green.
+///
+/// Both halves delegate to `ClipState`'s own `Codable` on the SAME container,
+/// so the three wire fields are encoded and decoded by exactly the code that
+/// encodes and decodes them for the wire -- including
+/// `ClipState.init(from:)`'s kind/hash pairing rule, which is what keeps a v2
+/// store file (a real hash, no `kind` key) rejected here rather than loaded as
+/// "a hash of unknown kind". See that initializer's own comment.
+extension StoredClipState: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case localSHA256 = "localSha256"
+    }
+
+    init(from decoder: Decoder) throws {
+        state = try ClipState(from: decoder)
+        localSHA256 = try decoder.container(keyedBy: CodingKeys.self)
+            .decodeIfPresent(String.self, forKey: .localSHA256)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        try state.encode(to: encoder)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        // `encodeIfPresent`: a `nil` local hash writes no key at all, so an
+        // ordinary record is byte-identical to what pre-v3.1 wrote and stays
+        // readable by anything that only knows `ClipState`.
+        try container.encodeIfPresent(localSHA256, forKey: .localSHA256)
+    }
+}
+
 /// Persists the last known `(sha256, ts)` pair to disk, so a process that
 /// starts fresh -- the PC agent on every connection (spawned new by sshd
 /// each time), either side after a crash or a Mac sleep/wake cycle -- can
 /// still answer "how old is what I hold" for content it never personally
 /// observed. Written on every locally-observed clipboard change, on every
-/// applied remote clip, and by the startup announcement -- each of the four
-/// through `persistClipState` (ClipStateAnnouncement.swift), which is where they are
-/// enumerated. Read at startup by whoever calls `resolveStartupState` below
+/// applied remote clip, on every image kept for its density, and by the
+/// startup announcement -- each of the five through `persistClipState`
+/// (ClipStateAnnouncement.swift), which is where they are enumerated. Read at startup by whoever calls `resolveStartupState` below
 /// with the result, and again by `handleFrame`'s `.clipState` case.
 struct ClipStateStore {
     let url: URL
@@ -65,9 +173,14 @@ struct ClipStateStore {
     /// distinguish reasons it would handle the same way regardless.
     /// Mirrors `Status.read`'s use of `try?` across the same two failure
     /// points in StatusFile.swift.
-    func load() -> ClipState? {
+    ///
+    /// A `StoredClipState`, not a `ClipState`, since v3.1 -- see that type
+    /// for why the store stopped being the wire type. A file written before
+    /// v3.1 still loads, with `localSHA256` absent, which is what makes this
+    /// a widening rather than a migration.
+    func load() -> StoredClipState? {
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(ClipState.self, from: data)
+        return try? JSONDecoder().decode(StoredClipState.self, from: data)
     }
 
     /// Throws rather than swallowing, unlike `load()` above -- so a future
@@ -76,13 +189,13 @@ struct ClipStateStore {
     /// replace pattern in StatusFile.swift exactly, for the same reason:
     /// `replaceItemAt` is atomic, so `load()` above -- possibly running in
     /// a different process -- can never observe a half-written file.
-    func save(_ state: ClipState) throws {
+    func save(_ record: StoredClipState) throws {
         lock.lock()
         defer { lock.unlock() }
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let tmp = url.appendingPathExtension("tmp")
-        try JSONEncoder().encode(state).write(to: tmp)
+        try JSONEncoder().encode(record).write(to: tmp)
         _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     }
 }
@@ -115,6 +228,26 @@ struct ClipStateStore {
 /// is honest about its age -- `currentKind` is equally honest about what it
 /// is, since it came from that exact same read, and is returned as-is
 /// rather than guessed.
+///
+/// Which hash "the hash on disk" means is the whole reason `StoredClipState`
+/// carries two, and v3.1 made the answer explicit: `localHash` -- what this
+/// machine's own clipboard returns -- never `state.sha256`, which after the
+/// density fix can be the PEER's hash for bytes this side is holding its own
+/// version of. Comparing the canonical hash against a live read would find a
+/// difference that is not a change, stamp `now` on content nobody touched,
+/// and log a false `clipboard changed while apart`: the defect protocol v3
+/// closed, reopened by its own fix. The two coincide for every record written
+/// before v3.1 and for every ordinary record since, which is exactly why the
+/// wrong one passes every test that does not construct the differing state on
+/// purpose -- see `testTheSeedComparesAgainstTheLocalHashNotTheCanonicalOne`.
+///
+/// The matching branch returns the stored record WHOLE, rather than rebuilding
+/// it around `currentHash`, for the same reason. Rebuilding is what the
+/// pre-v3.1 body did (the two hashes were the same value, so it could not
+/// matter), and it would now put the LOCAL hash into the canonical slot: this
+/// side would announce bytes the peer has never seen, the peer would answer
+/// with the copy it holds, and a frame would come back on every reconnect
+/// forever instead of only the first.
 ///
 /// Before Task 8 made `pasteboard.read()` kind-aware, this parameter did
 /// not exist and this branch hardcoded `.text`: `resolveCurrentClipState`
@@ -149,12 +282,23 @@ struct ClipStateStore {
 /// initializer does not enforce that rule, so a leak here would reach the
 /// wire and be rejected by the peer's decoder rather than by anything local.
 func resolveStartupState(currentHash: String?, currentKind: ClipKind?,
-                         stored: ClipState?, now: Double) -> ClipState {
+                         stored: StoredClipState?, now: Double) -> StoredClipState {
     guard let currentHash else {
-        return ClipState(sha256: nil, ts: now, kind: nil)
+        // `localSHA256: nil` alongside the nil canonical hash, for the reason
+        // the kind is nil here: a state that announces nothing has nothing
+        // for a later read to be compared against either, and carrying a
+        // stale local hash under a nil canonical one would make the next
+        // startup measure the clipboard against content this side has already
+        // declared it no longer holds.
+        return StoredClipState(state: ClipState(sha256: nil, ts: now, kind: nil), localSHA256: nil)
     }
-    if let stored, stored.sha256 == currentHash {
-        return ClipState(sha256: currentHash, ts: stored.ts, kind: stored.kind)
+    if let stored, stored.localHash == currentHash {
+        return stored
     }
-    return ClipState(sha256: currentHash, ts: now, kind: currentKind)
+    // The content changed, so whatever the two hashes used to describe is
+    // gone: what the clipboard now returns IS what this side will announce,
+    // and `nil` is how that is recorded -- no local hash, because there is no
+    // divergence left to record.
+    return StoredClipState(state: ClipState(sha256: currentHash, ts: now, kind: currentKind),
+                           localSHA256: nil)
 }
