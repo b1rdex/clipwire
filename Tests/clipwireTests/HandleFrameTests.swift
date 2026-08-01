@@ -47,7 +47,14 @@ final class HandleFrameTests: XCTestCase {
             writes.filter { $0.kind == .text }.map { String(decoding: $0.data, as: UTF8.self) }
         }
 
+        /// How many times `read()` was called. A cost, not bookkeeping: on
+        /// `SystemPasteboard` an image read pulls the board's TIFF
+        /// representation and converts it to PNG, so asking twice about the
+        /// same bytes converts a multi-megabyte screenshot twice.
+        private(set) var reads = 0
+
         func read() -> (kind: ClipKind, data: Data)? {
+            reads += 1
             if let textToRead, !textToRead.isEmpty { return (.text, textToRead) }
             if let imageToRead, !imageToRead.isEmpty { return (.image, imageToRead) }
             return nil
@@ -1998,6 +2005,38 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(pasteboard.writes.map(\.kind), [.image])
     }
 
+    /// One read serves both questions. The branch asks "are these the same
+    /// pixels" and then, only when they are not, "how do they differ" -- two
+    /// questions about the SAME bytes, which it used to answer by reading the
+    /// pasteboard twice. On `SystemPasteboard` that is not a cheap accessor:
+    /// an image read pulls the TIFF representation and converts it to PNG, so
+    /// the second read re-converted a multi-megabyte screenshot on the
+    /// channel's decode thread for no new information.
+    ///
+    /// A DIFFERENT picture, so the second question really is asked -- the
+    /// log line is the evidence it was -- and the count is still one.
+    func testTheImageBranchAsksThePasteboardOnceEvenWhenItAsksTwoQuestions() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Self.heldImage
+
+        handleFrame(Frame(type: .imageClip,
+                          payload: try ImagePayload.encode(ts: 1000, png: Self.otherImage)),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 2000)
+        log.flush()
+
+        XCTAssertTrue(loggedMessages(at: path).contains {
+            $0.hasPrefix("the peer's image differs from the local one: ")
+        }, "the second question has to have been asked; got: \(loggedMessages(at: path))")
+        XCTAssertEqual(pasteboard.reads, 1,
+                       "both questions are about the same bytes, and reading them again means "
+                       + "converting the whole image a second time")
+    }
+
     /// *** The mine the two-hash store exists to avoid, as an end-to-end
     /// assertion. *** Keep the local bytes, then let the next connection
     /// announce: the seed must find the clipboard UNCHANGED (it is), stay
@@ -2044,5 +2083,110 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(store.load()?.localSHA256, sha256Hex(Self.heldImage),
                        "and the local hash survives the announcement, or the connection after "
                        + "this one hits the false alarm instead")
+    }
+
+    /// *** The density state must not disable `.sendMine`. *** The branch that
+    /// answers a peer with no clipboard at all -- `resolveFreshness`'s
+    /// `(_, nil)`, the fix for v1's documented loss of Mac copies made while
+    /// the PC was off -- verifies the live pasteboard before it sends. While
+    /// that verification compared against the CANONICAL hash it could never
+    /// match here: after the density fix the canonical hash is the peer's copy
+    /// of the picture, on purpose, while the pasteboard holds this side's own
+    /// bytes. So the branch sent nothing and logged `clipboard changed before
+    /// the send`, asserting a change that had not happened, for exactly the
+    /// content the fix creates.
+    ///
+    /// Reachable without any clock going backwards: the PC's clipboard reads
+    /// empty at reconnect whenever its GPaste history was cleared or its
+    /// session is locked, and a locked session makes every read fail. The
+    /// owner's PC locks itself daily.
+    ///
+    /// Driven as the two frames that actually produce the state, in order --
+    /// the image that creates the divergence, then the peer's empty
+    /// announcement -- so nothing here depends on a store record hand-built to
+    /// suit the assertion.
+    func testAPeerWithNoClipboardStillGetsTheImageWeKeptTheLocalBytesOf() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let store = tempClipStateStore()
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Self.heldImage
+        var sent: [Frame] = []
+
+        handleFrame(Frame(type: .imageClip,
+                          payload: try ImagePayload.encode(ts: 424242, png: Self.returnedImage)),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 999_999)
+        XCTAssertEqual(store.load()?.localSHA256, sha256Hex(Self.heldImage),
+                       "the arrange step must have produced the divergent record, or this test "
+                       + "proves nothing about it")
+
+        // A later connection to a peer that has lost its clipboard entirely.
+        handleFrame(Frame(type: .clipState,
+                          payload: try ClipState(sha256: nil, ts: 500_000, kind: nil).encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 1_000_000)
+        log.flush()
+
+        XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed before the send"),
+                       "nobody touched this pasteboard; got: \(loggedMessages(at: path))")
+        XCTAssertEqual(sent.count, 1, "the peer holds nothing, so it must be sent something")
+        XCTAssertEqual(sent.first?.type, .imageClip)
+        let decoded = try ImagePayload.decode(XCTUnwrap(sent.first).payload)
+        XCTAssertEqual(decoded.png, Self.heldImage,
+                       "and what it gets is the copy that still carries the density -- the "
+                       + "whole reason those bytes were kept")
+        XCTAssertEqual(decoded.ts, 424242,
+                       "under the age the content actually has, not `now`")
+    }
+
+    /// The same recovery through the OTHER source of `mine`. When the store
+    /// cannot be read, the `.clipState` case falls back to what this
+    /// connection announced -- and that value has to be the whole record, not
+    /// the `ClipState` that went on the wire, or the local half is dropped on
+    /// the one path that exists for when a save has already failed and the
+    /// verification is comparing the peer's hash against our bytes again.
+    ///
+    /// The store file is removed between the announcement and the peer's
+    /// frame, which is what `ClipStateStore.load()` reports as "nothing
+    /// stored" -- the same answer a torn file gets. One announcement gate
+    /// across both calls, as `wireAgent` uses for a whole connection.
+    func testTheAnnouncedFallbackCarriesTheLocalHashTheVerificationNeeds() throws {
+        let store = tempClipStateStore()
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Self.heldImage
+        let announcement = ClipStateAnnouncement()
+        var sent: [Frame] = []
+
+        handleFrame(Frame(type: .imageClip,
+                          payload: try ImagePayload.encode(ts: 424242, png: Self.returnedImage)),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 999_999)
+        handleFrame(Frame(type: .hello, payload: ProtocolConstants.helloPayload),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 1_000_000)
+        XCTAssertEqual(announcement.announced?.localSHA256, sha256Hex(Self.heldImage),
+                       "the announcement has to keep the half the wire never carried")
+        try FileManager.default.removeItem(at: store.url)
+
+        handleFrame(Frame(type: .clipState,
+                          payload: try ClipState(sha256: nil, ts: 500_000, kind: nil).encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: store,
+                    clipStateAnnouncement: announcement, now: 1_000_001)
+
+        XCTAssertEqual(sent.filter { $0.type == .imageClip }.count, 1,
+                       "an unreadable store must not cost the peer the picture too")
+        let frame = try XCTUnwrap(sent.first { $0.type == .imageClip })
+        XCTAssertEqual(try ImagePayload.decode(frame.payload).png, Self.heldImage)
     }
 }

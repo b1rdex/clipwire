@@ -9,6 +9,19 @@ enum ImagePixelConstants {
     /// One byte per channel, RGBA, no padding between rows.
     static let bytesPerPixel = 4
     static let bitsPerComponent = 8
+
+    /// How many differing bytes `imagePixelDifference` counts before it stops
+    /// counting and reports a floor instead. The log line exists to answer one
+    /// question -- did the samples move, or is this a different picture -- and
+    /// four thousand differing bytes answers it exactly as well as sixteen
+    /// million do, at a bounded price on the channel's decode thread.
+    static let differenceReportCap = 4096
+
+    /// The stride `imagePixelDifference` compares with `memcmp` before it
+    /// looks at individual bytes. Whole chunks that match are skipped, so the
+    /// other extreme -- two buffers differing in a handful of bytes, where the
+    /// cap above never fires -- does not pay for a byte-by-byte walk either.
+    static let differenceChunkBytes = 4096
 }
 
 /// Whether two encoded images are the same picture -- the question
@@ -65,6 +78,18 @@ enum ImagePixelConstants {
 /// "not identical". A wrong `false` costs what today already costs -- the
 /// peer's bytes are applied. A wrong `true` throws away the peer's image and
 /// leaves the user pasting something they were never sent.
+///
+/// **A greyscale image is one of those `false`s, always**, and the consequence
+/// is worth naming rather than leaving to be re-derived from
+/// `normalizedRGBA`'s `copy(colorSpace:)` line: `CGImage.copy(colorSpace:)`
+/// refuses to re-tag across colour MODELS, monochrome against RGB, so a
+/// greyscale pair cannot be normalised at all and answers `false` even when
+/// the two are byte-identical. The density fix therefore never fires for one,
+/// and a greyscale retina screenshot still comes back from the PC at double
+/// size, exactly as everything did before v3.1. That is the safe direction and
+/// it is not a crash, which is what `testAGreyscaleImageIsNeverIdenticalToAnything`
+/// pins; it is recorded rather than fixed because nothing on the owner's Mac
+/// produces greyscale screenshots.
 ///
 /// Not `NSBitmapImageRep`, despite `SystemPasteboard` using it for the
 /// TIFF->PNG conversion next door: its `bitmapData` layout follows the SOURCE
@@ -170,6 +195,24 @@ private func normalizedRGBA(_ image: CGImage) -> Data? {
 /// moved and the whole comparison approach needs replacing with provenance --
 /// having the PC announce the hash it was GIVEN alongside the hash it read
 /// back, which needs no pixels at all and survives any transformation.
+///
+/// **Reports a floor rather than a count once the difference is obvious**, and
+/// that is the difference between a diagnostic and a stall. The first version
+/// walked `zip(a, b)` over every byte of both buffers: measured on a 2560x1600
+/// same-dimension pair, 16,384,000 bytes, **2.149 s** on the channel's decode
+/// thread -- against 0.077 s for `imagePixelsIdentical` next door, which is the
+/// whole rest of the work. Nothing bounds that: `FrameConstants.maxImageBytes`
+/// caps the PNG at 4 MiB, not the pixel count, and a large flat screenshot
+/// compresses far below the cap. And this is the path the release intends to
+/// exercise, on every reconnect, if the samples do move -- so it had to be
+/// cheap on precisely the input it was written to explain. Measured again
+/// after, on that same pair: **0.077 s**, which is the two decodes and nothing
+/// measurable on top of them, in a debug build and a release one alike.
+///
+/// "At least N of M bytes differ, max delta at least D" settles the same
+/// question. Rounding (samples that moved) reads as a small delta over a large
+/// count; a different picture reads as a large delta. Neither answer needs the
+/// exact total, and the exact total is the only thing the cap gives up.
 func imagePixelDifference(_ lhs: Data, _ rhs: Data) -> String? {
     guard let left = decodeImage(lhs), let right = decodeImage(rhs) else {
         return "one of them did not decode"
@@ -181,12 +224,59 @@ func imagePixelDifference(_ lhs: Data, _ rhs: Data) -> String? {
         return "could not normalise one of them"
     }
     guard a.count == b.count else { return "different buffer sizes" }
+    let found = boundedDifference(a, b)
+    guard found.differing > 0 else { return nil }
+    // The dimensions travel with every one of these lines, not only the
+    // "different dimensions" one above: a count of differing bytes says
+    // nothing without the size of the picture it came out of, and this line's
+    // whole job is to be read months later by someone deciding whether the
+    // premise held.
+    let size = "\(left.width)x\(left.height)"
+    guard found.truncated else {
+        return "\(size): \(found.differing) of \(a.count) bytes differ, max delta \(found.maxDelta)"
+    }
+    return "\(size): at least \(found.differing) of \(a.count) bytes differ, "
+        + "max delta at least \(found.maxDelta)"
+}
+
+/// Counts the bytes that differ between two equally sized buffers, and the
+/// largest gap any pair of them showed, stopping at
+/// `ImagePixelConstants.differenceReportCap` differences and saying so.
+///
+/// Two bounds, for the two ways a full walk gets expensive. `memcmp` over
+/// `differenceChunkBytes` at a time skips matching regions wholesale, so a pair
+/// differing in a few bytes costs a handful of `memcmp` calls rather than a
+/// byte-by-byte walk; the cap stops the opposite case, where nearly every byte
+/// differs and the answer was already obvious after the first chunk. Between
+/// them, no input walks sixteen million bytes one at a time.
+///
+/// `withUnsafeBytes` rather than `zip`, and that alone was most of the 2.149 s:
+/// `Data`'s iterator is not a pointer walk.
+private func boundedDifference(_ a: Data, _ b: Data)
+    -> (differing: Int, maxDelta: Int, truncated: Bool) {
     var differing = 0
     var maxDelta = 0
-    for (x, y) in zip(a, b) where x != y {
-        differing += 1
-        maxDelta = max(maxDelta, abs(Int(x) - Int(y)))
+    var truncated = false
+    a.withUnsafeBytes { lhs in
+        b.withUnsafeBytes { rhs in
+            guard let leftBase = lhs.baseAddress, let rightBase = rhs.baseAddress else { return }
+            let count = min(lhs.count, rhs.count)
+            var offset = 0
+            while offset < count {
+                let chunk = min(ImagePixelConstants.differenceChunkBytes, count - offset)
+                if memcmp(leftBase + offset, rightBase + offset, chunk) != 0 {
+                    for index in offset..<(offset + chunk) where lhs[index] != rhs[index] {
+                        differing += 1
+                        maxDelta = max(maxDelta, abs(Int(lhs[index]) - Int(rhs[index])))
+                        if differing >= ImagePixelConstants.differenceReportCap {
+                            truncated = true
+                            return
+                        }
+                    }
+                }
+                offset += chunk
+            }
+        }
     }
-    guard differing > 0 else { return nil }
-    return "\(differing) of \(a.count) bytes differ, max delta \(maxDelta)"
+    return (differing, maxDelta, truncated)
 }

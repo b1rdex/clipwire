@@ -259,7 +259,7 @@ final class PairingHarnessTests: XCTestCase {
     /// Task 3's measurement, kept as a test instead of as a sentence in a
     /// commit message: with a `gdbus` that answers `monitor` but not
     /// `introspect`, `GPasteWatcher.available()` is false, `make_watcher`
-    /// returns the plain poller, and the four tests above would still pass --
+    /// returns the plain poller, and the five tests above would still pass --
     /// on a run that exercised none of the machinery they exist to cover.
     ///
     /// So the harness refuses, and this is the evidence that its refusal is

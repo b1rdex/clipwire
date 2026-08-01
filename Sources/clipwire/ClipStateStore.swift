@@ -120,9 +120,9 @@ extension StoredClipState: Codable {
 /// each time), either side after a crash or a Mac sleep/wake cycle -- can
 /// still answer "how old is what I hold" for content it never personally
 /// observed. Written on every locally-observed clipboard change, on every
-/// applied remote clip, and by the startup announcement -- each of the four
-/// through `persistClipState` (ClipStateAnnouncement.swift), which is where they are
-/// enumerated. Read at startup by whoever calls `resolveStartupState` below
+/// applied remote clip, on every image kept for its density, and by the
+/// startup announcement -- each of the five through `persistClipState`
+/// (ClipStateAnnouncement.swift), which is where they are enumerated. Read at startup by whoever calls `resolveStartupState` below
 /// with the result, and again by `handleFrame`'s `.clipState` case.
 struct ClipStateStore {
     let url: URL

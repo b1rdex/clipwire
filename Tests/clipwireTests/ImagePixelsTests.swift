@@ -63,6 +63,32 @@ enum TestPNG {
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
                                      | CGBitmapInfo.byteOrder32Big.rawValue),
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        return writePNG(image, dpi: dpi)
+    }
+
+    /// One 8-bit channel, no alpha, a MONOCHROME colour space -- not a
+    /// variation on `encode` above but a different image at the CGImage level,
+    /// which is the point: `CGImage.copy(colorSpace:)` refuses to re-tag
+    /// across colour models, so this is the input `imagePixelsIdentical`
+    /// cannot normalise and always answers `false` for.
+    static func greyscale(width: Int, height: Int, dpi: Double? = nil) -> Data {
+        var samples = [UInt8]()
+        samples.reserveCapacity(width * height)
+        for y in 0..<height {
+            for x in 0..<width { samples.append(UInt8((x * 37 + y * 11) % 256)) }
+        }
+        let provider = CGDataProvider(data: Data(samples) as CFData)!
+        let image = CGImage(
+            width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 8,
+            bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        return writePNG(image, dpi: dpi)
+    }
+
+    /// The PNG destination both builders share, so the density chunk is
+    /// attached the same way for either kind of image.
+    private static func writePNG(_ image: CGImage, dpi: Double?) -> Data {
         let out = NSMutableData()
         let destination = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString,
                                                            1, nil)!
@@ -126,9 +152,11 @@ final class ImagePixelsTests: XCTestCase {
     /// original decodes into the same space either way, and this pair would
     /// still compare equal even if the comparison used each image's own space
     /// instead of a fixed one -- measured, by making that change and watching
-    /// this test stay green. The test that discriminates between those two
-    /// implementations is
-    /// `testAWideGamutOriginalAgainstAnUntaggedCopyIsNotIdentical` below.
+    /// this test stay green. The choice that this pair genuinely cannot see,
+    /// and the one v3.1 got wrong first, is re-tagging against CONVERTING:
+    /// `testAWideGamutOriginalAgainstAnUntaggedCopyIsIdentical` below is where
+    /// that shows up, and it inverted -- name and assertion together -- when
+    /// the conversion came out.
     func testAnImageStrippedOfEveryAncillaryChunkIsStillTheSamePixels() {
         let original = TestPNG.make(width: 9, height: 7, dpi: 144)
         let stripped = TestPNG.strippingAncillaryChunks(original)
@@ -257,5 +285,124 @@ final class ImagePixelsTests: XCTestCase {
     func testATruncatedImageIsNeverIdentical() {
         let png = TestPNG.make(width: 6, height: 6)
         XCTAssertFalse(imagePixelsIdentical(png, png.prefix(png.count / 2)))
+    }
+
+    /// A greyscale image can never take the density fix, and the consequence
+    /// is worth pinning rather than leaving as an inference from
+    /// `normalizedRGBA`'s `copy(colorSpace:)` line. `CGImage.copy(colorSpace:)`
+    /// returns nil when the colour MODELS disagree -- monochrome against RGB --
+    /// so a greyscale pair answers `false` here even when the two are the same
+    /// bytes, and `handleFrame` then applies the peer's copy exactly as it did
+    /// before v3.1.
+    ///
+    /// That is the safe direction (a wrong `false` costs what today already
+    /// costs; a wrong `true` throws away a picture the user was sent), and it
+    /// is not a crash, which is the other thing this asserts. What it costs is
+    /// real and stated: a greyscale screenshot from a retina display still
+    /// comes back at double size. No screenshot on the owner's Mac is
+    /// greyscale, which is why this is recorded rather than fixed.
+    func testAGreyscaleImageIsNeverIdenticalToAnything() {
+        let grey = TestPNG.greyscale(width: 9, height: 7, dpi: 144)
+
+        XCTAssertFalse(imagePixelsIdentical(grey, TestPNG.strippingAncillaryChunks(grey)),
+                       "a greyscale pair cannot be normalised into RGBA, so the fix never "
+                       + "fires for one -- safe, and the peer's copy is applied as before")
+        XCTAssertFalse(imagePixelsIdentical(grey, grey),
+                       "not even against itself -- the answer is about the colour model, not "
+                       + "about the pixels")
+    }
+
+    // MARK: - the diagnostic that settles whether the samples moved
+
+    /// The line has to carry enough to answer the question it exists for, and
+    /// the dimensions are half of that: a count of differing bytes means
+    /// nothing without the size of the picture it came from.
+    ///
+    /// One sample apart, by a known amount, so both numbers are checkable
+    /// rather than merely present.
+    func testTheDifferenceReportNamesTheDimensionsTheCountAndTheDelta() {
+        var samples = TestPNG.samples(width: 4, height: 4)
+        let original = TestPNG.encode(samples, width: 4, height: 4, dpi: 144)
+        samples[9] = samples[9] &+ 3
+        let altered = TestPNG.encode(samples, width: 4, height: 4)
+
+        XCTAssertEqual(imagePixelDifference(original, altered),
+                       "4x4: 1 of 64 bytes differ, max delta 3")
+    }
+
+    /// Nothing to say when the samples match, which is the answer the release
+    /// is hoping for: the line never appears at all for a re-encode that left
+    /// the pixels alone.
+    func testAStrippedCopyHasNoDifferenceToReport() {
+        let original = TestPNG.make(width: 9, height: 7, dpi: 144)
+
+        XCTAssertNil(imagePixelDifference(original, TestPNG.strippingAncillaryChunks(original)))
+    }
+
+    /// *** The bound. *** The first version walked every byte of both buffers
+    /// with `zip`: 2.149 s for a 2560x1600 pair, on the channel's decode
+    /// thread, for a log line. `FrameConstants.maxImageBytes` bounds the PNG,
+    /// not the pixel count, so nothing about the frame cap bounded that -- and
+    /// this is the path the release intends to exercise on every reconnect.
+    ///
+    /// So it counts to `differenceReportCap` and reports a floor. This pair is
+    /// two different pictures of a size that makes the cap fire, and the "at
+    /// least" wording is what proves it stopped rather than finished: an
+    /// unbounded walk would report a number in the hundreds of thousands, and
+    /// a bounded one that forgot to SAY so would be a lie in the log.
+    ///
+    /// The delta is left unpinned on purpose, and it is a floor for the same
+    /// reason the count is: it is the largest gap among the bytes the scan
+    /// reached before it stopped, not the largest in the picture. Asserting a
+    /// literal there would be asserting where the cap happened to land.
+    func testTheDifferenceReportStopsCountingOnceTheAnswerIsObvious() throws {
+        let a = TestPNG.make(width: 200, height: 200, seed: 0, dpi: 144)
+        let b = TestPNG.make(width: 200, height: 200, seed: 5)
+
+        let reported = try XCTUnwrap(imagePixelDifference(a, b))
+
+        XCTAssertTrue(reported.hasPrefix("200x200: at least "
+                                         + "\(ImagePixelConstants.differenceReportCap) of 160000 "
+                                         + "bytes differ, max delta at least "),
+                      "got: \(reported)")
+    }
+
+    /// The other extreme, and the one the cap does nothing for: a pair
+    /// differing in a single byte still has to be walked to the end to know
+    /// that. The `memcmp` stride is what keeps that walk cheap, and this is
+    /// the assertion that it walks it CORRECTLY -- a stride that skipped a
+    /// chunk it should have looked at reports nothing at all here, and the
+    /// exact count and delta pin the byte it found.
+    ///
+    /// The differing byte sits in the final chunk on purpose: 40,000 bytes of
+    /// buffer against a 4,096-byte stride, so it is found by the tenth
+    /// comparison and not the first.
+    func testASingleDifferingByteInTheLastChunkIsStillFound() {
+        var samples = TestPNG.samples(width: 100, height: 100)
+        let original = TestPNG.encode(samples, width: 100, height: 100, dpi: 144)
+        samples[samples.count - 2] = samples[samples.count - 2] &+ 7
+        let altered = TestPNG.encode(samples, width: 100, height: 100)
+
+        XCTAssertGreaterThan(samples.count, ImagePixelConstants.differenceChunkBytes,
+                             "the buffer has to span several strides, or this proves nothing")
+        XCTAssertEqual(imagePixelDifference(original, altered),
+                       "100x100: 1 of 40000 bytes differ, max delta 7")
+    }
+
+    /// Different dimensions never reach the byte scan: the answer is the shape
+    /// difference, and it is the one the reader needs.
+    func testDifferentDimensionsAreReportedAsSuch() {
+        XCTAssertEqual(imagePixelDifference(TestPNG.make(width: 4, height: 3),
+                                            TestPNG.make(width: 3, height: 4)),
+                       "different dimensions (4x3 vs 3x4)")
+    }
+
+    /// Bytes that will not decode are reported as such rather than crashing or
+    /// claiming a pixel difference nobody measured.
+    func testUndecodableBytesAreReportedAsUndecodable() {
+        let stub = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x07])
+
+        XCTAssertEqual(imagePixelDifference(stub, TestPNG.make(width: 3, height: 3)),
+                       "one of them did not decode")
     }
 }
