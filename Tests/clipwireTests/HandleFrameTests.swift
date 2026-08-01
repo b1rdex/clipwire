@@ -1549,6 +1549,12 @@ final class HandleFrameTests: XCTestCase {
     /// In production they even land in the same file: `Channel.attempt`
     /// pipes the agent's stderr into this log with a `remote: ` prefix, so
     /// one file shows the conflict and which side won it.
+    ///
+    /// The line also carries a `(mine=... peer=...)` kind suffix since
+    /// Task 14 -- matched with `contains` below rather than exact equality
+    /// for exactly that reason, so this test does not have to know its
+    /// shape. See `testTheReconciliationLineNamesBothKinds` for the suffix
+    /// itself.
     func testEveryReconciliationOutcomeIsLogged() throws {
         // The stored hash is the real digest of what the pasteboard double
         // returns, as in every other `sendMine` fixture in this file: the
@@ -1578,9 +1584,59 @@ final class HandleFrameTests: XCTestCase {
                         clipStateAnnouncement: ClipStateAnnouncement())
 
             log.flush()
-            XCTAssertTrue(loggedMessages(at: path).contains("reconciled with the peer: \(c.expected)"),
+            XCTAssertTrue(loggedMessages(at: path).contains(where: { $0.contains("reconciled with the peer: \(c.expected)") }),
                           "expected \(c.expected); got: \(loggedMessages(at: path))")
         }
+    }
+
+    /// "why did a picture overwrite my text" must have an answer in the log.
+    /// The decision word alone cannot say it -- see every case above, which
+    /// never once asks what kind either side held. Mirrors test_watcher.py's
+    /// test_the_reconciliation_line_names_both_kinds.
+    func testTheReconciliationLineNamesBothKinds() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let store = tempClipStateStore()
+        let png = Data([0x89, 0x50])
+        try store.save(ClipState(sha256: sha256Hex(png), ts: 5000, kind: .image))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = png
+        let peer = ClipState(sha256: Self.hashB, ts: 1000, kind: .text)
+
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store,
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        guard let line = loggedMessages(at: path).first(where: { $0.contains("reconciled with the peer") }) else {
+            return XCTFail("no reconciliation line logged; got: \(loggedMessages(at: path))")
+        }
+        XCTAssertTrue(line.contains("mine=image"), "got: \(line)")
+        XCTAssertTrue(line.contains("peer=text"), "got: \(line)")
+    }
+
+    /// The complement: neither side's hash implies neither side's kind, and
+    /// the line must say so rather than omit it or print "nil". Mirrors
+    /// test_watcher.py's test_the_line_says_none_when_a_side_holds_nothing.
+    func testTheLineSaysNoneWhenASideHoldsNothing() throws {
+        let path = tempLogPath()
+        let log = Log(path: path)
+        let peer = ClipState(sha256: nil, ts: 1000, kind: nil)
+
+        handleFrame(Frame(type: .clipState, payload: try peer.encodePayload()),
+                    send: { _ in }, noteWrittenLocally: { _, _ in },
+                    pasteboard: RecordingPasteboard(), status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement())
+
+        log.flush()
+        guard let line = loggedMessages(at: path).first(where: { $0.contains("reconciled with the peer") }) else {
+            return XCTFail("no reconciliation line logged; got: \(loggedMessages(at: path))")
+        }
+        XCTAssertTrue(line.contains("mine=none"), "got: \(line)")
+        XCTAssertTrue(line.contains("peer=none"), "got: \(line)")
     }
 
     // MARK: - Final wave: a failed save is logged, at every Swift save site

@@ -109,10 +109,13 @@ def encode_image_payload(ts, png):
     Unlike encode_clip_payload, this rejects a non-finite ts on ENCODE too,
     not just decode: encode_clip_payload's two existing callers only ever
     pass a ts that has already been validated finite by an earlier decode or
-    a fresh time.time() reading, but this function has no callers yet to
-    lean on that same invariant -- whatever a later task wires up to call it
-    should not have to re-derive this guarantee, so it is enforced here,
-    at the source, matching what the tests below require.
+    a fresh time.time() reading, and this function's own two callers (the
+    reconciliation send branch's mine[1], and _local_change's observed_at)
+    do too. The guarantee is enforced here, at the source, rather than
+    leaned on at each call site, matching what the tests below require --
+    written when this function had no callers yet to lean on in the first
+    place, and left that way on purpose once it did: the invariant belongs
+    to the codec, not to whichever callers happen to exist today.
     """
     if not math.isfinite(ts):
         raise ClipPayloadError("refusing to encode a non-finite ts: %r" % ts)
@@ -720,7 +723,19 @@ class Agent:
         # twice. In production both sides' lines even land in the same file:
         # Channel.attempt pipes this agent's stderr into the Mac's log,
         # prefixed with `remote: `.
-        log("reconciled with the peer: %s" % decision)
+        #
+        # Task 14: the decision word alone is not enough. "reconciled with
+        # the peer: sendMine" with the two sides holding different kinds is
+        # undiagnosable after the fact -- "why did a picture overwrite my
+        # text" has no answer in the line above this comment. mine[2] and
+        # peer[2] are None, KIND_TEXT or KIND_IMAGE; `or "none"` is safe
+        # here specifically because _KNOWN_KINDS admits no falsy string, so
+        # the only value that ever reaches the fallback is a real None, not
+        # an empty-but-real kind masquerading as one. Byte-identical to the
+        # Swift side's own suffix, the same convention the decision word
+        # itself already follows.
+        log("reconciled with the peer: %s (mine=%s peer=%s)"
+            % (decision, mine[2] or "none", peer[2] or "none"))
         if decision != SEND_MINE:
             # Hashes equal means we agree -- not a signal to resend. A peer
             # that is fresher means we wait. Conflating either with SEND_MINE

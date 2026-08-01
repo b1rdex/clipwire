@@ -755,7 +755,18 @@ func handleFrame(
         // twice. In production both sides' lines land in the SAME file:
         // `Channel.attempt` pipes the agent's stderr into this log with a
         // `remote: ` prefix, so one file shows the conflict and its winner.
-        log.line("reconciled with the peer: \(decision.rawValue)")
+        //
+        // Task 14: the decision word alone is not enough. "reconciled with
+        // the peer: sendMine" with the two sides holding different kinds is
+        // undiagnosable after the fact -- "why did a picture overwrite my
+        // text" has no answer in the line above this comment. `?? "none"`
+        // only ever fires on a genuine `nil` kind: `ClipKind` has exactly
+        // two cases and neither raw-values to an empty string, so there is
+        // no real kind this could be mistaken for. Byte-identical to the PC
+        // agent's own suffix, the same convention the decision word itself
+        // already follows.
+        log.line("reconciled with the peer: \(decision.rawValue) "
+            + "(mine=\(mine.kind?.rawValue ?? "none") peer=\(peerState.kind?.rawValue ?? "none"))")
         switch decision {
         case .sendMine:
             // Verify before sending: read the pasteboard, hash what came

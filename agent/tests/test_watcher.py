@@ -3252,7 +3252,13 @@ class TestIncomingClipState(unittest.TestCase):
         byte-identical for free -- the same convention the frame-cap and
         skew lines already follow. Both sides' lines land in the SAME file
         in production: Channel.attempt pipes this agent's stderr into the
-        Mac's log with a `remote: ` prefix."""
+        Mac's log with a `remote: ` prefix.
+
+        The line also carries a `(mine=... peer=...)` kind suffix since
+        Task 14 -- checked with `in` below rather than `==` for exactly that
+        reason, so this test does not have to know its shape. See
+        test_the_reconciliation_line_names_both_kinds for the suffix
+        itself."""
         # The stored hash is the real digest of what the clipboard double
         # returns, as in every other sendMine fixture in this class: the
         # decision line under test is logged BEFORE Task 11's verification,
@@ -3283,7 +3289,41 @@ class TestIncomingClipState(unittest.TestCase):
                 finally:
                     clipwire_agent.log = original_log
 
-                self.assertIn("reconciled with the peer: %s" % expected, log_lines)
+                self.assertTrue(
+                    any(("reconciled with the peer: %s" % expected) in line for line in log_lines),
+                    "expected a line naming %s; got: %r" % (expected, log_lines),
+                )
+
+    def test_the_reconciliation_line_names_both_kinds(self):
+        """'why did a picture overwrite my text' must have an answer in the
+        log. The decision word alone cannot say it -- see this class's other
+        reconciliation tests, which never once ask what kind either side
+        held. Mirrors HandleFrameTests.swift's
+        testTheReconciliationLineNamesBothKinds."""
+        log_lines = self.capture_log()
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(b"\x89P")  # the send branch's own verification read
+        agent = self.build(clipboard=clipboard)
+        mine = (sha256_hex(b"\x89P"), 5000.0, KIND_IMAGE)
+        peer = (HASH_B, 1000.0, KIND_TEXT)
+
+        agent._resolve_clip_state(peer, mine=mine)
+
+        line = next(l for l in log_lines if "reconciled with the peer" in l)
+        self.assertIn("mine=image", line)
+        self.assertIn("peer=text", line)
+
+    def test_the_line_says_none_when_a_side_holds_nothing(self):
+        """The complement: neither side's hash implies neither side's kind,
+        and the line must say so rather than omit it or print "None"."""
+        log_lines = self.capture_log()
+        agent = self.build()
+
+        agent._resolve_clip_state((None, 1000.0, None), mine=(None, 5000.0, None))
+
+        line = next(l for l in log_lines if "reconciled with the peer" in l)
+        self.assertIn("mine=none", line)
+        self.assertIn("peer=none", line)
 
     def test_an_applied_pending_clip_supersedes_the_peers_stashed_announcement(self):
         """The reboot flow (acceptance item 5), where the stash is stale by

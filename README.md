@@ -6,17 +6,27 @@ No server, no accounts, no sessions, no listening ports, no certificates. The Ma
 out; `sshd` on the other end spawns a single-file Python agent. Authentication and
 encryption come from SSH, so there is no state that a reboot can invalidate.
 
-Built for a specific pair of machines — macOS Sequoia and Ubuntu 25.10 on GNOME/Wayland,
-where `wl-paste --watch` does not work because Mutter has no wlroots data-control protocol.
+Built for a specific pair of machines — macOS Sequoia and Ubuntu 26.04 LTS with GNOME Shell
+50.1 on Wayland (upgraded from 25.10 mid-project), where `wl-paste --watch` does not work
+because Mutter has no wlroots data-control protocol.
 
 **Status:** implemented. For architecture and the constraints that shaped it, read
-[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md) and then
+[the design doc](docs/superpowers/specs/2026-07-30-clipwire-design.md), then
 [the protocol v2 amendment](docs/superpowers/specs/2026-07-31-protocol-v2-freshness-design.md),
 which supersedes it on the wire format and on what happens at connect time: the two sides
-now exchange what each holds and how old it is, and the fresher one sends. The Swift and
-Python test suites both run in CI. The acceptance test is manual and lives in the
-amendment; the two halves of the program have never been exercised against each other by
-any automated test, because each suite drives one side against scripted pipes.
+now exchange what each holds and how old it is, and the fresher one sends. [The protocol v3
+amendment](docs/superpowers/specs/2026-07-31-protocol-v3-images-design.md) adds image sync
+on top of that, unchanged on the freshness rule itself. The Swift and Python test suites
+both run in CI. The acceptance test is manual: the v2 amendment holds the base checklist
+and the v3 amendment adds items to it, covering images specifically. The two halves of the
+program have never been exercised against each other by any automated test, because each
+suite drives one side against scripted pipes.
+
+**Images sync too, up to 4 MiB, and text wins when the clipboard holds both.** A screenshot
+or a copied image syncs the same way text does. When both are on the clipboard at once —
+which is what Excel, LibreOffice Calc and Numbers all do, placing a bitmap of the copied
+cells alongside the text — text wins, so a spreadsheet range arrives as the text of the
+cells, not a picture of the table.
 
 **Passwords land in GPaste's history on the PC and stay there.** Anything copied on the
 Mac is written to the PC's clipboard, and GPaste records it in its on-disk history. A
@@ -27,6 +37,11 @@ synced, so the clearing does not replicate. Remove it on the PC with:
 ```sh
 gpaste-client delete-history
 ```
+
+**The same is true of screenshots, which may hold more than the person copying them
+intended.** GPaste writes image items to its on-disk history exactly as it writes text —
+verified: `images-support` is `true`, `~/.local/share/gpaste/images` holds them, and a
+screenshot copied on the Mac was confirmed to appear in the history listing.
 
 ## Installing
 
@@ -149,3 +164,22 @@ Set it to `false` if you would rather keep the whitespace:
 ```sh
 gsettings set org.gnome.GPaste trim-items false
 ```
+
+## GPaste re-encodes images, and that is not clipwire
+
+This is not something clipwire's write path does: it happens to images copied directly on
+the PC too, not only to ones clipwire writes there. Copy a screenshot, and a few seconds
+after it lands on the PC's clipboard, GPaste takes over selection ownership and silently
+replaces it with its own re-encoding of the same picture.
+
+Measured on the PC: a 105,700-byte PNG written to the clipboard read back a few seconds
+later as a *different* PNG — 180,287 bytes, 70% larger, and not the bytes that were
+written. The read-back value is stable after that, but it is never byte-identical to the
+one that was copied.
+
+This is the same disease as `trim-items` above: the clipboard does not necessarily hold
+what you put in it. clipwire is built around that rather than surprised by it — every hash
+it stores, announces or compares is the hash of what a clipboard read actually returned,
+never of what was written — so the re-encode does not confuse the two machines into
+re-sending the same screenshot forever. The picture that lands is still GPaste's
+re-encoding, though, not a byte-identical copy of what was on the Mac's pasteboard.
