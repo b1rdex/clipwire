@@ -2545,16 +2545,30 @@ class TestIncomingClipState(unittest.TestCase):
         agent._clip_state_sent = already_reconciled
         return agent
 
+    def capture_log(self):
+        """Collects clipwire_agent.log's lines for the duration of one test.
+        Several tests below assert on the send branch's own log line, and
+        the module-level patch plus its cleanup is the same four lines every
+        time."""
+        original_log = clipwire_agent.log
+        lines = []
+        clipwire_agent.log = lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        return lines
+
     def test_losing_clip_state_with_peer_fresher_produces_no_send(self):
         """resolve_freshness's waitForPeer outcome: the peer is fresher, so
         we wait. Conflating this with doNothing would be harmless here, but
         the point of a resend would be to CLOBBER a fresher peer -- exactly
         the defect this whole design exists to prevent."""
-        save_clip_state(HASH_A, 5, KIND_TEXT, path=self.clip_state_path)
-        # Real content on the clipboard, or a wrongly-resolved SEND_MINE
-        # would still send nothing (its first guard is a non-empty read)
-        # and this assertion would hold for the wrong reason. Mirrors
+        # Real content on the clipboard, and a stored hash that actually
+        # MATCHES it: a wrongly-resolved SEND_MINE would otherwise stop at
+        # one of that branch's own guards -- since Task 11 the first of them
+        # is the verification, which a placeholder hash fails -- and this
+        # assertion would hold for the wrong reason. Mirrors
         # HandleFrameTests.testLosingClipStateWithPeerFresherProducesNoSend.
+        save_clip_state(sha256_hex(b"something to wrongly send"), 5, KIND_TEXT,
+                        path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"something to wrongly send")
         agent = self.build(clipboard=clipboard)
@@ -2569,16 +2583,20 @@ class TestIncomingClipState(unittest.TestCase):
         """resolve_freshness's doNothing outcome via equal hashes: "hashes
         equal" must mean "we agree", not "resend" -- conflating it with
         sendMine would ping-pong the same content back and forth forever."""
-        save_clip_state(HASH_A, 5, KIND_TEXT, path=self.clip_state_path)
-        # See the test above: without real content a wrongly-resolved
-        # SEND_MINE sends nothing anyway, and this would pass regardless.
+        # See the test above: without real content the clipboard actually
+        # holds -- and a stored hash that matches it -- a wrongly-resolved
+        # SEND_MINE stops at one of that branch's own guards and this would
+        # pass regardless. The hash goes on BOTH sides here, since equal
+        # hashes are what the doNothing outcome under test turns on.
+        agreed = sha256_hex(b"something to wrongly send")
+        save_clip_state(agreed, 5, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"something to wrongly send")
         agent = self.build(clipboard=clipboard)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
 
-        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_A, 999, KIND_TEXT))  # same hash
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(agreed, 999, KIND_TEXT))  # same hash
 
         self.assertEqual(sent, [], "hashes equal means we agree, not resend")
 
@@ -2587,8 +2605,13 @@ class TestIncomingClipState(unittest.TestCase):
         all (also the fix for v1's documented loss of Mac copies made while
         the PC was off). The resulting clip must carry OUR stored ts, not
         now -- resending with now would perpetually refresh its age and let
-        it win every future reconciliation regardless of what happens next."""
-        save_clip_state(HASH_A, 777, KIND_TEXT, path=self.clip_state_path)
+        it win every future reconciliation regardless of what happens next.
+
+        The stored hash is the real digest of what the clipboard double
+        returns: since Task 11 the branch verifies the two against each
+        other before sending, so a placeholder hash here would make this
+        test prove only that the verification works."""
+        save_clip_state(sha256_hex(b"current clip text"), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
@@ -2625,7 +2648,7 @@ class TestIncomingClipState(unittest.TestCase):
         watcher does fire on non-changes (that is the entire reason
         _last_seen exists on this side at all), so the omission that is
         inert on the Mac is a real defect here."""
-        save_clip_state(HASH_A, 777, KIND_TEXT, path=self.clip_state_path)
+        save_clip_state(sha256_hex(b"current clip text"), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"current clip text")
         agent = self.build(clipboard=clipboard)
@@ -2639,7 +2662,7 @@ class TestIncomingClipState(unittest.TestCase):
             "_local_change's own send path already does",
         )
 
-    def test_winning_clip_state_prefers_a_just_applied_clip_over_a_racy_reread(self):
+    def test_winning_clip_state_stays_silent_when_a_racy_reread_disagrees_with_the_applied_clip(self):
         """The same class of bug clipboard_became_ready's announce step was
         fixed for, one door over: a TYPE_CLIP frame applied via _write_clip
         (the immediate _on_clip path, once READY) followed closely by a
@@ -2647,20 +2670,33 @@ class TestIncomingClipState(unittest.TestCase):
         plausible on the same connection, e.g. the Mac's watcher pushing a
         fresh local change around the time of its own one-time clip-state
         announcement. _write_clip already wrote to and correctly persisted
-        state for that applied clip; if _on_clip_state instead re-reads the
-        clipboard fresh to find the TEXT to send, that read can race
-        wl-copy's asynchronous, detached write (see _write_clip's own
-        comment) and see stale content -- sending WRONG text stamped with
-        the CORRECT mine[1] timestamp, which looks like a valid, fresh
-        reconciliation response to the peer.
+        state for that applied clip; if _on_clip_state re-reads the
+        clipboard to find the content to send, that read can race wl-copy's
+        asynchronous, detached write (see _write_clip's own comment) and
+        see stale content -- sending WRONG text stamped with the CORRECT
+        mine[1] timestamp, which looks like a valid, fresh reconciliation
+        response to the peer, and which the peer cannot tell from a real
+        one.
 
-        _last_seen_text already holds the applied clip's exact bytes
-        (_write_clip sets it, alongside _last_seen's own (kind, hash) pair,
-        before spawning wl-copy) -- and _last_seen is verified against
-        mine's (kind, hash) before last_seen_text is trusted, so a
-        stale/unrelated _last_seen (e.g. clipboard_became_ready's own
-        connect-time seed) still falls back to a live read exactly as
-        before.
+        The defect this pins is unchanged; the remedy is Task 11's. The
+        branch no longer trusts remembered bytes (_last_seen_text, deleted
+        with this task -- see _resolve_clip_state's own comment on why the
+        two are mutually exclusive): it reads, hashes, compares against
+        mine's own (kind, hash), and on a disagreement sends NOTHING and
+        logs. Nothing wrong reaches the peer either way. What is lost, and
+        accepted deliberately, is the correct send this scenario used to
+        produce: the applied clip is not re-offered from anywhere else
+        afterwards, since the watcher's own eventual observation of our
+        write is (correctly) suppressed as an echo. See
+        _resolve_clip_state's comment for why that exposure is narrower
+        than sending unverified bytes.
+
+        This is also the one test in the file where _last_seen agrees with
+        mine on both kind and hash at the moment the branch runs, which is
+        the COMMON case for a send resolution (a just-applied clip, or a
+        just-sent local change). Restoring a "trust _last_seen_text and skip
+        the read" fast path would send `applied_text` here and turn this
+        red -- which is exactly what it is for.
 
         QueueClipboard is the right double here, unmodified: its write()
         already never affects what a subsequently-queued read() returns --
@@ -2691,23 +2727,138 @@ class TestIncomingClipState(unittest.TestCase):
             load_clip_state(path=self.clip_state_path), (sha256_hex(applied_text), applied_ts, KIND_TEXT),
             "test setup must actually apply and persist the clip, or this test proves nothing",
         )
+        self.assertEqual(
+            agent._last_seen, (KIND_TEXT, sha256_hex(applied_text)),
+            "the applied clip must really be what this side remembers holding, or the "
+            "fast path this test exists to keep deleted was never reachable here",
+        )
 
-        # Queued for _on_clip_state's OWN read, if it takes the (buggy)
-        # fresh-read path -- stale content that predates the clip just
-        # applied above, modeling wl-copy not yet having taken over.
+        # Queued for the send branch's OWN read -- stale content that
+        # predates the clip just applied above, modeling wl-copy not yet
+        # having taken over.
         clipboard.queue_read(b"stale content predating this connection")
 
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
         agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))  # peer empty -> sendMine
 
-        self.assertEqual(len(sent), 1)
-        ts, text = decode_clip_payload(sent[0][1])
-        self.assertEqual(ts, applied_ts)
         self.assertEqual(
-            text, applied_text,
-            "must send the just-applied clip's own known text, not a stale "
-            "clipboard.read() racing wl-copy's asynchronous write",
+            sent, [],
+            "a read that disagrees with what we announced must send nothing -- neither the "
+            "stale bytes it returned nor the applied clip it contradicts",
+        )
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    # MARK: - Task 11: the send branch verifies before it sends
+
+    def test_the_send_branch_stays_silent_when_the_clipboard_moved_on(self):
+        """mine says text with hash A; by the time we send, the clipboard
+        holds an image. Sending it under A's timestamp is a clobber the peer
+        cannot detect: a well-formed text frame carrying a mojibake
+        transliteration of a PNG, at an age that was never that content's.
+
+        Both halves of the verification are wrong here at once (the kind and
+        the hash), which is the honest shape of the race: whatever replaced
+        the announced content is not required to be of the same kind."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(b"\x89PNG-something-else")
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        # Older than ours, so we resolve SEND_MINE.
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [], "the clipboard no longer holds what we announced")
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_stays_silent_when_only_the_hash_moved_on(self):
+        """The kind still matches and only the content changed -- the
+        ordinary shape of the race, a second text copy landing between the
+        announcement and this frame. A verification that compared only the
+        kind would pass this and send the wrong text under the announced
+        timestamp."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(b"whatever the user copied since")
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [], "the announced hash is not what the clipboard offers")
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_sends_when_the_clipboard_still_matches(self):
+        """The positive half: without it the two tests above pass against a
+        branch that never sends anything at all."""
+        body = b"still here"
+        save_clip_state(sha256_hex(body), 5000.0, KIND_TEXT, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_read(body)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], TYPE_CLIP)
+        self.assertEqual(decode_clip_payload(sent[0][1]), (5000.0, body))
+        self.assertNotIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_stays_silent_when_the_clipboard_emptied(self):
+        """A clipboard that now reads back as nothing at all is the same
+        class of failure as one holding different content: it does not hold
+        what we announced. read() returning None is the shape a Wayland
+        session with no selection owner takes -- and the shape a transient
+        wl-paste timeout takes too, which is why staying quiet (rather than
+        sending the announced hash's presumed bytes) is the only safe
+        reading of it."""
+        save_clip_state(HASH_A, 5000.0, KIND_TEXT, path=self.clip_state_path)
+        agent = self.build(clipboard=QueueClipboard(ready=True))  # empty queue -> read() is None
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [])
+        self.assertIn("clipboard changed before the send", "\n".join(log_lines))
+
+    def test_the_send_branch_stays_silent_for_a_verified_image_until_task_12(self):
+        """The verification passes -- the clipboard really does hold the
+        image we announced -- and the branch still sends nothing, because
+        the only clip frame it can build is TYPE_CLIP, the TEXT codec.
+        Sending PNG bytes through it would be a worse outcome than not
+        sending at all. Task 12 is where this becomes a TYPE_IMAGE_CLIP
+        send; until then the silence must be the KIND guard's doing, not
+        the verification's, or Task 12 would find nothing here to replace.
+
+        Distinguished from the verification's own silence by the absence of
+        its log line."""
+        png = b"\x89PNG\r\n\x1a\n" + b"pixels"
+        save_clip_state(sha256_hex(png), 5000.0, KIND_IMAGE, path=self.clip_state_path)
+        clipboard = QueueClipboard(ready=True)
+        clipboard.queue_image_read(png)
+        agent = self.build(clipboard=clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        log_lines = self.capture_log()
+
+        agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(HASH_B, 1000.0, KIND_TEXT))
+
+        self.assertEqual(sent, [], "an image must not go out through the text codec")
+        self.assertNotIn(
+            "clipboard changed before the send", "\n".join(log_lines),
+            "the clipboard holds exactly what we announced -- this silence is the kind "
+            "guard's, and Task 12 replaces it with a real image send",
         )
 
     def test_winning_clip_state_with_content_at_exactly_the_cap_produces_no_send(self):
@@ -2717,8 +2868,13 @@ class TestIncomingClipState(unittest.TestCase):
         a payload that exceeds MAX_TEXT_BYTES once wrapped in its 8-byte
         timestamp -- refused here on content-limit grounds, independently of
         whether the resulting frame would also exceed the (larger)
-        MAX_PAYLOAD_BYTES wire cap."""
-        save_clip_state(HASH_A, 777, KIND_TEXT, path=self.clip_state_path)
+        MAX_PAYLOAD_BYTES wire cap.
+
+        The stored hash is the real digest of the oversized content, not a
+        placeholder: since Task 11 the branch verifies before it sends, and
+        a placeholder would make this test pass on the verification's
+        silence while the cap it exists for went untested."""
+        save_clip_state(sha256_hex(b"x" * MAX_TEXT_BYTES), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * MAX_TEXT_BYTES)
         agent = self.build(clipboard=clipboard)
@@ -2730,8 +2886,8 @@ class TestIncomingClipState(unittest.TestCase):
         self.assertEqual(sent, [], "content of exactly the cap would encode to a payload 8 bytes over it")
 
     def test_winning_clip_state_with_content_leaving_exact_room_for_the_timestamp_prefix_still_sends(self):
-        save_clip_state(HASH_A, 777, KIND_TEXT, path=self.clip_state_path)
         text = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
+        save_clip_state(sha256_hex(text), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(text)
         agent = self.build(clipboard=clipboard)
@@ -2748,17 +2904,14 @@ class TestIncomingClipState(unittest.TestCase):
         be sent has nothing to look at otherwise -- matches the existing
         "skipping a clip of N bytes: over the text limit" line used for
         _local_change's own cap."""
-        save_clip_state(HASH_A, 777, KIND_TEXT, path=self.clip_state_path)
         oversized = MAX_TEXT_BYTES
+        save_clip_state(sha256_hex(b"x" * oversized), 777, KIND_TEXT, path=self.clip_state_path)
         clipboard = QueueClipboard(ready=True)
         clipboard.queue_read(b"x" * oversized)
         agent = self.build(clipboard=clipboard)
         agent.send = lambda t, p: None
 
-        original_log = clipwire_agent.log
-        log_lines = []
-        clipwire_agent.log = log_lines.append
-        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+        log_lines = self.capture_log()
 
         agent.on_frame(TYPE_CLIP_STATE, encode_clip_state(None, 0, None))
 
@@ -2859,6 +3012,10 @@ class TestIncomingClipState(unittest.TestCase):
         # for the same double-read shape.
         clipboard.queue_read(b"B")  # the seed read
         clipboard.queue_read(b"B")  # the announce step's own read
+        # And the send branch's own read, which since Task 11 verifies what
+        # the clipboard actually holds against what was just announced
+        # before it sends anything.
+        clipboard.queue_read(b"B")
         agent = self.build(clipboard=clipboard, already_reconciled=False)
         sent = []
         agent.send = lambda t, p: sent.append((t, p))
@@ -2897,12 +3054,19 @@ class TestIncomingClipState(unittest.TestCase):
         just announced to the peer: an age we invented, inflated past the
         one on the wire, able to win a comparison it should have lost.
 
-        Pinned two ways: the clipboard must not be read a third time at
-        all (the seed and the announce step are the only two legitimate
-        reads), and the clip we send after winning must carry the exact
-        timestamp we announced. The queued third read is what a
-        re-derivation would consume, and it returns DIFFERENT content so a
-        re-derivation cannot accidentally agree."""
+        Pinned by the TIMESTAMP the clip we send carries: it must be the
+        exact one we announced, not one a re-derivation would stamp from a
+        later clock reading. The clipboard's own content is deliberately
+        the same "A" on every read, so the two implementations differ ONLY
+        in the timestamp -- which is the whole disagreement.
+
+        A read count is deliberately NOT asserted, and the difference
+        matters. Since Task 11 the send branch reads once of its own,
+        verifying that the clipboard still holds what we announced before
+        sending it -- a verification AGAINST the pair, not a re-derivation
+        OF it. Counting reads cannot tell those two apart, so an assertion
+        on the count would read as "the pair must never be re-derived" and
+        push a later reader straight back into skipping the verification."""
         blocker = os.path.join(self._tmp.name, "blocker")
         with open(blocker, "wb") as handle:
             handle.write(b"occupying this name")
@@ -2911,9 +3075,9 @@ class TestIncomingClipState(unittest.TestCase):
             save_clip_state(HASH_A, 1, KIND_TEXT, path=unsaveable)
 
         clipboard = QueueClipboard(ready=True)
-        clipboard.queue_read(b"A")          # the connect-time seed
-        clipboard.queue_read(b"A")          # announce_clip_state's own read
-        clipboard.queue_read(b"DIFFERENT")  # only a re-derivation consumes this
+        clipboard.queue_read(b"A")  # the connect-time seed
+        clipboard.queue_read(b"A")  # announce_clip_state's own read
+        clipboard.queue_read(b"A")  # the send branch's own verification read
         agent = Agent(stdin=io.BytesIO(), stdout=io.BytesIO(),
                       clipboard=clipboard, clip_state_path=unsaveable)
         sent = []
@@ -2926,11 +3090,6 @@ class TestIncomingClipState(unittest.TestCase):
         with mock.patch.object(clipwire_agent, "make_watcher", return_value=SpyWatcher()):
             agent.clipboard_became_ready()
 
-        self.assertEqual(
-            len(clipboard._queue), 1,
-            "the store's own pair was already in hand -- re-reading the clipboard "
-            "to rebuild it is what invents a timestamp nobody announced",
-        )
         announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
         clips = [f for f in sent if f[0] == TYPE_CLIP]
         self.assertEqual(len(announced), 1)

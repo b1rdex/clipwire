@@ -654,22 +654,63 @@ func handleFrame(
         log.line("reconciled with the peer: \(decision.rawValue)")
         switch decision {
         case .sendMine:
-            // Text or nothing. Task 8 made this branch REACHABLE for an
-            // image for the first time: an image-only pasteboard used to
-            // read back as nothing, so it resolved a `nil` hash and could
-            // never win a reconciliation; it now resolves a real
-            // `(hash, ts, .image)` state, so `sendMine` is a live outcome
-            // for it. The branch itself still builds a `ClipPayload` -- the
-            // TEXT codec -- so sending those bytes would put a mojibake
-            // transliteration of a PNG on the wire, which is a worse outcome
-            // than not sending at all. A non-text read is therefore treated
-            // exactly like no read: this connection silently does not sync
-            // the image, precisely as it silently does not today. Task 11 is
-            // where this starts reading by `mine`'s OWN kind and sending an
-            // `.imageClip` frame instead. The PC agent's
-            // `_resolve_clip_state` carries the same guard, for the same
-            // reason and with the same scope boundary.
-            guard let read = pasteboard.read(), read.kind == .text, !read.data.isEmpty else { return }
+            // Verify before sending: read the pasteboard, hash what came
+            // back, and require it to match `mine` on BOTH halves -- the
+            // kind it records and the hash it records -- before a single
+            // byte of it goes out. `mine` is an ANNOUNCEMENT, made at some
+            // earlier moment; the pasteboard is free to have moved on since,
+            // and this branch is the one place that sends content it did not
+            // itself observe changing. Without the check it sends whatever
+            // it happens to find under the announced timestamp: the wrong
+            // kind, or the right kind at a stale age. Either is a clobber the
+            // receiver cannot detect, because everything it can see about the
+            // frame is well-formed and consistent -- the PC agent applies any
+            // incoming clip unconditionally, exactly as this side does.
+            //
+            // A mismatch sends NOTHING, and that is the whole remedy: the
+            // pasteboard changed, so `PasteboardWatcher` has either already
+            // carried the new content or is about to, and this frame's job --
+            // telling a peer about content it lacks -- is being done
+            // correctly by someone else. A `nil` read counts as a mismatch
+            // rather than as a special case: an emptied pasteboard genuinely
+            // no longer holds what we announced.
+            //
+            // The line is byte-identical to the PC agent's own in
+            // `_resolve_clip_state`, the convention the frame-cap and skew
+            // lines already follow: no interpolated values, so the two cannot
+            // drift apart in formatting. In production both land in the same
+            // file -- `Channel.attempt` pipes the agent's stderr into this
+            // log with a `remote: ` prefix.
+            guard let read = pasteboard.read(),
+                  read.kind == mine.kind,
+                  sha256Hex(read.data) == mine.sha256 else {
+                log.line("clipboard changed before the send")
+                return
+            }
+            // The verification says nothing about which kinds this branch can
+            // actually SEND. Task 8 made `sendMine` REACHABLE for an image
+            // for the first time: an image-only pasteboard used to read back
+            // as nothing, so it resolved a `nil` hash and could never win a
+            // reconciliation; it now resolves a real `(hash, ts, .image)`
+            // state. The verification passes for an image the pasteboard
+            // really does still hold -- but the only frame this branch builds
+            // is a `ClipPayload`, the TEXT codec, so sending those bytes
+            // would put a mojibake transliteration of a PNG on the wire,
+            // which is a worse outcome than not sending at all. A verified
+            // image therefore falls out here silently, precisely as it
+            // silently does today; sending it properly, as an `.imageClip`
+            // frame, is Task 13's job -- "images end to end on the Mac",
+            // which needs this send, the `.imageClip` apply and the announce
+            // wired together rather than one call site at a time. Task 12 is
+            // its mirror on the PC, where the PC agent's `_resolve_clip_state`
+            // carries this same guard, for the same reason and with the same
+            // scope boundary.
+            //
+            // Silent, unlike the mismatch above, and deliberately: nothing
+            // went wrong here -- this is a known gap, not a race -- and it
+            // would log on every reconnect for as long as an image sits on
+            // the pasteboard.
+            guard read.kind == .text, !read.data.isEmpty else { return }
             let data = read.data
             // The size bound matches PasteboardWatcher's own send-side guard
             // (Pasteboard.swift): this branch reads the live pasteboard

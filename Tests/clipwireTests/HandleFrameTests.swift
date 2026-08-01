@@ -567,15 +567,18 @@ final class HandleFrameTests: XCTestCase {
     /// the point of a resend would be to CLOBBER a fresher peer -- exactly
     /// the defect this whole design exists to prevent.
     func testLosingClipStateWithPeerFresherProducesNoSend() throws {
+        let held = Data("something to wrongly send".utf8)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 5, kind: .text))
+        // Real content on the pasteboard, and a stored hash that actually
+        // MATCHES it: a wrongly-resolved sendMine would otherwise stop at one
+        // of that branch's own guards -- since Task 11 the first of them is
+        // the verification, which a placeholder hash fails -- and this
+        // assertion would hold for the wrong reason.
+        try store.save(ClipState(sha256: sha256Hex(held), ts: 5, kind: .text))
         var sent: [Frame] = []
         let peerState = ClipState(sha256: Self.hashB, ts: 9, kind: .text) // peer fresher -> waitForPeer
-        // Real content on the pasteboard, or a wrongly-resolved sendMine
-        // would still send nothing (its first guard is a non-empty read)
-        // and this assertion would hold for the wrong reason.
         let pasteboard = RecordingPasteboard()
-        pasteboard.textToRead = Data("something to wrongly send".utf8)
+        pasteboard.textToRead = held
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
@@ -589,14 +592,19 @@ final class HandleFrameTests: XCTestCase {
     /// equal" must mean "we agree", not "resend" -- conflating it with
     /// `sendMine` would ping-pong the same content back and forth forever.
     func testAgreeingClipStateWithEqualHashesProducesNoSend() throws {
+        // See the test above: without real content the pasteboard actually
+        // holds -- and a stored hash that matches it -- a wrongly-resolved
+        // sendMine stops at one of that branch's own guards and this would
+        // pass regardless. The hash goes on BOTH sides here, since equal
+        // hashes are what the doNothing outcome under test turns on.
+        let held = Data("something to wrongly send".utf8)
+        let agreed = sha256Hex(held)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 5, kind: .text))
+        try store.save(ClipState(sha256: agreed, ts: 5, kind: .text))
         var sent: [Frame] = []
-        let peerState = ClipState(sha256: Self.hashA, ts: 999, kind: .text) // same hash -> doNothing regardless of ts
-        // See the test above: without real content a wrongly-resolved
-        // sendMine sends nothing anyway, and this would pass regardless.
+        let peerState = ClipState(sha256: agreed, ts: 999, kind: .text) // same hash -> doNothing regardless of ts
         let pasteboard = RecordingPasteboard()
-        pasteboard.textToRead = Data("something to wrongly send".utf8)
+        pasteboard.textToRead = held
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
@@ -612,9 +620,14 @@ final class HandleFrameTests: XCTestCase {
     /// `now` -- resending with `now` would perpetually refresh its age and
     /// let it win every future reconciliation regardless of what actually
     /// happens next.
+    ///
+    /// The stored hash is the real digest of what the pasteboard double
+    /// returns: since Task 11 the branch verifies the two against each other
+    /// before sending, so a placeholder hash here would make this test prove
+    /// only that the verification works.
     func testWinningClipStateProducesExactlyOneClipFrameCarryingOurStoredTimestamp() throws {
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
+        try store.save(ClipState(sha256: sha256Hex(Data("current clip text".utf8)), ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data("current clip text".utf8)
         var sent: [Frame] = []
@@ -641,26 +654,147 @@ final class HandleFrameTests: XCTestCase {
     /// from whatever it reads, so without a kind check it would send PNG
     /// bytes run through `String(decoding:as:UTF8.self)` as a text clip, and
     /// the peer would apply that mojibake to its clipboard. Not sending is
-    /// the correct behaviour until Task 11 teaches this branch to send by
-    /// `mine`'s own kind; this connection simply does not sync the image,
+    /// the correct behaviour until Task 13 teaches this branch to send an
+    /// `.imageClip` frame; this connection simply does not sync the image,
     /// exactly as it did not before. The PC agent's `_resolve_clip_state`
     /// carries the same guard, for the same reason.
+    ///
+    /// The stored hash is the image's REAL digest, so Task 11's verification
+    /// passes and the silence is the kind guard's own doing -- asserted
+    /// directly by the absence of the verification's log line. With a
+    /// placeholder hash this test would pass on the verification instead,
+    /// and the guard Task 13 exists to replace would rot untested.
     func testWinningClipStateWithAnImageOnThePasteboardProducesNoSend() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .image))
+        try store.save(ClipState(sha256: sha256Hex(png), ts: 777, kind: .image))
         let pasteboard = RecordingPasteboard()
-        pasteboard.imageToRead = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        pasteboard.imageToRead = png
         var sent: [Frame] = []
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil) // peer empty -> sendMine
+        let path = tempLogPath()
+        let log = Log(path: path)
 
         handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
                     send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
                     pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
-                    log: tempLog(), clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
 
         XCTAssertTrue(sent.isEmpty,
                       "an image must not be sent as a text clip just because we won the " +
                       "reconciliation -- the peer would apply mojibake to its clipboard")
+        XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed before the send"),
+                       "the pasteboard holds exactly what we announced -- this silence is the " +
+                       "kind guard's, and Task 13 replaces it with a real image send")
+    }
+
+    // MARK: - Task 11: the send branch verifies before it sends
+
+    /// `mine` says text with one hash; by the time we send, the pasteboard
+    /// holds an image. Sending it under the announced timestamp is a clobber
+    /// the peer cannot detect -- and the watcher will carry the real change a
+    /// moment later on its own path, so nothing is lost by staying quiet.
+    ///
+    /// Both halves of the verification are wrong here at once (the kind and
+    /// the hash), which is the honest shape of the race: whatever replaced
+    /// the announced content is not required to be of the same kind.
+    func testTheSendBranchStaysSilentWhenThePasteboardMovedOn() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashA, ts: 5000, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.imageToRead = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        var sent: [Frame] = []
+        // Older than ours, so we resolve sendMine.
+        let peerState = ClipState(sha256: Self.hashB, ts: 1000, kind: .text)
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty, "the pasteboard no longer holds what we announced")
+        XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed before the send"),
+                      "got: \(loggedMessages(at: path))")
+    }
+
+    /// The kind still matches and only the content changed -- the ordinary
+    /// shape of the race, a second copy landing between the announcement and
+    /// this frame. A verification that compared only the kind would pass this
+    /// and send the wrong text under the announced timestamp.
+    func testTheSendBranchStaysSilentWhenOnlyTheHashMovedOn() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashA, ts: 5000, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = Data("whatever the user copied since".utf8)
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: Self.hashB, ts: 1000, kind: .text)
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty, "the announced hash is not what the pasteboard offers")
+        XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed before the send"),
+                      "got: \(loggedMessages(at: path))")
+    }
+
+    /// A pasteboard that now reads back as nothing at all is the same class
+    /// of failure as one holding different content: it does not hold what we
+    /// announced.
+    func testTheSendBranchStaysSilentWhenThePasteboardEmptied() throws {
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: Self.hashA, ts: 5000, kind: .text))
+        let pasteboard = RecordingPasteboard() // nothing to read
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: Self.hashB, ts: 1000, kind: .text)
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertTrue(loggedMessages(at: path).contains("clipboard changed before the send"),
+                      "got: \(loggedMessages(at: path))")
+    }
+
+    /// The positive half: without it the three tests above pass against a
+    /// branch that never sends anything at all.
+    func testTheSendBranchSendsWhenThePasteboardStillMatches() throws {
+        let body = Data("still here".utf8)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(body), ts: 5000, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = body
+        var sent: [Frame] = []
+        let peerState = ClipState(sha256: Self.hashB, ts: 1000, kind: .text)
+        let path = tempLogPath()
+        let log = Log(path: path)
+
+        handleFrame(Frame(type: .clipState, payload: try peerState.encodePayload()),
+                    send: { sent.append($0) }, noteWrittenLocally: { _, _ in },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: log, clipStateStore: store, clipStateAnnouncement: ClipStateAnnouncement())
+        log.flush()
+
+        XCTAssertEqual(sent.count, 1)
+        XCTAssertEqual(sent.first?.type, .clip)
+        guard let first = sent.first else { return }
+        let decoded = try ClipPayload.decode(first.payload)
+        XCTAssertEqual(decoded.ts, 5000)
+        XCTAssertEqual(decoded.text, "still here")
+        XCTAssertFalse(loggedMessages(at: path).contains("clipboard changed before the send"))
     }
 
     /// Unlike the watcher's own local-change path, this branch reads the
@@ -673,11 +807,17 @@ final class HandleFrameTests: XCTestCase {
     /// guard) and `maxPayloadBytes` (the wire's frame cap, enforced only by
     /// `Frame.decode`) are separate constants that happen to still share
     /// this number.
+    ///
+    /// The stored hash is the real digest of the oversized content, not a
+    /// placeholder: since Task 11 the branch verifies before it sends, and a
+    /// placeholder would make this test pass on the verification's silence
+    /// while the cap it exists for went untested.
     func testWinningClipStateWithContentAtExactlyTheCapProducesNoSend() throws {
+        let oversized = Data(repeating: 0x61, count: FrameConstants.maxTextBytes)
         let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
+        try store.save(ClipState(sha256: sha256Hex(oversized), ts: 777, kind: .text))
         let pasteboard = RecordingPasteboard()
-        pasteboard.textToRead = Data(repeating: 0x61, count: FrameConstants.maxTextBytes)
+        pasteboard.textToRead = oversized
         var sent: [Frame] = []
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
 
@@ -695,11 +835,11 @@ final class HandleFrameTests: XCTestCase {
     /// silently refuse to reconcile a win over content the wire format
     /// actually supports.
     func testWinningClipStateWithContentLeavingExactRoomForTheTimestampPrefixStillSends() throws {
-        let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
-        let pasteboard = RecordingPasteboard()
         let text = String(repeating: "a",
                           count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(Data(text.utf8)), ts: 777, kind: .text))
+        let pasteboard = RecordingPasteboard()
         pasteboard.textToRead = Data(text.utf8)
         var sent: [Frame] = []
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
@@ -719,11 +859,12 @@ final class HandleFrameTests: XCTestCase {
     /// the same cap, and `PasteboardTests.testOversizedClipIsLoggedWithItsSize`
     /// for the watcher's own send-side guard.
     func testWinningClipStateWithOversizedContentIsLoggedWithItsSize() throws {
-        let store = tempClipStateStore()
-        try store.save(ClipState(sha256: Self.hashA, ts: 777, kind: .text))
-        let pasteboard = RecordingPasteboard()
         let oversized = FrameConstants.maxTextBytes
-        pasteboard.textToRead = Data(repeating: 0x61, count: oversized)
+        let content = Data(repeating: 0x61, count: oversized)
+        let store = tempClipStateStore()
+        try store.save(ClipState(sha256: sha256Hex(content), ts: 777, kind: .text))
+        let pasteboard = RecordingPasteboard()
+        pasteboard.textToRead = content
         let peerState = ClipState(sha256: nil, ts: 0, kind: nil)
         let logPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString)")

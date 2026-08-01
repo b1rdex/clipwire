@@ -135,7 +135,7 @@ final class PasteboardTests: XCTestCase {
     /// `String(decoding:as:UTF8.self)` and sends it as a TEXT clip. Dropping
     /// the check would put a mojibake transliteration of a PNG on the wire
     /// and into both persistent stores. Syncing a local image change is
-    /// later work (Task 11); until then an image observation is skipped
+    /// later work (Task 13); until then an image observation is skipped
     /// exactly as it has always been, and this test is what keeps "skipped"
     /// from quietly becoming "sent as text".
     func testAnImageOnThePasteboardIsNotEmittedAsText() {

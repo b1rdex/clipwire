@@ -277,8 +277,11 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
 /// lock and re-validate, not to reach for a counter.
 ///
 /// (The converted PNG is then discarded, because `pollLocked()` keeps text
-/// only — see its own comment. That waste ends with Task 11, which is what
-/// makes an image observation worth sending.)
+/// only — see its own comment. That waste ends with Task 13, "images end to
+/// end on the Mac", which is what makes an image observation worth sending.
+/// Not Task 11: that one taught `handleFrame`'s `.sendMine` branch to VERIFY
+/// the pasteboard against what was announced before sending it, which changes
+/// nothing about which kinds this watcher emits.)
 ///
 /// This lock is still not a complete contract on its own: it says nothing
 /// about the ORDER in which the future frame handler writes to the
@@ -368,8 +371,9 @@ final class PasteboardWatcher {
         // therefore put a mojibake transliteration of a PNG on the wire and
         // into both persistent stores. Keeping this text-only is a scope
         // boundary, not an oversight: syncing a local image change is later
-        // work (Task 11), which needs the image send, apply and announce
-        // wiring together rather than one call site at a time. Until then an
+        // work (Task 13, "images end to end on the Mac"), which needs the
+        // image send, apply and announce wiring together rather than one call
+        // site at a time. Until then an
         // image observation is skipped exactly as it always was — the
         // difference is that it is now skipped on purpose, pinned by
         // `testAnImageOnThePasteboardIsNotEmittedAsText`. The PC agent's
