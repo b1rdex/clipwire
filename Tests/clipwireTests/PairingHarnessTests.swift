@@ -390,6 +390,20 @@ final class PairingHarnessTests: XCTestCase {
     /// is true of a unit test sharing one process and NOT true here, where
     /// every reconnect kills the agent outright. Asserting each one lets the
     /// failure name whichever is actually first rather than the one predicted.
+    /// Measured, with the matched record rebuilt around the current hash: the
+    /// FIRST reconnect goes red, because the announce that has to carry the
+    /// origin is itself built from `resolve_startup_state`.
+    ///
+    /// WHICH LEAVES THE SECOND ITERATION'S TWO DECISION ASSERTIONS PROVING
+    /// LESS THAN THEY LOOK LIKE THEY DO, and that is said here rather than
+    /// left to be discovered. Under that same break the first reconnect's
+    /// unsuppressed exchange CONVERGES the two sides -- the PC wins freshness
+    /// by the nudge, sends its re-encode, and the Mac adopts it -- so by the
+    /// second reconnect both hold one hash and `doNothing` is reached by
+    /// freshness alone, with provenance never consulted. Both decision
+    /// assertions stay green there while the store assertion is red, which is
+    /// exactly the split that makes reading the disk worth a test of its own:
+    /// on the second reconnect it is the only witness left.
     func testTheOriginOutlivesEveryAgentThatCarriesItAcross() throws {
         let harness = try connected(substituting: true)
 
