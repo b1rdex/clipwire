@@ -1974,9 +1974,11 @@ class TestEchoBookkeeping(unittest.TestCase):
     # transient read() glitch in polling mode -- re-sends the current
     # content even though nothing actually changed, and can race a real
     # incoming write and clobber it. _last_seen is set in _write_clip
-    # (content arriving from the peer) and after a successful send
-    # (content leaving to the peer), and _local_change returns early
-    # whenever the freshly read text already matches it.
+    # (content arriving from the peer), after a successful send (content
+    # leaving to the peer), and -- since Task 10 -- in
+    # _consume_image_reoffer (the peer's own image as this clipboard
+    # re-encoded it), and _local_change returns early whenever the freshly
+    # read content already matches it.
 
     def test_non_change_signal_after_receiving_a_clip_produces_no_send(self):
         """Failure A from the final review, receive side: "A" arrives from
@@ -2097,9 +2099,11 @@ class TestEchoBookkeeping(unittest.TestCase):
         seed read AND announce_clip_state's read (called from inside it)
         both go through this same kind-aware clipboard.read() now.
 
-        _last_seen is a (kind, hash) pair since Task 9, but every
-        comparison against it stays text-only (see clipboard_became_ready's
-        own comment) -- an image-only clipboard at connect seeds no
+        _last_seen is a (kind, hash) pair since Task 9, and since Task 10 an
+        image observation compares against it too -- but the SEED still only
+        ever produces a KIND_TEXT pair or None (see clipboard_became_ready's
+        own comment for why that is a scope boundary rather than a property
+        anything relies on), so an image-only clipboard at connect seeds no
         baseline, exactly like an empty one already seeds none. But the
         CLIP_STATE announcement that goes out in the same
         call is a different matter: that frame is what gets PERSISTED to
@@ -2121,7 +2125,7 @@ class TestEchoBookkeeping(unittest.TestCase):
 
         self.assertIsNone(
             agent._last_seen,
-            "comparisons against _last_seen stay text-only -- an image seeds no baseline yet",
+            "the connect-time seed stays text-only -- an image seeds no baseline yet",
         )
         announced = [f for f in sent if f[0] == TYPE_CLIP_STATE]
         self.assertEqual(len(announced), 1, "the one-shot announcement must still go out")
@@ -2142,12 +2146,14 @@ class TestEchoBookkeeping(unittest.TestCase):
 
     def test_the_same_bytes_under_a_different_kind_are_a_change(self):
         """Not text-by-value and images-by-hash: one rule. A second
-        comparison branch is how the two sides drift. _local_change is
-        text-only until a later task teaches it to observe a local image
-        change too, so this seeds _last_seen directly under KIND_IMAGE
-        rather than getting there through two scripted reads -- the
-        identity rule under test lives in the comparison itself, not in
-        how _last_seen came to hold that value."""
+        comparison branch is how the two sides drift. _local_change still
+        never SENDS a locally-observed image (a later task's job), and the
+        one image observation it does act on since Task 10 -- the GPaste
+        re-offer of our own write -- needs an expectation armed by that
+        write, so this seeds _last_seen directly under KIND_IMAGE rather
+        than getting there through two scripted reads: the identity rule
+        under test lives in the comparison itself, not in how _last_seen
+        came to hold that value."""
         agent = self.build(ready=True)
         agent._last_seen = (KIND_IMAGE, sha256_hex(b"x"))
         agent.clipboard.queue_read(b"x")
@@ -2165,7 +2171,13 @@ class OrderRecordingClipboard:
     (clipboard.written == [...] and agent._last_written == ...) pass, since
     both would still be true by the time the test looks -- only checking
     what was armed AT WRITE TIME can tell the two orderings apart. Mirrors
-    HandleFrameTests.swift's RecordingPasteboard.onWrite callback."""
+    HandleFrameTests.swift's RecordingPasteboard.onWrite callback.
+
+    _last_written specifically, so this pins the arm-then-write ORDER only
+    for a TEXT write: since Task 10 an image write deliberately leaves
+    _last_written None and arms _expect_reoffer and _last_seen instead (see
+    _write_clip), so a test that drove an image through this double would
+    record None and prove nothing. Every test here writes text."""
 
     def __init__(self):
         self.agent = None  # set after construction, once the real agent exists

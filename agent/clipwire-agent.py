@@ -442,12 +442,13 @@ class Agent:
         # clipboard_became_ready: a plain bool with a single writer, so no lock.
         self._event_source_degraded = False
         # Persistent memory of what was last synced between the two
-        # machines -- set in _write_clip (content arriving FROM the peer)
-        # and after a successful send in _local_change (content sent TO
-        # the peer). Unlike _last_written/_write_gen (a ONE-SHOT echo
-        # suppression, consumed by the very next observed change), this
-        # never expires on its own: it is what the Mac already holds,
-        # for as long as neither side has genuinely changed it. See
+        # machines -- set in _write_clip (content arriving FROM the peer),
+        # after a successful send in _local_change (content sent TO the
+        # peer), and in _consume_image_reoffer (the peer's own image, as the
+        # PC's clipboard re-encoded it). Unlike _last_written/_write_gen (a
+        # ONE-SHOT echo suppression, consumed by the very next observed
+        # change), this never expires on its own: it is what the Mac already
+        # holds, for as long as neither side has genuinely changed it. See
         # _local_change for why a one-shot echo alone is not enough.
         #
         # A (kind, hash) pair, or None -- never the content itself. One
@@ -456,22 +457,25 @@ class Agent:
         # drift this project has already been bitten by twice, and holding
         # a hash instead of bytes is what keeps a synced image's pixels
         # out of memory here once a later task starts syncing them.
-        # _observe_local_change's own comparison against this field is
-        # text-only for now (its non-text guard already returned before
-        # ever reaching it). _resolve_clip_state's comparison is NOT
-        # text-only by itself -- it is kind-generic -- but its outcome
-        # stays text-only in practice today because of the
-        # `last_seen_text is not None` gate beside it (see that field's
-        # own comment), not because of this comparison. The shape is ready
-        # for a kind other than KIND_TEXT before any call site actually
-        # produces one.
+        # _observe_local_change now compares against this field under BOTH
+        # kinds: KIND_TEXT on its own text path, and KIND_IMAGE through
+        # _consume_image_reoffer, which needs it to tell our own write's
+        # echo apart from the re-offer that follows it.
+        # _resolve_clip_state's comparison is NOT text-only by itself either
+        # -- it is kind-generic -- but its outcome stays text-only in
+        # practice today because of the `last_seen_text is not None` gate
+        # beside it (see that field's own comment), not because of this
+        # comparison. So the kind half is now load-bearing rather than
+        # merely ready: _write_clip and _consume_image_reoffer both produce
+        # a KIND_IMAGE pair.
         self._last_seen = None
         # Companion to _last_seen, holding the ACTUAL BYTES the pair
         # describes -- but ONLY when _last_seen's kind is KIND_TEXT: set
         # together with _last_seen everywhere _last_seen is set to a
         # KIND_TEXT pair, and None everywhere _last_seen is set to None or
-        # (once a later task teaches this side to hold one) a KIND_IMAGE
-        # pair. That invariant is the entire reason this field exists
+        # to a KIND_IMAGE pair -- which _write_clip and
+        # _consume_image_reoffer now both do, and both honour.
+        # That invariant is the entire reason this field exists
         # rather than folding bytes back into _last_seen itself:
         # _resolve_clip_state's SEND_MINE branch needs to send WITHOUT
         # re-reading the clipboard when it already trusts its own memory --
@@ -485,7 +489,41 @@ class Agent:
         # for one call site, not a second copy of the rule Task 9 exists to
         # keep singular.
         self._last_seen_text = None
-        # Guards _last_written/_write_gen/_last_seen/_last_seen_text only. A
+        # The peer timestamp of an image this side has just applied and is
+        # still waiting to see GPaste re-offer -- or None when no re-offer is
+        # expected. Set by _write_clip on an image write, spent by
+        # _consume_image_reoffer, and cleared by any text observation.
+        #
+        # It exists because the PC's clipboard does not necessarily hold what
+        # was put in it. Measured on the live machine: a 105,700-byte PNG
+        # written here read back identical at t+1s, then as a DIFFERENT
+        # 180,287-byte PNG at t+4s and t+7s, stable from then on -- GPaste
+        # takes over the selection a few seconds after the write and
+        # re-encodes the image. Text is unaffected. Nothing in the protocol
+        # can prevent that, so the agent has to recognise the re-offer as its
+        # own write rather than as a fresh local clip; without it every
+        # screenshot costs a guaranteed extra round trip back to the Mac, and
+        # -- worse -- the store holds a hash the clipboard does not offer, so
+        # EVERY reconnect resolves "clipboard changed while apart", stamps
+        # ts=now, and lets a stale image win reconciliation against fresher
+        # content on the Mac.
+        #
+        # Deliberately NOT a timer: the takeover was measured between one and
+        # four seconds, on one machine, on one day, so any fixed wait is a
+        # race dressed as a constant. The expectation is spent by an EVENT
+        # instead -- the first image observation whose hash differs from
+        # _last_seen -- which is the echo guard's own shape, one door over.
+        #
+        # It holds the timestamp rather than a bare flag because the store
+        # write it authorises needs one, and the only correct value is the
+        # PEER's: the re-offer is not a new clip, it is the applied one
+        # re-encoded, so stamping it with the moment it was observed would
+        # make content the Mac sent us look freshly copied here and win the
+        # next reconciliation against the machine it came from. Tested with
+        # `is not None`, never for truth: a ts of 0.0 is a real timestamp.
+        self._expect_reoffer = None
+        # Guards _last_written/_write_gen/_last_seen/_last_seen_text/
+        # _expect_reoffer only. A
         # separate lock from _write_lock (which guards stdout) on purpose:
         # nesting them would invite a deadlock later, and this one is held
         # across nothing that ever blocks.
@@ -639,8 +677,8 @@ class Agent:
         triple, passed in rather than re-derived. It is the authoritative value by
         construction: clipboard_became_ready computed it one line earlier
         and ANNOUNCED IT TO THIS VERY PEER. Re-loading the store instead
-        only diverges when the store cannot be read back -- and since all
-        three save_clip_state call sites swallow their failure, an
+        only diverges when the store cannot be read back -- and since every
+        save_clip_state call site swallows its failure, an
         unwritable state directory is exactly that, silently. The fallback
         below would then rebuild the pair from a fresh clipboard read
         stamped time.time(), so the value we reconcile with would not be
@@ -715,10 +753,14 @@ class Agent:
             # verify the hash before trusting it -- see _observe_local_change's
             # own comment on this same scope boundary. Task 11's own scope
             # stops at that verification: actually sending a non-text kind
-            # from here is Task 12's job (PC images end to end -- on_frame,
-            # _write_clip, _observe_local_change and clipboard_became_ready
-            # all need the wiring together, per that method's own comment),
-            # not Task 11's. mine[2] can already be KIND_IMAGE here now that
+            # from here is Task 12's job (PC images end to end -- on_frame's
+            # TYPE_IMAGE_CLIP dispatch, the local-image send path and
+            # clipboard_became_ready still need wiring together, per
+            # _observe_local_change's own comment; _write_clip's own half of
+            # that wiring, its `kind` parameter, landed early with Task 10,
+            # which needed a way to drive an image through the apply path in
+            # order to pin the hash rule on it), not Task 11's.
+            # mine[2] can already be KIND_IMAGE here now that
             # resolve_startup_state no longer hardcodes KIND_TEXT: an
             # image-only clipboard resolves a real (hash, ts, KIND_IMAGE)
             # triple instead of a None hash, which makes SEND_MINE reachable
@@ -809,16 +851,24 @@ class Agent:
         # which is worse than losing a convenience. Do not "fix" this back.
         read = self.clipboard.read()
         # _last_seen is a (kind, hash) pair (Task 9); this seed only ever
-        # produces a KIND_TEXT pair or None, never KIND_IMAGE.
-        # _observe_local_change's own comparison is genuinely text-only (it
-        # hardcodes KIND_TEXT on its own side), so a KIND_IMAGE seed could
-        # never match there. _resolve_clip_state's comparison is
-        # kind-generic, but its fast path also requires
-        # `last_seen_text is not None` (see that field's own comment), and
-        # _last_seen_text can only ever hold text bytes -- so a KIND_IMAGE
-        # seed would leave it None and could never be used there either.
-        # An image-only clipboard at connect time therefore seeds no
-        # baseline yet, exactly as an empty one already seeds none.
+        # produces a KIND_TEXT pair or None, never KIND_IMAGE. That is a
+        # scope boundary rather than a property anything now relies on:
+        # _observe_local_change's comparison against _last_seen is no longer
+        # text-only (an image observation compares a KIND_IMAGE pair against
+        # it, in _consume_image_reoffer), so a KIND_IMAGE seed COULD match
+        # there today -- there simply is not one to match, since seeding an
+        # image baseline belongs with the task that teaches this side to
+        # send a locally-observed image. Leaving it None is also the safe
+        # direction: the re-offer path only ever consumes an observation
+        # that DIFFERS from _last_seen, so a missing image baseline can at
+        # worst let a re-offer through as differing, never suppress a real
+        # change. _resolve_clip_state's comparison is kind-generic too, but
+        # its fast path additionally requires `last_seen_text is not None`
+        # (see that field's own comment), and _last_seen_text can only ever
+        # hold text bytes -- so a KIND_IMAGE seed would leave it None and
+        # could never be used there either. An image-only clipboard at
+        # connect time therefore seeds no baseline yet, exactly as an empty
+        # one already seeds none.
         seed_text = read[1] if read is not None and read[0] == KIND_TEXT else None
         seed = (KIND_TEXT, sha256_hex(seed_text)) if seed_text is not None else None
         with self._echo_lock:
@@ -922,24 +972,38 @@ class Agent:
             self._watcher.stop()
             self._watcher = None
 
-    def _write_clip(self, payload):
+    def _write_clip(self, payload, kind=KIND_TEXT):
         """Single place where we touch the local clipboard, so echo
         bookkeeping cannot be forgotten on one of the paths.
 
-        `payload` is the wire-format [ts][text] encoding encode_clip_payload
-        produces -- not bare text -- since v2's clip frame carries its own
-        timestamp; both call sites (_on_clip's immediate-apply path and
-        clipboard_became_ready's pending_clip-apply path) pass the raw frame
-        payload through unchanged, so it is decoded here, once.
+        `payload` is the wire-format [ts][body] encoding for `kind` --
+        encode_clip_payload's for KIND_TEXT, encode_image_payload's for
+        KIND_IMAGE -- not a bare body, since every v2+ clip frame carries its
+        own timestamp; both existing call sites (_on_clip's immediate-apply
+        path and clipboard_became_ready's pending_clip-apply path) pass the
+        raw frame payload through unchanged, so it is decoded here, once.
 
-        A payload that fails to decode, or decodes with empty text, touches
-        neither the suppression nor the clipboard -- swallowed quietly,
-        mirroring Sources/clipwire/main.swift's handleFrame .clip case
-        (`try? ... !decoded.text.isEmpty`). This is a deliberate asymmetry
-        with _on_clip_state, which lets a malformed clip-state propagate and
-        close the connection: Swift's OWN .clip case swallows too, and
-        nothing in this task asks for a clip payload's malformed-content
-        behaviour to change.
+        `kind` defaults to KIND_TEXT because those two call sites are both
+        TYPE_CLIP paths and neither passes it. Nothing in production passes
+        KIND_IMAGE yet: on_frame still answers TYPE_IMAGE_CLIP with a log
+        line, and routing it here is Task 12's job (that task needs on_frame,
+        the local-send path and clipboard_became_ready wired together, not
+        one call site at a time). The parameter exists a task early because
+        THIS task's rule -- hash what the clipboard offers back, never what
+        was handed to the write tool -- is about the image apply path
+        specifically, and it cannot be pinned by a test without a way to
+        drive an image through here.
+
+        A payload that fails to decode, or decodes with an empty body,
+        touches neither the suppression nor the clipboard -- swallowed
+        quietly, mirroring Sources/clipwire/main.swift's handleFrame .clip
+        case (`try? ... !decoded.text.isEmpty`). This is a deliberate
+        asymmetry with _on_clip_state, which lets a malformed clip-state
+        propagate and close the connection: Swift's OWN .clip case swallows
+        too, and nothing in this task asks for a clip payload's
+        malformed-content behaviour to change. decode_image_payload raises
+        the same ClipPayloadError decode_clip_payload does, so the image path
+        joins that family without a second except clause.
 
         Runs on the main thread. _local_change() (below) runs on the
         watcher's background threads -- two of them since the safety-net poll
@@ -948,61 +1012,80 @@ class Agent:
 
         Returns the (sha256, ts, kind) triple that was applied and
         (best-effort) persisted, or None if the payload never decoded or
-        decoded with empty text and nothing was applied. clipboard_became_ready
-        uses this to announce a just-applied pending clip's state DIRECTLY,
-        rather than re-deriving it through a fresh clipboard read -- see
-        that method's own comment for why a read immediately after this
-        call cannot be trusted to reflect it yet.
+        decoded with an empty body and nothing was applied.
+        clipboard_became_ready uses this to announce a just-applied pending
+        clip's state DIRECTLY, rather than re-deriving it through a fresh
+        clipboard read -- see that method's own comment for why a read
+        immediately after this call cannot be trusted to reflect it yet.
         """
+        decode = decode_image_payload if kind == KIND_IMAGE else decode_clip_payload
         try:
-            ts, text = decode_clip_payload(payload)
+            ts, body = decode(payload)
         except ClipPayloadError:
             return None
-        if not text:
+        if not body:
             return None
+        # Hashed once, here, and reused by every site below. An image body can
+        # be up to MAX_IMAGE_BYTES, so the two SHA-256 passes this method used
+        # to make of a (wire-capped) text body are no longer free enough to be
+        # worth leaving as they were.
+        sha256 = sha256_hex(body)
         with self._echo_lock:
-            self._last_written = text
+            # The one-shot echo suppression is compared against a TEXT read
+            # (_observe_local_change's `body == expected`), so it holds bytes
+            # only for a text write and is cleared for an image one -- the
+            # same bytes-only-for-text rule _last_seen_text follows just
+            # below, and for the same two reasons: nothing would ever compare
+            # it against an image, and a 4 MiB body held here until the next
+            # observation is exactly the memory _last_seen exists as a hash to
+            # avoid. An image write's own echo is suppressed by _last_seen
+            # instead, which now carries the kind alongside the hash (Task 9).
+            self._last_written = body if kind == KIND_TEXT else None
             self._write_gen += 1
-            # KIND_TEXT: this method's only caller ever feeds it a
-            # TYPE_CLIP (text) payload, decoded above. Hashed again below,
-            # for save_clip_state's own return value, rather than reused:
-            # text is capped at MAX_PAYLOAD_BYTES by the wire, so a second
-            # SHA-256 of it is cheap enough not to be worth restructuring
-            # this method to thread one hash through both sites.
-            self._last_seen = (KIND_TEXT, sha256_hex(text))
-            self._last_seen_text = text
-        # KIND_TEXT: see the same reasoning spelled out just below, at the
-        # save_clip_state call this write() mirrors -- this method's only
-        # caller ever feeds it a TYPE_CLIP (text) payload.
-        self.clipboard.write(KIND_TEXT, text)
+            self._last_seen = (kind, sha256)
+            self._last_seen_text = body if kind == KIND_TEXT else None
+            # An image write is the one case where what we hand the clipboard
+            # and what it later offers back are not the same bytes: GPaste
+            # takes over the selection a few seconds later and re-encodes it.
+            # Arm the expectation here, spend it in _consume_image_reoffer.
+            # A text write clears it rather than leaving it: text reads back
+            # unchanged, and a stale expectation would swallow a later image.
+            self._expect_reoffer = ts if kind == KIND_IMAGE else None
+        self.clipboard.write(kind, body)
         # WaylandClipboard.write() spawns wl-copy DETACHED (Popen(...,
         # start_new_session=True)) and returns as soon as its own stdin pipe
         # is closed -- a hand-off, not a confirmation that wl-copy has
         # actually registered as the Wayland selection owner yet. The write
-        # above and this sha256_hex/save_clip_state pair are therefore not
-        # "the clipboard now reads this" -- they are "this is what we just
-        # told the clipboard to hold, and it is authoritative regardless of
-        # when (or whether) wl-copy finishes taking ownership." A caller
-        # that instead re-read the clipboard to find out what was just
-        # written would race that handoff.
-        sha256 = sha256_hex(text)
+        # above and the save_clip_state below are therefore not "the clipboard
+        # now reads this" -- they are "this is what we just told the clipboard
+        # to hold, and it is authoritative regardless of when (or whether)
+        # wl-copy finishes taking ownership." A caller that instead re-read
+        # the clipboard to find out what was just written would race that
+        # handoff.
+        #
+        # That is also the one place this method's hash legitimately describes
+        # bytes handed to the write tool rather than bytes read back, and it
+        # is not an exception to this task's rule so much as the only thing
+        # knowable at this instant: the clipboard genuinely holds `body` right
+        # now (wl-copy owns the selection), any read here would race the
+        # handoff, and the re-offer has not happened yet. _consume_image_reoffer
+        # corrects the store the moment it does. Saving here is still required
+        # rather than merely early -- on an installation with no GPaste the
+        # re-offer never comes at all, and a store that recorded nothing would
+        # resolve "clipboard changed while apart" on the next connect for an
+        # image it had applied correctly.
+        #
         # The peer's timestamp, never now: this is the entire reason it
         # travels in the frame. Stamping it with now would make applied
         # content look freshly copied here and win the next reconciliation
         # against the machine it actually came from. A local disk failure
         # here is not the peer's fault and must not undo the write above or
         # propagate as a FrameError and tear down the channel.
-        #
-        # KIND_TEXT unconditionally: this method's only caller ever feeds it
-        # a TYPE_CLIP payload, decoded two lines above by decode_clip_payload
-        # -- the text-clip codec. An image applied from the peer would arrive
-        # as TYPE_IMAGE_CLIP instead, which on_frame does not route here (see
-        # its own comment); that wiring is later work.
         try:
-            save_clip_state(sha256, ts, KIND_TEXT, path=self._clip_state_path)
+            save_clip_state(sha256, ts, kind, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
             log("could not persist clip state: %r" % error)
-        return sha256, ts, KIND_TEXT
+        return sha256, ts, kind
 
     def _local_change(self):
         """The single funnel for an observed local change, and the one entry
@@ -1022,6 +1105,10 @@ class Agent:
         sibling recognises the content as already synced and returns at the
         `(KIND_TEXT, sha256) == last_seen` check. There is deliberately no
         separate re-read -- the existing snapshot IS the read-after-acquire.
+        The image branch is closed by this same lock but does not lean on
+        that snapshot: _consume_image_reoffer compares against the LIVE
+        _last_seen and _expect_reoffer under _echo_lock, so a sibling finds
+        the expectation already spent whichever way it lost the race.
 
         It BLOCKS rather than skipping, which matters: PollingWatcher's
         `previous` has already advanced past the change it is reporting, so a
@@ -1069,34 +1156,67 @@ class Agent:
         observed_at = time.time()
         if read is None:
             return
+        if read[0] == KIND_IMAGE:
+            # An image observation is still never SENT here -- that is Task
+            # 12's job, and it needs on_frame, _write_clip, this method and
+            # clipboard_became_ready wired together rather than one call site
+            # at a time. But one image observation is not a local change at
+            # all: the re-offer GPaste raises seconds after this agent writes
+            # an image of its own. Recognising exactly that one, and nothing
+            # else, is what _consume_image_reoffer does; anything it declines
+            # falls out here to the same silently-not-synced outcome an image
+            # has always had. Indexed off `read` rather than unpacked so the
+            # text path below keeps `text` as its own name for the body.
+            if read[1]:
+                self._consume_image_reoffer(read[1], gen)
+            return
         kind, text = read
         if kind != KIND_TEXT or not text:
             # Task 7 made read() kind-aware -- before it, a non-text
             # clipboard could only ever read back as None, so this method
-            # was already, structurally, text-or-nothing. Keeping it that
-            # way here is a scope boundary, not an oversight: syncing a
-            # local IMAGE change is Task 12's job (on_frame, _write_clip,
-            # this method and clipboard_became_ready all need the image
-            # apply/announce wiring together, not one call site at a
-            # time). Until then an image observation is treated exactly
-            # like the pre-existing "nothing changed" outcome -- silently
-            # not synced -- rather than mis-sent as a text frame. The two
-            # other read() call sites this task touches (the connect-time
-            # seed below, and _resolve_clip_state's SEND_MINE branch) draw
-            # this same line for the same reason; see this comment rather
-            # than repeating it there.
+            # was already, structurally, text-or-nothing. Keeping every
+            # other kind that way here is a scope boundary, not an
+            # oversight: KIND_IMAGE is the only other kind read() can
+            # currently return (choose_kind picks nothing else), so this
+            # guard is reached today only by an empty body, and remains as
+            # the honest default for whatever third kind may arrive later.
+            # The two other read() call sites Task 7 touched (the
+            # connect-time seed below, and _resolve_clip_state's SEND_MINE
+            # branch) still draw the text-only line for that same reason;
+            # see this comment rather than repeating it there.
             return
 
         # Consume the suppression on the FIRST observed change, whatever it is —
-        # not only on a match. Our write produces exactly one change event; if we
-        # observe a different one instead, ours is already gone, and a lingering
-        # hash would silently swallow the user's later deliberate copy of the
-        # same text. Mirrors EchoGuard.shouldSend on the Swift side, where the
-        # match-only variant was found to be a real defect.
+        # not only on a match. A TEXT write produces exactly one change event; if
+        # we observe a different one instead, ours is already gone, and a
+        # lingering hash would silently swallow the user's later deliberate copy
+        # of the same text. Mirrors EchoGuard.shouldSend on the Swift side, where
+        # the match-only variant was found to be a real defect.
+        #
+        # "A text write", not "our write": an IMAGE write arms no one-shot value
+        # at all (_write_clip sets _last_written only for KIND_TEXT -- see its own
+        # comment) precisely because it does NOT produce exactly one change event.
+        # It produces two: our wl-copy handoff raises an Update, and GPaste's
+        # takeover raises a second one seconds later with re-encoded bytes. A
+        # one-shot consumed by the first of those would be spent before the one
+        # that matters, so an image write arms _expect_reoffer instead, and
+        # _consume_image_reoffer decides which of the two it is looking at by
+        # comparing against _last_seen. This block is reached only by a text
+        # observation anyway -- the kind guard above sends every image to that
+        # method instead.
+        #
+        # The pending image re-offer goes with it, and for a stronger reason
+        # than symmetry: a text copy means the user moved on, so the re-offer
+        # will never come, and an expectation left armed would silently
+        # swallow the next image they copy -- days later, with nothing in the
+        # log. Cleared HERE, before the `text == expected` and `last_seen`
+        # early returns below, because those return on observations that are
+        # not changes at all and would otherwise leave it armed forever.
         with self._echo_lock:
             stale = self._write_gen != gen
             if not stale:
                 self._last_written = None
+                self._expect_reoffer = None
 
         if stale:
             # A newer write landed on the main thread while this read was in
@@ -1108,8 +1228,10 @@ class Agent:
         if text == expected:
             return
         # _last_written/expected is a ONE-SHOT value: it is consumed by the
-        # very next observed change, whatever that change is (the block
-        # above), and is otherwise None. Signals here are deliberately
+        # very next observed TEXT change, whatever that change is (the block
+        # above -- an image observation never reaches it), and is otherwise
+        # None, including for the whole life of an image write, which arms
+        # _expect_reoffer instead. Signals here are deliberately
         # unfiltered (a real GPaste Update can be a history deletion, not a
         # clipboard change at all; a polling tick can follow a transient
         # read() timeout that returned None instead of the real content) --
@@ -1165,6 +1287,98 @@ class Agent:
         with self._echo_lock:
             self._last_seen = (KIND_TEXT, sha256)
             self._last_seen_text = text
+
+    def _consume_image_reoffer(self, png, gen):
+        """Recognises the one image observation that is this agent's own
+        write coming back changed, and records what the clipboard actually
+        offers instead of what was handed to the write tool.
+
+        Measured on the live PC, and the reason this method exists: a
+        105,700-byte PNG written here read back identical at t+1s, then as a
+        DIFFERENT 180,287-byte PNG at t+4s and t+7s. GPaste takes over the
+        selection a few seconds after the write and re-encodes the image;
+        the result is stable afterwards, but it is not what was written, and
+        it was 70% larger. The same probe on text returns the written bytes
+        unchanged, which is why no equivalent exists for KIND_TEXT.
+
+        Called only for a non-empty image observation, and returns without
+        touching anything unless ALL THREE hold:
+
+        * a write of ours is still waiting for its re-offer (_expect_reoffer),
+          so an image the USER copied -- nothing expected -- is left alone and
+          keeps whatever outcome the local-image path gives it;
+        * no newer write landed while the read was in flight (`gen`), the same
+          staleness rule the text path applies, and needed for the same
+          reason: the read could predate that write, and consuming the
+          expectation with pre-write bytes would record the wrong hash AND
+          clobber the newer write's own store entry;
+        * the bytes actually DIFFER from _last_seen. Our own wl-copy write
+          raises an Update of its own, seconds before GPaste's takeover
+          raises the second one, so the first image observation after a write
+          is normally the bytes we wrote. Spending the expectation on it --
+          the echo guard's own "consumed by the first change whatever it is"
+          rule, correct there -- would leave the real re-offer to be read as
+          a fresh local clip. An observation that matches _last_seen changed
+          nothing, so there is nothing to consume.
+
+        Nothing is sent: this content is already on the peer, in its original
+        encoding. What changes is what this side REMEMBERS holding, and both
+        halves of that memory must come from the bytes read back -- _last_seen
+        so the re-offer is never mistaken for a new clip, and the store so a
+        later reconnect finds the hash the clipboard will actually report and
+        does not resolve "clipboard changed while apart" on every Mac wake.
+
+        The stored timestamp is the peer's, carried on _expect_reoffer from
+        the write: the re-offer is not a new clip but the applied one
+        re-encoded, and stamping the moment it was observed would make
+        content the Mac sent us look freshly copied here and win the next
+        reconciliation against the machine it came from.
+        """
+        sha256 = sha256_hex(png)
+        # Compared against the LIVE _last_seen under the lock rather than
+        # against _observe_local_change's pre-read snapshot: both values this
+        # decision turns on are written by _write_clip on run()'s thread, so
+        # reading them as late as possible is what makes the staleness check
+        # above meaningful in the first place -- a snapshot would answer for
+        # the moment before the read, which is exactly the moment `gen` exists
+        # to reject.
+        with self._echo_lock:
+            if self._write_gen != gen:
+                return
+            ts = self._expect_reoffer
+            if ts is None or (KIND_IMAGE, sha256) == self._last_seen:
+                # `is None`, never a truth test: a ts of 0.0 is a real
+                # timestamp, and a falsy check would drop the re-offer of a
+                # clip copied at the epoch on the floor.
+                return
+            self._expect_reoffer = None
+            self._last_seen = (KIND_IMAGE, sha256)
+            # _last_seen_text holds bytes only alongside a KIND_TEXT pair --
+            # see its own field comment. This is the first call site that
+            # actually sets _last_seen to a KIND_IMAGE pair from a clipboard
+            # read, so it is also the first that has to honour that.
+            self._last_seen_text = None
+        if len(png) > MAX_IMAGE_BYTES:
+            # The size limit belongs on the read-back body too, because
+            # re-encoding INFLATES: 105 KB became 180 KB on the live machine,
+            # so an image comfortably under the limit going in can exceed it
+            # coming out. Applied as a log line rather than as a refusal to
+            # record. Nothing is sent from here either way, and declining to
+            # record would leave the store holding a hash the clipboard no
+            # longer offers -- reopening the false "clipboard changed while
+            # apart" on every wake, for exactly the images least able to
+            # afford being resent. Logged because an image this side can
+            # never forward on is otherwise a silent skip, and a silent skip
+            # is how a user concludes the tool is broken. Compared against the
+            # bare body, not body + TIMESTAMP_BYTES: MAX_IMAGE_BYTES is the
+            # limit on the image itself, which is the whole point of Task 4
+            # separating it from the frame cap.
+            log("the clipboard re-offered an image of %d bytes: over the image limit"
+                % len(png))
+        try:
+            save_clip_state(sha256, ts, KIND_IMAGE, path=self._clip_state_path)
+        except (OSError, ClipStateError) as error:
+            log("could not persist clip state: %r" % error)
 
     # --- main loop --------------------------------------------------------
 
@@ -1341,18 +1555,19 @@ def load_clip_state(path=None):
         return None
 
 
-# Serializes the whole encode-write-replace below. save_clip_state has three
+# Serializes the whole encode-write-replace below. save_clip_state has four
 # call sites, and they run on up to three threads: Agent._write_clip and
-# announce_clip_state on run()'s thread, Agent._local_change on the watcher
-# threads. All three derive the SAME `target + ".tmp"`, so two concurrent
-# savers truncate one another's temp file and whichever os.replace runs second
-# finds it already consumed -- observed directly as a FileNotFoundError, and in
-# the worse interleaving as a half-written file renamed into place.
+# announce_clip_state on run()'s thread, Agent._observe_local_change and
+# Agent._consume_image_reoffer on the watcher threads. All four derive the SAME
+# `target + ".tmp"`, so two concurrent savers truncate one another's temp file
+# and whichever os.replace runs second finds it already consumed -- observed
+# directly as a FileNotFoundError, and in the worse interleaving as a
+# half-written file renamed into place.
 #
 # That failure is not cosmetic: a temp moved into place mid-write makes
 # load_clip_state return None, so the NEXT connection stamps ts=now on old
 # content and wins a reconciliation it should lose -- a silent clipboard
-# clobber, the exact failure protocol v2 exists to prevent. All three call
+# clobber, the exact failure protocol v2 exists to prevent. All four call
 # sites swallow the exception, so nothing would surface either.
 #
 # Module-level because these are module functions, not a store object: it is

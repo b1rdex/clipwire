@@ -161,18 +161,19 @@ class TestSaveIsAtomic(_TempPathCase):
 
 
 class TestSaveIsSerialized(_TempPathCase):
-    """save_clip_state has three call sites, and since the safety-net poll
+    """save_clip_state has four call sites, and since the safety-net poll
     landed they run on up to three threads: _write_clip and
-    announce_clip_state on run()'s thread, _local_change on the watcher
-    threads. All three write the SAME `target + ".tmp"` and then os.replace
-    it, so two concurrent savers truncate one another's temp file and
-    whichever replace runs second finds it already consumed.
+    announce_clip_state on run()'s thread, _observe_local_change and
+    _consume_image_reoffer on the watcher threads. All four write the SAME
+    `target + ".tmp"` and then os.replace it, so two concurrent savers
+    truncate one another's temp file and whichever replace runs second finds
+    it already consumed.
 
     The consequence is already on record: a half-written temp moved into
     place makes load_clip_state return None, so the next connection stamps
     ts=now on old content and wins a reconciliation it should lose -- a
     silent clipboard clobber, the exact failure protocol v2 exists to
-    prevent. All three call sites swallow the exception, so nothing surfaces
+    prevent. All four call sites swallow the exception, so nothing surfaces
     either.
 
     Mirrors ClipStateStore.save's NSLock on the Swift side, fixed for this in
