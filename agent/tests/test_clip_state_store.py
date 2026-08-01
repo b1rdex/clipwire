@@ -9,12 +9,17 @@ from unittest import mock
 from agent_under_test import (
     KIND_IMAGE,
     KIND_TEXT,
+    MAX_IMAGE_BYTES,
+    MAX_TEXT_BYTES,
+    TIMESTAMP_BYTES,
     TYPE_CLIP_STATE,
+    WAIT_FOR_PEER,
     announce_clip_state,
     clip_state_path,
     decode_clip_state,
     load_clip_state,
     resolve_current_clip_state,
+    resolve_freshness,
     resolve_startup_state,
     save_clip_state,
     sha256_hex,
@@ -414,6 +419,138 @@ class TestResolveCurrentClipState(unittest.TestCase):
             result,
             (hashlib.sha256(b"first time seeing this").hexdigest(), 999, KIND_TEXT),
         )
+
+
+class TestOversizedContentIsNotAnnounced(unittest.TestCase):
+    """The announce path had no size cap on either machine, and the two
+    guards it lacked are the two the SENDERS already apply.
+
+    The failure it produced, traced end to end on the Mac and identical in
+    shape here: the local observation path skips an oversized clip with a
+    log and returns BEFORE persisting anything, so the store keeps its
+    older entry -- but resolve_current_clip_state then hashed the oversized
+    body with no cap at all, resolve_startup_state saw a hash differing
+    from the store and stamped `now`, and announce_clip_state persisted and
+    announced it. That announcement wins reconciliation against anything
+    the peer copied earlier, and the send branch then refuses the very
+    content it just won with. The peer, having correctly resolved
+    waitForPeer, has already suppressed its own push -- so a perfectly
+    sendable clip on the peer never arrives. That is precisely the wake
+    flow protocol v2 exists to serve.
+
+    The remedy is a null hash, which resolve_freshness already handles:
+    "we hold nothing announceable" makes the peer win and deliver.
+
+    The predicates are the senders' own, character for character --
+    `len(text) + TIMESTAMP_BYTES > MAX_TEXT_BYTES` for text and
+    `len(png) > MAX_IMAGE_BYTES` for an image -- so "announceable" and
+    "sendable" cannot diverge. The asymmetry between them is not a slip:
+    MAX_IMAGE_BYTES bounds the IMAGE (an image at exactly the limit is
+    legal and encodes to a payload 8 bytes over it, still far inside the
+    frame cap), while MAX_TEXT_BYTES bounds the encoded text clip.
+    """
+
+    def capture_log(self):
+        original = clipwire_agent.log
+        lines = []
+        clipwire_agent.log = lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original)
+        return lines
+
+    def test_an_oversized_image_resolves_a_null_hash_and_kind(self):
+        lines = self.capture_log()
+        oversized = b"\x89" * (MAX_IMAGE_BYTES + 1)
+
+        result = resolve_current_clip_state(
+            FixedReadClipboard((KIND_IMAGE, oversized)), stored=None, now=999)
+
+        self.assertEqual(result, (None, 999, None),
+                         "content this side can never send must be announced as nothing, "
+                         "not hashed and stamped `now`")
+        self.assertIn(
+            "not announcing an image of %d bytes: over the image limit" % len(oversized),
+            lines,
+            "a silent skip is how a user concludes the tool is broken")
+
+    def test_an_image_at_exactly_the_limit_is_still_announced(self):
+        """The boundary the three separated caps exist to permit. Written
+        as `len(png) + TIMESTAMP_BYTES > MAX_IMAGE_BYTES` this would refuse
+        exactly the maximum-size screenshot the sender accepts, and the two
+        would disagree about one image."""
+        lines = self.capture_log()
+        exact = b"\x89" * MAX_IMAGE_BYTES
+
+        result = resolve_current_clip_state(
+            FixedReadClipboard((KIND_IMAGE, exact)), stored=None, now=999)
+
+        self.assertEqual(result, (sha256_hex(exact), 999, KIND_IMAGE))
+        self.assertEqual(lines, [], "nothing was skipped, so nothing is worth a line")
+
+    def test_oversized_text_resolves_a_null_hash_and_kind(self):
+        """Text at exactly MAX_TEXT_BYTES is already over: it is wrapped in
+        an 8-byte timestamp before it reaches the wire, so the sender's own
+        guard refuses it, and this one must refuse the same byte count."""
+        lines = self.capture_log()
+        oversized = b"x" * MAX_TEXT_BYTES
+
+        result = resolve_current_clip_state(
+            FixedReadClipboard((KIND_TEXT, oversized)), stored=None, now=999)
+
+        self.assertEqual(result, (None, 999, None))
+        self.assertIn(
+            "not announcing a clip of %d bytes: over the text limit" % len(oversized),
+            lines)
+
+    def test_text_at_exactly_the_sendable_boundary_is_still_announced(self):
+        exact = b"x" * (MAX_TEXT_BYTES - TIMESTAMP_BYTES)
+        lines = self.capture_log()
+
+        result = resolve_current_clip_state(
+            FixedReadClipboard((KIND_TEXT, exact)), stored=None, now=999)
+
+        self.assertEqual(result, (sha256_hex(exact), 999, KIND_TEXT))
+        self.assertEqual(lines, [])
+
+    def test_the_peer_wins_instead_of_being_locked_out(self):
+        """The whole point, stated as the decision both sides actually run.
+        Before the guard, `mine` carried a real hash stamped `now` and beat
+        the peer's older-but-sendable clip; the peer then waited for a frame
+        the send branch had already refused to build."""
+        oversized = b"\x89" * (MAX_IMAGE_BYTES + 1)
+        self.capture_log()
+
+        mine = resolve_current_clip_state(
+            FixedReadClipboard((KIND_IMAGE, oversized)), stored=None, now=999999)
+
+        self.assertEqual(resolve_freshness(mine[:2], (HASH_A, 100)), WAIT_FOR_PEER,
+                         "a clip we cannot send must never win against one the peer can")
+
+    def test_an_oversized_clipboard_overwrites_the_store_with_nothing(self):
+        """announce_clip_state persists whatever it resolved, and that must
+        be the null state here rather than the older entry left behind by
+        the observation path's own skip. A store still describing content
+        the clipboard no longer offers is the "store goes stale" disease
+        this whole design exists to close: the next connection would find
+        it, see a hash the clipboard does not hold, and stamp `now` on it.
+
+        And the reconciliation line stays silent, because a null hash never
+        reaches a timestamp comparison -- there is no judgement to report.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "clip-state.json")
+        save_clip_state(HASH_B, 111, KIND_TEXT, path=path)
+        lines = self.capture_log()
+        sent = []
+
+        announce_clip_state(
+            lambda t, p: sent.append((t, p)),
+            FixedReadClipboard((KIND_IMAGE, b"\x89" * (MAX_IMAGE_BYTES + 1))),
+            now=999999, path=path)
+
+        self.assertEqual(load_clip_state(path=path), (None, 999999, None))
+        self.assertEqual(decode_clip_state(sent[0][1]), (None, 999999, None))
+        self.assertNotIn("clipboard changed while apart", lines)
 
 
 class TestAnnounceClipState(unittest.TestCase):

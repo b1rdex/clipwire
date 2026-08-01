@@ -183,12 +183,16 @@ final class SystemPasteboard: PasteboardReading, PasteboardWriting {
     /// A failed conversion is `nil` — never the unconverted TIFF, never a
     /// placeholder, both of which would put bytes on the wire that claim to
     /// be PNG and are not. It is logged here rather than by the caller (as
-    /// the task brief specified) because `read()` returns a bare optional:
-    /// at every call site, `nil` from a failed conversion is
+    /// the task brief specified), and the reason is about information, not
+    /// about who happens to hold a `Log`: `read()` returns a bare optional,
+    /// so at every call site `nil` from a failed conversion is
     /// indistinguishable from `nil` for an empty pasteboard — the ordinary,
-    /// uneventful case that must stay silent — and `resolveCurrentClipState`,
-    /// one of those call sites, has no logger at all. Logging where the
-    /// distinction still exists is the only place it can be made.
+    /// uneventful case that must stay silent. This is the last frame where
+    /// the two are still distinguishable, so it is the only place the
+    /// distinction can be reported. (`resolveCurrentClipState` does now take
+    /// a `Log?`, for the announce path's own size guard — it still receives
+    /// the same bare `nil` and still cannot tell the two apart, so that
+    /// changes nothing here.)
     private func readPNG() -> Data? {
         if let png = board.data(forType: .png), !png.isEmpty { return png }
         guard let tiff = board.data(forType: .tiff), !tiff.isEmpty else { return nil }

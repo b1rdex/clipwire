@@ -325,15 +325,63 @@ func sha256Hex(_ data: Data) -> String {
 /// `resolveStartupState` goes through here rather than reading the pasteboard and
 /// deciding a kind independently, which is what keeps a hash and a kind from ever
 /// being paired up wrong. Mirrors `resolve_current_clip_state` on the PC side.
-func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double) -> ClipState {
-    let currentHash: String?
-    let currentKind: ClipKind?
+///
+/// Content over its kind's limit resolves a NIL hash, with a log line -- the
+/// third pasteboard state, alongside "empty" and "unreadable", that has no
+/// announceable hash. Without it the announce path was the one path here with
+/// no size guard at all, and the omission was not merely untidy:
+/// `PasteboardWatcher.pollLocked` skips an oversized body and returns BEFORE
+/// `persistClipState`, so the store keeps its older entry, this function
+/// hashed the oversized body anyway, `resolveStartupState` saw a hash
+/// differing from the store and stamped `now`, and `announceClipState`
+/// persisted and announced it. That announcement beats anything the peer
+/// copied earlier -- and then `.sendMine` refuses to send it, correctly, at
+/// its own size guard. The peer has by then resolved `waitForPeer` and
+/// suppressed its own push, so its perfectly sendable clip never arrives: the
+/// wake flow protocol v2 exists to serve, broken by content that cannot
+/// travel. A nil hash makes the peer win and deliver, which is the outcome
+/// `resolveFreshness` already gives it for free.
+///
+/// The two predicates are the SENDERS' own, character for character
+/// (`PasteboardWatcher.pollLocked`'s and `.sendMine`'s), so "announceable"
+/// and "sendable" cannot drift apart. That includes their asymmetry:
+/// `maxImageBytes` bounds the IMAGE, so an image at exactly the limit is
+/// legal here and at every send site, while `maxTextBytes` bounds the encoded
+/// text clip and so must leave room for its 8-byte timestamp.
+///
+/// The verdict clauses (`over the image limit` / `over the text limit`) are
+/// the ones every other size-limit site already reports, byte for byte; the
+/// sentences differ because the EVENT differs -- nothing is being skipped on
+/// its way to the wire here, there is simply nothing to announce.
+///
+/// `log` is non-optional in the sense that matters: it has no default, so
+/// every call site has to decide, the same discipline `resolveStartupState`
+/// applies to `currentKind`. `nil` is legal and is what tests that assert
+/// only on the resolved state pass; both production callers pass the real
+/// one.
+func resolveCurrentClipState(pasteboard: PasteboardReading, stored: ClipState?, now: Double,
+                             log: Log?) -> ClipState {
+    var currentHash: String? = nil
+    var currentKind: ClipKind? = nil
     if let read = pasteboard.read(), !read.data.isEmpty {
-        currentHash = sha256Hex(read.data)
-        currentKind = read.kind
-    } else {
-        currentHash = nil
-        currentKind = nil
+        let size = read.data.count
+        let oversized: Bool
+        switch read.kind {
+        case .text:
+            oversized = size + ClipPayloadConstants.timestampBytes > FrameConstants.maxTextBytes
+            if oversized {
+                log?.line("not announcing a clip of \(size) bytes: over the text limit")
+            }
+        case .image:
+            oversized = size > FrameConstants.maxImageBytes
+            if oversized {
+                log?.line("not announcing an image of \(size) bytes: over the image limit")
+            }
+        }
+        if !oversized {
+            currentHash = sha256Hex(read.data)
+            currentKind = read.kind
+        }
     }
     return resolveStartupState(currentHash: currentHash, currentKind: currentKind,
                                stored: stored, now: now)
@@ -439,7 +487,7 @@ func announceClipState(
     now: Double
 ) -> ClipState? {
     let stored = clipStateStore.load()
-    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now)
+    let resolved = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: now, log: log)
     // The line the design spec mandates by name for exactly this branch --
     // startup reconciliation finding that the content no longer matches what
     // was last recorded, so only `now` is honest about its age. Two things
@@ -739,7 +787,7 @@ func handleFrame(
         // already sent to the peer by the watcher's own path.
         let mine = clipStateStore.load()
             ?? clipStateAnnouncement.announced
-            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now)
+            ?? resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: now, log: log)
         let decision = resolveFreshness(mine: mine, peer: peerState)
         // Every reconciliation outcome is reported, not only the interesting
         // ones. Acceptance item 2 requires the conflict to appear in the log,

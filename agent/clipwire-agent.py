@@ -1894,14 +1894,53 @@ def resolve_current_clip_state(clipboard, stored, now):
     resolve_startup_state goes through here rather than reading the
     clipboard and computing a kind independently, which is what keeps a
     hash and a kind from ever being paired up wrong.
+
+    Content over its kind's limit resolves a NULL hash, with a log line --
+    the third clipboard state, alongside "empty" and "unreadable", that has
+    no announceable hash. Without it the announce path was the one path in
+    the file with no size guard at all, and the omission was not merely
+    untidy: _observe_local_change skips an oversized clip and returns
+    BEFORE persisting anything, so the store keeps its older entry, this
+    function hashed the oversized body anyway, resolve_startup_state saw a
+    hash differing from the store and stamped `now`, and announce_clip_state
+    persisted and announced it. That announcement beats anything the peer
+    copied earlier -- and then _resolve_clip_state's SEND_MINE branch
+    refuses to send it, correctly, at its own size guard. The peer has by
+    then resolved WAIT_FOR_PEER and suppressed its own push, so its
+    perfectly sendable clip never arrives: the wake flow v2 exists to serve,
+    broken by content that cannot travel. A null hash makes the peer win and
+    deliver, which is the outcome resolve_freshness already gives it for
+    free.
+
+    The two predicates are the SENDERS' own, character for character --
+    _observe_local_change's and _resolve_clip_state's -- so "announceable"
+    and "sendable" cannot drift apart. That includes their asymmetry:
+    MAX_IMAGE_BYTES bounds the IMAGE, so an image at exactly the limit is
+    legal here and at every send site, while MAX_TEXT_BYTES bounds the
+    encoded text clip and so must leave room for its 8-byte timestamp.
+
+    The verdict clauses (`over the image limit` / `over the text limit`) are
+    the ones every other size-limit site already reports, byte for byte; the
+    sentences differ because the EVENT differs -- nothing is being skipped
+    on its way to the wire here, there is simply nothing to announce. The
+    same reason _consume_image_reoffer words its own line differently while
+    sharing the clause. Mirrored on the Mac side in
+    Sources/clipwire/main.swift's resolveCurrentClipState, which is why that
+    one had to grow a `log` parameter.
     """
     read = clipboard.read()
     if read is None:
-        current_hash, current_kind = None, None
-    else:
-        current_kind, data = read
-        current_hash = sha256_hex(data) if data else None
-    return resolve_startup_state(current_hash, current_kind, stored, now)
+        return resolve_startup_state(None, None, stored, now)
+    current_kind, data = read
+    if not data:
+        return resolve_startup_state(None, None, stored, now)
+    if current_kind == KIND_IMAGE and len(data) > MAX_IMAGE_BYTES:
+        log("not announcing an image of %d bytes: over the image limit" % len(data))
+        return resolve_startup_state(None, None, stored, now)
+    if current_kind == KIND_TEXT and len(data) + TIMESTAMP_BYTES > MAX_TEXT_BYTES:
+        log("not announcing a clip of %d bytes: over the text limit" % len(data))
+        return resolve_startup_state(None, None, stored, now)
+    return resolve_startup_state(sha256_hex(data), current_kind, stored, now)
 
 
 def announce_clip_state(send, clipboard, now=None, path=None):

@@ -275,7 +275,7 @@ final class ClipStateStoreTests: XCTestCase {
         pasteboard.setImage(png)
         let stored = ClipState(sha256: String(repeating: "ab", count: 32), ts: 100, kind: .text)
 
-        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: 999)
+        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: stored, now: 999, log: nil)
 
         XCTAssertEqual(result, ClipState(sha256: sha256Hex(png), ts: 999, kind: .image),
                        "the hash and the kind must both come from the one read that produced them")
@@ -287,7 +287,7 @@ final class ClipStateStoreTests: XCTestCase {
         let pasteboard = FakePasteboard()
         pasteboard.set("hello")
 
-        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999)
+        let result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: nil)
 
         XCTAssertEqual(result, ClipState(sha256: sha256Hex(Data("hello".utf8)), ts: 999, kind: .text))
     }
@@ -296,9 +296,153 @@ final class ClipStateStoreTests: XCTestCase {
     /// matching the wire contract that `sha256` is null for exactly this
     /// clipboard state.
     func testResolveCurrentClipStateReportsNothingForAnEmptyPasteboard() {
-        let result = resolveCurrentClipState(pasteboard: FakePasteboard(), stored: nil, now: 999)
+        let result = resolveCurrentClipState(pasteboard: FakePasteboard(), stored: nil, now: 999, log: nil)
         XCTAssertNil(result.sha256)
         XCTAssertNil(result.kind)
+    }
+
+    // MARK: - The announce path's own size guard
+
+    /// The announce path had no size cap on either machine, and the guards
+    /// it lacked are the two the SENDERS already apply.
+    ///
+    /// Traced end to end: `PasteboardWatcher.pollLocked` skips an oversized
+    /// body with a log and returns BEFORE `persistClipState`, so the store
+    /// keeps its older entry -- but `resolveCurrentClipState` hashed the
+    /// oversized body with no cap, `resolveStartupState` saw a hash
+    /// differing from the store and stamped `now`, and `announceClipState`
+    /// persisted and announced it. That announcement wins reconciliation
+    /// against anything the peer copied earlier, and then `.sendMine`
+    /// refuses the very content it won with, at its own size guard. The peer
+    /// has by that point resolved `waitForPeer` and suppressed its own push,
+    /// so its perfectly sendable clip never arrives -- the wake flow
+    /// protocol v2 exists to serve, broken by content that cannot travel.
+    ///
+    /// A nil hash is the remedy `resolveFreshness` already understands: the
+    /// peer wins and delivers. The PC agent's `resolve_current_clip_state`
+    /// carries the identical guard and the byte-identical lines.
+    private func loggedLines(_ body: (Log) -> Void) -> [String] {
+        let path = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipwire-announce-limit-\(UUID().uuidString)")
+            .appendingPathComponent("test.log").path
+        let log = Log(path: path)
+        body(log)
+        log.flush()
+        let contents = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        return contents.split(separator: "\n").map {
+            String($0.drop(while: { $0 != " " }).dropFirst())
+        }
+    }
+
+    func testAnOversizedImageResolvesANilHashAndKind() {
+        let oversized = Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1)
+        let pasteboard = FakePasteboard()
+        pasteboard.setImage(oversized)
+        var result: ClipState?
+
+        let lines = loggedLines { log in
+            result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
+        }
+
+        XCTAssertEqual(result, ClipState(sha256: nil, ts: 999, kind: nil),
+                       "content this side can never send must be announced as nothing, "
+                       + "not hashed and stamped `now`")
+        XCTAssertEqual(lines, ["not announcing an image of \(oversized.count) bytes: over the image limit"],
+                       "a silent skip is how a user concludes the tool is broken")
+    }
+
+    /// The boundary the three separated caps exist to permit. Written in the
+    /// text guard's shape this would refuse exactly the maximum-size
+    /// screenshot every send site accepts, and the two would disagree about
+    /// one image.
+    func testAnImageAtExactlyTheLimitIsStillAnnounced() {
+        let exact = Data(repeating: 0x89, count: FrameConstants.maxImageBytes)
+        let pasteboard = FakePasteboard()
+        pasteboard.setImage(exact)
+        var result: ClipState?
+
+        let lines = loggedLines { log in
+            result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
+        }
+
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(exact), ts: 999, kind: .image))
+        XCTAssertEqual(lines, [], "nothing was skipped, so nothing is worth a line")
+    }
+
+    /// Text at exactly `maxTextBytes` is already over: it is wrapped in an
+    /// 8-byte timestamp before it reaches the wire, so the senders refuse it
+    /// and this guard must refuse the same byte count.
+    func testOversizedTextResolvesANilHashAndKind() {
+        let pasteboard = FakePasteboard()
+        pasteboard.set(String(repeating: "x", count: FrameConstants.maxTextBytes))
+        var result: ClipState?
+
+        let lines = loggedLines { log in
+            result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
+        }
+
+        XCTAssertEqual(result, ClipState(sha256: nil, ts: 999, kind: nil))
+        XCTAssertEqual(lines,
+                       ["not announcing a clip of \(FrameConstants.maxTextBytes) bytes: over the text limit"])
+    }
+
+    func testTextAtExactlyTheSendableBoundaryIsStillAnnounced() {
+        let exact = String(repeating: "x",
+                           count: FrameConstants.maxTextBytes - ClipPayloadConstants.timestampBytes)
+        let pasteboard = FakePasteboard()
+        pasteboard.set(exact)
+        var result: ClipState?
+
+        let lines = loggedLines { log in
+            result = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999, log: log)
+        }
+
+        XCTAssertEqual(result, ClipState(sha256: sha256Hex(Data(exact.utf8)), ts: 999, kind: .text))
+        XCTAssertEqual(lines, [])
+    }
+
+    /// The whole point, stated as the decision both sides actually run.
+    /// Before the guard, `mine` carried a real hash stamped `now` and beat
+    /// the peer's older-but-sendable clip; the peer then waited for a frame
+    /// `.sendMine` had already refused to build.
+    func testThePeerWinsInsteadOfBeingLockedOut() {
+        let pasteboard = FakePasteboard()
+        pasteboard.setImage(Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1))
+        var mine = ClipState(sha256: nil, ts: 0, kind: nil)
+
+        _ = loggedLines { log in
+            mine = resolveCurrentClipState(pasteboard: pasteboard, stored: nil, now: 999_999, log: log)
+        }
+
+        let peer = ClipState(sha256: String(repeating: "aa", count: 32), ts: 100, kind: .text)
+        XCTAssertEqual(resolveFreshness(mine: mine, peer: peer), .waitForPeer,
+                       "a clip we cannot send must never win against one the peer can")
+    }
+
+    /// `announceClipState` persists whatever it resolved, and that must be
+    /// the nil state here rather than the older entry `pollLocked`'s own
+    /// skip left behind. A store still describing content the pasteboard no
+    /// longer offers is the "store goes stale" disease this whole design
+    /// closes: the next connection finds it, sees a hash the pasteboard does
+    /// not hold, and stamps `now` on it.
+    ///
+    /// The reconciliation line stays silent, because a nil hash never
+    /// reaches a timestamp comparison -- there is no judgement to report.
+    func testAnOversizedPasteboardOverwritesTheStoreWithNothing() throws {
+        try store.save(ClipState(sha256: String(repeating: "bb", count: 32), ts: 111, kind: .text))
+        let pasteboard = FakePasteboard()
+        pasteboard.setImage(Data(repeating: 0x89, count: FrameConstants.maxImageBytes + 1))
+        var sent: [Frame] = []
+
+        let lines = loggedLines { log in
+            announceClipState(send: { sent.append($0) }, pasteboard: pasteboard,
+                              clipStateStore: store, log: log, now: 999_999)
+        }
+
+        XCTAssertEqual(store.load(), ClipState(sha256: nil, ts: 999_999, kind: nil))
+        XCTAssertEqual(try ClipState.decodePayload(XCTUnwrap(sent.first).payload),
+                       ClipState(sha256: nil, ts: 999_999, kind: nil))
+        XCTAssertFalse(lines.contains("clipboard changed while apart"))
     }
 
     // MARK: - Task 6: a v2 store on disk must be rejected, not loaded as kindless
