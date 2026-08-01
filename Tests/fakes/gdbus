@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""A fake gdbus: the event source the harness would otherwise not have.
+
+Without it the agent's GPasteWatcher.available() -- which runs `gdbus
+introspect` and returns False on OSError, exactly what a Mac gives, having no
+gdbus at all -- is false, make_watcher() picks the plain poller, and every
+harness run passes while exercising the polling branch only. The pump, the
+worker and the safety net, where v3's two production defects actually lived,
+would never run. That is the blindness this file exists to remove, and it
+would have arrived as a green suite.
+
+So three things, and the harness silently tests nothing without any one of
+them:
+
+1. IT ANSWERS `introspect`, NOT ONLY `monitor`. See above.
+
+2. IT EMITS ON ANY CHANGE OF THE SHARED STATE, not only on the agent's own
+   writes. An `Update` per agent write would cover only the echo direction; a
+   person copying on the PC -- the direct PC->Mac flow -- has no such write
+   and would not exist in the harness at all. This watches the state file
+   itself, so whoever changed it, the agent hears about it.
+
+3. IT FLUSHES EVERY LINE. Block-buffered output would hold a 60-byte signal
+   in a userspace buffer indefinitely, the pump would never see it, and the
+   safety net would announce a dead event source -- from buffering, with no
+   defect anywhere.
+
+    gdbus introspect --session --dest <name> --object-path <path>
+    gdbus monitor    --session --dest <name> --object-path <path>
+
+Both are answered only for org.gnome.GPaste at /org/gnome/GPaste. Introspect
+on any other bus name exits 1, which is what a real gdbus does for a name
+with no owner -- and the agent has already shipped that exact mistake once,
+probing org.gnome.GPaste2 (the INTERFACE) and leaving the watcher on the
+polling fallback forever. A fake that answered anything would have hidden it.
+"""
+import hashlib
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fake_clipboard as fake                                   # noqa: E402
+
+PROGRAM = "gdbus"
+
+BUS_NAME = "org.gnome.GPaste"
+OBJECT_PATH = "/org/gnome/GPaste"
+
+# Byte-exact to production, taken from the real logs and checked against
+# parse_gpaste_line(), which accepts a line iff it contains "Update" and the
+# object path. The signal is Update(s action, s target, t index); the target
+# is 'ALL', not 'CLIPBOARD'.
+UPDATE_LINE = "%s: org.gnome.GPaste2.Update ('REPLACE', 'ALL', uint64 0)" % OBJECT_PATH
+
+# How often the state file is re-read. Small enough that the harness does not
+# wait on it, large enough not to spin: the whole file is a few hundred bytes.
+POLL_SECONDS = 0.05
+
+INTROSPECTION = """node %s {
+  interface org.gnome.GPaste2 {
+    signals:
+      Update(s action, s target, t index);
+  };
+};
+""" % OBJECT_PATH
+
+
+def parse(argv):
+    if not argv:
+        fake.die(PROGRAM, "no subcommand")
+    command, options = argv[0], argv[1:]
+    dest = object_path = None
+    index = 0
+    while index < len(options):
+        argument = options[index]
+        if argument == "--session":
+            pass
+        elif argument in ("--dest", "--object-path"):
+            index += 1
+            if index >= len(options):
+                fake.die(PROGRAM, "%s wants a value" % argument)
+            if argument == "--dest":
+                dest = options[index]
+            else:
+                object_path = options[index]
+        else:
+            # Loud rather than ignored: an unmodelled flag means the agent is
+            # asking for something this fake does not represent.
+            fake.die(PROGRAM, "unmodelled argument %r" % argument)
+        index += 1
+    return command, dest, object_path
+
+
+def digest(path):
+    """A change token for the whole state file, not just its `generation`
+    field, so a harness that rewrites the file without touching that field
+    still produces an Update. Equality is the only operation."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).digest()
+    except FileNotFoundError:
+        return b""
+
+
+def say(line):
+    """One line, flushed. See point 3 in the module docstring -- this is the
+    single reason this function exists rather than a bare print()."""
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The agent terminated us, or its pump closed. Leave without letting
+        # the interpreter try to flush the same dead pipe again on the way
+        # out.
+        fake.note(PROGRAM, "monitor stdout closed, leaving")
+        os._exit(0)
+
+
+def monitor(path, silent=False):
+    parent = os.getppid()
+    fake.note(PROGRAM, "monitor started, watching %s%s"
+              % (path, " (silent, wrong name)" if silent else ""))
+    if not silent:
+        # A real gdbus announces itself before any signal. Deliberately kept:
+        # it is a line the pump must ignore, and parse_gpaste_line does ignore
+        # it (no "Update" in it), so the harness carries proof of that rather
+        # than an assumption.
+        say("Monitoring signals on object %s owned by %s" % (OBJECT_PATH, BUS_NAME))
+    # The state as it stands is not a change. Emitting one here would put a
+    # spurious Update at the head of every connection, before the agent has
+    # even seeded what it is holding.
+    seen = digest(path)
+    while True:
+        time.sleep(POLL_SECONDS)
+        # The Mac has no PR_SET_PDEATHSIG, so _pdeathsig_preexec is a no-op
+        # here and nothing else reaps this child: the agent's run() returns on
+        # stdin EOF without calling clipboard_lost(), so stop() -- the only
+        # thing that terminates the real gdbus -- never runs on the normal
+        # exit path. Without this check every harness run would leave a
+        # process behind.
+        if os.getppid() != parent:
+            fake.note(PROGRAM, "monitor parent went away, leaving")
+            return 0
+        current = digest(path)
+        if current != seen:
+            seen = current
+            if not silent:
+                say(UPDATE_LINE)
+
+
+def main(argv):
+    command, dest, object_path = parse(argv)
+    path = fake.state_path(PROGRAM)
+    if command == "introspect":
+        if dest != BUS_NAME or object_path != OBJECT_PATH:
+            print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
+                  "The name %s was not provided by any .service files" % dest,
+                  file=sys.stderr, flush=True)
+            fake.note(PROGRAM, "introspect %s %s -> exit 1, not this fake's name"
+                      % (dest, object_path))
+            return 1
+        sys.stdout.write(INTROSPECTION)
+        sys.stdout.flush()
+        fake.note(PROGRAM, "introspect -> available")
+        return 0
+    if command == "monitor":
+        # A real monitor on a name nobody owns runs happily and never reports
+        # anything, so this one does too -- but it says so in the log, because
+        # a silent monitor is otherwise indistinguishable from a clipboard
+        # nobody touched.
+        return monitor(path, silent=(dest != BUS_NAME or object_path != OBJECT_PATH))
+    fake.die(PROGRAM, "unmodelled subcommand %r" % command)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

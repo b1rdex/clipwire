@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""A fake wl-paste. See fake_clipboard.py for the shared state file.
+
+The three invocations the agent actually makes, all of them through
+WaylandClipboard._run_wl_paste:
+
+    wl-paste --list-types                            _list_kind
+    wl-paste -n --type text/plain;charset=utf-8      _read_body, text
+    wl-paste --type image/png                        _read_body, image
+
+`-n` is a modifier, not a mode: the agent passes it only alongside the text
+type, and leaves it off for the image because wl-paste applies --no-newline
+automatically to any non-text MIME type. Bare `wl-paste -n`, with no --type,
+serves the first offered type -- the real tool's preferred-type behaviour,
+kept because refusing a real invocation would be this fake inventing a rule.
+
+Exits 1 -- "there is nothing to paste" -- for an empty selection and for a
+type that is not offered. The agent reads any non-zero exit as an empty or
+unreadable selection, which is a normal state and not an error. A broken
+harness exits 2 instead, precisely so that it cannot be mistaken for one of
+those normal states.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fake_clipboard as fake                                   # noqa: E402
+
+PROGRAM = "wl-paste"
+
+
+def parse(argv):
+    mime, list_types, newline = None, False, True
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in ("--list-types", "-l"):
+            list_types = True
+        elif argument in ("--no-newline", "-n"):
+            newline = False
+        elif argument.startswith("--type="):
+            mime = argument.split("=", 1)[1]
+        elif argument in ("--type", "-t"):
+            index += 1
+            if index >= len(argv):
+                fake.die(PROGRAM, "--type wants a MIME type")
+            mime = argv[index]
+        else:
+            # Loud rather than ignored -- see wl-copy's parse() for why.
+            fake.die(PROGRAM, "unmodelled argument %r" % argument)
+        index += 1
+    # `mime is None` is not an error: without --type the real wl-paste serves
+    # the selection's preferred type, which is the first one offered. The
+    # agent always names a type, so this is fidelity rather than a path the
+    # harness exercises -- but `wl-paste -n` is a real invocation and
+    # refusing it would be this fake inventing a rule.
+    return mime, list_types, newline
+
+
+def refuse(message, arguments):
+    """Exit 1 the way the real tool does for an empty or unsuitable
+    selection. The wording is not load-bearing; the agent only ever looks at
+    the exit code."""
+    print(message, file=sys.stderr, flush=True)
+    fake.note(PROGRAM, "%s -> exit 1, %s" % (" ".join(arguments), message))
+    return 1
+
+
+def main(argv):
+    mime, list_types, newline = parse(argv)
+    state = fake.load(fake.state_path(PROGRAM))
+    types = state.get("types") or []
+    if not types:
+        return refuse("No selection", argv)
+
+    if list_types:
+        sys.stdout.write("".join(offered + "\n" for offered in types))
+        sys.stdout.flush()
+        fake.note(PROGRAM, "--list-types -> %s" % " ".join(types))
+        return 0
+
+    if mime is None:
+        mime = types[0]
+    elif mime not in types:
+        return refuse("No suitable type of content copied", argv)
+    body = fake.body_bytes(state)
+    # The real wl-paste completes a text paste with a newline unless told not
+    # to. The agent always tells it not to, so this branch is fidelity rather
+    # than something the harness exercises -- but a fake that silently ignored
+    # -n would be a fake that lied about the one flag the agent bothers to
+    # pass.
+    if newline and fake.is_text_type(mime) and body and not body.endswith(b"\n"):
+        body += b"\n"
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+    fake.note(PROGRAM, "%s -> %d bytes" % (" ".join(argv), len(body)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
