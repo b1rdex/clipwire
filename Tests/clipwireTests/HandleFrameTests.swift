@@ -508,4 +508,38 @@ final class HandleFrameTests: XCTestCase {
 
     // MARK: - Final wave: reconcile against what we announced, not a re-derivation
 
+    /// The image twin of `testIncomingClipArmsSuppressionBeforeWritingToThePasteboard`.
+    /// `PasteboardWatcher` now EMITS images, so this ordering is load-bearing
+    /// for images for the first time: a write observed before its suppression
+    /// exists is echoed straight back to the peer it came from.
+    ///
+    /// Also pins WHICH bytes are armed -- the PNG alone, not `frame.payload`,
+    /// which carries the 8-byte timestamp prefix. The watcher hashes what
+    /// `pasteboard.read()` returns, which is the PNG; arming with the prefixed
+    /// payload would make `EchoGuard`'s digest never match and every applied
+    /// image bounce back.
+    func testAnIncomingImageClipArmsSuppressionBeforeWritingToThePasteboard() throws {
+        let png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x07])
+        var order: [String] = []
+        var armed: [(kind: ClipKind, data: Data)] = []
+        let pasteboard = RecordingPasteboard()
+        pasteboard.onWrite = { order.append("write") }
+
+        handleFrame(Frame(type: .imageClip, payload: try ImagePayload.encode(ts: 1000, png: png)),
+                    send: { _ in },
+                    noteWrittenLocally: { kind, data in
+                        order.append("arm")
+                        armed.append((kind, data))
+                    },
+                    pasteboard: pasteboard, status: AgentStatus(pid: 1, url: tempStatusURL()),
+                    log: tempLog(), clipStateStore: tempClipStateStore(),
+                    clipStateAnnouncement: ClipStateAnnouncement(), now: 2000)
+
+        XCTAssertEqual(order, ["arm", "write"],
+                       "suppression must be armed BEFORE the write becomes observable")
+        XCTAssertEqual(armed.map(\.kind), [.image],
+                       "armed under the kind the watcher will observe, or the digests never meet")
+        XCTAssertEqual(armed.first?.data, png,
+                       "the PNG alone -- the timestamp-prefixed payload would never match a read")
+    }
 }
