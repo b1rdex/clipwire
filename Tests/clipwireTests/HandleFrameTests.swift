@@ -66,18 +66,18 @@ final class HandleFrameTests: XCTestCase {
         }
     }
 
-    private func tempStatusURL() -> URL {
+    func tempStatusURL() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString).json")
     }
 
-    private func tempLogPath() -> String {
+    func tempLogPath() -> String {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString)")
             .appendingPathComponent("test.log").path
     }
 
-    private func tempLog() -> Log {
+    func tempLog() -> Log {
         Log(path: tempLogPath())
     }
 
@@ -85,7 +85,7 @@ final class HandleFrameTests: XCTestCase {
     /// (one token, then a single space) stripped, so a test can assert the
     /// exact message `handleFrame` asked for. Call `log.flush()` first --
     /// `line(_:)` only enqueues the write; `LogTests` pins that contract.
-    private func loggedMessages(at path: String) -> [String] {
+    func loggedMessages(at path: String) -> [String] {
         let contents = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
         return contents.split(separator: "\n").map {
             String($0.drop(while: { $0 != " " }).dropFirst())
@@ -100,14 +100,14 @@ final class HandleFrameTests: XCTestCase {
     /// which would make every "no send expected" assertion below pass without
     /// resolveFreshness ever running. `hashA` sorts below `hashB`, which the
     /// hash tie-break depends on.
-    private static let hashA = String(repeating: "aa", count: 32)
-    private static let hashB = String(repeating: "bb", count: 32)
+    static let hashA = String(repeating: "aa", count: 32)
+    static let hashB = String(repeating: "bb", count: 32)
 
     /// A real, temp-path-backed store -- not a live production state
     /// directory -- mirroring `tempStatusURL()`/`tempLog()`'s existing
     /// pattern of injecting real-but-disposable dependencies rather than
     /// mocking file I/O.
-    private func tempClipStateStore() -> ClipStateStore {
+    func tempClipStateStore() -> ClipStateStore {
         ClipStateStore(path: FileManager.default.temporaryDirectory
             .appendingPathComponent("clipwire-handleframe-test-\(UUID().uuidString).json").path)
     }

@@ -537,7 +537,7 @@ final class PairingHarnessTests: XCTestCase {
 /// genuinely shared across threads. `HarnessPasteboard` below carries the
 /// lock that makes that safe; everything else here is either immutable after
 /// `start()` or guarded by `framesLock`.
-private final class PairingHarness {
+final class PairingHarness {
     /// Which `gdbus` goes on `PATH`.
     enum EventSource {
         /// `Tests/fakes/gdbus`: answers `introspect` and `monitor`, so the
@@ -1485,7 +1485,7 @@ private func exportEnvironment(_ name: String, _ value: String,
 /// guard. Reusing it here would have made the harness's own reads a data race
 /// and its failures intermittent, which is the last thing a harness whose job
 /// is evidence can afford.
-private final class HarnessPasteboard: PasteboardReading, PasteboardWriting {
+final class HarnessPasteboard: PasteboardReading, PasteboardWriting {
     private let lock = NSLock()
     private var text: Data?
     private var image: Data?
