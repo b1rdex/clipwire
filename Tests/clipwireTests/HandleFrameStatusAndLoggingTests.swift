@@ -8,6 +8,8 @@ import XCTest
 
 extension HandleFrameTests {
 
+    // MARK: - Task 13: the local-change path, with a send spy
+
     /// The save is best-effort and the send must not depend on it: a local
     /// disk failure is not the peer's fault, and gating the send behind it
     /// would silently disable Mac-to-PC sync for as long as the state
@@ -25,6 +27,7 @@ extension HandleFrameTests {
         XCTAssertEqual(sent.count, 1, "a disk failure must not stop the frame")
         XCTAssertEqual(persistFailures(at: path).count, 1, "and must not be silent either")
     }
+
     // MARK: - Final wave: reconcile against what we announced, not a re-derivation
 
     /// The `.clipState` case re-derived `mine` from the live pasteboard

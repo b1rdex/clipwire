@@ -187,8 +187,8 @@ class SignallingClipboard:
     the pump has delivered it, only then returning the changed value. So "the
     signal for this very change has already been delivered" is a fact by the
     time the safety net compares, not a timing hope -- the same
-    deterministic-side-effect-inside-read() trick RacyClipboard uses further
-    down this file, instead of racing two real threads and hoping.
+    deterministic-side-effect-inside-read() trick RacyClipboard uses,
+    instead of racing two real threads and hoping.
 
     Deliberately waits on the CALLBACK having run rather than on the watcher's
     private signal counter, so the test is evidence about observable behaviour

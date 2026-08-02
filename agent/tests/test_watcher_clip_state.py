@@ -51,7 +51,7 @@ from test_watcher import (
 class TestIncomingClipState(unittest.TestCase):
     """Agent._on_clip_state: resolves an incoming TYPE_CLIP_STATE frame
     against what we hold, per resolve_freshness, and sends only when we
-    win. Mirrors HandleFrameTests.swift's "Contract 5" section
+    win. Mirrors the Swift suite's "Contract 5" section
     (resolving a peer's clip-state announcement).
 
     Fix round 1, Finding 1: _on_clip_state only resolves a peer's
@@ -813,7 +813,7 @@ class TestIncomingClipState(unittest.TestCase):
         """'why did a picture overwrite my text' must have an answer in the
         log. The decision word alone cannot say it -- see this class's other
         reconciliation tests, which never once ask what kind either side
-        held. Mirrors HandleFrameTests.swift's
+        held. Mirrors Swift's
         testTheReconciliationLineNamesBothKinds.
 
         FOUR elements in each hand-built record since v3.2, when this method
