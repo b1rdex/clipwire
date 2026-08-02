@@ -58,6 +58,7 @@ list:
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -105,7 +106,13 @@ def worktree_at(root, rev):
     r = run(["git", "worktree", "add", "--detach", d, rev],
             cwd=root, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
-        os.rmdir(d)
+        # rmtree, not rmdir: a failed `git worktree add` can still have
+        # partially populated `d` (e.g. it fails partway through checkout),
+        # and rmdir raises on a non-empty directory -- an uncaught OSError
+        # here would be exactly the bare traceback fail()'s own docstring
+        # promises never to emit. ignore_errors=True because this is already
+        # the failure path; a cleanup problem must not mask the real one.
+        shutil.rmtree(d, ignore_errors=True)
         fail("could not create a worktree at %s -- %s" % (rev, r.stderr.strip()))
     return d
 
@@ -337,8 +344,11 @@ def cmd_compare(argv):
               (swift_stats["failures"], swift_stats["skipped"]))
 
     if ok:
-        print("OK  %d swift + %d python pairs match %s; both suites green, nothing skipped" %
-              (len(current_swift), len(current_python), rev))
+        print("OK  %d swift + %d python pairs match %s; "
+              "python failures=%d errors=%d skipped=%d, swift failures=%d skipped=%d" %
+              (len(current_swift), len(current_python), rev,
+               py_stats["failures"], py_stats["errors"], py_stats["skipped"],
+               swift_stats["failures"], swift_stats["skipped"]))
         return 0
     return 1
 
