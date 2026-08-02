@@ -1625,7 +1625,7 @@ final class HandleFrameTests: XCTestCase {
         // elsewhere in this suite, so a change that reordered the pair or
         // dropped the space still goes red here. The leading space matters
         // specifically: production builds this line from two concatenated
-        // string literals (main.swift), with the space on the FIRST one, so
+        // string literals (HandleFrame.swift), with the space on the FIRST one, so
         // a literal starting at "(" would miss that one being dropped.
         XCTAssertTrue(line.contains(" (mine=image peer=text)"), "got: \(line)")
     }
@@ -1680,7 +1680,7 @@ final class HandleFrameTests: XCTestCase {
     /// age from `now` and wins a comparison it should have lost.
     ///
     /// One test per Swift site, and the sites are enumerated on
-    /// `persistClipState` in main.swift -- four now, since Task 13 gave
+    /// `persistClipState` in ClipStateAnnouncement.swift -- four now, since Task 13 gave
     /// `.imageClip` an apply path of its own. Both counts have moved once
     /// already, which is why neither is written as a number here.
     func testAnnounceClipStateLogsAFailedSave() throws {
