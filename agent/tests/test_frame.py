@@ -28,7 +28,7 @@ from agent_under_test import (
 
 # agent_under_test registers the loaded module under this name in
 # sys.modules; grabbed here to swap the module-level log() for a list
-# appender, the same way test_mainloop.py and test_watcher.py already do.
+# appender, the same way test_mainloop.py already does.
 import clipwire_agent
 
 

@@ -1598,7 +1598,7 @@ final class HandleFrameTests: XCTestCase {
 
     /// "why did a picture overwrite my text" must have an answer in the log.
     /// The decision word alone cannot say it -- see every case above, which
-    /// never once asks what kind either side held. Mirrors test_watcher.py's
+    /// never once asks what kind either side held. Mirrors
     /// test_the_reconciliation_line_names_both_kinds.
     func testTheReconciliationLineNamesBothKinds() throws {
         let path = tempLogPath()
@@ -1632,7 +1632,7 @@ final class HandleFrameTests: XCTestCase {
 
     /// The complement: neither side's hash implies neither side's kind, and
     /// the line must say so rather than omit it or print "nil". Mirrors
-    /// test_watcher.py's test_the_line_says_none_when_a_side_holds_nothing.
+    /// test_the_line_says_none_when_a_side_holds_nothing.
     func testTheLineSaysNoneWhenASideHoldsNothing() throws {
         let path = tempLogPath()
         let log = Log(path: path)
