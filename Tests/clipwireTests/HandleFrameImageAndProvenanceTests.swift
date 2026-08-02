@@ -7,6 +7,8 @@ import XCTest
 @testable import clipwire
 
 extension HandleFrameTests {
+    // MARK: - Task 13: an image clip from the peer is applied
+
     /// Replaces `testImageClipFrameIsReceivedAndLoggedButNotYetHandled`,
     /// which pinned Task 4's placeholder body (log the receipt, do nothing
     /// else) and would now pass vacuously against the real handler for the

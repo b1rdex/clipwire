@@ -25,6 +25,8 @@ extension HandleFrameTests {
         XCTAssertEqual(sent.count, 1, "a disk failure must not stop the frame")
         XCTAssertEqual(persistFailures(at: path).count, 1, "and must not be silent either")
     }
+    // MARK: - Final wave: reconcile against what we announced, not a re-derivation
+
     /// The `.clipState` case re-derived `mine` from the live pasteboard
     /// whenever `clipStateStore.load()` came back nil, stamping `now` on it.
     /// Since every save site swallows its failure, an unwritable state
@@ -557,7 +559,5 @@ extension HandleFrameTests {
                        "and the write must have happened anyway -- a local disk failure is not " +
                        "the peer's fault and must not undo the clip it sent")
     }
-
-    // MARK: - Task 13: an image clip from the peer is applied
 
 }

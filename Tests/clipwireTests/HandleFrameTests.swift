@@ -301,7 +301,7 @@ final class HandleFrameTests: XCTestCase {
         XCTAssertEqual(stored?.sha256, sha256Hex(Data("peer's clip".utf8)))
     }
 
-    // MARK: - Contract 3: a received hello always produces a reply
+    // MARK: - Task 13: one function turns a kind into a frame
 
     /// The kind-to-codec mapping, pinned where it lives rather than at each
     /// of its two call sites. Both of them -- `handleLocalChange` (a local
@@ -505,8 +505,6 @@ final class HandleFrameTests: XCTestCase {
 
         XCTAssertEqual(sent.count, 1, "a local disk failure must not prevent the announcement from going out")
     }
-
-    // MARK: - Final wave: reconcile against what we announced, not a re-derivation
 
     /// The image twin of `testIncomingClipArmsSuppressionBeforeWritingToThePasteboard`.
     /// `PasteboardWatcher` now EMITS images, so this ordering is load-bearing

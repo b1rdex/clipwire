@@ -7,6 +7,8 @@ import XCTest
 @testable import clipwire
 
 extension HandleFrameTests {
+    // MARK: - Contract 3: a received hello always produces a reply
+
     /// The `.up` half of this became `.clipboardPending` in the final wave
     /// -- see `testAMatchedHelloAloneDoesNotReportUp` for why. The reply
     /// count is what this test is actually for.
@@ -271,7 +273,5 @@ extension HandleFrameTests {
                       "neither a .clip nor a .clipState input frame may itself trigger the announcement")
         XCTAssertFalse(announcement.sent, "the gate must remain unclaimed -- only a matched hello claims it")
     }
-
-    // MARK: - Contract 5 (new in Task 9): resolving a peer's clip-state announcement
 
 }

@@ -7,6 +7,8 @@ import XCTest
 @testable import clipwire
 
 extension HandleFrameTests {
+    // MARK: - Contract 5 (new in Task 9): resolving a peer's clip-state announcement
+
     /// `resolveFreshness`'s `waitForPeer` outcome: the peer is fresher, so we
     /// wait. Conflating this with `doNothing` would be harmless here, but
     /// the point of a resend would be to CLOBBER a fresher peer -- exactly
@@ -416,7 +418,5 @@ extension HandleFrameTests {
         guard let first = sent.first else { return }
         XCTAssertEqual(try ClipPayload.decode(first.payload).text, "what we actually hold")
     }
-
-    // MARK: - Task 13: one function turns a kind into a frame
 
 }
