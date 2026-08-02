@@ -147,7 +147,7 @@ class TestMainLoop(unittest.TestCase):
     def test_agent_exits_cleanly_on_an_oversized_integer_timestamp_in_a_clip_state_frame(self):
         """The real deployed agent's twin of test_freshness.py's
         test_decode_rejects_an_oversized_integer_timestamp and
-        test_watcher.py's TestIncomingClipState.
+        TestIncomingClipState.
         test_a_malformed_clip_state_raises_a_clip_state_error_not_a_crash.
 
         json.loads parses a 400-digit integer ts as arbitrary-precision
