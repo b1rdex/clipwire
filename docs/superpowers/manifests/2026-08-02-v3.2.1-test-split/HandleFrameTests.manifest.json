@@ -1,0 +1,125 @@
+{
+  "original": "Tests/clipwireTests/HandleFrameTests.swift",
+  "blob": "ff2041d",
+  "files": [
+    {
+      "path": "Tests/clipwireTests/HandleFrameTests.swift",
+      "scaffold_before": [],
+      "scaffold_after": [],
+      "intervals": [
+        [
+          1,
+          305
+        ],
+        [
+          985,
+          1077
+        ],
+        [
+          1096,
+          1207
+        ],
+        [
+          2165,
+          2165
+        ]
+      ]
+    },
+    {
+      "path": "Tests/clipwireTests/HandleFrameHelloTests.swift",
+      "scaffold_before": [
+        "// Tests/clipwireTests/HandleFrameHelloTests.swift",
+        "//",
+        "// A shard of HandleFrameTests, split out in v3.2.1. Extension of the same",
+        "// class, so the (class, method) pairs the release is verified against are",
+        "// unchanged. See docs/superpowers/specs/2026-08-02-v3.2.1-test-split-design.md.",
+        "import XCTest",
+        "@testable import clipwire",
+        "",
+        "extension HandleFrameTests {"
+      ],
+      "scaffold_after": [
+        "}"
+      ],
+      "intervals": [
+        [
+          306,
+          572
+        ]
+      ]
+    },
+    {
+      "path": "Tests/clipwireTests/HandleFrameClipStateTests.swift",
+      "scaffold_before": [
+        "// Tests/clipwireTests/HandleFrameClipStateTests.swift",
+        "//",
+        "// A shard of HandleFrameTests, split out in v3.2.1. Extension of the same",
+        "// class, so the (class, method) pairs the release is verified against are",
+        "// unchanged. See docs/superpowers/specs/2026-08-02-v3.2.1-test-split-design.md.",
+        "import XCTest",
+        "@testable import clipwire",
+        "",
+        "extension HandleFrameTests {"
+      ],
+      "scaffold_after": [
+        "}"
+      ],
+      "intervals": [
+        [
+          573,
+          984
+        ]
+      ]
+    },
+    {
+      "path": "Tests/clipwireTests/HandleFrameStatusAndLoggingTests.swift",
+      "scaffold_before": [
+        "// Tests/clipwireTests/HandleFrameStatusAndLoggingTests.swift",
+        "//",
+        "// A shard of HandleFrameTests, split out in v3.2.1. Extension of the same",
+        "// class, so the (class, method) pairs the release is verified against are",
+        "// unchanged. See docs/superpowers/specs/2026-08-02-v3.2.1-test-split-design.md.",
+        "import XCTest",
+        "@testable import clipwire",
+        "",
+        "extension HandleFrameTests {"
+      ],
+      "scaffold_after": [
+        "}"
+      ],
+      "intervals": [
+        [
+          1078,
+          1095
+        ],
+        [
+          1208,
+          1742
+        ]
+      ]
+    },
+    {
+      "path": "Tests/clipwireTests/HandleFrameImageAndProvenanceTests.swift",
+      "scaffold_before": [
+        "// Tests/clipwireTests/HandleFrameImageAndProvenanceTests.swift",
+        "//",
+        "// A shard of HandleFrameTests, split out in v3.2.1. Extension of the same",
+        "// class, so the (class, method) pairs the release is verified against are",
+        "// unchanged. See docs/superpowers/specs/2026-08-02-v3.2.1-test-split-design.md.",
+        "import XCTest",
+        "@testable import clipwire",
+        "",
+        "extension HandleFrameTests {"
+      ],
+      "scaffold_after": [
+        "}"
+      ],
+      "intervals": [
+        [
+          1743,
+          2164
+        ]
+      ]
+    }
+  ]
+}
