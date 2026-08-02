@@ -26,6 +26,23 @@ copy, so the proof does not depend on whatever produced the shard files --
 a manifest can be checked before, during or after the split that it
 describes, and against a blob nobody has looked at in months.
 
+A manifest's `files[*].path` is resolved exactly as given, relative to
+whatever directory this is invoked FROM -- there is no repo-root anchor.
+Manifests committed beside a real split should use paths relative to the
+repo root and this should be run from there, both so the manifest works
+regardless of who checks it out and so no local absolute path (a
+committer's home directory, say) ends up in a public repo.
+
+Check 3 (scaffold + intervals == the produced file) compares LINE LISTS,
+both sides run through the same splitlines(): it cannot see a produced
+file's own trailing-newline-or-not, or a produced file using non-`\n` line
+endings, the way check 2 can for the ORIGINAL (see point 2 above). That
+follows from scaffold text living in the manifest as plain JSON strings,
+which carry no terminator information to compare against -- not a gap in
+what this release's byte-identity claim needs, since a shard the split
+itself writes is not going to invent CRLF, but worth knowing if this is
+ever reused somewhere that assumption doesn't hold.
+
 Every failure calls fail(), which prints a diagnostic naming the file and
 the specific inconsistency and exits 1. Nothing here ever prints a passing
 report for input it could not fully read: a manifest naming an unreadable
