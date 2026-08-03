@@ -395,6 +395,15 @@ class EventSourceTests(ToolTestCase):
                  "--object-path", "/org/gnome/GPaste")
         self.assertEqual(self.run_fake("gdbus", "introspect", *wrong).returncode, 1)
 
+    def test_introspect_refuses_a_stray_positional(self):
+        """Positional arguments belong to `call` alone -- GetElementAtIndex's
+        index. Scoping their acceptance to `call` must not reopen the door for
+        introspect: a stray word after its flags is exactly the unmodelled
+        input the bare `else` used to catch before `call` needed positionals
+        at all."""
+        self.assertEqual(self.run_fake("gdbus", "introspect", *self.DEST,
+                                       "stray").returncode, 2)
+
     def test_gdbus_call_returns_a_uuid_and_the_top_text(self):
         """The fast tier's whole input. Shape is byte-compatible with real gdbus:
         a tuple literal, uuid first."""
@@ -425,6 +434,14 @@ class EventSourceTests(ToolTestCase):
         parse = load("clipwire_agent_for_fakes", AGENT).parse_gpaste_line
         self.assertTrue(parse(line))
         self.assertTrue(parse(line + "\n"))     # how the pump actually sees it
+
+    def test_monitor_refuses_a_method_flag(self):
+        """--method belongs to `call` alone. A monitor that silently accepted
+        it would run forever having ignored an argument it does not model --
+        the one shape of bug this file's loudness rule exists to make
+        impossible."""
+        self.assertEqual(self.run_fake("gdbus", "monitor", *self.DEST, "--method",
+                                       "org.gnome.GPaste2.Whatever").returncode, 2)
 
     def test_monitor_emits_on_a_change_nobody_asked_it_to_watch(self):
         """Any change by anyone, not just the agent's own writes -- otherwise

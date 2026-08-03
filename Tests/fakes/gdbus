@@ -77,21 +77,31 @@ def parse(argv):
         argument = options[index]
         if argument == "--session":
             pass
-        elif argument in ("--dest", "--object-path", "--method"):
+        elif argument in ("--dest", "--object-path"):
             index += 1
             if index >= len(options):
                 fake.die(PROGRAM, "%s wants a value" % argument)
             if argument == "--dest":
                 dest = options[index]
-            elif argument == "--object-path":
-                object_path = options[index]
             else:
-                method = options[index]
-        elif argument.startswith("-"):
-            fake.die(PROGRAM, "unmodelled argument %r" % argument)
-        else:
-            # `call` takes the method's arguments positionally.
+                object_path = options[index]
+        elif argument == "--method" and command == "call":
+            index += 1
+            if index >= len(options):
+                fake.die(PROGRAM, "%s wants a value" % argument)
+            method = options[index]
+        elif not argument.startswith("-") and command == "call":
+            # `call` takes the method's arguments positionally. Scoped to
+            # `call` specifically: introspect and monitor take none, so a
+            # stray word there falls through to the `fake.die` below, same
+            # as it always has.
             positionals.append(argument)
+        else:
+            # Loud rather than ignored: an unmodelled flag, or an argument
+            # this subcommand does not take at all -- --method or a bare
+            # positional outside `call` -- means the agent is asking for
+            # something this fake does not represent.
+            fake.die(PROGRAM, "unmodelled argument %r" % argument)
         index += 1
     return command, dest, object_path, method, positionals
 
@@ -216,6 +226,8 @@ def main(argv):
             print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
                   "The name %s was not provided by any .service files" % dest,
                   file=sys.stderr, flush=True)
+            fake.note(PROGRAM, "call %s %s -> exit 1, not this fake's name"
+                      % (dest, object_path))
             return 1
         if method != "org.gnome.GPaste2.GetElementAtIndex":
             fake.die(PROGRAM, "unmodelled method %r" % method)
