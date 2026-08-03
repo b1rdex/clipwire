@@ -3138,6 +3138,70 @@ GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
 # the watcher on the polling fallback forever.
 GPASTE_BUS_NAME = "org.gnome.GPaste"
 
+# The interface name, not the bus name: GPASTE_BUS_NAME above is what owns the
+# object, and org.gnome.GPaste2 is the interface the methods live on. The agent
+# has already shipped this confusion once in the other direction -- probing the
+# interface as a --dest, which has no owner -- so both names are spelled out.
+GPASTE_INTERFACE = "org.gnome.GPaste2"
+
+# What the fast tier costs, measured on the target machine: 3-5 ms per call,
+# with no Wayland client and therefore no focus grab. The wl-paste probe it
+# replaces measured 104 ms AND blinked the foreground app.
+GPASTE_CALL_TIMEOUT = 3
+
+
+def gpaste_history_uuid(run=subprocess.run):
+    """The uuid of GPaste's top history entry, or None when it was NOT MEASURED.
+
+    THE TOKEN THE FAST TIER COMPARES, and the reason v3.3 exists. GPaste
+    re-offers an image one to six seconds after any copy -- measured, the
+    offered type list goes from one entry to twenty-three -- and emits no
+    Update for it. The old token was that type list, so a healthy machine
+    looked like one whose event source had died. A history entry is not created
+    by a re-offer, so this token does not move for it.
+
+    None is "not measured", and it is NOT a value: spec 4.0.1. It may never be
+    compared for equality with a previous reading, because "the call failed" and
+    "the clipboard did not change" are opposite conclusions. Treating them alike
+    turns a renamed method into a permanent false 'tracking dead' verdict --
+    exactly the state whose latch this release does not yet clear.
+
+    The reply also carries the top item's TEXT, which may be a password. Only
+    the uuid is returned and neither is ever logged (spec 5.2).
+    """
+    try:
+        result = run(
+            ["gdbus", "call", "--session", "--dest", GPASTE_BUS_NAME,
+             "--object-path", GPASTE_OBJECT_PATH,
+             "--method", "%s.GetElementAtIndex" % GPASTE_INTERFACE, "0"],
+            capture_output=True, timeout=GPASTE_CALL_TIMEOUT, env=clipboard_env(),
+        )
+    # Deliberately not `except ... as error: log(...)` -- the pattern
+    # WaylandClipboard._run_wl_paste uses for its own subprocess timeouts,
+    # and so the obvious template to copy here by habit. Checked directly
+    # (a child that writes a marker then hangs) rather than assumed: a real
+    # TimeoutExpired from subprocess.run(..., capture_output=True, timeout=
+    # ...) sets .output/.stdout to exactly what the child had already
+    # written, and for GetElementAtIndex(0) that can be the clipboard's text
+    # field. repr(error)/str(error) do NOT surface it -- confirmed the same
+    # way, they print only argv and the timeout -- so the leak is not `%r`
+    # of the bare exception; it is whatever a handler goes on to do with
+    # error.output once the name is bound. Not binding it here removes that
+    # field from reach instead of trusting every future edit to leave it
+    # alone -- spec 5.2 names exception branches as covered, not exempt.
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    # ('<uuid>', '<text>') -- the first single-quoted field. Deliberately not a
+    # full GVariant parse: anything this does not recognise is None, which the
+    # callers already treat as "no evidence", rather than a guess.
+    text = result.stdout.decode("utf-8", "replace")
+    parts = text.split("'")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    return parts[1]
+
 
 def _env_seconds(name, default):
     """An interval overridden from the environment, or `default`.
