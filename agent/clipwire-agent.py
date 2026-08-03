@@ -3207,17 +3207,23 @@ def _env_seconds(name, default):
     """An interval overridden from the environment, or `default`.
 
     Exists for PairingHarness, which needs sub-second tiers to exercise in
-    seconds what production does in minutes. Nothing in the agent's own code
-    paths calls this yet -- SAFETY_NET_POLL_SECONDS and DEGRADED_POLL_SECONDS
-    below are still bare constants, not routed through here, so "production
-    sets none of these" is a fact about the general mechanism this task
-    adds, not a claim that either constant below is overridable today; a
-    later task wires one of them, and will need to update this paragraph
-    when it does. What production actually does, checked rather than
-    assumed: grepping the whole repository (not just this file) for
-    CLIPWIRE_ finds nothing outside the fakes/harness and this task's own
-    test, and neither the launchd plist nor the ssh arguments production
-    actually invokes sets an environment variable. ssh's own default
+    seconds what production does in minutes. Called from the agent's own
+    code since v3.3's fast/slow tiers -- GPasteWatcher.__init__ resolves both
+    CLIPWIRE_FAST_TIER_SECONDS and CLIPWIRE_SLOW_TIER_SECONDS through here --
+    which is this paragraph's own forecast ("a later task wires one of them,
+    and will need to update this paragraph when it does") coming due rather
+    than going stale. SAFETY_NET_POLL_SECONDS and DEGRADED_POLL_SECONDS
+    themselves remain bare constants even so: CLIPWIRE_SLOW_TIER_SECONDS
+    overrides the safety_net_interval_seconds PARAMETER, itself only ever
+    defaulted from the former, never the constant directly, and nothing
+    overrides DEGRADED_POLL_SECONDS at all. None of that touches what
+    "production sets none of these" was ever a claim about -- the
+    environment a real deploy runs with, not which code exists to read it --
+    and that claim still holds, checked rather than assumed: grepping the
+    whole repository (not just this file) for CLIPWIRE_ finds nothing
+    outside the fakes/harness and this file's own test suite, and neither
+    the launchd plist nor the ssh arguments production actually invokes sets
+    an environment variable. ssh's own default
     SendEnv/AcceptEnv forwards nothing beyond LANG/LC_*, which no CLIPWIRE_*
     name matches, so even a variable set in the Mac-side shell would not
     cross -- two independent reasons a real deploy never sees one of these
@@ -3259,6 +3265,15 @@ SAFETY_NET_POLL_SECONDS = 30.0
 # fallback interval, shared from one place so degraded mode and the
 # never-had-GPaste mode cannot drift apart.
 DEGRADED_POLL_SECONDS = 1.0
+
+# The fast tier's interval: the worst-case PC->Mac latency in the state where
+# the SIGNAL path has gone silent without saying so (spec 6.1) -- the
+# subscription remains the PRIMARY source and its own latency is effectively
+# zero, so this budgets only for noticing that it stopped. Below the
+# threshold at which a person notices a clipboard lag, and three orders of
+# magnitude above gpaste_history_uuid's measured 3-5 ms cost, so paying it
+# every tick is not the thing worth economizing.
+FAST_TIER_SECONDS = 5.0
 
 
 def parse_gpaste_line(line):
@@ -3471,7 +3486,9 @@ class GPasteWatcher:
     def __init__(self, clipboard,
                  safety_net_interval_seconds=SAFETY_NET_POLL_SECONDS,
                  degraded_interval_seconds=DEGRADED_POLL_SECONDS,
-                 degraded=False, on_degrade=None, on_idle_tick=None):
+                 degraded=False, on_degrade=None, on_idle_tick=None,
+                 read_history_uuid=gpaste_history_uuid,
+                 fast_interval_seconds=None, slow_interval_seconds=None):
         self.clipboard = clipboard
         self._process = None
         self._thread = None
@@ -3511,6 +3528,48 @@ class GPasteWatcher:
         # copy. Called at most once, from _observe_tick, behind the same latch
         # that gates the log line.
         self._on_degrade = on_degrade
+        # The fast tier's probe, injectable so tests need no gdbus -- the
+        # same shape TestFastTier's watcher() helper in
+        # test_watcher_uuid_tier.py relies on. Production gets the module
+        # function, gpaste_history_uuid, unmodified.
+        self._read_history_uuid = read_history_uuid
+        # Argument first (what a test passes), then the environment (what a
+        # harness sets, PairingHarness among them), then the constant --
+        # the same three-step order _env_seconds itself implements for the
+        # single case of "no argument given", now applied at the call site
+        # too so an explicit fast_interval_seconds=0.05 in a test is never
+        # second-guessed by a stray CLIPWIRE_FAST_TIER_SECONDS left over in
+        # the shell that ran it.
+        self._fast_interval = (fast_interval_seconds if fast_interval_seconds is not None
+                               else _env_seconds("CLIPWIRE_FAST_TIER_SECONDS",
+                                                 FAST_TIER_SECONDS))
+        # NOT a second timer -- "the slow tier IS the existing safety net",
+        # so nothing below starts a thread from this value. It exists
+        # because a later task (the uuid-tier failure fallback, spec 4.3:
+        # "N consecutive failures... expressed as a DURATION, at least 2x
+        # the slow interval") needs that interval as a number to multiply,
+        # and safety_net_interval_seconds above is a constructor argument
+        # this instance would otherwise not retain anywhere. Resolved by the
+        # identical three-step rule as _fast_interval just above, mirrored
+        # on purpose so the two tiers cannot silently drift onto different
+        # override rules -- but note the default it falls back to is the
+        # PARAMETER, never SAFETY_NET_POLL_SECONDS directly, so a caller
+        # that already passed a non-default safety_net_interval_seconds
+        # (already-degraded watchers pass degraded_interval_seconds instead;
+        # see the PollingWatcher construction below) is not second-guessed
+        # by this constant a second time.
+        self._slow_interval = (slow_interval_seconds if slow_interval_seconds is not None
+                               else _env_seconds("CLIPWIRE_SLOW_TIER_SECONDS",
+                                                 safety_net_interval_seconds))
+        # The last MEASURED uuid, or None right after a failed call. Written
+        # only by _fast_tick, below; nothing in THIS commit reads it back
+        # (Tasks 6 and 7 do), but it is where spec 4.0.1's distinction is
+        # kept alive between commits: "the history did not move" (a real
+        # reading, unchanged) must stay tellable from "we do not know
+        # whether it moved" (the last call failed) for whichever tick reads
+        # it next. See _fast_tick's own docstring for how that is enforced.
+        self._last_uuid = None
+        self._fast_thread = None
         # PollingWatcher is defined below this class: resolved at call time
         # from module globals, so the forward reference is fine -- nothing
         # constructs a GPasteWatcher until main() runs.
@@ -3692,6 +3751,54 @@ class GPasteWatcher:
                 self._on_degrade()
         self._signals_at_last_tick = signals
 
+    def _fast_tick(self):
+        """One fast-tier iteration: measure the history uuid and signal iff it
+        MOVED. Returns what it measured, for the loop's own bookkeeping.
+
+        Three outcomes, and conflating any two of them is a defect the design
+        names explicitly (spec 4.0.1):
+
+          - moved   -- both readings present and different. A real change.
+          - frozen  -- both present and equal. Nothing happened; in particular
+                       this is what GPaste's own re-offer looks like from here,
+                       which is the whole reason this tier exists.
+          - unknown -- either reading is None, i.e. a call FAILED. Evidence
+                       about nothing. It neither signals nor is remembered as a
+                       value, so a failure between two identical readings cannot
+                       masquerade as two changes.
+
+        Signalled, never called: this is the third reader of the shared event
+        (the gdbus pump and the safety-net poll are the others) and, like them,
+        it must never touch Agent._local_change directly -- a reader that ran
+        the handler could block on Agent._observe_lock and could die of
+        anything the handler raised.
+        """
+        current = self._read_history_uuid()
+        previous = self._last_uuid
+        if current is not None and previous is not None and current != previous:
+            self._event.set()
+        if current is not None:
+            self._last_uuid = current
+        return current
+
+    def _fast_loop(self):
+        """The fast tier's own thread: measure and maybe signal, every
+        _fast_interval seconds, for the life of the connection.
+
+        Guarded exactly like PollingWatcher.pump's loop and for the identical
+        reason -- this is the only caller of _fast_tick, so an uncaught
+        exception here would not cost one observation, it would silently end
+        the tier for the rest of the connection while start()'s other two
+        threads carried on looking healthy. _handle_observer_error's fatal
+        set (a dead stdout/stderr) still ends the process either way; anything
+        else is logged and the loop continues on the next interval.
+        """
+        while not self._stop.wait(self._fast_interval):
+            try:
+                self._fast_tick()
+            except Exception as error:
+                _handle_observer_error(error, "fast tier")
+
     def available(self):
         try:
             result = subprocess.run(
@@ -3755,6 +3862,19 @@ class GPasteWatcher:
         # safety net carries a timestamp up to one safety-net interval late
         # (30 seconds with the production default).
         self._worker = _start_observer(self._event, self._stop, on_change)
+        # The fast tier -- the third reader of self._event, after the gdbus
+        # pump above and before the safety net below. It holds no reference
+        # to on_change at all (see _fast_tick/_fast_loop), so unlike the
+        # pump's own comment above there is no "could block on
+        # Agent._observe_lock" to even guard against here: there is nothing
+        # in this thread's call graph that could reach it. Started between
+        # the other two only to keep this method's reads in the same order
+        # as the class docstring lists them; threading.Event.set() is safe
+        # to call before any wait() has run, so which of these three threads
+        # is first to actually execute is not load-bearing.
+        self._fast_thread = threading.Thread(
+            target=self._fast_loop, daemon=True)
+        self._fast_thread.start()
         self._safety_net.start()
 
     def worker_alive(self):
