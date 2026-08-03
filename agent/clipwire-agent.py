@@ -3585,6 +3585,49 @@ class GPasteWatcher:
         # whether it moved" (the last call failed) for whichever tick reads
         # it next. See _fast_tick's own docstring for how that is enforced.
         self._last_uuid = None
+        # A RUN of failures, reset by any measured reading (the `else`
+        # branch in _fast_tick, below) -- not a total. One bad call is an
+        # EPISODE, already handled for free: it produces a None probe that
+        # _fast_tick neither signals from nor remembers (spec 4.0.1), so by
+        # itself it costs nothing. A RUN is different -- it is a STATE, and
+        # the state is what silently costs the fast tier entirely (spec 4.3:
+        # "a 30-180x degradation of sync with not one line in the log").
+        # Written only by _fast_tick, on the fast-tier thread -- the same
+        # single-writer shape as self._last_uuid and self._signals above,
+        # so the cross-thread READS _observe_tick does below (on the safety
+        # net's poll thread) need no lock either: the worst a read sees is
+        # last tick's count, one moment longer.
+        self._uuid_failures = 0
+        # Once True, stays True for the rest of the connection. Recovery --
+        # the method starting to answer again -- is deliberately NOT
+        # implemented this release; spec 4.3's closing paragraph calls it
+        # "next cycle's latch work, the same family as un-degrading on
+        # signal evidence." Read by _observe_tick for the identical
+        # single-writer reason self._uuid_failures is, immediately above.
+        self._uuid_tier_failed = False
+        # N, expressed as a DURATION rather than a bare count, so tuning
+        # either tier's interval cannot silently make this number meaningless
+        # (spec 4.3: "let the count follow from the interval"). Long enough
+        # to span two slow-tier ticks, so the fallback can only engage once
+        # the slow tier could have completed two full ticks on nothing but a
+        # stale reading -- never before. At the PRODUCTION defaults (5s
+        # fast, 30s slow) that is max(3, int(60/5)) == 12; at the top of spec
+        # 4.2's 5-15 minute slow-tier range it is max(3, int(600/5)) == 120,
+        # the "well over a hundred" the spec text itself names.
+        #
+        # The floor of 3 covers the degenerate case where the slow tier is
+        # configured no slower than the fast one (a test harness's own
+        # tuning, never a production shape, but __init__ does not refuse
+        # it): without it the derived count could be 1 or 2, and a single
+        # bad call -- an EPISODE, per self._uuid_failures's own comment --
+        # would read as the STATE this counter exists to distinguish from
+        # one. int() TRUNCATES rather than rounds, so a ratio landing just
+        # under a whole number (binary floats being what they are) rounds
+        # DOWN, never up -- harmless here, since a duration expressed as "at
+        # least" loses nothing by erring short, and the floor already covers
+        # the one case where truncation could otherwise reach 0.
+        self._uuid_failures_before_fallback = max(
+            3, int((2 * self._slow_interval) / self._fast_interval))
         self._fast_thread = None
         # Spec 6.1's own one-shot flag -- "signal path silent, tracking
         # alive" -- and per spec 6 it is a LOG flag, never a mode latch:
@@ -3774,17 +3817,51 @@ class GPasteWatcher:
         # method would latch a false verdict that this release cannot
         # clear. No verdict is reached while that is true.
         #
-        # NOT CLOSED BY THIS DELTA ALONE, and said here so a later reader
-        # does not conclude it is: a fast tier that measured once and then
-        # fails PERSISTENTLY (a renamed method, say) leaves BOTH
-        # self._last_uuid and self._uuid_at_last_tick stuck at the SAME
-        # stale value forever, which this comparison reads as frozen no
-        # differently than a genuinely idle uuid -- so a persistent failure
-        # can still arm a false verdict on an active user. Real, and
-        # deliberately not closed here: Task 7 owns self._uuid_failures
-        # (spec 4.3) and adds "no verdict while a failure run is in
-        # progress" ON TOP of this delta. Until that lands, this predicate
-        # is necessary but not sufficient for the persistent-failure case.
+        # NOT CLOSED BY THIS DELTA ALONE -- said here so a later reader does
+        # not conclude the paragraphs below are decorative: a fast tier that
+        # measured once and then fails PERSISTENTLY (a renamed method, say)
+        # leaves BOTH self._last_uuid and self._uuid_at_last_tick stuck at
+        # the SAME stale value forever, which this comparison alone reads as
+        # frozen no differently than a genuinely idle uuid -- so a
+        # persistent failure could still arm a false verdict on an active
+        # user. CLOSED by Task 7, in uuid_unknown immediately below: this
+        # predicate was disclosed as owing self._uuid_failures (spec 4.3)
+        # and "no verdict while a failure run is in progress" ON TOP of this
+        # delta -- now landed, so uuid_frozen alone stays necessary but is no
+        # longer the whole story.
+        #
+        # THE OTHER HALF OF SPEC 4.0.1'S "FROZEN MEANS MEASURED-AND-
+        # UNCHANGED, NEVER UNMEASURED": self._uuid_failures is the one piece
+        # of state that tells "genuinely idle" apart from "unknown because
+        # nothing has been read since" -- a nonzero run means the most
+        # recent fast-tier call(s) did not resolve, so whatever uuid_frozen
+        # above computed is judging a stale pair of readings, not a live
+        # one. Read here on the safety net's poll thread; written only by
+        # _fast_tick on the fast-tier thread, the identical single-writer
+        # shape as self._last_uuid just above (see that field's own
+        # __init__ comment) -- so this needs no lock, and the worst this
+        # read can do is see last tick's count a moment longer.
+        #
+        # LIFTS once spec 4.3's fallback has actually engaged
+        # (self._uuid_tier_failed), and that is not symmetry for its own
+        # sake: while a run is in progress but short of the fallback
+        # threshold, spec 4.0.1 says plainly "no verdict may be reached" --
+        # safety first, before N is even decided (spec 4.3: "N sets when the
+        # log line and the fallback arrive, not whether the machine is safe
+        # meanwhile"). But once the fallback DOES engage, self._uuid_failures
+        # keeps climbing forever in the ordinary case -- the method that
+        # broke does not fix itself, and recovery is explicitly out of scope
+        # this release -- so if this guard did not LIFT there, _observe_tick
+        # could never reach a verdict again for the rest of the connection:
+        # silently WORSE than pre-v3.3, which had no uuid tier to get stuck
+        # behind at all, and a direct contradiction of spec 4.0.1's own
+        # closing sentence: "Once section 4.3's fallback engages, this table
+        # stops applying and today's mechanics resume." Once self._last_uuid
+        # stops being updated for good, uuid_frozen above settles
+        # permanently True on its own -- which is what lets "today's
+        # mechanics resume" fall out of the EXISTING wl-paste-divergence
+        # check below rather than needing a second copy of the old
+        # signal-based predicate reintroduced here.
         #
         # DO NOT restore the one-tick verdict without restoring the synchronous
         # call. Two ticks will look like one too many to a reader who cannot
@@ -3810,7 +3887,8 @@ class GPasteWatcher:
                        and self._uuid_at_last_tick is not None
                        and self._last_uuid == self._uuid_at_last_tick)
         token_moved = previous != current
-        if not read_ok or not uuid_frozen:
+        uuid_unknown = self._uuid_failures > 0 and not self._uuid_tier_failed
+        if not read_ok or not uuid_frozen or uuid_unknown:
             confirmed = False
             self._armed = False
         elif self._armed:
@@ -3876,9 +3954,16 @@ class GPasteWatcher:
                        this is what GPaste's own re-offer looks like from here,
                        which is the whole reason this tier exists.
           - unknown -- either reading is None, i.e. a call FAILED. Evidence
-                       about nothing. It neither signals nor is remembered as a
-                       value, so a failure between two identical readings cannot
-                       masquerade as two changes.
+                       about nothing FOR THIS COMPARISON: it neither signals
+                       nor is remembered as a VALUE (self._last_uuid is left
+                       untouched), so a failure between two identical
+                       readings cannot masquerade as two changes. Not
+                       weightless, though, once repeated: spec 4.3 counts it
+                       toward self._uuid_failures, a RUN tracked below the
+                       three-way branch this list describes -- "not a value
+                       this tick" and "not nothing at all" are different
+                       claims, and only the first one is what this bullet is
+                       about.
 
         Signalled, never called: this is the third reader of the shared event
         (the gdbus pump and the safety-net poll are the others) and, like them,
@@ -3936,7 +4021,75 @@ class GPasteWatcher:
                     "zero focus cost. Informational only; no interval "
                     "changes because of this line."
                     % (signals, self._fast_interval))
-        if current is not None:
+        # Spec 4.3: the uuid tier itself failing -- NOT a fourth VALUE of the
+        # three-way comparison the docstring above enumerates (moved/frozen/
+        # unknown stays exhaustive for what one tick's reading MEANS), but a
+        # layer of bookkeeping across ticks that only "unknown" ever feeds,
+        # because "current is None" is not just one unmeasured reading, it is
+        # also the only signal a RUN of them ever produces. current is None
+        # here iff the `unknown` branch above was taken (mutually exclusive
+        # with `moved` and with the remembering write this replaces), so this
+        # if/else covers exactly the same two cases the old unconditional
+        # `if current is not None: self._last_uuid = current` did, plus the
+        # run-counting neither branch needed before this task.
+        if current is None:
+            self._uuid_failures += 1
+            if (not self._uuid_tier_failed
+                    and self._uuid_failures >= self._uuid_failures_before_fallback):
+                self._uuid_tier_failed = True
+                # Named, not guessed (spec 5.3's principle, applied to an
+                # effect rather than a cause). The verdict line below in
+                # _observe_tick has shipped three times blaming a disabled
+                # gnome-shell extension on a machine where it was measured
+                # enabled and ACTIVE at all three production incidents (spec
+                # 1.3/5.3) -- so this line reports only what THIS tier
+                # observed: how many calls failed, and for how long. Never
+                # the reply's payload (spec 5.2) -- moot by construction in
+                # this branch, since a failed call's payload is None, not a
+                # value there is anything to leak from.
+                #
+                # %g, not %.0f, for the duration: the SAME lesson
+                # _observe_tick's and _fast_tick's other two log lines both
+                # already carry a comment about, a third time -- %.0f
+                # renders any sub-second duration (the only kind a
+                # millisecond-scale TEST interval ever produces) as the
+                # literal string "0s", which is not imprecise, it is false.
+                # SAFETY_NET_POLL_SECONDS is a module constant, never
+                # overridden per test, so %g costs nothing there either --
+                # kept the same specifier as the other two for one uniform
+                # rule rather than a mixed one.
+                log("the GPaste history uuid call has failed %d times in a "
+                    "row (%gs); falling back to polling every %gs"
+                    % (self._uuid_failures,
+                       self._uuid_failures * self._fast_interval,
+                       SAFETY_NET_POLL_SECONDS))
+                # Deliberately SKIPPED when _observe_tick has ALREADY
+                # diagnosed the source dead (spec 6.2) and put the safety net
+                # on its own degraded backoff -- self._degraded, set on the
+                # POLL thread. Task 9 also writes self._safety_net.interval,
+                # from that same poll thread, so this write (from the
+                # fast-tier thread) and that one can interleave. RULING
+                # (progress.md's pre-flight scan, carried into this task's
+                # dispatch): the degraded backoff is the MORE SPECIFIC state
+                # -- it means a verdict was actually reached about this
+                # connection's tracker, not merely that one more D-Bus call
+                # failed -- so it wins, and this assignment defers to it
+                # rather than risk overwriting a tighter, already-in-place
+                # backoff with a flatter 30s figure. self._degraded_interval
+                # and SAFETY_NET_POLL_SECONDS are each <= SAFETY_NET_POLL_
+                # SECONDS by construction (the former by its own docstring's
+                # promise, the latter is that constant), so no interleaving
+                # between the two writers can ever push the interval OUTSIDE
+                # the range either state alone would already produce -- this
+                # `if` decides which of two already-safe values wins a race,
+                # never whether the result stays safe. The log line above is
+                # NOT guarded the same way: it reports a fact (this D-Bus
+                # call is failing) that stays true and stays worth knowing no
+                # matter which interval the other diagnosis already chose.
+                if not self._degraded:
+                    self._safety_net.interval = SAFETY_NET_POLL_SECONDS
+        else:
+            self._uuid_failures = 0
             self._last_uuid = current
         self._signals_at_last_fast_tick = signals
         return current

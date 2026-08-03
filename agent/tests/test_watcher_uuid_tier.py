@@ -293,6 +293,62 @@ class TestSlowTierVerdict(unittest.TestCase):
         self.assertFalse(watcher._degraded,
                          "a failing uuid call was read as a dead tracker")
 
+    def test_no_verdict_while_a_uuid_failure_run_is_in_progress(self):
+        """Spec 4.0.1's closing paragraph -- the half Task 6's own review
+        explicitly left for this task, named in _observe_tick's "NOT CLOSED
+        BY THIS DELTA ALONE" comment: self._last_uuid is STICKY (_fast_tick
+        assigns it only on a MEASURED reading), so a fast tier that measured
+        once and then fails PERSISTENTLY leaves uuid_frozen reading True
+        forever -- not because the history is idle, but because nothing has
+        been read since. self._uuid_failures is the one piece of state that
+        tells "idle" apart from "unknown": a nonzero run means the most
+        recent fast-tier call(s) did not resolve, so whatever this tick's
+        uuid_frozen computed is judging a stale pair of readings, not a live
+        one.
+
+        watcher() primes BOTH uuid fields to the SAME value, so uuid_frozen
+        reads True from the OLD delta alone -- exactly the false "tracking
+        is dead" signature spec 4.0.1 warns about. Only self._uuid_failures
+        being nonzero should be standing between these two diverging ticks
+        and a false verdict; this test hand-sets it rather than driving
+        _fast_tick for real, the same convention
+        test_no_verdict_while_the_uuid_is_unknown above already uses for the
+        identical reason (see that test's own docstring)."""
+        watcher = self.watcher()
+        watcher._uuid_failures = 1   # a run in progress, well short of the fallback threshold
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertFalse(
+            watcher._degraded,
+            "a uuid failure run in progress was read as a dead tracker")
+
+    def test_verdicts_resume_once_the_fallback_has_engaged(self):
+        """The mirror of the test above, and spec 4.0.1's OTHER half: "Once
+        section 4.3's fallback engages, this table stops applying and
+        today's mechanics resume." self._uuid_failures keeps climbing
+        forever in the ordinary case once the fallback has fired -- the
+        method that broke does not fix itself, and recovery is explicitly
+        out of scope this release (spec 4.3's closing paragraph: "next
+        cycle's latch work") -- so if the guard above did not LIFT once
+        self._uuid_tier_failed is True, _observe_tick could never reach a
+        verdict again for the rest of the connection: silently WORSE than
+        pre-v3.3, which had no uuid tier to get stuck behind at all, and a
+        direct contradiction of the sentence this test is named for.
+
+        Once self._last_uuid stops being updated for good, uuid_frozen above
+        settles permanently True on its own -- which is what lets "today's
+        mechanics resume" fall out of the EXISTING wl-paste-divergence check
+        below rather than needing a second copy of the old signal-based
+        predicate reintroduced here."""
+        watcher = self.watcher()
+        watcher._uuid_failures = 5
+        watcher._uuid_tier_failed = True
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertTrue(
+            watcher._degraded,
+            "a verdict did not resume once the uuid-tier fallback had engaged")
+
     def test_an_actively_copying_healthy_connection_does_not_degrade(self):
         """THE regression found in review, and the one a user would have
         felt: "self._last_uuid is not None" alone is permanently true from
@@ -698,6 +754,202 @@ class TestFastTierIntegration(unittest.TestCase):
             "either it is not running, or it died on the first (raising) "
             "tick instead of surviving to the next one",
         )
+
+
+class TestUuidTierFallback(unittest.TestCase):
+    """Spec 4.3: the uuid tier itself failing -- a third state, distinct from
+    both "moved" and "frozen" (spec 4.0's table, bottom row: "unknown (method
+    failing)"). Treating each failed GetElementAtIndex call as a solitary
+    None probe is correct for an EPISODE (already handled -- see
+    TestFastTier's own unmeasured-reading tests above) and catastrophic as a
+    STEADY STATE: the fast tier goes mute, the slow tier is the only thing
+    left, and -- per spec 1 -- that is a 30-180x sync regression with not one
+    line in the log. This class is the fallback that makes the steady state
+    loud instead of silent.
+
+    The brief this class is built from (task-7-brief.md) references a
+    `_capture_log` context-manager helper that does not exist anywhere in
+    this codebase -- confirmed by grep across agent/tests/, zero hits -- a
+    brief defect, reported rather than invented around (see task-7-report.md).
+    This file's OWN established convention for the identical need --
+    TestSignalPathSilenceLog.setUp and TestFastTierIntegration.setUp, both
+    above -- is a plain setUp/addCleanup pair patching clipwire_agent.log
+    directly, so that is what this class uses too, rather than inventing a
+    second capture mechanism the file does not otherwise have.
+    """
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def marker_lines(self):
+        return [line for line in self.log_lines if "history uuid" in line]
+
+    def test_the_default_intervals_derive_twelve(self):
+        """Spec 4.3: "N is defined, not left to the plan: enough consecutive
+        failures to span two slow-tier ticks ... express it as a duration
+        (>= 2x the slow interval) rather than a raw count, and let the count
+        follow from the interval." At the PRODUCTION defaults --
+        FAST_TIER_SECONDS=5, SAFETY_NET_POLL_SECONDS=30 -- that is
+        2 * 30 / 5 == 12, smaller than the spec text's own illustrative
+        "well over a hundred" (which describes a 5-minute slow tier nothing
+        in this codebase currently configures by default). Pinned against
+        the actual constants rather than the spec's illustrative figure."""
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard())
+        self.addCleanup(watcher.stop)
+        self.assertEqual(watcher._uuid_failures_before_fallback, 12)
+
+    def test_the_floor_holds_when_the_slow_tier_is_not_slower_than_the_fast_one(self):
+        """max(3, ...) is not decoration. Without it, this ratio (slow <=
+        fast -- a test harness's own tuning, not a production shape, but
+        __init__ does not refuse it) derives 1: a SINGLE failed call, an
+        episode by this task's own definition (see self._uuid_failures's
+        __init__ comment), would then be enough to trigger the fallback --
+        the exact episode/state conflation this design exists to avoid,
+        approached from the threshold side rather than the counter side."""
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), fast_interval_seconds=1.0,
+            slow_interval_seconds=0.5)
+        self.addCleanup(watcher.stop)
+        self.assertEqual(watcher._uuid_failures_before_fallback, 3)
+
+    def test_a_persistent_failure_logs_once_and_falls_back(self):
+        """task-7-brief.md Step 1, adapted twice over from what the brief
+        gives -- both changes needed to make this test's own claims true of
+        what it actually checks, not just of what it is named for.
+
+        (1) The brief builds this watcher with NO explicit
+        safety_net_interval_seconds, so self._safety_net.interval is ALREADY
+        SAFETY_NET_POLL_SECONDS before the first tick -- identical to the
+        value this test asserts the fallback PRODUCES. Deleting the
+        implementation's interval-assignment line entirely would leave that
+        assertion passing by coincidence. Fixed by starting the safety net at
+        a distinguishable 42.0 instead, so the assertion has to actually
+        observe a write.
+
+        (2) Added a boundary check the brief did not ask for: threshold - 1
+        ticks must NOT have fired yet, proving the threshold fires EXACTLY
+        at watcher._uuid_failures_before_fallback rather than merely
+        "eventually" -- an off-by-one here (> instead of >=) would leave
+        detection one full fast-tier interval later than the spec's own
+        accounting assumes, silently, and nothing in the brief's own script
+        would have caught it (it only ever checks threshold + 2).
+        """
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), read_history_uuid=lambda: None,
+            fast_interval_seconds=0.001, slow_interval_seconds=0.01,
+            safety_net_interval_seconds=42.0)
+        self.addCleanup(watcher.stop)
+        threshold = watcher._uuid_failures_before_fallback
+
+        for _ in range(threshold - 1):
+            watcher._fast_tick()
+        self.assertFalse(
+            watcher._uuid_tier_failed,
+            "the fallback fired before its own threshold was reached")
+
+        watcher._fast_tick()   # the Nth failure -- exactly AT the threshold
+        self.assertTrue(
+            watcher._uuid_tier_failed,
+            "did not fire exactly at the threshold (>= vs > boundary)")
+
+        for _ in range(2):   # held past it: must not re-log or re-assign
+            watcher._fast_tick()
+        self.assertEqual(len(self.marker_lines()), 1,
+                         "the fallback logged more than once")
+        self.assertEqual(watcher._safety_net.interval, agent.SAFETY_NET_POLL_SECONDS)
+
+    def test_an_intermittent_failure_does_not_fall_back(self):
+        """task-7-brief.md Step 1 / Step 5, corrected. "One bad call is an
+        episode, not a state" -- but the brief's own script (5 reads, 2
+        Nones, default intervals => threshold 12) cannot prove that: its
+        Step 5 break-check instructs deleting the `else: self._uuid_failures
+        = 0` reset and claims this test "must FAIL", but with only 2
+        CUMULATIVE failures against a threshold of 12, the counter reaches 2
+        either way and the assertion stays green with the reset gone --
+        empirically confirmed by running the deletion against the brief's
+        own numbers before writing this version. A brief defect in the same
+        "check weaker than its claim" family this project has now shipped
+        (and caught) five times.
+
+        Fixed by flooring the threshold at 3 (fast_interval == slow_interval)
+        and scripting exactly 3 ISOLATED failures, each surrounded by a
+        success: with the run-reset present, the longest RUN is 1 and the
+        fallback never fires; with the reset deleted, the CUMULATIVE count
+        reaches 3 on the third failure and it does -- verified both
+        directions below, not merely reasoned about (see Step 5 of
+        task-7-report.md).
+        """
+        readings = ["a", None, "b", None, "c", None, "d"]
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), read_history_uuid=lambda: readings.pop(0),
+            fast_interval_seconds=0.001, slow_interval_seconds=0.001)
+        self.addCleanup(watcher.stop)
+        self.assertEqual(watcher._uuid_failures_before_fallback, 3,
+                         "test precondition: the floor, not a derived ratio")
+        for _ in range(len(readings)):
+            watcher._fast_tick()
+        self.assertFalse(watcher._uuid_tier_failed)
+        self.assertEqual(watcher._uuid_failures, 0,
+                         "the run must be freshly reset by the final (successful) reading")
+
+    def test_the_log_line_states_the_true_duration_not_a_truncated_zero(self):
+        """This file's OWN twice-shipped lesson -- _observe_tick's and
+        _fast_tick's existing log lines, BOTH carry some variant of "%g, not
+        %.1f: ... this is exercised with millisecond-scale intervals in
+        tests, where %.1f renders '0.0s' and the line would misstate what
+        the code actually did" -- applies a third time here: task-7-brief.md
+        Step 3's snippet used %.0f for the duration, which renders any
+        sub-second value as the literal string "0s". Not merely imprecise
+        but FALSE, in the same spirit spec 5.3 names for a guessed CAUSE
+        even though this line states an effect, not a cause.
+        """
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), read_history_uuid=lambda: None,
+            fast_interval_seconds=0.001, slow_interval_seconds=0.01)
+        self.addCleanup(watcher.stop)
+        for _ in range(watcher._uuid_failures_before_fallback):
+            watcher._fast_tick()
+        lines = self.marker_lines()
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn("(0s)", lines[0],
+                         "a real sub-second duration was rendered as exactly zero")
+
+    def test_the_degrade_backoff_wins_the_interval_but_the_log_still_fires(self):
+        """The pre-flight ruling (progress.md) and this task's own dispatch:
+        Tasks 7 and 9 both write self._safety_net.interval, from DIFFERENT
+        THREADS (this fallback from the fast-tier loop, the degraded backoff
+        from the poll thread inside _observe_tick). The degraded backoff is
+        the MORE SPECIFIC state -- a verdict was actually reached about this
+        connection's tracker, not merely that one more D-Bus call failed --
+        so it wins: this fallback's interval write is skipped while
+        self._degraded is already set. The log line is NOT skipped -- it
+        reports a distinct, still-true fact (the uuid CALL is failing)
+        regardless of what interval the other diagnosis already chose.
+        """
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), read_history_uuid=lambda: None,
+            fast_interval_seconds=0.001, slow_interval_seconds=0.01,
+            degraded=True)
+        self.addCleanup(watcher.stop)
+        before = watcher._safety_net.interval
+        self.assertEqual(
+            before, agent.DEGRADED_POLL_SECONDS,
+            "test precondition: an already-degraded watcher starts on the "
+            "degraded interval, per make_watcher's own convention")
+        for _ in range(watcher._uuid_failures_before_fallback + 2):
+            watcher._fast_tick()
+        self.assertTrue(watcher._uuid_tier_failed)
+        self.assertEqual(
+            len(self.marker_lines()), 1,
+            "the fallback must still report what it observed even though "
+            "its interval write below is deferred")
+        self.assertEqual(
+            watcher._safety_net.interval, before,
+            "the more specific degraded backoff must not be overwritten by "
+            "the flatter SAFETY_NET_POLL_SECONDS")
 
 
 if __name__ == "__main__":
