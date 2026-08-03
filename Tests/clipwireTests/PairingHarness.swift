@@ -126,7 +126,18 @@ final class PairingHarness {
     private let framesLock = NSLock()
     private var received: [Frame] = []
 
-    init(eventSource: EventSource = .gpaste, substituting: Bool = false) throws {
+    /// `tierSeconds` overrides the spawned agent's fast/slow tier polling
+    /// intervals by exporting environment variables before the agent is
+    /// spawned -- see the `exportEnvironment` calls below, and `_env_seconds`
+    /// in the agent, which is what reads them back out. `nil` in either half
+    /// means "leave that one at production's constant," which is what every
+    /// call site gets from the default here: there is no separate
+    /// configuration type in this file to hang the option on (`eventSource`
+    /// and `substituting` are init parameters only, not stored properties,
+    /// for the same reason -- nothing after `init` needs either one back),
+    /// so the option lives here, beside them.
+    init(eventSource: EventSource = .gpaste, substituting: Bool = false,
+         tierSeconds: (fast: Double?, slow: Double?) = (nil, nil)) throws {
         // Tests/clipwireTests/ -> Tests/ -> the repo root. The same walk
         // FixtureTests and ChannelTests already do; `#filePath` is the only
         // thing in a test binary that knows where the source tree is.
@@ -183,6 +194,17 @@ final class PairingHarness {
         // suite -- the same rule agent/tests already follows by injecting
         // `clip_state_path`.
         exportEnvironment("XDG_STATE_HOME", stateHome.path, restoring: &restore)
+        // Sub-second tiers, so a test can exercise in seconds what production
+        // does in minutes. Only set when `tierSeconds` asks: an unset
+        // variable is what production runs, and a harness that always
+        // overrode them would never exercise the real defaults, only ever
+        // its own substitute for them.
+        if let fast = tierSeconds.fast {
+            exportEnvironment("CLIPWIRE_FAST_TIER_SECONDS", "\(fast)", restoring: &restore)
+        }
+        if let slow = tierSeconds.slow {
+            exportEnvironment("CLIPWIRE_SLOW_TIER_SECONDS", "\(slow)", restoring: &restore)
+        }
         restoreEnvironment = restore
 
         log = Log(path: logPath)

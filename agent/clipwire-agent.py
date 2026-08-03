@@ -3138,6 +3138,40 @@ GPASTE_OBJECT_PATH = "/org/gnome/GPaste"
 # the watcher on the polling fallback forever.
 GPASTE_BUS_NAME = "org.gnome.GPaste"
 
+
+def _env_seconds(name, default):
+    """An interval overridden from the environment, or `default`.
+
+    Exists for PairingHarness, which needs sub-second tiers to exercise in
+    seconds what production does in minutes. Production sets none of these, so
+    the constants below are what a real agent runs -- verified by grepping the
+    whole repository (not just this file) for CLIPWIRE_, and by reading the
+    launchd plist and the ssh arguments production actually invokes: neither
+    sets an environment variable, and ssh's own default AcceptEnv/SendEnv
+    forwards none either, so there are two independent reasons a real deploy
+    never sees one of these set, not one.
+
+    Anything unparseable or non-positive returns the default rather than
+    raising: a typo in a harness must not produce a zero-second poll that spins
+    a core, and must not take down an agent on a machine where the variable was
+    never meant to be read. No env= parameter, unlike runtime_dir() and
+    clip_state_path() above: those compose a dict for a subprocess call and
+    are exercised with fabricated environments in tests, where a real dict
+    argument earns its keep. This reads a single scalar out of the one
+    environment this process actually has, the same shape _select_clipboard()
+    already uses just above for CLIPWIRE_FAKE_CLIPBOARD -- another
+    harness-only override nothing in production ever sets.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 # available() below probes the bus NAME, but GPaste tracks the clipboard
 # through a gnome-shell extension: a GNOME upgrade can leave the daemon
 # running and the bus answering while the extension is disabled, so Update
