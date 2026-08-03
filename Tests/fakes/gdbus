@@ -159,7 +159,22 @@ def monitor(path, silent=False):
         current = digest(path)
         if current != seen:
             seen = current
-            if not silent:
+            # A silent change is absorbed into the baseline above and NOT
+            # announced -- the next real change is still seen, because `seen`
+            # already moved. This is GPaste's re-offer: it takes the
+            # selection back and re-offers it under its own type list
+            # (measured on the live machine, one entry becomes twenty-three)
+            # and emits no Update for it. See fake_clipboard.EMPTY_STATE
+            # ["silent"] for where a harness sets this.
+            #
+            # `silent` here (this function's own parameter) is a different
+            # thing -- "nobody owns this bus name", set in main() -- so both
+            # have to allow it before a line is actually printed.
+            try:
+                announce = not fake.load(path).get("silent")
+            except Exception:
+                announce = True     # an unreadable state file is not evidence of silence
+            if announce and not silent:
                 say(UPDATE_LINE)
 
 

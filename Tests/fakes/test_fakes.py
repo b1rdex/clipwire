@@ -400,6 +400,57 @@ class EventSourceTests(ToolTestCase):
     def gdbus_uuid(self):
         return self.gdbus_call()[0]
 
+    def start_gdbus_monitor(self):
+        """A `gdbus monitor` subprocess of our own, stdout made non-blocking
+        so `drain()` below can prove a NEGATIVE -- that nothing arrived in a
+        window -- which a blocking `readline()` (as the other monitor tests
+        use) cannot do without hanging forever on silence.
+
+        The 0.2s sleep is generous next to POLL_SECONDS (0.05s in the fake):
+        it has to outlast both process startup and the fake taking its
+        baseline digest, or the first write a test makes could land before
+        the fake has anything to compare it against, and be missed as "no
+        change yet" rather than caught as a change.
+        """
+        process = subprocess.Popen([str(HERE / "gdbus"), "monitor"] + list(self.DEST),
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, env=self.env())
+        # Registered in the order that makes cleanup -- LIFO -- terminate,
+        # then reap, then release the pipe: the same order
+        # test_monitor_emits_on_a_change_nobody_asked_it_to_watch uses below.
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.terminate)
+        os.set_blocking(process.stdout.fileno(), False)
+        # 0.2s is generous next to POLL_SECONDS (0.05s), but this file's own
+        # measured numbers (fake_clipboard.py, "WHAT THEY COST") say a cold
+        # first invocation can take 0.2-0.8s -- so this drain, not a bare
+        # read, is what keeps a slow-starting fake from raising instead of
+        # just returning "nothing yet". Its return value (Update lines, of
+        # which there cannot be any yet) is discarded along with the banner.
+        self.drain(process, seconds=0.2)
+        return process
+
+    def drain(self, process, seconds):
+        """Every Update line the monitor emitted within `seconds`.
+
+        `TextIOWrapper.read()` -- what `text=True` on Popen wraps stdout in
+        -- does NOT return None the way the raw/buffered binary layers do
+        when a non-blocking read has nothing available: it RAISES
+        BlockingIOError instead (message "read() returned None", confirmed
+        empirically against this Python; a bare `read() or ""` crashes on
+        the very first call, before anything has been written). When SOME
+        text is already available it still returns that text normally --
+        only the zero-bytes-available case raises -- so this catches
+        exactly that one case rather than swallowing a real error.
+        """
+        time.sleep(seconds)
+        try:
+            text = process.stdout.read() or ""
+        except BlockingIOError:
+            text = ""
+        return [line for line in text.splitlines() if "Update" in line]
+
     def test_introspect_is_answered(self):
         """The decisive one. Serve only `monitor` and available() is false,
         make_watcher picks the plain poller, and every harness run passes
@@ -506,6 +557,44 @@ class EventSourceTests(ToolTestCase):
         self.assertEqual(line.rstrip("\n"),
                          load("fake_gdbus", HERE / "gdbus").UPDATE_LINE)
         self.assertLess(time.time() - started, 5, "the line was not flushed promptly")
+
+    def test_a_silent_state_change_emits_no_update(self):
+        """GPaste's re-offer, which is the whole v3.3 defect: the offered
+        types change and no signal is emitted.
+
+        The third write below (reverting to the exact pre-silent bytes) is
+        the assertion that actually proves the silent change MOVED the
+        monitor's baseline, rather than merely proving it swallowed one
+        announcement -- the two are not the same claim. The digest check is
+        a boolean inequality against a stored reference, so an ORDINARY
+        different change after the silent one (a new generation, new types,
+        as below) differs from a stale never-updated baseline exactly as
+        surely as it differs from a correctly-advanced one, and would be
+        announced exactly once either way; it cannot tell the two
+        implementations apart, which is why it is not the only write here.
+        A revert to BYTE-IDENTICAL content is the one write that can: it
+        differs from an advanced baseline (so it must fire) and is IDENTICAL
+        to a frozen one (so a frozen baseline would wrongly see no change at
+        all, and stay silent a second time). See task-2-report.md for the
+        empirical trace that found this gap in the original brief.
+        """
+        baseline = {"generation": "1", "types": ["image/png"], "body": ""}
+        fake.save(self.state, dict(baseline))
+        monitor = self.start_gdbus_monitor()
+        self.assertEqual(self.drain(monitor, seconds=0.3), [],
+                         "the monitor spoke before anything changed")
+        fake.save(self.state, {"generation": "1", "types": ["image/png", "image/webp"],
+                               "body": "", "silent": True})
+        self.assertEqual(self.drain(monitor, seconds=0.5), [],
+                         "a silent takeover emitted an Update")
+        fake.save(self.state, dict(baseline))
+        self.assertEqual(len(self.drain(monitor, seconds=0.5)), 1,
+                         "reverting to the pre-silent bytes emitted no Update -- "
+                         "the silent change never advanced the monitor's baseline")
+        fake.save(self.state, {"generation": "2", "types": ["image/png"], "body": ""})
+        self.assertEqual(len(self.drain(monitor, seconds=0.5)), 1,
+                         "a real copy after a silent one emitted no Update")
+        monitor.terminate()
 
     def test_monitor_leaves_when_its_parent_does(self):
         """The Mac has no PR_SET_PDEATHSIG and the agent's normal exit path
