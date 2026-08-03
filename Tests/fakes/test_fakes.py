@@ -376,6 +376,12 @@ class EventSourceTests(ToolTestCase):
     DEST = ("--session", "--dest", "org.gnome.GPaste",
             "--object-path", "/org/gnome/GPaste")
 
+    def gdbus_uuid(self):
+        result = self.run_fake("gdbus", "call", *self.DEST,
+                               "--method", "org.gnome.GPaste2.GetElementAtIndex", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.decode().split("'")[1]
+
     def test_introspect_is_answered(self):
         """The decisive one. Serve only `monitor` and available() is false,
         make_watcher picks the plain poller, and every harness run passes
@@ -388,6 +394,29 @@ class EventSourceTests(ToolTestCase):
         wrong = ("--session", "--dest", "org.gnome.GPaste2",
                  "--object-path", "/org/gnome/GPaste")
         self.assertEqual(self.run_fake("gdbus", "introspect", *wrong).returncode, 1)
+
+    def test_gdbus_call_returns_a_uuid_and_the_top_text(self):
+        """The fast tier's whole input. Shape is byte-compatible with real gdbus:
+        a tuple literal, uuid first."""
+        state = {"generation": "17", "types": list(fake.TEXT_ALIASES),
+                 "body": base64.b64encode(b"hello").decode("ascii")}
+        fake.save(self.state, state)
+        result = self.run_fake("gdbus", "call", *self.DEST,
+                               "--method", "org.gnome.GPaste2.GetElementAtIndex", "0")
+        self.assertEqual(result.returncode, 0)
+        self.assertRegex(result.stdout.decode(), r"^\('[0-9a-f-]+', ")
+
+    def test_gdbus_call_uuid_changes_only_when_the_history_changes(self):
+        """The property the whole design rests on: our own re-offer of the SAME
+        content must not move the uuid, while a new copy must."""
+        fake.save(self.state, {"generation": "1", "types": ["image/png"], "body": ""})
+        first = self.gdbus_uuid()
+        fake.save(self.state, {"generation": "1", "types": ["image/png", "image/webp"],
+                               "body": ""})
+        self.assertEqual(self.gdbus_uuid(), first,
+                         "a type-list change with no new history entry moved the uuid")
+        fake.save(self.state, {"generation": "2", "types": ["image/png"], "body": ""})
+        self.assertNotEqual(self.gdbus_uuid(), first, "a new copy did not move the uuid")
 
     def test_the_update_line_is_the_one_the_agent_parses(self):
         line = load("fake_gdbus", HERE / "gdbus").UPDATE_LINE
