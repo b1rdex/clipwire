@@ -101,7 +101,7 @@ final class FrameTests: XCTestCase {
     }
 
     func testProtocolVersionIsBumpedToV3() {
-        // ProtocolConstants lives in main.swift, not this file -- but
+        // ProtocolConstants lives in Hello.swift, not this file -- but
         // @testable import gives this test target access regardless, and
         // this is the file the task brief designates for the assertion.
         XCTAssertEqual(ProtocolConstants.version, 3)

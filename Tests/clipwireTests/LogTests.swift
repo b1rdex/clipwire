@@ -10,7 +10,7 @@ final class LogTests: XCTestCase {
             .path
     }
 
-    // Task 15 finding: main.swift's fatal-config-error path calls
+    // Task 15 finding: runAgent's fatal-config-error path (Commands.swift) calls
     // `log.line("\(error)")` immediately before returning, on a path that
     // reaches `exit(0)` at the top level. `line(_:)` only enqueues the
     // write onto Log's own serial queue and returns immediately, and

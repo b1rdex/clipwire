@@ -4,7 +4,7 @@
 // the echo chain. `handleFrame` (HandleFrameTests.swift) and
 // `PasteboardWatcher` (PasteboardTests.swift) each prove their half of the
 // echo-suppression contract in isolation, but nothing proved that
-// `wireAgent` (extracted from `runAgent()` in main.swift for exactly this
+// `wireAgent` (extracted from `runAgent()` for exactly this
 // purpose) actually connects them: that `channel.onFrame`'s handler is
 // wired with `noteWrittenLocally: watcher.noteWrittenLocally` -- the SAME
 // watcher instance whose own poll() will later observe the write. A

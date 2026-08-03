@@ -86,9 +86,9 @@ class AsyncWriteClipboard:
     test_watcher.py's QueueClipboard actually CAN express the same
     decoupling already -- its read() only ever pops from an explicitly
     queued sequence, never derived from write(), which is exactly this
-    same shape (see TestIncomingClipState's own version of this bug in
-    test_watcher.py, reproduced by simply not queuing the applied text as
-    a read value). AsyncWriteClipboard exists here only because this file
+    same shape (see TestIncomingClipState's own version of this bug,
+    reproduced by simply not queuing the applied text as a read value).
+    AsyncWriteClipboard exists here only because this file
     has no queue-based double to reuse, and a name that says what the
     race is beats "queue nothing and rely on the empty-queue path."
     """
@@ -1159,7 +1159,7 @@ class InterleavingSilentClipboard(SilentClipboard):
 
 
 class RacyImageClipboard:
-    """The image twin of test_watcher.py's RacyClipboard: read() drives a
+    """The image twin of RacyClipboard: read() drives a
     _write_clip on the way past, so a newer write lands "on the main thread"
     while this read is still in flight -- deterministically, from one thread,
     rather than by racing two real ones. The real window is TWO wl-paste round
@@ -1362,7 +1362,7 @@ class TestImagesEndToEndOnThePC(ImageAgentTestCase):
         self.assertEqual(len(self.sent), 1, "a non-change signal must not resend")
 
     def test_a_stale_image_read_racing_a_newer_write_is_not_sent(self):
-        """The image twin of test_watcher.py's
+        """The image twin of
         test_a_write_that_lands_during_the_read_is_not_echoed. Before Task 12
         a stale image read had nowhere to go, so the staleness check only
         protected the store; it now stands between a read that predates a
