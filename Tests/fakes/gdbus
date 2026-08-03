@@ -194,22 +194,46 @@ def call_get_element_at_index(path):
     """
     state = fake.load(path)
     body = fake.body_bytes(state)
+    # Truncated to 40 characters: enough to prove a real body travelled
+    # (the whole point per spec 5.2), short enough that a multi-megabyte
+    # clipboard image or paste does not get written byte-for-byte into the
+    # invocation log every time `call` runs -- fake.note() below logs this
+    # same line, and that log is what the harness reads back.
     text = body.decode("utf-8", "replace")[:40] if body else ""
+    # Quotes stripped so the printed line is always a well-formed Python
+    # tuple literal of two single-quoted strings, parseable with
+    # ast.literal_eval. A real clipboard body could contain a quote; this
+    # fake does not model escaping it, only proving the field arrived.
     say("('%s', '%s')" % (history_uuid(state), text.replace("'", "")))
     fake.note(PROGRAM, "call GetElementAtIndex(0) -> uuid")
     return 0
+
+
+def refuse_unowned_name(command, dest, object_path):
+    """The wrong-name refusal `introspect` and `call` share verbatim: the
+    same stderr message a real gdbus prints for a name with no owner, and a
+    log line so the harness can tell "refused" from "never ran" apart.
+    `monitor` hits the same condition (see main()) but answers it by running
+    silently instead of exiting, so it is not routed through here.
+
+    Returns True if it refused (the caller should exit 1); False if the name
+    matches and the caller should proceed.
+    """
+    if dest == BUS_NAME and object_path == OBJECT_PATH:
+        return False
+    print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
+          "The name %s was not provided by any .service files" % dest,
+          file=sys.stderr, flush=True)
+    fake.note(PROGRAM, "%s %s %s -> exit 1, not this fake's name"
+              % (command, dest, object_path))
+    return True
 
 
 def main(argv):
     command, dest, object_path, method, positionals = parse(argv)
     path = fake.state_path(PROGRAM)
     if command == "introspect":
-        if dest != BUS_NAME or object_path != OBJECT_PATH:
-            print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
-                  "The name %s was not provided by any .service files" % dest,
-                  file=sys.stderr, flush=True)
-            fake.note(PROGRAM, "introspect %s %s -> exit 1, not this fake's name"
-                      % (dest, object_path))
+        if refuse_unowned_name(command, dest, object_path):
             return 1
         sys.stdout.write(INTROSPECTION)
         sys.stdout.flush()
@@ -222,12 +246,7 @@ def main(argv):
         # nobody touched.
         return monitor(path, silent=(dest != BUS_NAME or object_path != OBJECT_PATH))
     if command == "call":
-        if dest != BUS_NAME or object_path != OBJECT_PATH:
-            print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
-                  "The name %s was not provided by any .service files" % dest,
-                  file=sys.stderr, flush=True)
-            fake.note(PROGRAM, "call %s %s -> exit 1, not this fake's name"
-                      % (dest, object_path))
+        if refuse_unowned_name(command, dest, object_path):
             return 1
         if method != "org.gnome.GPaste2.GetElementAtIndex":
             fake.die(PROGRAM, "unmodelled method %r" % method)

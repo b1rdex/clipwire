@@ -15,6 +15,7 @@ The end-to-end proof is not here and cannot be: it is running the real agent
 against these, watching its log say it is on the event path, and watching a
 clip cross. That was done before they were handed over.
 """
+import ast
 import base64
 import importlib.util
 import json
@@ -376,11 +377,28 @@ class EventSourceTests(ToolTestCase):
     DEST = ("--session", "--dest", "org.gnome.GPaste",
             "--object-path", "/org/gnome/GPaste")
 
-    def gdbus_uuid(self):
+    def gdbus_call(self):
+        """(uuid, text) for the top of history, parsed as the Python tuple
+        literal `call_get_element_at_index` prints. Safe to parse with
+        `ast.literal_eval` because that function strips every quote from the
+        text first, so the two quoted fields can never contain one and the
+        line is always well-formed Python syntax.
+
+        Asserts the shape (exactly two fields) as well as returning them: a
+        fake that printed one field, or three, would otherwise fail with a
+        bare ValueError from the tuple-unpack at some call site far from
+        here, instead of a named assertion at the point that actually saw
+        the malformed output.
+        """
         result = self.run_fake("gdbus", "call", *self.DEST,
                                "--method", "org.gnome.GPaste2.GetElementAtIndex", "0")
         self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout.decode().split("'")[1]
+        parsed = ast.literal_eval(result.stdout.decode())
+        self.assertEqual(len(parsed), 2, result.stdout)
+        return parsed
+
+    def gdbus_uuid(self):
+        return self.gdbus_call()[0]
 
     def test_introspect_is_answered(self):
         """The decisive one. Serve only `monitor` and available() is false,
@@ -404,16 +422,40 @@ class EventSourceTests(ToolTestCase):
         self.assertEqual(self.run_fake("gdbus", "introspect", *self.DEST,
                                        "stray").returncode, 2)
 
+    def test_call_refuses_a_name_this_fake_does_not_own(self):
+        """The same wrong-name guard as introspect (see
+        test_introspect_refuses_a_name_this_fake_does_not_own), on `call`'s
+        route through refuse_unowned_name(). Unexercised until now: the other
+        `call` tests all pass *self.DEST, so nothing had ever run this path,
+        let alone proven its exit code. Both halves of the compound check are
+        tried -- wrong dest, then wrong object-path -- since
+        `dest == BUS_NAME and object_path == OBJECT_PATH` is one condition
+        that a test hitting only one half cannot fully pin."""
+        for wrong in (("--session", "--dest", "org.gnome.GPaste2",
+                       "--object-path", "/org/gnome/GPaste"),
+                      ("--session", "--dest", "org.gnome.GPaste",
+                       "--object-path", "/org/gnome/GPaste2")):
+            with self.subTest(wrong=wrong):
+                self.assertEqual(self.run_fake("gdbus", "call", *wrong, "--method",
+                                               "org.gnome.GPaste2.GetElementAtIndex",
+                                               "0").returncode, 1)
+
     def test_gdbus_call_returns_a_uuid_and_the_top_text(self):
         """The fast tier's whole input. Shape is byte-compatible with real gdbus:
-        a tuple literal, uuid first."""
+        a tuple literal, uuid first. Checks BOTH fields: a fake that returned
+        the uuid with an empty or truncated text would satisfy a uuid-only
+        check and hide exactly the payload-logging regression spec 5.2 warns
+        about -- which is why the body below is built to a specific value
+        rather than merely a non-empty one."""
         state = {"generation": "17", "types": list(fake.TEXT_ALIASES),
                  "body": base64.b64encode(b"hello").decode("ascii")}
         fake.save(self.state, state)
-        result = self.run_fake("gdbus", "call", *self.DEST,
-                               "--method", "org.gnome.GPaste2.GetElementAtIndex", "0")
-        self.assertEqual(result.returncode, 0)
-        self.assertRegex(result.stdout.decode(), r"^\('[0-9a-f-]+', ")
+        uuid, text = self.gdbus_call()
+        # history_uuid()'s fixed 8-4-4-4-12 shape, not just "some hex and
+        # dashes" -- the loose form would also accept a bare "-".
+        self.assertRegex(uuid, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                               r"[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertEqual(text, "hello")
 
     def test_gdbus_call_uuid_changes_only_when_the_history_changes(self):
         """The property the whole design rests on: our own re-offer of the SAME
