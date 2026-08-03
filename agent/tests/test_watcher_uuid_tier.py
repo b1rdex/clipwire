@@ -2,11 +2,24 @@
 
 Design: docs/superpowers/specs/2026-08-03-v3.3-focus-free-detection-design.md
 """
+import inspect
 import os
 import subprocess
+import time
 import unittest
+from unittest import mock
 
 import agent_under_test as agent
+# agent_under_test registers the loaded module under this name in
+# sys.modules (see test_watcher.py's own comment on the same import) --
+# needed here only by TestFastTierIntegration, to patch clipwire_agent.log
+# the same way test_watcher_polling.py's TestPollingWatcher and
+# test_watcher_safety_net.py's TestGPasteSafetyNet do: `agent.log = ...`
+# would patch the wrong module, since log() is resolved against
+# clipwire_agent's own globals, not agent_under_test's.
+import clipwire_agent
+
+from test_watcher import FakeGPasteProcess, JOIN_TIMEOUT
 
 
 class _StubClipboard:
@@ -134,12 +147,12 @@ class TestFastTier(unittest.TestCase):
         not itself look like a change) but NOT the "does not poison" half:
         it cannot distinguish "correctly remembered the last real reading"
         from "incorrectly reset it to None", because both produce no signal
-        here. A discriminating case would continue with a THIRD distinct
-        reading (e.g. ["a", None, "b"]) and assert the signal DOES fire --
-        proving the baseline survived the None untouched rather than merely
-        proving a None does not fire one of its own. Not added here: see the
-        mutation table for why this gap is reported rather than silently
-        closed.
+        here. The discriminating case -- a THIRD, distinct reading after the
+        None, asserting the signal DOES fire -- is
+        test_a_real_change_survives_a_failed_call_between_two_readings,
+        immediately below: added in fix round 1 after the coordinator's
+        review of task-5-report.md's mutation table, which named this exact
+        gap and the exact input that closes it.
         """
         watcher = self.watcher(["a", None, "a"])
         watcher._fast_tick()
@@ -148,6 +161,52 @@ class TestFastTier(unittest.TestCase):
         watcher._fast_tick()
         self.assertFalse(watcher._event.is_set(),
                          "recovery from a failed call signalled a change nobody made")
+
+    def test_a_real_change_survives_a_failed_call_between_two_readings(self):
+        """Fix round 1, row 5 of task-5-report.md's original mutation table.
+
+        test_an_unmeasured_reading_does_not_signal_and_does_not_poison just
+        above re-uses "a" on both sides of the None, so it cannot tell
+        "self._last_uuid correctly remembered across the failed call" apart
+        from "incorrectly reset to None by it" -- both produce no signal
+        there. This uses a THIRD, DISTINCT reading after the None instead.
+
+        If the remembering guard (`if current is not None:` in _fast_tick)
+        were weakened to an unconditional assignment, the failed call's None
+        would overwrite self._last_uuid, and the real a->b change on the
+        next tick would compare "b" against a wrongly-None baseline instead
+        of "a" -- so `previous is not None` would be false, and the
+        signal that SHOULD fire would not. Confirmed empirically during
+        Task 5 (task-5-report.md): the mutated code printed False for this
+        exact sequence; the code as shipped printed True. This is the copy a
+        user would feel -- silently never syncing -- so it is asserted
+        directly, not just reasoned about.
+        """
+        watcher = self.watcher(["a", None, "b"])
+        watcher._fast_tick()   # baseline: "a"
+        watcher._fast_tick()   # a failed call: must not overwrite the baseline
+        self.assertFalse(watcher._event.is_set(), "a failed call signalled")
+        watcher._fast_tick()   # the real change, straddling the failed call
+        self.assertTrue(
+            watcher._event.is_set(),
+            "a real change (a -> b) across a failed call must still signal",
+        )
+
+    def test_the_production_default_read_history_uuid_is_the_real_probe(self):
+        """Fix round 1, row 7 of task-5-report.md's original mutation table.
+
+        Every OTHER test in this class passes its own read_history_uuid
+        stub, so none of them can tell whether GPasteWatcher.__init__'s
+        DEFAULT -- what production actually uses when nobody overrides it --
+        points at the real gpaste_history_uuid or somewhere else entirely;
+        changing the default to `lambda: None` left the full 369-test suite
+        green (task-5-report.md). Checked directly against the signature's
+        own default value, not through a behavioral test built on a scripted
+        stub, which could not distinguish "the real default" from
+        "coincidentally correct because this test injected its own"."""
+        default = inspect.signature(agent.GPasteWatcher.__init__).parameters[
+            "read_history_uuid"].default
+        self.assertIs(default, agent.gpaste_history_uuid)
 
 
 class TestTierIntervalResolution(unittest.TestCase):
@@ -205,6 +264,145 @@ class TestTierIntervalResolution(unittest.TestCase):
         watcher.stop()
         self.assertEqual(watcher._fast_interval, 0.25)
         self.assertEqual(watcher._slow_interval, 0.75)
+
+
+class TestFastTierIntegration(unittest.TestCase):
+    """Fix round 1: closes rows 1 and 6 of task-5-report.md's original
+    mutation table. Both shared one root cause, named in the coordinator's
+    review: nothing in the suite ever called GPasteWatcher.start() and let
+    the fast tier run as a REAL thread against a real interval.
+    TestFastTier's tests all call _fast_tick() directly, which cannot catch
+    either start() silently never launching self._fast_thread (row 1 --
+    deleting those 3 lines left the full 369-test suite green) or
+    _fast_loop's try/except silently not existing (row 6 -- same result,
+    since nothing ever ran the loop for an exception to reach).
+
+    No real gdbus subprocess: subprocess.Popen is patched to a
+    FakeGPasteProcess exactly as TestGPasteWatcherLifecycle does in
+    test_watcher.py, so the gdbus pump thread this same start() call also
+    launches has a real pipe to block on -- nothing is ever written to it,
+    so it produces zero signals of its own -- instead of forking a real
+    gdbus monitor process. The safety net's own interval is set far past
+    JOIN_TIMEOUT, the convention used throughout this suite (see
+    TestGPasteWatcherLifecycle.start_watcher and
+    TestGPasteSafetyNet.start_watcher in test_watcher*.py), so within this
+    test's window it can only ever take its one baseline read and cannot
+    itself be the thing that sets the event.
+    """
+
+    def setUp(self):
+        # This test deliberately makes the fast tier's first tick raise, to
+        # prove _fast_loop survives it (row 6) -- so a real traceback is
+        # expected on the log path. Captured rather than left to print to
+        # real stderr during a test run, the same convention
+        # test_watcher_polling.py's TestPollingWatcher and
+        # test_watcher_safety_net.py's TestGPasteSafetyNet use for the
+        # identical reason (a deliberately-triggered error path).
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    def test_start_runs_the_fast_tier_as_a_real_thread_and_survives_a_failing_tick(self):
+        """Row 1: start() must launch a thread that reaches a real
+        observation on its own -- nobody here calls _fast_tick by hand. The
+        thread's existence is also checked directly (assertIsNotNone/
+        is_alive) immediately after start() returns, rather than inferred
+        only from an observation eventually happening: _fast_loop's very
+        first action is `self._stop.wait(self._fast_interval)`, which blocks
+        for at least fast_interval_seconds before doing anything else, so a
+        correctly launched thread is GUARANTEED still alive at that
+        checkpoint -- this assertion is not a timing gamble, and it pins row
+        1 even if some future change altered the pump or safety net's own
+        timing within the window this test does not otherwise rule out.
+
+        Row 6, in the same test: the FIRST scripted reading raises. A fast
+        tier whose loop dies on an uncaught exception (deleting
+        _fast_loop's try/except -- see the report) would never reach the
+        second and third readings the final assertion below depends on, so
+        reaching a real observation at all proves the loop survived tick 1's
+        exception and kept going rather than dying silently -- the
+        production defect this file's whole "signalled, never called" shape
+        exists to prevent, applied to the tier's own internal robustness
+        rather than to the handler-call boundary.
+
+        Waits on `changes` -- the HANDLER having run -- not on
+        `watcher._event.is_set()`. The first draft of this test waited on
+        the raw event and failed 100% of the time even against known-correct
+        code: `_start_observer`'s worker (started by this same start() call)
+        is ALSO parked in `event.wait()` and clears the event BEFORE calling
+        the handler, so by the time this thread's own polling loop (checking
+        every 5ms) gets to look, the worker has almost always already
+        consumed it -- the event is a transient wakeup, not a status flag.
+        Confirmed by a standalone repro that drove _fast_loop directly with
+        no observer attached, where waiting on the bare event worked every
+        time. Mirrors test_watcher.py's own documented rationale for this
+        exact choice (see SignallingClipboard's docstring: "waits on the
+        CALLBACK having run rather than the watcher's private signal
+        counter, so the test is evidence about observable behaviour").
+
+        The stub raises a named AssertionError rather than letting a plain
+        iterator run dry into StopIteration past its 3 scripted readings:
+        both are caught identically by _fast_loop's `except Exception`, so
+        this changes nothing about which assertion below catches a real
+        failure -- only what a later reader sees in the captured log if the
+        tier ticks more times than expected, whether from a slow CI box or
+        an unrelated mutation, rather than a bare, unexplained StopIteration.
+        """
+        readings = [RuntimeError("simulated gdbus failure"), "a", "b"]
+        calls = 0
+
+        def read_history_uuid():
+            nonlocal calls
+            index = calls
+            calls += 1
+            if index >= len(readings):
+                raise AssertionError(
+                    "the fast tier ticked %d times; this test scripted only "
+                    "%d readings" % (index + 1, len(readings)))
+            value = readings[index]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        fake_process = FakeGPasteProcess()
+        patcher = mock.patch("subprocess.Popen", return_value=fake_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(fake_process.close)
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(),
+            safety_net_interval_seconds=JOIN_TIMEOUT * 100,
+            read_history_uuid=read_history_uuid,
+            fast_interval_seconds=0.01,
+        )
+        self.addCleanup(watcher.stop)
+        changes = []
+        watcher.start(lambda: changes.append(1))
+
+        self.assertIsNotNone(
+            watcher._fast_thread,
+            "start() must launch the fast tier's own thread")
+        self.assertTrue(
+            watcher._fast_thread.is_alive(),
+            "the fast tier's thread must still be running immediately after "
+            "start() -- a correct _fast_loop cannot have finished even one "
+            "iteration this fast, since its first action always waits at "
+            "least fast_interval_seconds",
+        )
+
+        self.wait_until(lambda: changes)
+        self.assertEqual(
+            changes, [1],
+            "the fast tier's own thread never drove a real observation -- "
+            "either it is not running, or it died on the first (raising) "
+            "tick instead of surviving to the next one",
+        )
 
 
 if __name__ == "__main__":
