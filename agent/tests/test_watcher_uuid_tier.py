@@ -241,7 +241,20 @@ class TestSlowTierVerdict(unittest.TestCase):
     def watcher(self, uuid="frozen"):
         watcher = agent.GPasteWatcher(clipboard=_StubClipboard(),
                                       read_history_uuid=lambda: uuid)
+        # Both fields primed to the SAME value: this represents a connection
+        # that has already been through at least one prior slow-tier tick
+        # with a stable uuid, which is the steady state every test below
+        # means to start from -- not a brand new watcher's first-ever tick,
+        # which can never see uuid_frozen True by construction (see
+        # _observe_tick's own predicate comment on the one-tick warm-up
+        # cost). Priming only self._last_uuid (as an earlier revision of
+        # this helper did) left self._uuid_at_last_tick at its __init__
+        # default of None, so every test's FIRST _observe_tick call saw
+        # uuid_frozen False regardless of what the test needed to pin --
+        # found and fixed in review, alongside the predicate defect this
+        # helper exists to exercise correctly.
         watcher._last_uuid = uuid
+        watcher._uuid_at_last_tick = uuid
         self.addCleanup(watcher.stop)
         return watcher
 
@@ -279,6 +292,72 @@ class TestSlowTierVerdict(unittest.TestCase):
         watcher._observe_tick(("text", "b"), ("text", "c"))
         self.assertFalse(watcher._degraded,
                          "a failing uuid call was read as a dead tracker")
+
+    def test_an_actively_copying_healthy_connection_does_not_degrade(self):
+        """THE regression found in review, and the one a user would have
+        felt: "self._last_uuid is not None" alone is permanently true from
+        the fast tier's first successful reading onward -- it is STICKY
+        (_fast_tick only ever assigns it on a measured reading) -- so it has
+        NO discriminating power against two consecutive REAL, TRACKED
+        copies, which is exactly what a healthy actively-copying connection
+        looks like. "Two consecutive windows each containing a copy" is the
+        walkthrough that found this: without a delta against what the uuid
+        was at the LAST tick, that pattern alone would arm-then-confirm,
+        which is a regression against the predicate this task replaced --
+        `signals == self._signals_at_last_tick` protected exactly this user,
+        because Updates move 1:1 with real copies.
+
+        The uuid changes every tick below, exactly as it would if GPaste is
+        genuinely tracking the user's copies -- must not degrade."""
+        watcher = self.watcher()
+        watcher._last_uuid = "uuid-1"
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # window 1: a real, tracked copy
+        watcher._last_uuid = "uuid-2"
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # window 2: another real, tracked copy
+        self.assertFalse(
+            watcher._degraded,
+            "an actively-copying healthy connection was degraded")
+
+    def test_the_snapshot_updates_every_tick_so_a_tracker_that_goes_dead_is_still_caught(self):
+        """Closes a mutation hole found while re-verifying the fix round:
+        deleting `self._uuid_at_last_tick = self._last_uuid` at the bottom
+        of the function leaves the snapshot stuck at whatever it was primed
+        with, forever. A tracker that is dead from the very start would
+        still (coincidentally) be diagnosed correctly, because a NEVER-
+        UPDATED snapshot happens to equal a NEVER-CHANGING self._last_uuid
+        either way -- so this needs a uuid that moves ONCE and then holds,
+        which only a snapshot updated every tick can compare against
+        correctly on the tick after."""
+        watcher = self.watcher(uuid="uuid-A")   # primes both fields to "uuid-A"
+        watcher._last_uuid = "uuid-B"           # one real, tracked copy: the uuid moves
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # tick 1: uuid-B vs primed uuid-A -- correctly NOT frozen
+        # From here self._last_uuid is left at "uuid-B": the tracker goes
+        # dead right after that one real copy, exactly the scenario a
+        # stuck snapshot cannot tell apart from a healthy idle uuid.
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # tick 2: uuid stayed at B -- ARMS
+        watcher._observe_tick(("text", "c"), ("text", "d"))   # tick 3: uuid still B -- CONFIRMS
+        self.assertTrue(
+            watcher._degraded,
+            "a tracker that went dead right after one real copy was not diagnosed")
+
+    def test_a_brand_new_watcher_with_no_prior_snapshot_reaches_no_verdict(self):
+        """The startup case the predicate comment names (spec 4.0.1's
+        warm-up cost): a brand new watcher's first-EVER tick has no
+        snapshot to compare against (self._uuid_at_last_tick starts at
+        None in __init__, and nothing primes it here), so it must reach no
+        verdict regardless of self._last_uuid -- including the one case a
+        naive `A == B` on two None values gets wrong (`None == None` is
+        True in Python), which is exactly why the predicate checks BOTH
+        readings are present and not only that they are equal."""
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard(),
+                                      read_history_uuid=lambda: None)
+        self.addCleanup(watcher.stop)
+        # Neither field seeded: both sit at __init__'s default, None.
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertFalse(
+            watcher._degraded,
+            "a watcher with no prior snapshot reached a verdict from nothing")
 
     def test_a_cleared_run_rearms_rather_than_immediately_confirming(self):
         """A settle that clears must actually reset self._armed to False, not

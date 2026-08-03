@@ -111,7 +111,18 @@ class TestGPasteSafetyNet(unittest.TestCase):
         # WL-PASTE TOKEN's own arm/confirm/clear behaviour, not about the
         # uuid tier's own measured-vs-unmeasured distinction, which has its
         # own dedicated tests there.
+        #
+        # BOTH fields, not just self._last_uuid (fix round 1, a coordinator
+        # review finding): _observe_tick's "frozen" is a DELTA against
+        # self._uuid_at_last_tick, not a presence check, so seeding only
+        # self._last_uuid left self._uuid_at_last_tick at its __init__
+        # default of None -- meaning every test's FIRST _observe_tick call
+        # still saw uuid_frozen False regardless, needing an extra warm-up
+        # tick none of these scripts provide. Priming both to the SAME
+        # value represents a connection already past its first slow-tier
+        # tick, which is the steady state every test here means to exercise.
         watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
         # Same reason as `process` above, and the same instant: a clipboard
         # that drives the SIGNAL COUNTER from inside its own read() must hold
         # the watcher before the baseline read.

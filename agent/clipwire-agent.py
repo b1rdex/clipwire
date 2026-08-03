@@ -3512,6 +3512,19 @@ class GPasteWatcher:
         self._signals = 0
         # Only ever touched by _observe_tick, i.e. by that one poll thread.
         self._signals_at_last_tick = 0
+        # _observe_tick's OWN snapshot of the uuid, mirroring
+        # _signals_at_last_tick immediately above it in shape and in
+        # lifetime -- same "only this one poll thread touches it", same
+        # "restarts on a watcher rebuild rather than being carried across
+        # one". NOT the same field as _fast_tick's self._last_uuid: that one
+        # is STICKY (Task 5 only ever assigns it on a measured reading, so
+        # it is never None again after the first success), which is
+        # precisely why "self._last_uuid is not None" alone cannot answer
+        # spec 4.0.1's "frozen" -- it would still be true forever after one
+        # successful read regardless of how many times the uuid has since
+        # moved. This snapshot is what makes "frozen" a comparison instead
+        # of a presence check: see _observe_tick's own predicate comment.
+        self._uuid_at_last_tick = None
         # The first half of the two-tick verdict: a divergence is waiting to be
         # confirmed or cleared by the next tick. Deliberately NOT carried across
         # a watcher rebuild the way _degraded is -- a Wayland flap restarts the
@@ -3729,13 +3742,49 @@ class GPasteWatcher:
         # evidence that tracking is alive. Do not "strengthen" this with an
         # `and signals silent` clause.
         #
-        # FROZEN MEANS MEASURED-AND-UNCHANGED, never unmeasured (spec 4.0.1).
-        # While the uuid call is failing we know nothing about the history,
-        # and an active user moving the wl-paste token then looks exactly
-        # like a dead tracker -- so a failing method would latch a false
-        # verdict that this release cannot clear. No verdict is reached at
-        # all until the reading is measured again, or until the fallback
-        # engages.
+        # FROZEN MEANS MEASURED-AND-UNCHANGED, never unmeasured (spec 4.0.1)
+        # -- and "UNCHANGED" is load-bearing, not decorative, found missing
+        # in review before this shipped: self._last_uuid is STICKY (Task 5's
+        # _fast_tick only ever assigns it on a MEASURED reading, never resets
+        # it to None on a failure), so "is not None" alone is true FOREVER
+        # after the first successful read, whether or not the uuid has moved
+        # since. That has NO discriminating power against two consecutive
+        # real, TRACKED copies -- which is exactly what a healthy, actively-
+        # copying connection looks like -- and is a regression against the
+        # predicate this replaces: `signals == self._signals_at_last_tick`
+        # protected that exact user, because Updates move 1:1 with real
+        # copies. Mutation testing could not have found this on its own: it
+        # is an ABSENT comparison, not a mutated one.
+        #
+        # So frozen is a DELTA, mirroring how self._signals_at_last_tick
+        # already works two lines below: this tick's self._last_uuid against
+        # self._uuid_at_last_tick, a snapshot of what it was AT THE LAST
+        # TICK (updated at the bottom of this function, beside
+        # self._signals_at_last_tick). Frozen means those two READINGS
+        # AGREE, not merely that a reading exists. A brand new watcher's
+        # very first tick can never see uuid_frozen True by construction
+        # (self._uuid_at_last_tick starts at None) -- a one-tick warm-up
+        # cost, not a regression, the same shape as the fast tier's own
+        # baseline-on-rebuild transient (__init__'s comment on
+        # self._last_uuid).
+        #
+        # While the uuid call is failing (self._last_uuid is None) we know
+        # nothing about the history, and an active user moving the wl-paste
+        # token then looks exactly like a dead tracker -- so a failing
+        # method would latch a false verdict that this release cannot
+        # clear. No verdict is reached while that is true.
+        #
+        # NOT CLOSED BY THIS DELTA ALONE, and said here so a later reader
+        # does not conclude it is: a fast tier that measured once and then
+        # fails PERSISTENTLY (a renamed method, say) leaves BOTH
+        # self._last_uuid and self._uuid_at_last_tick stuck at the SAME
+        # stale value forever, which this comparison reads as frozen no
+        # differently than a genuinely idle uuid -- so a persistent failure
+        # can still arm a false verdict on an active user. Real, and
+        # deliberately not closed here: Task 7 owns self._uuid_failures
+        # (spec 4.3) and adds "no verdict while a failure run is in
+        # progress" ON TOP of this delta. Until that lands, this predicate
+        # is necessary but not sufficient for the persistent-failure case.
         #
         # DO NOT restore the one-tick verdict without restoring the synchronous
         # call. Two ticks will look like one too many to a reader who cannot
@@ -3757,7 +3806,9 @@ class GPasteWatcher:
         # full stop, independent of how often they copy); this tier's own
         # job narrows to the GPaste-takeover false positive, not to being
         # the sole backstop for every dead-tracker shape.
-        uuid_frozen = self._last_uuid is not None
+        uuid_frozen = (self._last_uuid is not None
+                       and self._uuid_at_last_tick is not None
+                       and self._last_uuid == self._uuid_at_last_tick)
         token_moved = previous != current
         if not read_ok or not uuid_frozen:
             confirmed = False
@@ -3808,6 +3859,10 @@ class GPasteWatcher:
                 # the verdict escapes it.
                 self._on_degrade()
         self._signals_at_last_tick = signals
+        # Beside it, the same unconditional bottom-of-every-tick update, for
+        # the same reason: next tick's delta needs THIS tick's reading,
+        # whether or not a verdict was reached from it.
+        self._uuid_at_last_tick = self._last_uuid
 
     def _fast_tick(self):
         """One fast-tier iteration: measure the history uuid and signal iff it
