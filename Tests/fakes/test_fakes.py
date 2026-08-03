@@ -575,8 +575,10 @@ class EventSourceTests(ToolTestCase):
         A revert to BYTE-IDENTICAL content is the one write that can: it
         differs from an advanced baseline (so it must fire) and is IDENTICAL
         to a frozen one (so a frozen baseline would wrongly see no change at
-        all, and stay silent a second time). See task-2-report.md for the
-        empirical trace that found this gap in the original brief.
+        all, and stay silent a second time) -- confirmed by running this
+        test's original three assertions (no revert step) against a build
+        with the baseline-advance deliberately broken: all three still pass,
+        which is why the revert step is not optional here.
         """
         baseline = {"generation": "1", "types": ["image/png"], "body": ""}
         fake.save(self.state, dict(baseline))
