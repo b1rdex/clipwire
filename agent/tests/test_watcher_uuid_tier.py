@@ -951,6 +951,59 @@ class TestUuidTierFallback(unittest.TestCase):
             "the more specific degraded backoff must not be overwritten by "
             "the flatter SAFETY_NET_POLL_SECONDS")
 
+    def test_a_real_failure_run_read_by_a_real_slow_tick_reaches_no_verdict(self):
+        """THE COMPOSED PATH, not the predicate in isolation. Every other
+        test of this guard drives just one side of the seam: this class's
+        own tests above call _fast_tick repeatedly but never call
+        _observe_tick at all, while TestSlowTierVerdict's
+        test_no_verdict_while_a_uuid_failure_run_is_in_progress hand-sets
+        self._uuid_failures and calls _observe_tick without ever calling
+        _fast_tick. Neither proves the two functions actually PRODUCE this
+        state when run against each other, one real tick at a time -- the
+        exact "a guard nothing connects" shape a mutation enumeration
+        cannot see if nothing in the suite exercises the seam itself
+        (task-5-report.md, row 1: deleting the fast tier's thread launch
+        left the full suite green for the identical reason).
+
+        The specific risk this closes: _observe_tick's own bottom line
+        unconditionally does `self._uuid_at_last_tick = self._last_uuid` on
+        EVERY tick, including ones where no verdict was reached -- so a
+        REAL failure run (built by _fast_tick, which leaves self._last_uuid
+        untouched while it runs) needs a REAL prior _observe_tick tick to
+        have already caught self._uuid_at_last_tick up to that same stale
+        value, or this test would not even reach the uuid_frozen==True
+        precondition the guard exists to override. Hand-setting both
+        fields to the same value (TestSlowTierVerdict.watcher()'s own
+        convention) assumes that composition rather than demonstrating it.
+        """
+        readings = iter(["a"])   # one real success, then real failures forever
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(),
+            read_history_uuid=lambda: next(readings, None),
+            fast_interval_seconds=0.001, slow_interval_seconds=0.01)
+        self.addCleanup(watcher.stop)
+
+        watcher._fast_tick()   # measures "a" for real: self._last_uuid = "a"
+        # A settled slow tick, exactly as a real prior one would leave the
+        # connection: self._uuid_at_last_tick catches up to "a" too.
+        watcher._observe_tick(("text", "x"), ("text", "x"))
+
+        for _ in range(3):   # a REAL failure run, well short of the fallback threshold
+            watcher._fast_tick()
+        self.assertEqual(
+            watcher._uuid_failures, 3,
+            "test precondition: a run built by _fast_tick, not hand-set")
+        self.assertFalse(
+            watcher._uuid_tier_failed,
+            "test precondition: short of the threshold, the fallback has not engaged")
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertFalse(
+            watcher._degraded,
+            "a real uuid failure run, read by a real slow tick, was "
+            "diagnosed as a dead tracker")
+
 
 if __name__ == "__main__":
     unittest.main()
