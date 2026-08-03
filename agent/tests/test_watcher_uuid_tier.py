@@ -44,7 +44,14 @@ class TestHistoryUuidProbe(unittest.TestCase):
             "ecf318fd-a295-40a8-b591-9721fcf7cbcc")
 
     def test_a_nonzero_exit_is_not_measured(self):
-        self.assertIsNone(self.probe(b"", returncode=1))
+        """A well-formed reply, not empty stdout: b"" independently trips the
+        `len(parts) < 2` parse guard regardless of returncode, so an empty
+        payload here could not tell this guard apart from that one -- fix
+        round 1 finding. A real gdbus non-zero exit does not print the
+        method's reply at all, but this deliberately gives it one anyway, so
+        a `returncode != 0` check that gets deleted is caught HERE rather
+        than only coincidentally by whatever stdout happens to be empty."""
+        self.assertIsNone(self.probe(b"('would-be-uuid', 'text')\n", returncode=1))
 
     def test_a_timeout_is_not_measured(self):
         self.assertIsNone(self.probe(
