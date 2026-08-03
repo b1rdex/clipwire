@@ -3500,12 +3500,15 @@ class GPasteWatcher:
         self._worker = None
         self._event = threading.Event()
         self._stop = threading.Event()
-        # Accepted Update lines. Written ONLY by the gdbus pump thread and read
-        # only by the safety net's poll thread, so `+= 1` has a single writer
-        # and cannot lose an update; no lock is needed, and the worst the
-        # reader can do is see the previous value a moment longer -- which is
-        # exactly the window the ordering in start()/PollingWatcher.start is
-        # arranged to absorb.
+        # Accepted Update lines. Written ONLY by the gdbus pump thread and
+        # read by the safety net's poll thread AND (since Task 6) the fast
+        # tier's own thread -- still a single writer, so `+= 1` cannot lose
+        # an update regardless of how many readers there are; no lock is
+        # needed, and the worst any reader can do is see the previous value
+        # a moment longer -- which is exactly the window the ordering in
+        # start()/PollingWatcher.start is arranged to absorb for the safety
+        # net, and which spec 6.1's own log line is explicitly informational
+        # enough to tolerate for the fast tier (see _fast_tick).
         self._signals = 0
         # Only ever touched by _observe_tick, i.e. by that one poll thread.
         self._signals_at_last_tick = 0
@@ -3570,6 +3573,25 @@ class GPasteWatcher:
         # it next. See _fast_tick's own docstring for how that is enforced.
         self._last_uuid = None
         self._fast_thread = None
+        # Spec 6.1's own one-shot flag -- "signal path silent, tracking
+        # alive" -- and per spec 6 it is a LOG flag, never a mode latch:
+        # unlike self._degraded it is never read outside _fast_tick, never
+        # handed to Agent, and never changes an interval. A fresh watcher (a
+        # new connection, per this file's own rebuild pattern -- see
+        # self._degraded's own comment on why THAT one takes `degraded` as a
+        # constructor argument) gets a fresh False here with no argument to
+        # match, because there is nothing about this flag worth carrying
+        # across a rebuild: "once per connection" just falls out of a new
+        # instance starting at False.
+        self._signal_path_silence_logged = False
+        # The fast tier's OWN "since the last tick" signal baseline,
+        # mirroring _signals_at_last_tick's shape but deliberately NOT
+        # sharing it: that field is documented as touched only by
+        # _observe_tick, on the safety net's poll thread, and this one is
+        # touched only by _fast_tick, on the fast tier's own thread. Two
+        # readers of self._signals (below), never a second writer of
+        # EITHER bookkeeping field.
+        self._signals_at_last_fast_tick = 0
         # PollingWatcher is defined below this class: resolved at call time
         # from module globals, so the forward reference is fine -- nothing
         # constructs a GPasteWatcher until main() runs.
@@ -3597,20 +3619,32 @@ class GPasteWatcher:
             on_idle_tick=on_idle_tick)
 
     def _observe_tick(self, previous, current):
-        """Judge the event source from one safety-net tick.
+        """Judge whether GPaste is TRACKING the clipboard, from one
+        safety-net tick -- spec 4.0 splits that question from whether the
+        signal SOURCE is alive, which this function no longer decides at all
+        (that one is spec 6.1, judged in _fast_tick, the only place that
+        ever sees a uuid MOVE rather than merely whether it is frozen).
 
         Runs on the safety net's own poll thread, after it has already
-        SIGNALLED any change -- see PollingWatcher.start, and read the grace
-        period note there before trusting `signals` to be current.
+        SIGNALLED any change -- see PollingWatcher.start. `signals` below
+        feeds only the verdict LINE's evidence fields now (spec 4.0 dropped
+        it from the predicate itself, below); read the grace period note in
+        PollingWatcher.start before trusting it as a precise count of what
+        happened strictly before this tick -- it is reported evidence, not
+        a decision input.
 
-        Order within a tick is load-bearing and free: the clipboard is
-        probed FIRST, in PollingWatcher's loop, and the counter is
-        snapshotted below only afterwards. That wl-paste fork hands a signal
-        still in flight a millisecond of grace before the first strike is
-        recorded. Still a fork after the loop moved from read() to probe():
-        probe() is fewer wl-paste calls, never zero. Do not reorder it for
-        tidiness; the second tick covers the tail, but this costs nothing
-        and shortens the tail.
+        Order within a tick still matters, for a narrower reason than
+        before Task 6: the clipboard is probed FIRST, in PollingWatcher's
+        loop, and the counter is snapshotted below only afterwards. That
+        wl-paste fork hands a signal still in flight a millisecond of grace
+        before this tick's own snapshot. Still a fork after the loop moved
+        from read() to probe(): probe() is fewer wl-paste calls, never zero.
+        Reordering it now changes no verdict at all -- signals feed no
+        decision in this function any more -- only whether the verdict
+        line's `signals=`/`signals_at_last_tick=` fields undercount by one
+        preventable count. Kept in this order anyway: it is free, and a log
+        line that fires at most once per connection is still worth not
+        shipping slightly wrong.
 
         `previous`/`current` are probe() TOKENS, not content -- for an image
         they are the offered type list. This function only ever compares
@@ -3624,9 +3658,11 @@ class GPasteWatcher:
         # the poll's own baseline, because the poll keeps one. Concluding
         # "dead" from the difference alone would degrade every healthy
         # installation to polling on the user's first copy, which is worse than
-        # the bug this safety net exists to fix. The count of accepted signals
-        # is the discriminator: the source is dead only if the clipboard moved
-        # while no signal arrived to report it.
+        # the bug this safety net exists to fix. The fast tier's uuid is the
+        # discriminator now (spec 4.0), not the signal count this sentence
+        # named before Task 6: the source is dead only if the wl-paste token
+        # moved while the uuid stayed frozen -- see the predicate comment
+        # below for the full rule and why signals were dropped from it.
         #
         # "Token", not "content", throughout this function: for an image these
         # values are the offered type list, so what this tick observes is that
@@ -3665,9 +3701,6 @@ class GPasteWatcher:
         # A failing --list-types still produces them, which is the case this
         # clause was written for.
         read_ok = previous is not None and current is not None
-        # "Still" as in since the previous tick: _signals_at_last_tick is
-        # assigned at the bottom of every one.
-        still_silent = signals == self._signals_at_last_tick
         # ONE diverging tick is not a verdict, and this is a reversal of v2's
         # rule rather than an accident -- see the design doc, "The verdict now
         # needs two consecutive ticks". v2 judged from a single tick, which was
@@ -3682,23 +3715,27 @@ class GPasteWatcher:
         # acknowledgement from the worker -- would re-couple this thread to it
         # and restore the wedge path the decoupling exists to remove.
         #
-        # A divergence ARMS; the next tick CONFIRMS if the counter is still
-        # unmoved. What may clear an armed run is the crux, and the first
-        # version of this rule got it wrong: the armed state is a claim about
-        # the EVENT SOURCE, not about the clipboard, so only evidence about the
-        # source may clear it.
+        # THE SLOW TIER'S DIVERGENCE PREDICATE, and it compares against the
+        # FAST TIER rather than against the signal counter (spec 4.0). The old
+        # predicate -- "the token moved while no signal arrived" -- is wrong
+        # here for a reason that is not obvious: in the state where the signal
+        # path has gone silent but tracking is alive, signals ARE silent and
+        # the token DOES move on every real copy, so that predicate diagnoses
+        # a dead tracker on a machine whose tracker is fine.
         #
-        #   - the counter MOVED: the source is alive. A signal that was merely
-        #     in flight when the run was armed lands here, which is exactly the
-        #     race this shape exists to absorb. Reset.
-        #   - a probe FAILED: probe() returns None for a timed-out wl-paste and
-        #     for an empty selection alike, so it is evidence either way about
-        #     nothing at all. Reset.
-        #   - the token SETTLED: says nothing whatever about the source. It
-        #     must NOT reset, and a rule that cleared the run here looked
-        #     symmetrical and was not: a dead source on any machine whose copies
-        #     fall more than one tick apart would arm, clear, arm, clear and
-        #     never once be diagnosed.
+        # Signals are deliberately absent from this predicate. Operations on
+        # the history alone -- deleting an entry from GPaste's UI -- emit
+        # Update with no selection tracking whatever, so a signal is not
+        # evidence that tracking is alive. Do not "strengthen" this with an
+        # `and signals silent` clause.
+        #
+        # FROZEN MEANS MEASURED-AND-UNCHANGED, never unmeasured (spec 4.0.1).
+        # While the uuid call is failing we know nothing about the history,
+        # and an active user moving the wl-paste token then looks exactly
+        # like a dead tracker -- so a failing method would latch a false
+        # verdict that this release cannot clear. No verdict is reached at
+        # all until the reading is measured again, or until the fallback
+        # engages.
         #
         # DO NOT restore the one-tick verdict without restoring the synchronous
         # call. Two ticks will look like one too many to a reader who cannot
@@ -3710,15 +3747,36 @@ class GPasteWatcher:
         # positive costs one more interval on a machine that is already not
         # syncing. Every change is still REPORTED throughout either way; only
         # the interval the safety net polls at is at stake.
-        if not read_ok or not still_silent:
+        #
+        # On THIS tier that "late true positive" is now optimistic, not
+        # merely late: settled-clears (below) means a dead tracker under a
+        # USER WHOSE COPIES ARE SPARSER than this tier's own interval arms,
+        # clears, arms, clears and may never confirm here at all -- by
+        # design, not a regression. The fast tier is what actually catches
+        # that user (spec 4.0's top row: a dead tracker's uuid never moves,
+        # full stop, independent of how often they copy); this tier's own
+        # job narrows to the GPaste-takeover false positive, not to being
+        # the sole backstop for every dead-tracker shape.
+        uuid_frozen = self._last_uuid is not None
+        token_moved = previous != current
+        if not read_ok or not uuid_frozen:
             confirmed = False
             self._armed = False
         elif self._armed:
-            confirmed = True
-            self._armed = False   # the run is spent, whatever is done with it
+            # A SETTLED TOKEN CLEARS on this tier, which is the exact reverse
+            # of the fast tier's rule and correct for the opposite reason.
+            # Here the unsignalled-then-settling event is a KNOWN BENIGN
+            # CLASS -- GPaste taking the selection back and re-offering it,
+            # measured at one to six seconds after every copy -- while a
+            # genuinely dead tracker under an active user keeps diverging
+            # tick after tick. On the fast tier's input the same rule would
+            # be wrong, and its own comment says so. Two inputs, two rules;
+            # see gpaste_history_uuid.
+            confirmed = token_moved
+            self._armed = token_moved
         else:
             confirmed = False
-            self._armed = previous != current
+            self._armed = token_moved
         if confirmed and not self._degraded:
             self._degraded = True
             # Report what was observed, not a diagnosis this thread cannot
@@ -3772,13 +3830,60 @@ class GPasteWatcher:
         it must never touch Agent._local_change directly -- a reader that ran
         the handler could block on Agent._observe_lock and could die of
         anything the handler raised.
+
+        ALSO the sole place spec 4.0's top-row second clause can be judged --
+        "the uuid moves; whether the signal path ALSO saw it is separate,
+        answered by the counter alone" -- because this is the only code that
+        ever observes a uuid MOVE; _observe_tick only ever sees whether
+        self._last_uuid is frozen, never the transition itself. Silent there
+        is spec 6.1 ("signal path silent, tracking alive") -- a log line,
+        never a mode change (spec 6: "its own one-shot flag, and it is a LOG
+        flag, not a mode latch") -- because the fast tier already IS the sync
+        at that point, at _fast_interval seconds and zero focus cost. Routed
+        to this task rather than Task 5's, though this is Task 5's function:
+        Task 5's implementer correctly declined to invent it since its own
+        brief did not contain it, and this task owns the state table that
+        tells 6.1 apart from every other row.
+
+        The FIRST tick can never log it: `previous is None`, so the move
+        branch below cannot be entered at all -- there is nothing yet to
+        compare the baseline reading against.
+
+        A named, accepted race, not a bug to close: the signal path and the
+        query path are two different D-Bus mechanisms (spec S3), so a fast
+        tick can in principle land in the few milliseconds between GPaste
+        recording a move and the gdbus pump counting that same copy's Update
+        line. That tick would log 6.1 for a copy the signal path was about to
+        report a moment later. Cost: one informational log line, no interval
+        change -- unlike spec 6.2, nothing here is a verdict a wrong guess
+        could latch.
         """
         current = self._read_history_uuid()
         previous = self._last_uuid
+        # Snapshotted AFTER the probe, mirroring _observe_tick's own
+        # grace-period ordering (see its docstring, post-Task-6: evidence
+        # accuracy only, not a decision input there either -- the same is
+        # true here, this log line is not a verdict). The gdbus call this
+        # measures against is 3-5ms, not wl-paste's 104ms, so the window is
+        # smaller, not absent.
+        signals = self._signals
         if current is not None and previous is not None and current != previous:
             self._event.set()
+            if (not self._signal_path_silence_logged
+                    and signals == self._signals_at_last_fast_tick):
+                self._signal_path_silence_logged = True
+                # %g, not %.1f: see _observe_tick's identical choice -- this
+                # is exercised with millisecond-scale intervals in tests.
+                log("the uuid tier saw the clipboard history move while the "
+                    "accepted-signal count held at %d; the signal path may "
+                    "be silent, but tracking itself is alive -- the fast "
+                    "tier is already this connection's sync, every %gs, at "
+                    "zero focus cost. Informational only; no interval "
+                    "changes because of this line."
+                    % (signals, self._fast_interval))
         if current is not None:
             self._last_uuid = current
+        self._signals_at_last_fast_tick = signals
         return current
 
     def _fast_loop(self):

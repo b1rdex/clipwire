@@ -209,6 +209,222 @@ class TestFastTier(unittest.TestCase):
         self.assertIs(default, agent.gpaste_history_uuid)
 
 
+# What GPaste offers after it re-encodes an image, measured on the live
+# machine: one type becomes twenty-three, with no Update signal. Design doc
+# S1.2.
+TWENTY_THREE = tuple(sorted([
+    "image/webp", "image/tiff", "image/jpeg", "text/ico", "image/icon", "image/ico",
+    "application/ico", "image/vnd.microsoft.icon", "image/x-win-bitmap", "image/x-ico",
+    "image/x-icon", "image/x-MS-bmp", "image/x-bmp", "image/bmp", "image/avif",
+    "audio/x-riff", "image/jxl", "image/png", "SAVE_TARGETS", "MULTIPLE", "TARGETS",
+    "TIMESTAMP"]))
+
+
+class TestSlowTierVerdict(unittest.TestCase):
+    """Spec 4.0 / 4.0.1 / 4.2: _observe_tick's OWN verdict, now judged
+    against the fast tier's uuid instead of the signal counter.
+
+    Placed HERE, not in test_watcher_safety_net.py's TestGPasteSafetyNet --
+    the pre-v3.3 home of _observe_tick's OTHER tests, and the literal file
+    task-6-brief.md names. That name is stale: docs/superpowers/specs/
+    2026-08-02-v3.2.1-test-split-design.md moved _observe_tick's tests into
+    test_watcher_safety_net.py a cycle before this one, and test_watcher.py
+    is that split's fixture ANCHOR (FakeGPasteProcess, ScriptedReadClipboard,
+    etc.), never home to a `_observe_tick` test itself -- confirmed by grep,
+    zero hits. This file is the right one on independent grounds too: the
+    brief's own snippet below calls `agent.GPasteWatcher(...)` and
+    `_StubClipboard()`, both of which exist only in THIS module's namespace
+    (test_watcher_safety_net.py imports GPasteWatcher bare, with no `agent.`
+    alias, and has no _StubClipboard at all) -- so the code as given could
+    only ever run here. See task-6-report.md for the full reasoning."""
+
+    def watcher(self, uuid="frozen"):
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard(),
+                                      read_history_uuid=lambda: uuid)
+        watcher._last_uuid = uuid
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def test_a_takeover_does_not_degrade(self):
+        """THE DEFECT. The token moves, the uuid does not, and one quiet tick
+        follows. Today this confirms; it must not."""
+        watcher = self.watcher()
+        watcher._observe_tick(("image", ("image/png",)), ("image", TWENTY_THREE))
+        watcher._observe_tick(("image", TWENTY_THREE), ("image", TWENTY_THREE))
+        self.assertFalse(watcher._degraded, "GPaste's own re-offer degraded the connection")
+
+    def test_a_dead_tracker_still_degrades(self):
+        """THE MIRROR, and the reason the rule above is not simply 'never
+        degrade'. A dead tracker under an active user diverges REPEATEDLY."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertTrue(watcher._degraded, "a genuinely dead tracker was not diagnosed")
+
+    def test_no_verdict_while_the_uuid_is_unknown(self):
+        """Spec 4.0.1: a failing GetElementAtIndex plus an active user looks
+        exactly like a dead tracker. It must reach no verdict at all.
+
+        _last_uuid is set to None BY HAND: that is the state production is in
+        only before the fast tier's first successful reading (or, later, once
+        Task 7's own persistent-failure fallback -- spec 4.3 -- re-engages
+        this table; see spec 4.0.1's closing sentence). self._last_uuid never
+        reverts to None once a reading has SUCCEEDED even once -- a later
+        failure leaves it holding the last good value, by design (see
+        _fast_tick) -- so this test pins the predicate's own logic rather
+        than claiming to reproduce the renamed-method scenario end to end."""
+        watcher = self.watcher()
+        watcher._last_uuid = None
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertFalse(watcher._degraded,
+                         "a failing uuid call was read as a dead tracker")
+
+    def test_a_cleared_run_rearms_rather_than_immediately_confirming(self):
+        """A settle that clears must actually reset self._armed to False, not
+        merely compute confirmed=False for that one tick and leave the flag
+        stuck true. Otherwise the run's THIRD tick would treat any next
+        divergence -- however unrelated to the first one -- as tick two of a
+        pair that was never really re-armed, and confirm one tick early.
+
+        Four ticks: arms, settles (clears), diverges again (must ARM, not
+        confirm, since the run was genuinely cleared), diverges once more
+        (NOW it may confirm)."""
+        watcher = self.watcher()
+        watcher._observe_tick(("image", ("image/png",)), ("image", TWENTY_THREE))  # arms
+        watcher._observe_tick(("image", TWENTY_THREE), ("image", TWENTY_THREE))    # settles, clears
+        watcher._observe_tick(("image", TWENTY_THREE), ("image", ("image/png",)))  # unrelated divergence
+        self.assertFalse(
+            watcher._degraded,
+            "a cleared run confirmed on its very next divergence instead of re-arming")
+        watcher._observe_tick(("image", ("image/png",)), ("image", TWENTY_THREE))  # confirms the re-armed pair
+        self.assertTrue(
+            watcher._degraded,
+            "a genuinely re-armed run must still be able to confirm")
+
+    def test_a_frozen_tick_does_not_pre_arm_the_next_real_divergence(self):
+        """The mirror of the test above, from the other side: a tick where
+        NOTHING moved must leave the run genuinely unarmed, not merely
+        compute confirmed=False for that one tick and leave the flag stuck
+        true. Otherwise the FIRST real divergence right after a frozen tick
+        would be treated as tick two of a pair that was never truly armed,
+        and confirm one tick early -- a dead source diagnosed on its very
+        first observed copy, with no second confirming tick at all."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "a"))   # frozen: nothing happened
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # the FIRST real divergence
+        self.assertFalse(
+            watcher._degraded,
+            "a frozen tick pre-armed the run, confirming on the first real divergence")
+
+
+class TestSignalPathSilenceLog(unittest.TestCase):
+    """Spec 4.0's top row, second clause, and spec 6.1: the uuid moving means
+    tracking is alive, full stop -- but whether the SIGNAL PATH also saw that
+    same move is a separate question, answered by the accepted-signal counter
+    alone. Silent there is spec 6.1, "signal path silent, tracking alive",
+    and it is explicitly NOT a degraded state (spec 6: "its own one-shot
+    flag, and it is a log flag, not a mode latch") -- the fast tier already
+    IS the sync at that point, at _fast_interval seconds and zero focus cost.
+    A log line and nothing else; "log only" is a claim about what the code
+    does NOT do, so it gets its own test below rather than living only in
+    the log-line tests' incidental silence.
+
+    Owned by _fast_tick (Task 5's function) because it is the only code that
+    ever OBSERVES a uuid MOVE -- _observe_tick only ever sees whether
+    self._last_uuid is frozen, never the transition itself. Routed to this
+    task per the dispatch: Task 5's implementer correctly declined to invent
+    this line since the brief it built from did not contain it; this task
+    owns the state table, so it owns the line (task-5-report.md, "Disagreement
+    with the brief")."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def marker_lines(self):
+        return [line for line in self.log_lines if "signal path may be silent" in line]
+
+    def watcher(self, uuids):
+        """A watcher whose fast tier reads `uuids` in order -- TestFastTier's
+        own helper, duplicated rather than shared because that one lives
+        inside TestFastTier and importing across sibling TestCase classes in
+        the same module for one helper is not worth the coupling."""
+        readings = list(uuids)
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(), read_history_uuid=lambda: readings.pop(0))
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def test_a_moved_uuid_with_no_signal_logs_once_per_connection(self):
+        watcher = self.watcher(["a", "b", "c"])
+        watcher._fast_tick()   # baseline: previous is None, nothing to judge
+        watcher._fast_tick()   # a -> b, and no signal has ever arrived
+        self.assertEqual(
+            len(self.marker_lines()), 1,
+            "a real uuid move alongside a silent signal path must be logged")
+        watcher._fast_tick()   # b -> c, still silent -- must NOT log again
+        self.assertEqual(
+            len(self.marker_lines()), 1,
+            "the flag is one-shot per CONNECTION, not per tick")
+
+    def test_a_moved_uuid_with_a_signal_does_not_log(self):
+        """The healthy case: the signal path caught this exact move, so
+        there is nothing to report."""
+        watcher = self.watcher(["a", "b"])
+        watcher._fast_tick()          # baseline
+        watcher._signals = 1          # a signal arrived in this window
+        watcher._fast_tick()          # a -> b, WITH a signal
+        self.assertEqual(
+            self.marker_lines(), [],
+            "a healthy signal path must not be reported as silent")
+
+    def test_a_frozen_uuid_never_logs(self):
+        """Nothing moved; there is no "is the signal path silent" question to
+        even ask -- spec 4.0's top row is conditioned on the uuid MOVING."""
+        watcher = self.watcher(["a", "a", "a"])
+        watcher._fast_tick()
+        watcher._fast_tick()
+        watcher._fast_tick()
+        self.assertEqual(self.marker_lines(), [], "a frozen uuid logged something")
+
+    def test_a_stale_signal_count_does_not_suppress_a_later_silent_move(self):
+        """A signal in one window must not hide silence in the NEXT one. The
+        two tests above cannot tell a correctly-updated per-tick baseline
+        from one that is set once and never touched again: with no signal
+        ever, both look silent every time; with a signal every time, both
+        look healthy every time. This needs a signal in window 1 and none in
+        window 2, which only a per-tick baseline gets right -- a stale one
+        would still be comparing window 3's count against window 1's signal,
+        see it as "unchanged", and wrongly call window 2 healthy too."""
+        watcher = self.watcher(["a", "b", "c"])
+        watcher._fast_tick()          # baseline: "a"
+        watcher._signals = 1          # a signal arrives in this window
+        watcher._fast_tick()          # a -> b, WITH a signal: must not log
+        self.assertEqual(self.marker_lines(), [], "the healthy window logged")
+        watcher._fast_tick()          # b -> c: no NEW signal since the last tick
+        self.assertEqual(
+            len(self.marker_lines()), 1,
+            "a later silent window must still be caught even though an "
+            "earlier one had a signal")
+
+    def test_the_log_line_changes_no_interval_and_sets_no_latch(self):
+        """Spec 6: a LOG flag, not a mode latch -- 6.1 is explicitly NOT
+        degraded, unlike 6.2's _observe_tick verdict."""
+        watcher = self.watcher(["a", "b"])
+        before = watcher._safety_net.interval
+        watcher._fast_tick()
+        watcher._fast_tick()
+        self.assertEqual(
+            len(self.marker_lines()), 1,
+            "must actually have logged, or this test proves nothing")
+        self.assertEqual(watcher._safety_net.interval, before,
+                         "6.1 must not touch the poll interval")
+        self.assertFalse(watcher._degraded, "6.1 must not set the degrade latch")
+
+
 class TestTierIntervalResolution(unittest.TestCase):
     """__init__ wiring, not _env_seconds in isolation. Every test above and
     below this class exercises _fast_tick/_env_seconds directly or through a
