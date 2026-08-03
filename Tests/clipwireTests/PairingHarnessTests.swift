@@ -525,4 +525,47 @@ final class PairingHarnessTests: XCTestCase {
                           "reader does not have to guess which precondition failed: \(what)")
         }
     }
+
+    // MARK: - the harness's own configuration plumbing
+
+    /// `tierSeconds`'s two `exportEnvironment` calls run BEFORE
+    /// `restoreEnvironment = restore` copies the accumulated dictionary in
+    /// `init` -- `Dictionary` is a value type, so that assignment is a
+    /// snapshot, and anything added to the local `restore` afterward is
+    /// invisible to `stop()`'s restore loop. Nothing about that ordering is
+    /// enforced by the type system: swap the two and `swift build` still
+    /// succeeds, `setenv` still runs (so a test READING the variable while
+    /// the harness is alive would still see it and stay green), and only
+    /// `stop()` silently stops unsetting it -- leaking
+    /// CLIPWIRE_FAST_TIER_SECONDS/CLIPWIRE_SLOW_TIER_SECONDS into every
+    /// later XCTest in the same process, since nothing else in this file
+    /// ever reads either name back to notice. This test is the one thing
+    /// that fails if that ordering regresses.
+    func testTierSecondsDoNotLeakIntoLaterTestsAfterStop() throws {
+        // If either of these is not nil, a previous test already leaked --
+        // and this test could not tell its own export apart from that leak.
+        // XCTAssertNil records a failure and keeps running rather than
+        // stopping the test, so a leak from a prior test shows up as THIS
+        // test's own failure here, rather than as a silent pass below on
+        // borrowed state it did not create.
+        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"],
+                     "already set before this test constructed a harness -- a prior test leaked it")
+        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"],
+                     "already set before this test constructed a harness -- a prior test leaked it")
+
+        let harness = try PairingHarness(tierSeconds: (fast: 0.25, slow: 3.5))
+        self.harness = harness
+
+        // The mechanism actually ran, not just "construction did not throw".
+        XCTAssertEqual(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"], "0.25")
+        XCTAssertEqual(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"], "3.5")
+
+        harness.stop()
+
+        // The regression this test exists for: gone, not "0.25" forever.
+        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"],
+                     "stop() did not restore this -- it will leak into every later test")
+        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"],
+                     "stop() did not restore this -- it will leak into every later test")
+    }
 }

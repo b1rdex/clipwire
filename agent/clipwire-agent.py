@@ -3143,13 +3143,21 @@ def _env_seconds(name, default):
     """An interval overridden from the environment, or `default`.
 
     Exists for PairingHarness, which needs sub-second tiers to exercise in
-    seconds what production does in minutes. Production sets none of these, so
-    the constants below are what a real agent runs -- verified by grepping the
-    whole repository (not just this file) for CLIPWIRE_, and by reading the
-    launchd plist and the ssh arguments production actually invokes: neither
-    sets an environment variable, and ssh's own default AcceptEnv/SendEnv
-    forwards none either, so there are two independent reasons a real deploy
-    never sees one of these set, not one.
+    seconds what production does in minutes. Nothing in the agent's own code
+    paths calls this yet -- SAFETY_NET_POLL_SECONDS and DEGRADED_POLL_SECONDS
+    below are still bare constants, not routed through here, so "production
+    sets none of these" is a fact about the general mechanism this task
+    adds, not a claim that either constant below is overridable today; a
+    later task wires one of them, and will need to update this paragraph
+    when it does. What production actually does, checked rather than
+    assumed: grepping the whole repository (not just this file) for
+    CLIPWIRE_ finds nothing outside the fakes/harness and this task's own
+    test, and neither the launchd plist nor the ssh arguments production
+    actually invokes sets an environment variable. ssh's own default
+    SendEnv/AcceptEnv forwards nothing beyond LANG/LC_*, which no CLIPWIRE_*
+    name matches, so even a variable set in the Mac-side shell would not
+    cross -- two independent reasons a real deploy never sees one of these
+    set, not one.
 
     Anything unparseable or non-positive returns the default rather than
     raising: a typo in a harness must not produce a zero-second poll that spins
