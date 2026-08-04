@@ -3953,9 +3953,14 @@ class GPasteWatcher:
         # harness connection alike got the constant. That made spec 9.1's own
         # acceptance test unrunnable in the Swift pairing harness, which can
         # set environment variables and nothing else: reproducing GPaste's
-        # re-offer there needs three ticks, and three ticks at the constant
-        # is a hundred seconds. See PairingHarness's `tierSeconds` for the
-        # other end, and test_watcher_gpaste_reoffer.py for the scenario.
+        # re-offer there would have needed three ticks, and three ticks at the
+        # constant is a hundred seconds against a suite that runs in ten. So
+        # it was not written. It exists now --
+        # testAGPasteReofferDoesNotDegradeTheConnection in
+        # PairingHarnessTests.swift, measured red at 58d3c60 -- and this line
+        # is the whole of what it needed. See PairingHarness's `tierSeconds`
+        # for the other end, and test_watcher_gpaste_reoffer.py for the same
+        # scenario one altitude down.
         #
         # `None` is the parameter's default rather than SAFETY_NET_POLL_SECONDS
         # so that "the caller said 30" stays tellable from "nobody said

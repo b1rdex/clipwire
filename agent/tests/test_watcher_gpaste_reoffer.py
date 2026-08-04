@@ -35,31 +35,51 @@ everything between the rule and the machine:
     the fast tier, the safety net) against real intervals, rather than with
     `_observe_tick` called synchronously from the test's own thread.
 
-WHAT THIS FILE IS NOT, and the reason is worth reading before assuming this
-closes the plan's task 10. The end-to-end test that release names -- the two
-IMPLEMENTATIONS paired, a clip crossing a real pipe to the Swift side -- is
-`Tests/clipwireTests/PairingHarnessTests.swift`, and it cannot host this
-scenario today: the verdict lives on the safety net's poll thread, and NOTHING
-the harness can set changes that thread's interval. `make_watcher` passes no
-`safety_net_interval_seconds`, so every connection's poller gets the
-`SAFETY_NET_POLL_SECONDS` constant, 30 s; `CLIPWIRE_SLOW_TIER_SECONDS` reaches
-only `self._slow_interval`, whose one consumer is
-`_uuid_failures_before_fallback`. The plan's task 3 named a third variable,
-`CLIPWIRE_SAFETY_NET_SECONDS`, alongside the two that shipped, and it was
-never implemented -- so spec 9.0's third capability, "interval injection into
-the agent spawned by the harness", is injection of the one interval this
-scenario is measured in. Reproducing it there costs three 30-second ticks
-against a Swift suite that runs in under ten seconds. This file is what can be
-honest today, at a quarter of a second per tick, because a constructor
-argument reaches what an environment variable does not.
+THE OTHER HALF OF THIS SCENARIO LIVES IN THE SWIFT SUITE, and the two are not
+duplicates. `testAGPasteReofferDoesNotDegradeTheConnection` in
+`Tests/clipwireTests/PairingHarnessTests.swift` stages the same incident
+between the two real IMPLEMENTATIONS, with a clip crossing a real pipe to a
+real Swift peer. Both were measured red at `58d3c60`; see the class docstring
+below for the recipe.
 
-Spec 9.0's FIRST capability also shipped in a different shape than the spec
-asked for, and this file depends on the difference rather than papering over
-it: the spec wanted the takeover fired "after the Nth probe", inside the fake.
-What task 2 built is a `silent` flag the caller sets, with no counter -- so
-the determinism has to come from the caller instead, and it does: the takeover
-below is written after an OBSERVED condition (the slow tier having snapshotted
-a uuid), never after a sleep. Same guarantee, different owner.
+WHAT EACH ONE CAN SEE AND THE OTHER CANNOT, which is the whole reason to keep
+both and the thing a later reader is most likely to get wrong:
+
+  - over there, that the clip CROSSED. There is no peer in this process, so
+    the strongest claim available here is that the agent OBSERVED the copy;
+  - here, the watcher's own state. `_armed`, `_signals` and `_last_uuid` are
+    fields of a Python object in THIS process and fields of another process's
+    object over there, so only this file can assert that the divergence armed
+    a run and that the run was then let go. That is the difference between
+    "the fix worked" and "nothing happened at all", and it is why the mutation
+    that deletes the fake's silent mode dies here and not there.
+
+THAT SWIFT TEST EXISTS ONLY SINCE TASK 10's FIX ROUND, and the history is kept
+because the gap it closed is the shape this plan keeps repeating. The verdict
+is reached on the safety net's poll thread, and until that round NOTHING the
+harness could set moved that thread's interval: `make_watcher` passes no
+`safety_net_interval_seconds`, and `CLIPWIRE_SLOW_TIER_SECONDS` -- the
+variable whose name suggests otherwise -- reaches only `self._slow_interval`,
+whose one consumer is `_uuid_failures_before_fallback`. The plan's task 3
+named three variables and only two shipped; the missing one,
+`CLIPWIRE_SAFETY_NET_SECONDS`, was spec 9.0's third capability, and without it
+reproducing this scenario over there cost three 30-second ticks against a
+Swift suite that runs in ten. So it was never written. It is wired now, and
+`_env_seconds`'s own docstring carries the table of which name reaches what.
+
+SPEC 9.0's FIRST CAPABILITY SHIPPED IN A DIFFERENT SHAPE than the spec asked
+for, and this file depends on the difference rather than papering over it. The
+spec wanted the takeover fired "after the Nth probe", inside the fake; what
+task 2 built is a `silent` flag the caller sets, with no counter. So the
+determinism comes from the caller instead, and it does come: every takeover in
+either test is written after an OBSERVED condition, never after a sleep.
+
+A RULED DEVIATION, not an unowned gap -- the coordinator accepted the
+substitute on the grounds that §9.0's stated rationale is determinism
+("shortening intervals alone would only make the straddle probable"), which
+ordering on observed conditions delivers at least as well as a probe counter.
+Recorded here so nobody re-opens it as missing work, and so nobody removes the
+ordering on the theory that the fake will do it.
 """
 import base64
 import json
@@ -336,14 +356,21 @@ class TestAGPasteReofferIsNotADeadEventSource(unittest.TestCase):
     def watcher(self):
         """Production's wiring, plus the three intervals it defaults.
 
-        Only ONE of those three is the reason this test cannot go through
-        `make_watcher`: `fast_interval_seconds` has an environment override
-        (`CLIPWIRE_FAST_TIER_SECONDS`) and could have been set from outside,
-        while `safety_net_interval_seconds` -- the tick every verdict here is
-        measured in -- and `reprobe_interval_seconds` have none, and
-        `make_watcher` accepts neither. Naming that distinction here rather
-        than lumping the three together: it is the whole of why this file
-        exists in this suite instead of the Swift one.
+        `reprobe_interval_seconds` is the only one of the three with no
+        environment override at all; the other two have had one since task
+        10's fix round wired `CLIPWIRE_SAFETY_NET_SECONDS` beside the existing
+        `CLIPWIRE_FAST_TIER_SECONDS`. So a direct construction is no longer
+        the ONLY way to build the watcher this test needs -- an earlier
+        revision of this paragraph said it was, and went on saying it after
+        the wiring that made it false had already landed in the same branch.
+
+        It stays direct for a reason that outlives that one, and the reason is
+        this suite's shape rather than this test's: every test here runs in ONE
+        process, so a test that reached its intervals by writing `os.environ`
+        would be reaching into every other test's agent as well. An argument
+        is scoped to the watcher it builds, and cannot be second-guessed by a
+        stray variable in the shell that ran the suite -- the same precedence
+        `__init__` documents, used here rather than merely relied on.
 
         And going around `make_watcher` costs something, which is why the two
         D-Bus readers below are passed by hand: that function is the only

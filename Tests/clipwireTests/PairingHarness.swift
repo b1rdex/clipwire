@@ -110,15 +110,28 @@ final class PairingHarness {
     let pasteboard = HarnessPasteboard()
 
     /// What the agent's own log says when it built the watcher this harness
-    /// requires. A PREFIX of the real line, deliberately: the rest of it
-    /// interpolates SAFETY_NET_POLL_SECONDS, and pinning that here would make
-    /// a tuning change to the agent look like a broken harness.
+    /// requires. A PREFIX of the real line, deliberately, and there are now
+    /// TWO reasons rather than the one this comment used to give:
+    ///
+    /// - a tuning change to SAFETY_NET_POLL_SECONDS, which the rest of the
+    ///   line interpolates, must not look like a broken harness;
+    /// - and since `tierSeconds.safetyNet` exists, that interpolation can be
+    ///   WRONG rather than merely variable. `make_watcher` renders the
+    ///   CONSTANT while the poller it just built runs at the injected
+    ///   interval, so a harness run's agent log says "every 30s" during a
+    ///   0.4 s tier. Matching a prefix means this harness never depended on
+    ///   the number; the line itself is inaccurate under injection and is
+    ///   left that way deliberately -- it is agent code, out of scope for the
+    ///   task that noticed it, and reported rather than quietly changed.
     ///
     /// Internal rather than private because a test reads it: `start()`
     /// already refuses a world without this line, but a test whose subject is
     /// "the watcher stayed live" has to assert that in its OWN method, or it
     /// green-lights a run where the agent never started at all.
     static let liveWatcherLine = "watching the clipboard through GPaste"
+    /// What the fake `gdbus` logs for one fast-tier probe of GPaste's history
+    /// uuid. Counted, never searched for -- see `occurrences`.
+    private static let historyUuidCall = "call GetElementAtIndex(0) -> uuid"
     /// The one line both implementations log for a reconciliation, byte for
     /// byte -- `FreshnessDecision`'s raw values ARE the PC agent's SEND_MINE /
     /// WAIT_FOR_PEER / DO_NOTHING constants. Which is exactly why reading a
@@ -606,7 +619,7 @@ final class PairingHarness {
 
     /// GPaste taking the selection back and re-offering the same picture
     /// under its own type list -- spec 1.2, and the production incident this
-    /// release exists to prevent. THREE things are true of it at once, and
+    /// release exists to prevent. Four things are true of it at once, and
     /// each is load-bearing:
     ///
     /// - the offered TYPES change, so the agent's `probe()` token moves;
@@ -681,29 +694,51 @@ final class PairingHarness {
                                     + types.joined(separator: " ") + "\n")
     }
 
-    /// Waits until the agent's FAST tier has read GPaste's history uuid at
-    /// least once, from the fakes' own invocation log.
+    /// Waits until the agent's FAST tier has ASKED GPaste for its history
+    /// uuid at least once, counted from the fakes' own invocation log.
     ///
-    /// A precondition with teeth, not a settle. The slow tier's verdict rests
-    /// on `uuid_frozen`, which is a DELTA between two of its own ticks -- and
-    /// the earlier of the two records whatever the fast tier had read by
-    /// then, `None` included. So a slow tick that lands before the fast
-    /// tier's first successful call poisons the comparison: the next tick
-    /// sees "unmeasured", reaches no verdict, and a test asserting that no
-    /// verdict was reached passes WITHOUT THE SCENARIO HAVING RUN.
+    /// WHY IT IS WORTH WAITING FOR. The slow tier's verdict rests on
+    /// `uuid_frozen`, a DELTA between two of its own ticks, and the earlier of
+    /// the two records whatever the fast tier had read by then -- `None`
+    /// included. A slow tick that lands before the fast tier's first
+    /// successful call therefore poisons the comparison: the next tick sees
+    /// "unmeasured", reaches no verdict, and a test asserting that no verdict
+    /// was reached passes WITHOUT THE SCENARIO HAVING RUN. Measured at roughly
+    /// one run in six, and the cause is in `Tests/fakes/fake_clipboard.py`: an
+    /// agent's FIRST fork of a fake has been seen taking 0.2-0.8 s, which at a
+    /// sub-second fast tier is several slow ticks.
     ///
-    /// Not hypothetical. Measured at roughly one run in six, and the cause is
-    /// documented in `Tests/fakes/fake_clipboard.py`: an agent's FIRST fork of
-    /// a fake has been seen taking 0.2-0.8 s, which at a sub-second fast tier
-    /// is several slow ticks. Waiting for the call itself removes the guess.
+    /// WHAT IT DOES NOT PROVE, stated because an earlier revision called this
+    /// "a precondition with teeth" and that was a notch stronger than the
+    /// mechanism. The fake writes its log line while SERVING the call -- the
+    /// same "logged before the caller consumed it" shape
+    /// `waitForTheAgentToProbeAndSee` exists to absorb -- so this returning
+    /// says the fast tier asked, not that `_last_uuid` has been assigned. What
+    /// actually closes the window is the two further slow probes its one
+    /// caller waits for next; this only moves the start of that wait past the
+    /// slow first fork. Both are needed, and the ordering is the point.
+    ///
+    /// THAT MATTERS MOST IF SOMEONE SHORTENS THE INTERVALS. The disclosed
+    /// remedy for a flake in the test above is a LONGER interval; shortening
+    /// them narrows the gap this pair of waits is covering and brings the
+    /// one-in-six back.
+    ///
+    /// Counted rather than `contains`, which is this file's standing rule (see
+    /// `occurrences` and `Marks`): the invocation log accumulates across
+    /// connections, so a `contains` here would answer instantly -- and on the
+    /// previous agent's evidence -- for anything staged after a `reconnect()`.
+    /// No caller reconnects today; the method is written so that one could.
     func waitForTheAgentsFastTierToReadAHistoryUuid() throws {
-        try wait(for: "the agent's fast tier to read a history uuid through gdbus") {
-            self.invocationLog().contains("call GetElementAtIndex(0) -> uuid")
+        let asked = invocationLog().occurrences(of: PairingHarness.historyUuidCall)
+        try wait(for: "the agent's fast tier to ask gdbus for a history uuid") {
+            self.invocationLog().occurrences(of: PairingHarness.historyUuidCall) > asked
         }
     }
 
     /// Waits until `count` of the agent's probes have come back offering
-    /// exactly this list.
+    /// exactly this list, AND one further probe has followed them -- so the
+    /// predicate below waits for `count + 1`, and the tick that made the
+    /// `count`-th probe has provably finished judging it.
     ///
     /// `count` is a number of PROBES and callers want a number of TICKS, so
     /// the arithmetic lives here rather than at each call site. In a quiet
@@ -711,9 +746,10 @@ final class PairingHarness {
     /// only other thing that forks `--list-types` is the worker's clipboard
     /// read, and the worker runs at most once per selection change (the tick
     /// that observes a moved token signals it; the ticks that see a settled
-    /// one do not). So for a selection the agent has just started offering,
-    /// `n + 1` probes guarantee at least `n` ticks, and for one it has been
-    /// offering all along there is no worker read at all.
+    /// one do not). So for a selection the agent has just STARTED offering,
+    /// `count` probes guarantee at least `count - 1` ticks; for one it has
+    /// been offering all along there is no worker read to absorb and the two
+    /// numbers are equal.
     ///
     /// THE `+ 1` BELOW IS NOT SLACK, and it was measured rather than
     /// reasoned into existence: without it this wait returns too early and
@@ -904,21 +940,29 @@ final class PairingHarness {
     /// to its stderr is in the shared log before a test asserts on what is
     /// NOT in there.
     ///
-    /// THE RACE THIS CLOSES IS NOT THEORETICAL AND WAS NOT CHEAP. `agentLog()`
-    /// flushes THIS side's queue, but a line the PC wrote reaches that file
-    /// only once `Channel.attempt`'s readability handler has read it -- so a
-    /// negative assertion can be evaluated microseconds before the very line
-    /// it denies arrives. Measured with the agent's fix deliberately removed:
-    /// `testAGPasteReofferDoesNotDegradeTheConnection` caught the regression
-    /// on 2 runs in 3, and reported success on the third. Counting the
-    /// agent's own probes proves the TICK happened and cannot prove its log
-    /// line crossed a pipe; only this can. The density test above documents
-    /// the same hazard and closes it by waiting for a later line from the PC,
-    /// which works only where a later line is guaranteed -- for a verdict
-    /// that must never be reached, there is none.
+    /// THE RACE THIS NARROWS IS NOT THEORETICAL AND WAS NOT CHEAP.
+    /// `agentLog()` flushes THIS side's queue, but a line the PC wrote reaches
+    /// that file only once `Channel.attempt`'s readability handler has read
+    /// it -- so a negative assertion can be evaluated microseconds before the
+    /// very line it denies arrives. Measured with the agent's fix deliberately
+    /// removed: `testAGPasteReofferDoesNotDegradeTheConnection` caught the
+    /// regression on 2 runs in 3, and reported success on the third. Counting
+    /// the agent's own probes proves the TICK happened and cannot prove its
+    /// log line crossed a pipe. The density test above documents the same
+    /// hazard and closes it by waiting for a LATER line from the PC, which
+    /// works only where a later line is guaranteed -- for a verdict that must
+    /// never be reached, there is none, which is why this exists at all.
     ///
-    /// `attempt()` drains that handler and tears it down before returning,
-    /// and this waits for exactly that.
+    /// NARROWS, NOT PROVES, and the difference is stated because an earlier
+    /// revision claimed the stronger thing. What `attempt()` actually does is
+    /// `waitUntilExit()` and then `readabilityHandler = nil`
+    /// (`Channel.swift`); there is no final read of its own. So what this buys
+    /// is that the writer is GONE and the handler has had every write up to
+    /// its exit to consume -- in practice everything, and it cannot make the
+    /// window wider, but it is not a proof the way the probe counting above
+    /// is a proof. Its contribution was never isolated from the two fixes that
+    /// landed beside it (the probe arithmetic and the fast-tier ordering); the
+    /// 18-of-18 figure quoted in the test belongs to all three together.
     ///
     /// DELIBERATELY NOT `stop()`, which does the same two things and then
     /// deletes the temp directory the log file lives in -- after which every

@@ -538,8 +538,9 @@ final class PairingHarnessTests: XCTestCase {
     /// object in another process. What crosses is what the agent FORKED, so
     /// "the slow tier saw the divergence" is asserted as its own
     /// `wl-paste --list-types` coming back with the re-offered list -- a real
-    /// fork, a real observation, twice. The arming and clearing of the run
-    /// itself is pinned one altitude down, in
+    /// fork, a real observation, and enough of them to cover the tick that
+    /// arms and the tick that would have confirmed. The arming and clearing
+    /// of the run itself is pinned one altitude down, in
     /// `agent/tests/test_watcher_gpaste_reoffer.py`, which drives the real
     /// watcher against these same fakes. THE TWO ARE NOT DUPLICATES AND MUST
     /// NOT BE DE-DUPLICATED: that one can read the watcher's state and goes
@@ -626,9 +627,14 @@ final class PairingHarnessTests: XCTestCase {
                         "the PC's clipboard has no change token at all, so the assertion above " +
                         "compared two absences and proved nothing")
 
-        // Two ticks: the one that sees the divergence and arms, and the one
-        // that would have confirmed it. Three probes guarantee both, since the
-        // worker's read can inflate the count by at most one.
+        // Two ticks have to land here: the one that sees the divergence and
+        // arms, and the one that would have confirmed it. Three probes would
+        // guarantee both -- the worker's read inflates the count by at most
+        // one, so `n` probes of a newly-offered selection are at least `n - 1`
+        // ticks -- and four is asked for anyway. The extra tick is margin
+        // against fork pressure, measured rather than decorative: see this
+        // test's own note on why the answer to a flake here is a longer
+        // interval and never a retry.
         try harness.waitForTheAgentToProbeAndSee(PairingHarness.gpasteImageTypes, atLeast: 4)
 
         // --- and the verdict that must not have been reached --------------
