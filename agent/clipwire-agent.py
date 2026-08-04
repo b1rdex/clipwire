@@ -3216,10 +3216,15 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 # one more is written, and the previous revision of this paragraph both
 # counted them and dated the count to "the same commit as this one" -- a
 # self-reference that is unverifiable from the file and stale the moment
-# anything else is corrected. Grep the figure instead; the sites that leaned
-# on it were swept in one pass rather than an allowlist, which is the only
-# check that can see the one nobody remembered. The 3 s timeout is unaffected
-# either way: 30x headroom over 103 ms is still a timeout, not a budget.
+# anything else is corrected. GREP THE FIGURE. That instruction is the whole
+# of what belongs here, because a reader can carry it out and get an answer
+# that is true now rather than one that was true when somebody wrote it
+# down. A first repair of this paragraph added "the sites that leaned on it
+# were swept in one pass rather than an allowlist" -- which is a claim about
+# how a past commit was produced, unverifiable from the file, one sentence
+# after condemning exactly that. Deleted rather than softened. The 3 s
+# timeout is unaffected either way: 30x headroom over 103 ms is still a
+# timeout, not a budget.
 GPASTE_CALL_TIMEOUT = 3
 
 
@@ -3917,8 +3922,17 @@ class GPasteWatcher:
     """Event-driven. Python has no stdlib DBus binding, so this shells out to
     gdbus monitor and parses its output line by line.
 
-    THREE THREADS, AND THE CLASS DOCSTRING NAMED ONE OF THEM UNTIL v3.3.
-    start() below is the authority; this is the map:
+    THREE READERS, AND THE FAST TIER WAS ABSENT FROM THIS DOCSTRING UNTIL
+    v3.3 -- an absence, not a miscount. The old text named the gdbus pump
+    and the composed safety net; what it said nothing about was the uuid
+    tier, which is the thing this release exists for, above the class that
+    runs it. (A first repair of this heading said the docstring "named ONE
+    of them", which is false in every reading: it named two of the three as
+    mechanisms, and zero of them as threads.)
+
+    start() below launches FOUR threads -- these three readers plus
+    _start_observer's single worker -- and it is the authority for that.
+    This is the map of the readers:
 
       - the gdbus MONITOR pump, the primary source. Counts accepted Update
         lines into self._signals and sets the shared event. Latency
@@ -3935,8 +3949,9 @@ class GPasteWatcher:
         for the same reason the Update signals do, and only a wl-paste
         token can tell that apart from an idle clipboard (spec 4.0).
 
-    All three set ONE event and none of them calls the handler --
-    _start_observer's single worker does that, and only it.
+    All three readers set ONE event and none of them calls the handler --
+    the fourth thread, _start_observer's single worker, does that, and only
+    it.
 
     What the slow tier looks at is a probe() TOKEN, not the content -- for
     an image, the offered type list -- which is enough to tell "something
@@ -5529,8 +5544,11 @@ class PollingWatcher:
     "FORKS wl-paste ON EVERY TICK" IS NO LONGER TRUE, and spec 8 names that
     exact phrase among the prose v3.3 invalidates. Since spec 4.2's idle
     gate a tick can decline to probe at all (`should_probe`, consulted at
-    the top of pump before anything else happens), so the fork rate is at
-    most the tick rate and is lower on any tick a wired gate declines. Two
+    the top of pump's LOOP BODY -- not at the top of pump, which runs an
+    UNGATED baseline probe before the loop is entered and therefore forks
+    once whatever the gate would have said), so the fork rate is at most one
+    per tick plus that baseline, and is lower on any tick a wired gate
+    declines. Two
     constructions still do fork every tick, for different reasons: the
     standalone poller below, which is handed no gate at all, and a degraded
     slow tier, whose gate stands itself down (see
@@ -6412,11 +6430,38 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
             # this one was missed, and it is the line a person reads on the
             # connection AFTER the one that degraded.
             #
-            # Second, smaller: %.1f, where every other interval-bearing line in
-            # this file now uses %g. At a harness's millisecond-scale interval
-            # this renders "every 0.0s" -- the same false statement %g was
-            # adopted to end, at the one call site that still spells it the old
-            # way. Production is unaffected (1.0 either way).
+            # Second, smaller, and TWO SITES rather than this one. THE CHECK,
+            # so a reader re-runs it instead of trusting this sentence: grep
+            # the file for a numeric format spec and sort the hits by what
+            # they render. POLL INTERVALS -- _observe_tick's verdict (two),
+            # _fast_tick's 6.1 line, its 4.3 fallback line (two),
+            # make_watcher's healthy line -- all use %g. Exactly two render a
+            # poll interval with %.1f: this line and make_watcher's fallback
+            # below. Everything else matching %.Nf renders a DIFFERENT
+            # quantity and is out of scope either way: skew_log_line's clock
+            # skew, and _log_duration_if_notable's %.3f, which is a measured
+            # read duration where three decimals are the point.
+            #
+            # At a harness's millisecond-scale interval %.1f renders "every
+            # 0.0s" -- the same false statement %g was adopted to end.
+            # Production is unaffected (1.0 either way).
+            #
+            # THE OTHER SITE IS make_watcher's OWN FALLBACK LINE, at the
+            # bottom of this function: "GPaste unavailable, falling back to
+            # polling every %.1fs". Same specifier, same argument, same
+            # rendering defect. Named because the first draft of this comment
+            # said "every other interval-bearing line in this file now uses
+            # %g" and "the one call site that still spells it the old way" --
+            # both false, and falsified by a sibling in this very function
+            # that the paragraph never looked at. Grepping `%.1f` takes a
+            # second and would have found it; asserting completeness from
+            # memory is what this file keeps paying for.
+            #
+            # The two are NOT the same defect otherwise. The fallback line
+            # states a FLAT rate and states it correctly -- spec 2 keeps the
+            # standalone poller untouched, so it really does poll at one
+            # figure forever. Only the specifier is wrong there. Here BOTH
+            # the specifier and the quantity are.
             log("watching the clipboard through GPaste, already diagnosed as silent "
                 "this connection, so polling every %.1fs" % fallback_interval_seconds)
         else:

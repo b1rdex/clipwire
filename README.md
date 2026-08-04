@@ -134,7 +134,11 @@ a new binary against an old agent does not sync at all.
 ## A locked PC cannot serve its clipboard
 
 While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
-call returns in about 20 ms. That much is measured; *why* the lock screen has this effect
+call returns quickly — measured at about 20 ms here, and at about a tenth of a second by the
+later campaign quoted in the next section. Two measurements, months and a GNOME upgrade apart,
+never reconciled against each other; both are recorded rather than one being picked, because
+nobody has re-run them side by side. Nothing here or below turns on which is right: the
+contrast that matters is *answers* against *hangs indefinitely*. *Why* the lock screen has this effect
 was not established, and the GPaste daemon, the session bus and the compositor all keep
 answering normally throughout — so the usual health checks all pass while nothing works.
 Nothing syncs in either direction until the screen is unlocked, and the Mac's log fills with
@@ -153,26 +157,29 @@ Nothing degrades as a result: a read that fails proves nothing about whether the
 source is alive, so it never counts toward the verdict that switches the agent to faster
 polling.
 
-## Watching the clipboard no longer steals keyboard focus
+## Watching the clipboard steals much less keyboard focus
+
+Not *none*, and the last two bullets below say exactly where it survives.
 
 Measured on this PC: `wl-paste --list-types` **takes keyboard focus while it runs**, which
 shows up as the foreground window blinking. Blind A/B, 2 Hz for 15 seconds a phase, phases
 unlabelled until they had been judged; `xclip -o -t TARGETS` against the same selection does
-not blink, which is what proves the test was sensitive enough to see the effect at all.
-Mutter implements no `wlr-data-control`/`ext-data-control`, so a focus grab is how
-wl-clipboard reads a selection here in the first place.
+not blink. The `wl-paste` phase is the **positive control** — it is what proves the observer
+could see the effect at all, so xclip's silence is a real negative rather than an instrument
+that was never sensitive enough. Mutter implements no
+`wlr-data-control`/`ext-data-control`, so a focus grab is how wl-clipboard reads a selection
+here in the first place.
 
-The agent's routine check no longer forks that call. It asks GPaste over D-Bus for the
-identifier of the newest item in its history instead, every five seconds, and that takes no
-focus. **It is not faster** — both calls cost about a tenth of a second. The design doc
-claimed the D-Bus call was twenty to thirty times cheaper until it was timed the way the
-agent actually makes it, as a subprocess; that claim is retracted. The entire difference is
-the focus grab.
+**The five-second history check** no longer forks that call. It asks GPaste over D-Bus for
+the identifier of the newest item in its history instead, and that takes no focus. **It is
+not faster** — both calls cost about a tenth of a second. The design doc claimed the D-Bus
+call was twenty to thirty times cheaper until it was timed the way the agent actually makes
+it, as a subprocess; that claim is retracted. The entire difference is the focus grab.
 
 What that changes, and what it does not:
 
-- The blinking that actually hurt was never the background check, which costs one blink
-  every 30 seconds. It was the *fallback*:
+- The blinking that actually hurt was never **the 30-second clipboard poll**, which costs one
+  blink every 30 seconds. It was the *fallback*:
   once the agent concluded GPaste had stopped working it polled `wl-paste` once a second for
   the rest of the connection, blinking on every tick and dropping keystrokes while typing.
   It fired three times, ever. One of the three was reconstructed to the second and was
@@ -180,14 +187,16 @@ What that changes, and what it does not:
   nothing was wrong; a second is consistent with the same mechanism without having been
   reconstructed; the third involved text and has no established cause. That mechanism no
   longer reaches a verdict.
-- When a verdict *is* reached, the fallback now starts at one second after each observed
-  change and doubles toward 30 seconds while nothing changes, instead of staying at one
-  second forever.
-- Background ticks are skipped entirely once nobody has touched the keyboard or mouse for
+- 30-second poll ticks are skipped entirely once nobody has touched the keyboard or mouse for
   five minutes. With nobody copying there is nothing for them to find.
-- The 30-second look at the clipboard itself is **unchanged** and still forks `wl-paste`. It
-  is the only thing that can tell a clipboard manager that has stopped recording from a
-  clipboard nobody is using, so it stays.
+- **Where the blinking survives, first:** the 30-second clipboard poll itself is **unchanged**
+  and still forks `wl-paste` on every tick it is not gated out of. It is the only thing that
+  can tell a clipboard manager that has stopped recording from a clipboard nobody is using,
+  so it stays.
+- **And second:** when a verdict *is* reached, that poll is still the connection's only way
+  of seeing a change, so it keeps blinking. What changed is the rate — it now starts at one
+  second after each observed change and doubles toward 30 seconds while nothing changes,
+  instead of staying at one second forever.
 
 ## A clip GPaste refuses to record still syncs
 
@@ -202,9 +211,9 @@ GPaste's own history, which moves for a recorded clip and stands still for an ex
 A single excluded copy raises a suspicion that the next look drops, because by then the
 clipboard has settled.
 
-The clip itself still reaches the Mac, through the same 30-second background look that
+The clip itself still reaches the Mac, through the same 30-second clipboard poll that
 carried it before — that part is unchanged. What is worth knowing is that a *run* of
-excluded copies, landing on consecutive background ticks with the clipboard moving each
+excluded copies, landing on consecutive poll ticks with the clipboard moving each
 time, still looks exactly like a clipboard manager that has stopped recording, and still
 produces the fallback. Nothing is lost when it does; the clips keep syncing, the poll just
 runs faster for that connection.
@@ -239,8 +248,8 @@ remote: the uuid tier saw the clipboard history move while the accepted-signal c
 ```
 
 **If GPaste has stopped recording clips at all,** that identifier stops moving too, so the
-only thing left that can tell is a direct look at the clipboard. That is the safety-net poll,
-every 30 seconds. When it sees the clipboard change twice running while GPaste's history
+only thing left that can tell is a direct look at the clipboard. That is the 30-second
+clipboard poll — the safety net, and the same one the two sections above describe. When it sees the clipboard change twice running while GPaste's history
 stands still, it concludes the tracker is dead and falls back to polling — starting one
 second after each change it observes and doubling toward 30 seconds while nothing changes,
 for the rest of the connection. It says so in the Mac's log
