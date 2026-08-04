@@ -584,7 +584,22 @@ final class PairingHarnessTests: XCTestCase {
         try harness.waitForTheAgentToProbeAndSee(["image/png"], atLeast: 3)
 
         // --- GPaste takes the selection back, silently --------------------
+        let entryBefore = harness.pcsClipboardGeneration()
         try harness.silentTakeover(types: PairingHarness.gpasteImageTypes)
+        // The fixture's own invariant, pinned because breaking it leaves
+        // everything below passing while staging a different scenario: a
+        // re-offer creates NO history entry, which is what keeps the agent's
+        // uuid frozen and the slow tier's discriminator meaningful. A
+        // takeover that stamped a fresh `generation` would be a COPY wearing
+        // a re-offer's name, the uuid would move, no verdict could be reached
+        // for a reason that has nothing to do with the fix, and this test
+        // would go on reporting success.
+        XCTAssertEqual(harness.pcsClipboardGeneration(), entryBefore,
+                       "the re-offer created a new clipboard entry, so this is a copy and not " +
+                       "the takeover spec 1.2 measured")
+        XCTAssertNotNil(entryBefore,
+                        "the PC's clipboard has no change token at all, so the assertion above " +
+                        "compared two absences and proved nothing")
 
         // Two ticks: the one that sees the divergence and arms, and the one
         // that would have confirmed it. Three probes guarantee both, since the

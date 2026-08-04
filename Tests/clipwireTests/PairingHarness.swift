@@ -693,9 +693,23 @@ final class PairingHarness {
     /// one do not). So for a selection the agent has just started offering,
     /// `n + 1` probes guarantee at least `n` ticks, and for one it has been
     /// offering all along there is no worker read at all.
+    ///
+    /// THE `+ 1` BELOW IS NOT SLACK, and it was measured rather than
+    /// reasoned into existence: without it this wait returns too early and
+    /// the test above it goes GREEN AGAINST AN AGENT WITH THE FIX REMOVED.
+    /// The fake writes its invocation-log line while it is SERVING the probe,
+    /// which is strictly before the agent has read the result, let alone
+    /// judged it -- so the count reaching its target says the probe happened,
+    /// never that a verdict followed. Waiting for one further probe is what
+    /// closes it, and it closes it exactly rather than probably: the poll
+    /// thread is strictly sequential -- probe, `_on_tick`, wait, probe -- so
+    /// a LATER probe existing is proof that the previous one's verdict has
+    /// already been reached and logged. A sleep would have been a guess about
+    /// the same thing.
     func waitForTheAgentToProbeAndSee(_ types: [String], atLeast count: Int) throws {
-        try wait(for: "\(count) of the agent's own probes to see \(types.count) offered types") {
-            self.probesThatSaw(types) >= count
+        try wait(for: "\(count) of the agent's own probes to see \(types.count) offered types, "
+                 + "and a further probe proving the last of them was judged") {
+            self.probesThatSaw(types) >= count + 1
         }
     }
 
@@ -932,6 +946,22 @@ final class PairingHarness {
 
     private func invocationLog() -> String {
         (try? String(contentsOfFile: invocationLogPath, encoding: .utf8)) ?? ""
+    }
+
+    /// The PC clipboard's opaque change token -- the field the fake `gdbus`
+    /// derives GPaste's history uuid from, and therefore the difference
+    /// between "a new entry was created" and "the same entry was re-offered".
+    ///
+    /// Exposed so a test can pin that its own staging stayed the scenario it
+    /// meant to stage. `silentTakeover` leaves this alone by construction;
+    /// a version that stopped doing so would turn the re-offer into a COPY,
+    /// the agent's uuid would move, no verdict could be reached for a reason
+    /// unrelated to the fix, and every assertion downstream would still pass.
+    func pcsClipboardGeneration() -> String? {
+        guard let data = FileManager.default.contents(atPath: statePath),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return state["generation"] as? String
     }
 
     private func pcClipboard() -> (types: [String], body: Data)? {
