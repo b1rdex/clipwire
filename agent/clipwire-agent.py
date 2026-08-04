@@ -3197,6 +3197,25 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 # samples: 103 ms per call, with no Wayland client and therefore no focus grab.
 # The wl-paste probe it replaces measured 104 ms AND blinked the foreground app.
 #
+# THE 104 ms HAS AN UNRECONCILED SIBLING, and the comparison below is what
+# rests on it, so it is named here rather than left in one file. README.md's
+# locked-PC section records `wl-paste --list-types` answering in ABOUT 20 ms
+# when the session is unlocked -- recorded 2026-08-01 out of the v3 acceptance
+# run, two days before spec 1's 104 ms, on the same machine, with nothing
+# recorded in between to account for a fivefold gap. The earlier reading's
+# conditions were not written down and the two have never been run side by
+# side. Neither is retracted here: spec 1's is the better-EVIDENCED one --
+# spec 10 says that campaign's measurements are recorded with their
+# instrument, controls and failures in a named directory, where the 20 ms has
+# no recorded conditions at all -- and it is what this file uses. NOT the
+# better-SAMPLED one: spec 1 gives no sample count for the 104 ms row, and
+# the "ten samples each" in that section belongs to the 2026-08-04 gdbus
+# table, which does not include wl-paste. A first draft of this paragraph
+# attributed those ten samples to the 104 ms; they are not its. What a
+# re-measurement could move is the
+# COST comparison below; the focus grab is measured either way and is the
+# claim the release actually rests on.
+#
 # THE TWO ARE THE SAME PRICE IN WALL CLOCK, and this comment said 3-5 ms until
 # that was measured properly. The 3-5 ms was the D-Bus ROUND TRIP; the agent
 # does not make a round trip, it forks `gdbus`, and ~103 ms of that is gdbus's
@@ -6432,15 +6451,33 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
             #
             # Second, smaller, and TWO SITES rather than this one. THE CHECK,
             # so a reader re-runs it instead of trusting this sentence: grep
-            # the file for a numeric format spec and sort the hits by what
-            # they render. POLL INTERVALS -- _observe_tick's verdict (two),
-            # _fast_tick's 6.1 line, its 4.3 fallback line (two),
-            # make_watcher's healthy line -- all use %g. Exactly two render a
-            # poll interval with %.1f: this line and make_watcher's fallback
-            # below. Everything else matching %.Nf renders a DIFFERENT
-            # quantity and is out of scope either way: skew_log_line's clock
-            # skew, and _log_duration_if_notable's %.3f, which is a measured
-            # read duration where three decimals are the point.
+            # the file for a numeric format spec, then SORT THE HITS BY WHAT
+            # THEY RENDER. The grep is mechanical; the sort is a judgement,
+            # and the sort is where this paragraph has already been wrong
+            # once -- see the note on the fallback line below.
+            #
+            #   POLL INTERVAL, %g -- five: _observe_tick's verdict renders
+            #     two (the degraded floor and the cap), _fast_tick's 6.1 line
+            #     one, its 4.3 fallback line one, make_watcher's healthy line
+            #     one.
+            #   POLL INTERVAL, %.1f -- exactly two, and they are the defect:
+            #     this line, and make_watcher's fallback below.
+            #   NOT A POLL INTERVAL -- everything else, whatever its
+            #     specifier, and none of it in scope: the 4.3 fallback line's
+            #     OTHER %g is how long the failure run lasted, which that
+            #     line's own comment calls "the duration"; the two re-offer
+            #     budget lines in Agent are %g durations; skew_log_line's
+            #     %.1f is a clock skew; and _log_duration_if_notable's %.3f
+            #     is a measured read duration, where three decimals are the
+            #     point.
+            #
+            # A FIRST DRAFT OF THIS LIST SORTED THE 4.3 FALLBACK LINE AS
+            # RENDERING TWO POLL INTERVALS. It renders one, beside a
+            # duration. The conclusion is unaffected -- the pair of %.1f
+            # sites is what this comment is about -- but the taxonomy a
+            # reader is told to reproduce was off by one, which is the whole
+            # failure mode again one level down: a complete grep, sorted
+            # wrong.
             #
             # At a harness's millisecond-scale interval %.1f renders "every
             # 0.0s" -- the same false statement %g was adopted to end.

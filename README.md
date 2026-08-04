@@ -134,11 +134,18 @@ a new binary against an old agent does not sync at all.
 ## A locked PC cannot serve its clipboard
 
 While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
-call returns quickly — measured at about 20 ms here, and at about a tenth of a second by the
-later campaign quoted in the next section. Two measurements, months and a GNOME upgrade apart,
-never reconciled against each other; both are recorded rather than one being picked, because
-nobody has re-run them side by side. Nothing here or below turns on which is right: the
-contrast that matters is *answers* against *hangs indefinitely*. *Why* the lock screen has this effect
+call returns quickly — and this file now carries **two figures** for that, which is worth
+naming rather than leaving for a reader to trip over. "About 20 ms" was recorded here on
+2026-08-01, out of the v3 acceptance run. The next section quotes about a tenth of a second,
+measured 2026-08-03 with the agent stopped. Two days apart, on the same machine, with nothing
+recorded in between that would account for a fivefold difference. The later campaign wrote
+down its instrument and its controls; the earlier reading's conditions were not recorded at
+all. Nobody has re-run the two side by side, and neither is retracted on the strength of the
+other. What matters *in this section* is unaffected either
+way: the contrast is *answers* against *hangs indefinitely*. The next section flags the one
+claim that does depend on which figure is right.
+
+*Why* the lock screen has this effect
 was not established, and the GPaste daemon, the session bus and the compositor all keep
 answering normally throughout — so the usual health checks all pass while nothing works.
 Nothing syncs in either direction until the screen is unlocked, and the Mac's log fills with
@@ -176,6 +183,14 @@ not faster** — both calls cost about a tenth of a second. The design doc claim
 call was twenty to thirty times cheaper until it was timed the way the agent actually makes
 it, as a subprocess; that claim is retracted. The entire difference is the focus grab.
 
+**This is the claim that depends on the unreconciled figure above.** It rests on
+`wl-paste --list-types` costing about a tenth of a second, measured over ten samples on
+2026-08-03. Under the section above's older "about 20 ms" reading it would not hold: the
+D-Bus call would be several times *slower* in wall clock, and the difference would not be
+the focus grab alone. The focus grab itself is measured either way and is not in doubt —
+what a re-measurement could move is the *cost* comparison, not the conclusion that this
+check stopped taking focus.
+
 What that changes, and what it does not:
 
 - The blinking that actually hurt was never **the 30-second clipboard poll**, which costs one
@@ -193,10 +208,16 @@ What that changes, and what it does not:
   and still forks `wl-paste` on every tick it is not gated out of. It is the only thing that
   can tell a clipboard manager that has stopped recording from a clipboard nobody is using,
   so it stays.
-- **And second:** when a verdict *is* reached, that poll is still the connection's only way
-  of seeing a change, so it keeps blinking. What changed is the rate — it now starts at one
-  second after each observed change and doubles toward 30 seconds while nothing changes,
-  instead of staying at one second forever.
+- **And second:** when a verdict *is* reached, that poll keeps running and keeps blinking.
+  What changed is the rate — it now starts at one second after each observed change and
+  doubles toward 30 seconds while nothing changes, instead of staying at one second forever.
+  It is **not** true that the poll is then the connection's only way of seeing a change, and
+  a first draft of this bullet said so: the agent goes on listening for GPaste's signals
+  through the switch and never tears that subscription down, and one of the two ways this
+  verdict can be reached — the excluded-clip case in the next section — leaves GPaste tracking
+  and signalling normally. The poll is the only detector left **in the state the verdict
+  describes**, where the clipboard manager really has stopped recording; the verdict can also
+  be reached when it has not.
 
 ## A clip GPaste refuses to record still syncs
 
