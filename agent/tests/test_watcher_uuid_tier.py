@@ -231,7 +231,11 @@ class TestTrackingProbe(unittest.TestCase):
     The verdict line shipped "the gnome-shell extension being disabled is one
     possible cause" through three production incidents where the extension was
     measured Enabled/ACTIVE with track-changes true. This function is what the
-    line asks instead."""
+    line asks instead.
+
+    Named for the QUESTION ("is GPaste tracking"), not for the property that
+    answers it -- on GPaste 45.3 that property is `Active`, measured; see
+    GPASTE_TRACKING_PROPERTY."""
 
     def tracking(self, stdout=b"", returncode=0, raises=None):
         def run(argv, **kwargs):
@@ -254,9 +258,13 @@ class TestTrackingProbe(unittest.TestCase):
         collapsing them would re-commit the exact sin spec 5.3 exists to
         undo -- reporting something the line does not know.
 
-        `returncode=1` is also where a WRONG PROPERTY NAME lands: gdbus exits
-        non-zero on "No such property", so a name this file guessed wrong
-        reports unavailable rather than false."""
+        `returncode=1` is also where a WRONG PROPERTY NAME lands, and that is
+        MEASURED rather than reasoned: asking GPaste 45.3 for the property
+        spec 5.3 originally named exits 1 with EMPTY stdout and
+        `InvalidArgs: No such property "Tracking"` on stderr. So a name this
+        file gets wrong reports unavailable rather than false -- the property
+        that made shipping an unverified name defensible, and the reason this
+        branch does not change now that the name is known."""
         for failure in (dict(returncode=1), dict(stdout=b"junk"),
                         dict(stdout=b""),
                         dict(raises=subprocess.TimeoutExpired(["gdbus"], 3)),
@@ -272,12 +280,21 @@ class TestTrackingProbe(unittest.TestCase):
 
     def test_the_call_asks_gpaste_for_the_named_property(self):
         """Pins the property name to the module constant rather than to a
-        literal in the argv, because that name is the one thing in this
-        function that could not be verified against a live GPaste at
-        authoring time -- so its correction must be one line, and the log
-        line reports it for exactly that reason (see the constant's own
-        comment). Also pins that this reads a PROPERTY and never
-        GetElementAtIndex, whose reply carries clipboard text (spec 5.2)."""
+        literal in the argv, so the constant stays the ONE place the name is
+        spelled -- which is what made correcting it a one-line change when the
+        target machine was finally introspected and spec 5.3's original
+        `Tracking` turned out not to exist. What the VALUE must be is a
+        separate test, in test_watcher_safety_net.py's TestVerdictNamesTheCause,
+        because that is a measured fact about GPaste and this is a fact about
+        this function's argv; a single test asserting both would go red for two
+        unrelated reasons.
+
+        The INTERFACE is asserted for its own reason: the bus name is
+        org.gnome.GPaste and the interface is org.gnome.GPaste2, and this file
+        has already shipped that confusion once in the other direction (see
+        GPASTE_INTERFACE's own comment). Also pins that this reads a PROPERTY
+        and never GetElementAtIndex, whose reply carries clipboard text
+        (spec 5.2)."""
         seen = []
 
         def run(argv, **kwargs):

@@ -220,7 +220,7 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "the verdict named a cause measured false in all three incidents",
         )
         self.assertIn(
-            "gpaste_Tracking=", line,
+            "gpaste_Active=", line,
             "spec 5.3 replaces the guess with a READING -- an observed value, "
             "or an honest 'unavailable', never a cause invented at the point "
             "of reporting",
@@ -1182,10 +1182,20 @@ class TestDivergenceReprobe(unittest.TestCase):
 
 
 class TestVerdictNamesTheCause(unittest.TestCase):
-    """Spec 5.3: "read the Tracking property over D-Bus and put the observed
-    value in the log line. The current verdict line blames a disabled
+    """Spec 5.3: "read GPaste's tracking-state property over D-Bus and put the
+    observed value in the log line. The current verdict line blames a disabled
     gnome-shell extension; the extension was measured enabled and ACTIVE
     during all three incidents. That makes three shipped guesses."
+
+    THE FIELD IS `gpaste_Active=`. Spec 5.3 said `Tracking` until it was
+    corrected against the target machine: GPaste 45.3 has `Track(b)` as a
+    METHOD and `Active` as the boolean property, and no `Tracking` property at
+    all. The literal spelling is asserted below rather than derived from
+    GPASTE_TRACKING_PROPERTY, because this is USER-VISIBLE OUTPUT -- a
+    derived assertion would follow the constant silently through a rename and
+    pin nothing about what production actually prints. The constant's VALUE
+    gets its own test, so the pair covers both "the field says what we think"
+    and "we are asking for the property that exists".
 
     TestGPasteSafetyNet above already pins that the line carries evidence and
     asserts no cause; this class pins what REPLACED the guess. Separate from
@@ -1212,21 +1222,51 @@ class TestVerdictNamesTheCause(unittest.TestCase):
 
     def test_a_tracking_daemon_is_reported_as_tracking(self):
         line = self.verdict_line(read_tracking=lambda: True)
-        self.assertIn("gpaste_Tracking=true", line)
+        self.assertIn("gpaste_Active=true", line)
 
     def test_a_daemon_that_stopped_tracking_is_reported_as_such(self):
         """The reading this release was written to be able to make. Three
         production incidents were diagnosed from a line that guessed instead."""
         line = self.verdict_line(read_tracking=lambda: False)
-        self.assertIn("gpaste_Tracking=false", line)
+        self.assertIn("gpaste_Active=false", line)
 
     def test_a_read_that_failed_is_reported_as_unavailable_and_never_as_false(self):
         """"We could not ask" is DIFFERENT EVIDENCE from "GPaste says no", and
         a line that rendered None as false would be a fourth shipped guess in
         the place the third one was removed from."""
         line = self.verdict_line(read_tracking=lambda: None)
-        self.assertIn("gpaste_Tracking=unavailable", line)
-        self.assertNotIn("gpaste_Tracking=false", line)
+        self.assertIn("gpaste_Active=unavailable", line)
+        self.assertNotIn("gpaste_Active=false", line)
+
+    def test_the_property_asked_for_is_the_one_that_exists(self):
+        """MEASURED, 2026-08-04, on the target machine running GPaste 45.3:
+
+            gdbus introspect --session --dest org.gnome.GPaste \
+                             --object-path /org/gnome/GPaste
+              interface org.gnome.GPaste2 {
+                  Track(in  b tracking-state);    <- a METHOD
+                  readonly b Active = true;       <- the boolean PROPERTY
+              }
+            Properties.Get org.gnome.GPaste2 Active   -> (<true>,)  exit 0
+            Properties.Get org.gnome.GPaste2 Tracking -> exit 1, empty stdout,
+              InvalidArgs: No such property "Tracking"
+
+        Spec 5.3 named `Tracking` until that measurement corrected it. Pinned
+        here as a VALUE rather than left to the constant's comment, because a
+        comment cannot go red: reverting this constant to the spec's original
+        word would make every production verdict report the field unavailable
+        forever, and nothing else in this suite would notice -- the deliverable
+        would be inert, which is the failure shape spec 5.3 exists to end.
+
+        The interface is asserted too: the bus name is org.gnome.GPaste and
+        the interface is org.gnome.GPaste2, a confusion this file has already
+        shipped once in the other direction (see GPASTE_INTERFACE)."""
+        self.assertEqual(
+            clipwire_agent.GPASTE_TRACKING_PROPERTY, "Active",
+            "GPaste 45.3 has no `Tracking` property: asking for it exits 1 and "
+            "the verdict reports the field unavailable on every machine")
+        self.assertEqual(clipwire_agent.GPASTE_INTERFACE, "org.gnome.GPaste2")
+        self.assertEqual(clipwire_agent.GPASTE_BUS_NAME, "org.gnome.GPaste")
 
     def test_the_property_name_is_in_the_line(self):
         """The name could not be verified against a live GPaste at authoring
@@ -1242,8 +1282,8 @@ class TestVerdictNamesTheCause(unittest.TestCase):
         self.assertNotIn("possible cause", line)
 
     def test_every_evidence_field_survives_the_replacement(self):
-        """The incident reconstruction was built from these four. The Tracking
-        read is an ADDITION, and a replacement that quietly dropped one of
+        """The incident reconstruction was built from these four. The
+        tracking-state read is an ADDITION, and a replacement that quietly dropped one of
         them would cost more than the guess did."""
         line = self.verdict_line(read_tracking=lambda: True)
         for field in ("signals=", "signals_at_last_tick=",
@@ -1313,7 +1353,7 @@ class TestVerdictNamesTheCause(unittest.TestCase):
         The line must degrade to "unavailable", not to a TypeError that takes
         the poll thread's whole judgement with it."""
         line = self.verdict_line(read_tracking=None)
-        self.assertIn("gpaste_Tracking=unavailable", line)
+        self.assertIn("gpaste_Active=unavailable", line)
 
 
 def _raise_gdbus_exploded():

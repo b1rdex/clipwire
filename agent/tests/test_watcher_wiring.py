@@ -150,7 +150,7 @@ class TestMakeWatcher(unittest.TestCase):
 
         Without this test the failure is silent and total: drop either
         argument from make_watcher and every machine runs the slow tier
-        ungated and reports "gpaste_Tracking=unavailable" forever, with no
+        ungated and reports "gpaste_Active=unavailable" forever, with no
         test red and no log line to say so. That is the same "correct code no
         production path reaches" shape the idle-tick test above was written
         for, which is why the two sit together.

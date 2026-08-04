@@ -3215,25 +3215,60 @@ def gpaste_history_uuid(run=subprocess.run):
     return parts[1]
 
 
-# The property asked for at the slow tier's verdict, spelled once so a wrong
-# guess is a ONE-LINE correction rather than a hunt. Spec 5.3 names it
-# "Tracking" and this implements the spec as written -- but say plainly what is
-# and is not established: the name is NOT verified against a live GPaste from
-# here, and the interface's published introspection is commonly read as
-# `Tracking` being a SIGNAL on org.gnome.GPaste2 with `Active` as the boolean
-# PROPERTY. Deliberately NOT "hedged" by asking for both in turn: rejecting the
-# PowerSaveMode gate for planning against an unmeasured branch of an API and
-# then shipping a two-call fallback built on weaker evidence than that would be
-# the same mistake with more code. So: ask for what the spec names, put the
-# name IN the log line (see _observe_tick's verdict), and let the first
-# production line settle it -- which is spec 5.3's own principle, "report what
-# was observed", applied to this uncertainty rather than only to GPaste's.
-GPASTE_TRACKING_PROPERTY = "Tracking"
+# The property asked for at the slow tier's verdict. THE CONSTANT NAMES THE
+# ROLE AND THE VALUE CARRIES THE MEASURED NAME -- those are two different
+# things and the mismatch is deliberate, not a stale rename: what this file
+# wants is GPaste's tracking state (spec 5.3), and the property that holds it
+# is called `Active`. Renaming the constant to match its value would tie this
+# file's identity to a name GPaste is free to change again, and would cut the
+# only link back to the spec section that asked for it.
+#
+# MEASURED ON THE TARGET MACHINE, 2026-08-04, GPaste 45.3 -- this is a cited
+# fact now, not a disclosed unknown, and that is the whole reason it is written
+# out here. `gdbus introspect --session --dest org.gnome.GPaste --object-path
+# /org/gnome/GPaste` gives interface org.gnome.GPaste2 with:
+#
+#     Track(in  b tracking-state);        <- a METHOD
+#     readonly b Active = true;           <- the boolean PROPERTY
+#     readonly s Version = '45.3';
+#
+#   - `Properties.Get org.gnome.GPaste2 Active`   -> `(<true>,)`, exit 0, 103 ms.
+#   - `Properties.Get org.gnome.GPaste2 Tracking` -> exit 1, EMPTY stdout,
+#     `org.freedesktop.DBus.Error.InvalidArgs: No such property "Tracking"`.
+#
+# SPEC 5.3 ORIGINALLY NAMED `Tracking`, AND THERE IS NO SUCH PROPERTY. The spec
+# has been corrected; this comment exists so a reader who finds the old wording
+# in some other document does not "fix" this line back to it. Shipped as the
+# spec said it first, on purpose: hedging with an unmeasured second call would
+# have been the same mistake this release's plan rejects PowerSaveMode for,
+# with more code. What made shipping the unverified name SAFE is the last
+# bullet above -- a wrong name exits non-zero with empty stdout, so it lands on
+# "not measured" and never on a guess -- and that property is why the failure
+# path below is unchanged by this correction.
+#
+# The name still goes IN the log line (see _observe_tick's verdict), which is
+# no longer about settling an open question and is still worth keeping: it is
+# what lets a reader tell "GPaste says false" from "this file asked for
+# something GPaste 46 renamed".
+GPASTE_TRACKING_PROPERTY = "Active"
 
 
 def gpaste_tracking(run=subprocess.run):
     """Whether GPaste says it is tracking the clipboard, or None when it was
     NOT MEASURED.
+
+    NAMED FOR THE QUESTION, NOT FOR THE PROPERTY, and deliberately: the
+    question is "is GPaste tracking", and on GPaste 45.3 the property that
+    answers it is `Active` (measured -- see GPASTE_TRACKING_PROPERTY, which
+    carries the name and the introspection it came from). `Track(b)` is the
+    METHOD that sets it. Renaming this function to gpaste_active() would name
+    it after today's spelling of the answer rather than after the question,
+    and this file already has one constant doing the spelling.
+
+    Cost, measured on the target machine with the rest of it: 103 ms. Two
+    orders above gpaste_history_uuid's 3-5 ms, which would be unaffordable
+    per tick and is nothing at once per connection -- see the paragraph on
+    the latch below, and the test that counts the calls.
 
     SPEC 5.3, and it exists to delete a guess. The slow tier's verdict line
     shipped "the gnome-shell extension being disabled is one possible cause"
@@ -3277,9 +3312,14 @@ def gpaste_tracking(run=subprocess.run):
     except (subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode != 0:
-        # WHERE A WRONG PROPERTY NAME LANDS, and it lands safely: gdbus exits
-        # non-zero on "No such property", so a name this file guessed wrong
-        # reports "unavailable" -- true, and never a guess.
+        # WHERE A WRONG PROPERTY NAME LANDS, and it lands safely -- MEASURED,
+        # not assumed, which matters because this branch is what made shipping
+        # an unverified name defensible in the first place. Asking GPaste 45.3
+        # for the property spec 5.3 originally named gives exit 1 with EMPTY
+        # stdout and the InvalidArgs error on stderr, so a wrong name reports
+        # "unavailable" -- true, and never a guess. (Measure it unpiped: a
+        # first attempt at this measurement read the exit code through a pipe
+        # and got a misleading one.)
         return None
     # `(<true>,)` -- a variant-wrapped boolean. Same deliberately partial parse
     # as gpaste_history_uuid: anything unrecognised is None, which every caller
@@ -4355,9 +4395,16 @@ class GPasteWatcher:
             # shipped guess and this is its deletion. What replaces it is a
             # value GPaste itself was asked for, reported with the PROPERTY
             # NAME so a reader of the first production line can tell "GPaste
-            # says false" from "this file asked for the wrong property" --
-            # which is what turns that log line into the verification this
-            # code could not run at authoring time.
+            # says false" from "this file asked for something GPaste renamed".
+            #
+            # THE FIELD IS `gpaste_Active=`, not `gpaste_Tracking=`, because
+            # the name comes from GPASTE_TRACKING_PROPERTY and that constant
+            # now carries a MEASURED name: GPaste 45.3 has no `Tracking`
+            # property at all, which is what spec 5.3 asked for before it was
+            # corrected. See that constant for the introspection. This is
+            # user-visible output, so anyone grepping production logs for the
+            # old spelling will find nothing -- said here rather than only at
+            # the constant, because this is the line they will be grepping.
             #
             # AFTER self._degraded is already True, and that ordering is the
             # whole answer to "what if the read hangs". The VERDICT is reached
