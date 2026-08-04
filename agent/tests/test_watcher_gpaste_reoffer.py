@@ -272,23 +272,44 @@ class TestAGPasteReofferIsNotADeadEventSource(unittest.TestCase):
             time.sleep(0.005)
         self.fail("timed out waiting for %s\n%s" % (what, self.diagnostics()))
 
-    def wait_for_the_monitor(self):
-        """Until the fake gdbus monitor has taken its baseline digest.
+    def prime_the_monitor(self, watcher):
+        """Changes the clipboard until the monitor actually reports one, so
+        that everything staged afterwards is staged against a monitor PROVEN
+        to be emitting.
 
-        Not politeness, and PairingHarness.assertTheAgentIsOnTheEventPath
-        carries the same two steps for the same reason: the monitor digests
-        the whole state file once at startup and treats any later difference
-        as a change, so a copy written before that digest is absorbed into it
-        and NO Update follows. The test would then be judging a scenario in
-        which the signal path never reported the copy either -- silence for
-        two reasons, one of them the harness's own fault.
+        The hazard, and it is the same one PairingHarness.assertTheAgentIsOn-
+        TheEventPath guards: the monitor digests the whole state file once at
+        startup and treats any later difference as a change, so a copy written
+        before that digest is absorbed into it and NO Update ever follows. The
+        test would then be judging a scenario in which the signal path never
+        reported the copy either -- silence for two reasons, one of them the
+        test's own fault.
 
-        The log line goes out immediately BEFORE the digest is taken, so a
-        few of the monitor's own 0.05 s poll intervals close the last gap.
+        MEASURED, which is why this is a loop and not a sleep. The first
+        version waited for the monitor's own log line (written immediately
+        BEFORE it takes the digest) and then slept 0.2 s. That failed 2 runs
+        in 12: an agent's first fork of a fake has been seen taking 0.2-0.8 s
+        (see fake_clipboard.py, "WHAT THEY COST"), which is longer than any
+        sleep worth writing. Re-writing until a signal lands cannot be
+        outrun -- once the digest has been taken, the very next write
+        produces an Update -- and it needs no estimate of how slow a loaded
+        machine can be.
+
+        An EMPTY selection, so nothing here is content the rest of the test
+        could mistake for the clip it stages: probe() reads it as None and
+        _local_change returns early on it.
         """
         self.wait_until(lambda: "monitor started" in self.invocations(),
                         "the fake gdbus monitor to start")
-        time.sleep(0.2)
+        deadline = time.monotonic() + WAIT_TIMEOUT
+        while time.monotonic() < deadline:
+            self.write_state(types=[], body="",
+                             generation="priming-%d" % time.time_ns(), silent=False)
+            for _ in range(20):
+                if watcher._signals:
+                    return
+                time.sleep(0.01)
+        self.fail("the fake gdbus monitor never reported a change\n%s" % self.diagnostics())
 
     def invocations(self):
         try:
@@ -345,14 +366,24 @@ class TestAGPasteReofferIsNotADeadEventSource(unittest.TestCase):
         changes = []
         watcher.start(lambda: changes.append(time.monotonic()))
 
+        # 0. The monitor is proven to be emitting before anything is staged
+        #    against it -- see prime_the_monitor for the race that closes.
+        self.prime_the_monitor(watcher)
+        # Baselines, not absolutes: priming produced one real Update and one
+        # real observation of its own, and counting from zero afterwards
+        # would credit them to the copy below. The same rule PairingHarness's
+        # `Marks` follows, for the same reason.
+        signals_before_the_copy = watcher._signals
+        changes_before_the_copy = len(changes)
+
         # 1. THE IMAGE LANDS, through the real event path: the fake gdbus
         #    monitor sees the state file move, prints a real Update line down
         #    a real pipe, the pump counts it and the worker runs the handler.
-        self.wait_for_the_monitor()
         self.copy_an_image_on_the_pc()
-        self.wait_until(lambda: changes, "the agent to observe the copy")
+        self.wait_until(lambda: len(changes) > changes_before_the_copy,
+                        "the agent to observe the copy")
         signals_after_the_copy = watcher._signals
-        self.assertEqual(signals_after_the_copy, 1,
+        self.assertEqual(signals_after_the_copy - signals_before_the_copy, 1,
                          "exactly one Update per copy, which is what makes "
                          "the silence below mean something")
 
