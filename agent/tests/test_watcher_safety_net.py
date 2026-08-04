@@ -391,10 +391,16 @@ class TestGPasteSafetyNet(unittest.TestCase):
         used to be that both the failure (a->None) and the recovery
         (None->a) looked like changes to the comparison, and the point was
         that neither may be read as a missed change. On the composed
-        watcher this builds, neither reaches the comparison at all: the
-        failing tick is `unresolved`, so it holds the baseline and observes
-        nothing, and the recovery tick compares b"a" against a still-held
-        b"a" and signals through `recovered` instead of through `!=`. The
+        watcher this builds, neither is READ AS A CHANGE by the comparison:
+        the failing tick is `unresolved`, so the comparison is never
+        evaluated for it at all -- it holds the baseline and observes
+        nothing -- while the recovery tick DOES evaluate it, comparing b"a"
+        against a still-held b"a", gets False, and signals through
+        `recovered` instead. This said "neither reaches the comparison at
+        all", which its own next sentence then contradicted by describing
+        what the recovery tick compares: `current != previous or recovered`
+        evaluates its left operand first, so on that tick the comparison is
+        reached and merely yields False. The
         assertion below is unchanged and still the one that matters -- a
         failed read and its recovery must produce no verdict -- so this is
         kept as the regression check it always was, now covering the

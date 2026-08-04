@@ -721,7 +721,13 @@ class Agent:
         #
         # Deliberately NOT a timer: the takeover was measured between one and
         # four seconds, on one machine, on one day, so any fixed wait is a
-        # race dressed as a constant. The expectation is spent by an EVENT
+        # race dressed as a constant. That was v3's campaign; v3.3 measured
+        # the same takeover again and got a WIDER spread (spec 1.2, "one to
+        # six seconds"), which strengthens this ruling rather than revising
+        # it -- see gpaste_history_uuid for the one account of that window
+        # this file keeps, and read the range from there rather than from
+        # the figure above, which is the older and narrower of the two.
+        # The expectation is spent by an EVENT
         # instead -- the first image observation whose hash differs from
         # _last_seen -- which is the echo guard's own shape, one door over.
         # v3.2's disarm does not weaken that: `written_at` is never a
@@ -1911,9 +1917,10 @@ class Agent:
         copying again, and the alternative is the permanent loss above.
 
         OVERDUE, not merely "the read failed", which is the whole reason
-        this is gated at all: GPaste's takeover was measured between one
-        and four seconds, and a transient wl-paste failure inside that
-        window is no evidence about the machine. Gated on `gen` for this
+        this is gated at all: GPaste's takeover was measured at one to six
+        seconds (spec 1.2, and see gpaste_history_uuid for this file's one
+        account of that window), and a transient wl-paste failure inside
+        that window is no evidence about the machine. Gated on `gen` for this
         file's recorded defect shape -- the read is in flight for two
         wl-paste round trips, and a _write_clip landing on run()'s thread
         inside that window arms a brand-new expectation this observation
@@ -2027,7 +2034,7 @@ class Agent:
         so the ruling had to be re-taken rather than inherited.
 
         It is still not a timer, because a wall-clock deadline loses to a
-        phase race: the takeover happens at one to four seconds, but with
+        phase race: the takeover happens at one to six seconds, but with
         the event source dead it is OBSERVED only by the safety-net poll, up
         to a full interval later, and a deadline and the tick carrying the
         observation then arrive neck and neck. What decides both outcomes
@@ -2846,6 +2853,29 @@ class WaylandClipboard:
         Never content in its own right -- nothing may hash, send or write
         what this returns.
 
+        CHEAP IN BYTES, NEVER IN FOCUS, and since v3.3 that second half is
+        the more important one. "Cheap" throughout this docstring means
+        cheap AGAINST read(), which is the comparison it was written to
+        make, and it is still the right one -- but it is not a claim that
+        the call is free. `wl-paste --list-types` measures 104 ms on the
+        target machine and, on this compositor, TAKES KEYBOARD FOCUS while
+        it runs: blind A/B, 2 Hz, 15 s a phase, phases unlabelled, with
+        `xclip -o -t TARGETS` as the negative control (spec 1). So the blink
+        rate a user sees is the rate this method is CALLED at, not the rate
+        content actually changes (spec 1.1), and every caller below is
+        spending focus rather than only time.
+
+        THAT IS WHY THIS IS NO LONGER THE ONLY NON-SIGNAL DETECTOR. On a
+        machine with GPaste the fast tier watches the history uuid over
+        D-Bus instead (gpaste_history_uuid), which costs the same ~103 ms
+        and no focus at all -- the two are within a millisecond of each
+        other in wall clock, so the entire difference is the blink. This
+        method keeps the jobs the uuid cannot do: it is the slow tier's
+        token, and it is the only thing that observes the SELECTION rather
+        than GPaste's opinion of it, which is what makes a dead tracker
+        visible at all (spec 4.0). Its callers are the poll loop's baseline
+        and its per-tick probe, and nothing else.
+
         THE POINT, which is a spec requirement the plan dropped rather than
         an optimisation. PollingWatcher.pump used to call read() on every
         tick, and since read() became kind-aware that means forking
@@ -2883,12 +2913,19 @@ class WaylandClipboard:
         application's list and GPaste's. That expectation is not verified
         -- this project has no live Wayland machine to check it against --
         so if it does not hold, two image copies from the SAME source
-        landing inside GPaste's takeover window (measured at one to four
-        seconds) look identical to this loop and the second waits for the
-        next type-list change. In healthy mode nothing is lost either way:
-        GPaste's Update signal carries that change and the poll is only a
-        net. In degraded mode it is a real gap, bounded by the next
-        transition.
+        landing inside GPaste's takeover window (measured at one to six
+        seconds -- see gpaste_history_uuid, which keeps this file's one
+        account of that window) look identical to this loop and the second
+        waits for the
+        next type-list change. In healthy mode nothing is lost either way,
+        and since v3.3 for two independent reasons rather than one: GPaste's
+        Update signal carries that change, and if the signal path has gone
+        quiet the fast tier's history uuid moves for it anyway (spec 6.1) --
+        this poll is only a net under both. In degraded mode it is still a
+        real gap, bounded by the next transition, and the fast tier does NOT
+        close it: spec 6.2 is the state where GPaste has stopped tracking,
+        so its uuid is frozen by definition and has nothing to say about a
+        selection it never saw.
 
         RETURNS None on the same failures read() does, with one deliberate
         difference: an image whose BODY fetch would have failed or come
@@ -3174,9 +3211,15 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 # a millisecond of each other -- so every argument for this release rests on
 # the one thing that IS different, that gdbus takes no focus and wl-paste does.
 # Any comment anywhere leaning on the fast tier being cheap in TIME is
-# unsupported; three in this file were, and all three are corrected in the same
-# commit as this one. The 3 s timeout is unaffected either way: 30x headroom
-# over 103 ms is still a timeout, not a budget.
+# unsupported. THE RULE, NOT A LIST OF THE SITES THAT BROKE IT: a hand-kept
+# inventory of "which comments were wrong" here has to be revisited whenever
+# one more is written, and the previous revision of this paragraph both
+# counted them and dated the count to "the same commit as this one" -- a
+# self-reference that is unverifiable from the file and stale the moment
+# anything else is corrected. Grep the figure instead; the sites that leaned
+# on it were swept in one pass rather than an allowlist, which is the only
+# check that can see the one nobody remembered. The 3 s timeout is unaffected
+# either way: 30x headroom over 103 ms is still a timeout, not a budget.
 GPASTE_CALL_TIMEOUT = 3
 
 
@@ -3186,9 +3229,37 @@ def gpaste_history_uuid(run=subprocess.run):
     THE TOKEN THE FAST TIER COMPARES, and the reason v3.3 exists. GPaste
     re-offers an image one to six seconds after any copy -- measured, the
     offered type list goes from one entry to twenty-three -- and emits no
-    Update for it. The old token was that type list, so a healthy machine
-    looked like one whose event source had died. A history entry is not created
-    by a re-offer, so this token does not move for it.
+    Update for it. That type list was the WHOLE of the old change token, so a
+    healthy machine looked like one whose event source had died. A history
+    entry is not created by a re-offer, so this token does not move for it.
+
+    THE TYPE LIST IS DEMOTED, NOT RETIRED, and a reader who takes the
+    sentence above as "that token is gone" will misread _observe_tick. It is
+    still what probe() returns and still what the slow tier compares, so that
+    tier still takes the re-offer as an input -- spec 4.2 says so in as many
+    words ("it consumes wl-paste tokens, so it inherits 1.2's false-positive
+    input"). What changed is that the re-offer can no longer reach a verdict
+    on its own: the slow tier judges the type list AGAINST this uuid, and a
+    settled token CLEARS an armed run there instead of confirming it.
+
+    THE WINDOW'S PROVENANCE lives here, because the other comments in this
+    file that need it now point at this one rather than each carrying a
+    figure of its own -- which is how the same measured quantity came to be
+    written down two different ways. TWO campaigns measured this takeover:
+
+      - v3 (2026-07-31), one machine, one day: "between one and four
+        seconds", from a written PNG that read back unchanged at t+1s and
+        re-encoded at t+4s.
+      - v3.3 (spec 1.2), and this is the range in force: "one to six
+        seconds", from four Update-to-re-offer gaps measured at 4.6 s,
+        0.4 s, 0.03 s and 0.04 s.
+
+    So "one" is a rounded headline rather than a floor -- two of those four
+    samples are under a twentieth of a second, and spec 1.2's own text does
+    not reconcile the two. The bound that is load-bearing is the TOP:
+    DIVERGENCE_REPROBE_SECONDS is sized to clear six seconds and says so.
+    Nothing should be built on the bottom of the range, which is not a
+    measurement of anything.
 
     None is "not measured", and it is NOT a value: spec 4.0.1. It may never be
     compared for equality with a previous reading, because "the call failed" and
@@ -3401,17 +3472,36 @@ def _user_recently_active(run=subprocess.run):
     the word "measured" in front of it. Recorded rather than quietly replaced,
     because the failure was the word, not the number.
 
-    WHAT THE REAL NUMBER MEANS FOR THIS GATE, since 103 ms is not free. The
-    probe it stands in front of costs 104 ms, so as a TIME optimisation this
-    gate is worthless -- break-even when it skips a tick, double cost when it
-    does not. It is a FOCUS optimisation and only that: gdbus takes no focus
-    and wl-paste does, so what a closed gate buys is a blink that never
-    happens, which matters to a user who is idle-but-present (watching,
-    presenting, recording) rather than absent. Priced per tier: ~0.3% duty
-    cycle on the 30 s slow tier, which is the tier it is wired to. It is NOT
-    wired to the 1 s degraded loop, where the same call would be ~10% -- see
-    GPasteWatcher._slow_tier_should_probe for why that is a separate decision
-    and not an oversight.
+    WHAT THE REAL NUMBER MEANS FOR THIS GATE, since 103 ms is not free, and
+    the arithmetic DEPENDS ON THE KIND -- a previous revision priced it for
+    one kind and stated the answer for both. What probe() forks is one
+    wl-paste call for an IMAGE (the type list, 104 ms) and TWO for TEXT (the
+    type list, then the body), so against a 103 ms gate:
+
+      - image: a skipped tick breaks even, an unskipped one roughly doubles;
+      - text:  a skipped tick saves about half of what the probe would have
+               cost, an unskipped one adds about half again.
+
+    So as a TIME optimisation it ranges from worthless (image) to a small
+    win (text), and it is not worth having for either. It is a
+    FOCUS optimisation and only that: gdbus takes no focus and wl-paste
+    does, so what a closed gate buys is a blink that never happens, which
+    matters to a user who is idle-but-present (watching, presenting,
+    recording) rather than absent.
+
+    PRICED PER TIER, AND IT IS WIRED TO BOTH -- said carefully, because the
+    sentence here used to read "it is NOT wired to the 1 s degraded loop",
+    which is false and points a reader at the construction-time scoping
+    GPasteWatcher._slow_tier_should_probe argues against. `pump` is SHARED:
+    __init__ hands the gate to the one poller, and that poller becomes the
+    degraded loop when the verdict fires mid-connection, so there is no
+    construction-time choice to make. What is true is that the gate STANDS
+    ITSELF DOWN once degraded -- `if self._degraded: return True` at the top
+    of _slow_tier_should_probe -- so it costs ~0.3% duty cycle on the 30 s
+    slow tier, where it runs, and 0% rather than ~10% on the 1 s degraded
+    loop, where it returns before making a call at all. See that method for
+    the three reasons the stand-down exists, and for why spec 4.3's fallback
+    is deliberately NOT given the same treatment.
 
     See spec 1's corrected table rather than restating any of these figures
     somewhere new; they have drifted once already.
@@ -3533,10 +3623,24 @@ def _env_seconds(name, default):
 # available() below probes the bus NAME, but GPaste tracks the clipboard
 # through a gnome-shell extension: a GNOME upgrade can leave the daemon
 # running and the bus answering while the extension is disabled, so Update
-# never fires, PC->Mac sync is silently dead, and the polling fallback does
-# not engage because it is keyed on the bus being unreachable rather than on
-# events being absent. This is the detection budget for that state -- an
-# acceptable worst case for NOTICING a broken subscription.
+# never fires and the polling fallback does not engage, because it is keyed
+# on the bus being unreachable rather than on events being absent.
+#
+# THAT STATE IS NO LONGER THIS CONSTANT'S JOB, and the sentence that used to
+# stand here -- "the detection budget for noticing a broken subscription" --
+# is what spec 8 names among the prose v3.3 invalidates. A silent
+# subscription is spec 6.1, and FAST_TIER_SECONDS owns it now: the history
+# uuid moves on every real copy whether or not an Update arrives, so PC->Mac
+# sync is not "silently dead" in that state either, it runs at 5 s with no
+# focus cost and logs one line saying so (_fast_tick).
+#
+# WHAT IS LEFT FOR THIS INTERVAL is the state the uuid cannot see, because
+# the uuid is what goes quiet in it: spec 6.2, GPaste no longer tracking the
+# selection at all. This is the rate the SLOW TIER ticks at, so it is the
+# budget for noticing THAT -- two consecutive diverging ticks, since a
+# settled token clears an armed run here (_observe_tick). Also the default of
+# an overridable parameter rather than the value itself, since Task 10:
+# GPasteWatcher's safety_net_interval_seconds, or CLIPWIRE_SAFETY_NET_SECONDS.
 SAFETY_NET_POLL_SECONDS = 30.0
 # The FLOOR of what the safety net polls at once it has concluded the event
 # source is dead -- not a flat rate since spec 6.2's backoff (_observe_tick):
@@ -3762,20 +3866,30 @@ def _start_observer(event, stop, on_change):
     """Start the ONE thread allowed to call the clipboard handler.
 
     Every other thread in a watcher is a reader -- the gdbus pump, the poll
-    loop -- and readers only ever set `event`. A reader that called the handler
+    loop, and since v3.3 the fast tier as well -- and readers only ever set
+    `event`. A reader that called the handler
     could block on Agent._observe_lock and could die of anything the handler
     raised, silently and for the rest of the connection; that is the production
     defect this shape removes by construction. There is exactly one of these
     per watcher tree, which is also what keeps "one observation path" true: one
     place decides what a local change means, and only one thread is ever inside
-    it.
+    it -- and it stays one however many readers are added, which is the
+    property that made adding a third reader a thread rather than a redesign.
 
-    No queue, deliberately. The handler reads clipboard STATE, not the contents
-    of any event -- GPaste's Update payload carries nothing this agent uses,
-    and the poll loop's own signal carries nothing either: it compares a
-    probe() token and sets the event, and the token never leaves that loop.
-    So signals arriving while the handler runs collapse into one set() and one
-    re-read afterwards. That is
+    No queue, deliberately, and the reason is a property of every reader
+    rather than a list of them: the handler reads clipboard STATE, so no
+    signal has to carry anything, whatever the reader observed to raise it.
+    GPaste's Update payload carries nothing this agent uses; the poll loop
+    compares a probe() token; the fast tier compares a history uuid. None of
+    those three reaches on_change -- the event is a bare wakeup and carries
+    no value at all. (The uuid does travel WITHIN the watcher: _fast_tick
+    returns it and stores it in self._last_uuid, which _observe_tick reads
+    on the poll thread. What spec 5.2 forbids is a different thing -- the
+    reply's TEXT field, possibly a password, and the uuid appearing in any
+    log line. Neither rule is about confining it to one function, and an
+    earlier draft of this paragraph said it was.) So signals arriving while
+    the handler runs collapse into one set()
+    and one re-read afterwards. That is
     the semantics a clipboard wants; a queue would hold nothing and only add a
     way to fall behind.
     """
@@ -3803,18 +3917,39 @@ class GPasteWatcher:
     """Event-driven. Python has no stdlib DBus binding, so this shells out to
     gdbus monitor and parses its output line by line.
 
-    Composes a PollingWatcher as a slow safety net (see
-    SAFETY_NET_POLL_SECONDS): a subscription that has silently stopped
-    delivering is indistinguishable from an idle clipboard until something
-    else actually looks at the clipboard. What that poller looks at is a
-    probe() TOKEN, not the content -- for an image, the offered type list --
-    which is enough to tell "something changed" from "nothing did", and is
-    all this class ever asked of it.
+    THREE THREADS, AND THE CLASS DOCSTRING NAMED ONE OF THEM UNTIL v3.3.
+    start() below is the authority; this is the map:
 
-    `clipboard` is only used by that safety net -- available() never touches
-    it -- but it is a required argument rather than a defaulted one, because a
-    GPasteWatcher built without one would look healthy and silently have no
-    safety net at all, which is the exact failure this class exists to catch.
+      - the gdbus MONITOR pump, the primary source. Counts accepted Update
+        lines into self._signals and sets the shared event. Latency
+        effectively zero, and nothing here supersedes it.
+      - the FAST TIER (_fast_loop/_fast_tick), every FAST_TIER_SECONDS.
+        Reads GPaste's top history uuid over D-Bus and signals when it
+        MOVED. This is what makes a silent subscription cheap: it takes no
+        focus, so noticing that the pump has gone quiet no longer costs a
+        blink (spec 6.1, spec 1).
+      - the SLOW TIER, a composed PollingWatcher (see
+        SAFETY_NET_POLL_SECONDS). Still the only thing that looks at the
+        SELECTION rather than at GPaste's opinion of it, which is why it
+        cannot be dropped: if GPaste stops tracking, its uuid goes quiet
+        for the same reason the Update signals do, and only a wl-paste
+        token can tell that apart from an idle clipboard (spec 4.0).
+
+    All three set ONE event and none of them calls the handler --
+    _start_observer's single worker does that, and only it.
+
+    What the slow tier looks at is a probe() TOKEN, not the content -- for
+    an image, the offered type list -- which is enough to tell "something
+    changed" from "nothing did". It is no longer all this class asks of it:
+    _observe_tick judges that token AGAINST the fast tier's uuid rather than
+    on its own, which is what stops GPaste's own re-offer from reading as a
+    dead event source (spec 1.2, spec 4.2).
+
+    `clipboard` is only used by that slow tier -- available() never touches
+    it, and the fast tier holds no reference to it -- but it is a required
+    argument rather than a defaulted one, because a GPasteWatcher built
+    without one would look healthy and silently have no safety net at all,
+    which is the exact failure this class exists to catch.
     """
 
     def __init__(self, clipboard,
@@ -3973,11 +4108,15 @@ class GPasteWatcher:
             else _env_seconds("CLIPWIRE_SAFETY_NET_SECONDS", SAFETY_NET_POLL_SECONDS))
         # NOT a second timer -- "the slow tier IS the existing safety net",
         # so nothing below starts a thread from THIS value (the one directly
-        # above is the one that does). It exists because a later task (the
-        # uuid-tier failure fallback, spec 4.3: "N consecutive failures...
-        # expressed as a DURATION, at least 2x the slow interval") needs that
-        # interval as a number to multiply, and it would otherwise not be
-        # retained anywhere. Resolved by the identical three-step rule as
+        # above is the one that does). It exists because spec 4.3's uuid-tier
+        # failure fallback ("N consecutive failures... expressed as a
+        # DURATION, at least 2x the slow interval") needs that interval as a
+        # number to multiply, and it would otherwise not be retained
+        # anywhere. That was written as "a later task needs it"; the task
+        # landed, and its one consumer is self._uuid_failures_before_fallback
+        # a few lines below -- a forward reference outlives its own tense
+        # unless someone goes back for it, which is what this file's audit
+        # exists to do. Resolved by the identical three-step rule as
         # _fast_interval just above, mirrored on purpose so the tiers cannot
         # silently drift onto different override rules -- but note the default
         # it falls back to is the RESOLVED safety-net interval, never
@@ -3992,9 +4131,15 @@ class GPasteWatcher:
                                else _env_seconds("CLIPWIRE_SLOW_TIER_SECONDS",
                                                  self._safety_net_interval))
         # The last MEASURED uuid, or None right after a failed call. Written
-        # only by _fast_tick, below; nothing in THIS commit reads it back
-        # (Tasks 6 and 7 do), but it is where spec 4.0.1's distinction is
-        # kept alive between commits: "the history did not move" (a real
+        # only by _fast_tick, below, and READ BY _observe_tick -- which it
+        # was not when this comment first said "nothing in THIS commit reads
+        # it back (Tasks 6 and 7 do)". Both landed; the reader is real, it
+        # runs on another thread, and the tearing window that creates is
+        # disclosed at self._uuid_failures below. A comment dated to "this
+        # commit" cannot be checked from the file and stops being true
+        # without anything touching it, which is why the reader is named
+        # instead. It is where spec 4.0.1's distinction is
+        # kept alive: "the history did not move" (a real
         # reading, unchanged) must stay tellable from "we do not know
         # whether it moved" (the last call failed) for whichever tick reads
         # it next. See _fast_tick's own docstring for how that is enforced.
@@ -4012,8 +4157,11 @@ class GPasteWatcher:
         # net's poll thread) need no lock either: the worst a read sees is
         # last tick's count, one moment longer. True of the COUNT on its own;
         # _observe_tick consumes the count and self._last_uuid as a PAIR,
-        # which is written non-atomically here and read non-atomically there
-        # (nine lines apart), so NEITHER the single-writer shape nor the
+        # which is written non-atomically in _fast_tick's `else` branch (two
+        # adjacent stores, nothing blocking between them) and read
+        # non-atomically in _observe_tick (nine lines apart) -- NOT "here",
+        # which is what this said while sitting in __init__, where neither
+        # the write nor the read is. So NEITHER the single-writer shape nor the
         # store order makes that pair safe -- the order narrows the window
         # and no more. See _fast_tick's `else` branch for both windows,
         # which one the order closes, and which one it leaves open.
@@ -4134,13 +4282,16 @@ class GPasteWatcher:
         pump's arbiter paragraph, which enumerates the claimants and does not
         list this one -- deliberately, and stated in both places.
 
-        NOT WIRED TO THE DEGRADED LOOP, and this is a decision with a
-        measurement behind it rather than a scoping accident. `pump` is
-        SHARED: after spec 6.2's verdict the same loop runs at
-        DEGRADED_POLL_SECONDS and is, in exactly the state that verdict
-        describes, the connection's ONLY change detector. Three things go
-        wrong if the gate runs there, and the second is the one that decides
-        it:
+        IT STANDS DOWN ONCE DEGRADED -- which is not the same as not being
+        wired there, and the difference is the whole reason the first line
+        of this method is what it is. `pump` is SHARED: __init__ hands the
+        gate to the one poller, and after spec 6.2's verdict that same loop
+        runs at DEGRADED_POLL_SECONDS and is, in exactly the state that
+        verdict describes, the connection's ONLY change detector. So there
+        is no construction-time scoping available to make -- the gate
+        reaches the degraded loop by construction and has to decline the
+        tick itself. Three things go wrong if it does not, and the second is
+        the one that decides it:
 
           1. It suppresses SYNC rather than a divergence probe. Spec 4.2's
              whole justification -- "with nobody copying there is no
@@ -4157,12 +4308,21 @@ class GPasteWatcher:
              is idle. Measured, driving the real loop at a 5 ms floor for
              250 ms: gate saying "active" -> 6 probes and the interval backed
              off 0.005 -> 0.16; gate saying "idle" -> ONE probe (the
-             ungated baseline) and the interval still 0.005, forever. So the
-             gated connection polls the gate 200x more often than the ungated
-             one polls the clipboard, and syncs nothing while it does.
+             ungated baseline) and the interval still 0.005, forever.
+             THE DAMAGE IS A DIVERGING RATIO, and it is not the number this
+             comment used to give: it said "200x more often", which is the
+             pinned loop's tick RATE at that 5 ms floor (200 a second) rather
+             than a ratio against anything. The ratio is whatever the ungated
+             loop has backed off TO, so it grows as the idle stretch does.
+             Over the measured 250 ms it is about ten. At the production
+             floor and cap -- 1 s pinned against the backoff's 30 s -- the
+             steady state is thirty: the gated connection asks the gate once
+             a second, forever, and syncs nothing while it does, while the
+             ungated one probes twice a minute and still would.
           3. The price is the wrong way round. The gate costs 103 ms (see
              _user_recently_active); on this loop that is ~10% duty cycle
-             against ~0.3% on the 30 s tier, to skip a 104 ms fork. Task 9's
+             against ~0.3% on the 30 s tier, to skip a 104 ms fork -- two of
+             them, for a text selection. Task 9's
              backoff already solves "an idle degraded connection kept
              blinking at the floor rate" -- its test says so by name -- and
              solves it by polling LESS rather than by asking a question every
@@ -4240,8 +4400,20 @@ class GPasteWatcher:
         silent" on a tick where the source DID report, and that is a false
         spec 6.2 verdict this release has no way to clear. Undercounting the
         verdict line's own `signals=`/`signals_at_last_tick=` fields is now
-        the LESSER of the two things this ordering prevents, not the only
-        one.
+        the LESSER of the two things this ordering guards against, not the
+        only one.
+
+        NARROWS, NEVER PREVENTS. The hedge earlier in this docstring -- the
+        one sending readers to PollingWatcher.start's grace-period note
+        "before trusting it as a precise count" -- is the accurate one, and
+        this paragraph said "prevents" while standing next to it.
+        The probe is a wl-paste fork, so the ordering buys the pump the
+        duration of that fork to get an in-flight Update counted; it does
+        not close the window, because a copy landing in the last few
+        milliseconds before the fork is still uncounted when the snapshot
+        is taken. PollingWatcher.pump says the same thing from the other
+        side, in as many words, and it is the note to read before trusting
+        either count.
 
         `previous`/`current` are probe() TOKENS, not content -- for an image
         they are the offered type list. This function only ever compares
@@ -5135,9 +5307,15 @@ class GPasteWatcher:
             # the swap with the stronger claim ("no verdict, deferred by one
             # tick, never a wrong one"), which round 2 retracts: that is the
             # same asserting-a-residual-out-of-existence this file gets
-            # wrong more often than it gets code wrong, and the
-            # interval-write residual disclosed a few lines above got the
-            # identical question RIGHT in this very commit.
+            # wrong more often than it gets code wrong. The
+            # interval-write residual disclosed in the branch above -- the
+            # one that defers to self._degraded -- gets the identical
+            # question right, and is the shape to copy. (It said "in this
+            # very commit" until the doc audit: a claim about which commit
+            # is which cannot be checked from the file, and goes stale by
+            # construction the moment anything else lands. Point at the
+            # neighbouring paragraph, which a reader can actually go and
+            # read.)
             #
             # _observe_tick reads self._last_uuid and self._uuid_failures as
             # a PAIR, from the poll thread, with no lock (single writer --
@@ -5180,10 +5358,19 @@ class GPasteWatcher:
             # So the two-tick shape does not narrow this at all, and the
             # sentence claiming it did is deleted rather than softened. The
             # honest bound is narrower in a different place: this window
-            # exists ONLY while the uuid tier is alive, because the
-            # post-fallback branch above reads neither of these two fields
-            # -- there is no pair left to tear once the discriminator is the
-            # signal counter.
+            # exists ONLY while the uuid tier is alive, because neither of
+            # these two fields reaches the DECISION once the discriminator
+            # is the signal counter -- there is no pair left to tear.
+            #
+            # "Reaches the decision", not "is read", which is what this said
+            # and is false of one of the two: uuid_frozen is computed
+            # unconditionally at the top of _observe_tick, so self._last_uuid
+            # IS read on every post-fallback tick -- the result is then
+            # thrown away by the `if self._uuid_tier_failed` branch, which
+            # never looks at it. self._uuid_failures is the one that is
+            # genuinely not read there. The bound is the same either way,
+            # because a torn pair can only do harm through a verdict, and no
+            # verdict is computed from it in that regime.
             #
             # So: strictly non-worsening, strictly narrower, NOT a proof of
             # safety. Disclosed rather than locked, on the same reasoning as
@@ -5335,8 +5522,33 @@ class GPasteWatcher:
 
 
 class PollingWatcher:
-    """Degraded mode: forks wl-paste on every tick, so it runs at a slower
-    interval than the Mac's in-process poll.
+    """Compare-and-notify against the clipboard itself: fork wl-paste, take a
+    token, signal when it moved. Because each tick is a fork it runs at a
+    slower interval than the Mac's in-process poll.
+
+    "FORKS wl-paste ON EVERY TICK" IS NO LONGER TRUE, and spec 8 names that
+    exact phrase among the prose v3.3 invalidates. Since spec 4.2's idle
+    gate a tick can decline to probe at all (`should_probe`, consulted at
+    the top of pump before anything else happens), so the fork rate is at
+    most the tick rate and is lower on any tick a wired gate declines. Two
+    constructions still do fork every tick, for different reasons: the
+    standalone poller below, which is handed no gate at all, and a degraded
+    slow tier, whose gate stands itself down (see
+    GPasteWatcher._slow_tier_should_probe).
+
+    THREE ROLES, ONE CLASS, and the opening line named only the degraded one
+    until the v3.3 doc audit -- which matters because most of what is
+    written below is about the other two:
+
+      - GPasteWatcher's SLOW TIER on a healthy connection, at
+        SAFETY_NET_POLL_SECONDS. This is the common case;
+      - the same object after spec 6.2's verdict, backing off between
+        DEGRADED_POLL_SECONDS and that same cap. `pump` is shared, so this
+        is a change of interval and of gate behaviour, never a different
+        loop;
+      - make_watcher's STANDALONE poller on a machine with no GPaste, which
+        gets no on_tick, no gate, and therefore none of the rules those two
+        bring with them.
 
     Change detection goes through clipboard.probe(), NEVER clipboard.read().
     That is a correctness-relevant distinction rather than a tuning one, and
@@ -5783,6 +5995,24 @@ class PollingWatcher:
                     # probes are returning nothing, and it cannot outlast that
                     # by even one tick.
                     #
+                    # ONE WAY IT CAN OUTLAST IT, disclosed rather than closed,
+                    # and it was in a task report and not in this file until
+                    # the doc audit. "Probes are returning nothing" is read as
+                    # `current is None`, which is what probe() ANSWERS on a
+                    # failure -- but a probe that RAISES never returns at all.
+                    # The exception unwinds straight to this try's handler, so
+                    # self._retry_interval is neither doubled nor cleared,
+                    # `before`/`current` never reach _on_tick, and the elevated
+                    # interval from whatever run preceded it is held across
+                    # that tick and every tick that keeps raising. Bounded the
+                    # same way the run itself is (the cap), released by the
+                    # first tick whose probe returns anything at all, and
+                    # unreachable through WaylandClipboard.probe, which
+                    # converts every wl-paste failure it knows about into
+                    # None. Left as is: a bare except around one call here
+                    # would swallow exactly the class of defect the poll
+                    # thread's guard exists to make loud.
+                    #
                     #   - SPEC 6.2's degraded latch (_observe_tick, this
                     #     file) always takes effect on the very next wait,
                     #     and the ordering is what guarantees it rather
@@ -5821,27 +6051,56 @@ class PollingWatcher:
                     #     first bullet's ordering argument then applies to it
                     #     word for word.
                     #
-                    # The pairs that do NOT involve this backoff -- spec 4.3's
-                    # fallback against EITHER spec 6.2 write, which since Task
-                    # 9 is two of them rather than "the remaining pair" this
-                    # sentence said while there were only three claimants --
-                    # are a DIFFERENT question and are settled elsewhere, by
-                    # the explicit `if not self._degraded` in _fast_tick and
-                    # the reasoning beside it. One guard covers both, because
-                    # both 6.2 writes require self._degraded to be True. Do
-                    # not read that ruling and this one as one: there a guard
-                    # was needed because those really do write the same field,
-                    # and here none is because the backoff never outlives the
-                    # condition that raised it. Since Task 12 the same sentence
-                    # covers the three pairs that involve the re-probe and not
-                    # this backoff: they are settled in _observe_tick, by that
-                    # block's own `if not self._degraded` and by the bullets
-                    # above, not here.
+                    # THE SIX PAIRS THAT DO NOT INVOLVE THIS RETRY BACKOFF are
+                    # a DIFFERENT question and are settled elsewhere -- six
+                    # because ten minus the four bullets above, and the count
+                    # is written out because the previous revision of this
+                    # sentence opened "The pairs that do NOT involve this
+                    # backoff" and then named five, in the paragraph repaired
+                    # for being off by one. Where each is settled:
+                    #
+                    #   - spec 4.3's fallback against EITHER spec 6.2 write
+                    #     (two pairs): the explicit `if not self._degraded` in
+                    #     _fast_tick and the reasoning beside it. One guard
+                    #     covers both, because both 6.2 writes require
+                    #     self._degraded to be True. Do not read that ruling
+                    #     and this one as one: there a guard was needed
+                    #     because those really do write the same field, and
+                    #     here none is because this retry never outlives the
+                    #     condition that raised it.
+                    #   - spec 6.2's latch against spec 6.2's OWN backoff (one
+                    #     pair): no rule anywhere, and none is owed. Its own
+                    #     bullet in the enumeration above says why -- same
+                    #     thread, one function, fixed order, and `confirmed`
+                    #     implies `token_moved`, so the doubling that follows
+                    #     a latch always takes the reset branch and writes the
+                    #     same floor. This is the pair the old sentence
+                    #     silently dropped, and its assertion would have been
+                    #     FALSE of it: nothing in _fast_tick settles it.
+                    #   - the three that involve spec 4.2's re-probe and not
+                    #     this retry: settled in _observe_tick, by that
+                    #     block's own `if not self._degraded` and by the two
+                    #     re-probe bullets above, not here.
                     unresolved = current is None and self._on_tick is not None
                     # Read BEFORE the assignments below, and self._retry_interval
                     # doubles as the run's memory rather than earning a second
                     # field: it is non-None exactly while a run of unresolved
                     # ticks is in progress.
+                    #
+                    # `and not unresolved` IS PROVABLY REDUNDANT TODAY, and it
+                    # stays. `recovered` is read in exactly one place -- the
+                    # change branch inside the `else` below -- and reaching
+                    # that `else` already establishes `not unresolved`, so the
+                    # conjunct can never change the value that is read. A
+                    # mutation run finds it as an EQUIVALENT MUTANT rather
+                    # than as an uncaught guard, which is the right verdict
+                    # and is recorded here so the next run does not
+                    # re-litigate it. Kept because it makes this line's
+                    # meaning independent of where it is read from: the
+                    # equivalence is a property of the branch structure below,
+                    # nothing announces if that structure moves, and the
+                    # failure mode if it does is a "recovery" asserted on a
+                    # tick that resolved nothing.
                     recovered = self._retry_interval is not None and not unresolved
                     if unresolved:
                         # AND NOTHING ELSE ON THIS TICK -- no baseline
@@ -5864,7 +6123,21 @@ class PollingWatcher:
                         # longer the whole basis -- spec 6.2's backoff assigns
                         # self.interval after construction -- but it holds
                         # anyway, because that writer caps itself at this same
-                        # constant. So min() can only ever slow the loop down.
+                        # constant. So min() can never make the loop FASTER
+                        # than self.interval -- which is the one-sided claim,
+                        # and the only one that holds.
+                        #
+                        # THIS SAID "CAN ONLY EVER SLOW THE LOOP DOWN", WHICH
+                        # IS FALSE AT THE CAP: with self.interval already at
+                        # SAFETY_NET_POLL_SECONDS, min(30, 60) is 30 and the
+                        # retry waits exactly what the base rate waited. The
+                        # "AND IT BACKS OFF" paragraph in this same try block
+                        # states that correctly -- "at the 30-second net
+                        # itself the cap makes this inert by construction,
+                        # min() of two thirty-second figures" -- so the two
+                        # sentences contradicted each other inside one
+                        # function, which is why the weaker claim is the one
+                        # written here: >= is guaranteed, > is not.
                         # Spec 4.2's slow tier is
                         # 5-15 MINUTES; the day that becomes this poller's
                         # interval rather than only self._slow_interval,
@@ -5910,9 +6183,27 @@ class PollingWatcher:
                             # _start_observer.
                             self._event.set()
                         elif self._on_idle_tick is not None and self._on_idle_tick():
-                            # THE NO-CHANGE BRANCH, and the one place in this
-                            # file where an observation is asked for without the
-                            # token having moved. Agent._reoffer_pending is the
+                            # THE NO-CHANGE BRANCH: an observation is asked for
+                            # although this loop's token did not move.
+                            #
+                            # THE RULE, NOT A UNIQUENESS CLAIM. This said "the
+                            # one place in this file where an observation is
+                            # asked for without the token having moved", and
+                            # it stopped being true twice -- once when Task 8
+                            # made `recovered` signal on a settled token in the
+                            # branch directly above, and once when the fast
+                            # tier began setting THIS SAME EVENT on a uuid move
+                            # the wl-paste token cannot see. Re-counting them
+                            # would only schedule the next stale count, so the
+                            # rule instead: A SETTLED wl-paste TOKEN IS NOT
+                            # EVIDENCE THAT NOTHING HAPPENED, so anything
+                            # holding independent evidence signals over it. What
+                            # is particular to this branch is only where that
+                            # evidence comes from -- a PREDICATE asked on this
+                            # thread, rather than a run of failed probes ending
+                            # or another thread's token moving.
+                            #
+                            # Agent._reoffer_pending is the
                             # only caller's predicate: while an applied image is
                             # still waiting for GPaste to re-offer it, the
                             # clipboard may sit perfectly still forever -- on a
@@ -5931,35 +6222,62 @@ class PollingWatcher:
                             # deliberately below the real-change branch, which
                             # must always win.
                             #
-                            # THE DISCLOSED GAP, health accounting. The v3.2
-                            # design requires a re-offer seen by a signal-less
-                            # poll to count toward the two-tick dead-source
-                            # verdict BEFORE _consume_image_reoffer absorbs it,
-                            # or a dead extension whose first unsignalled change
-                            # happens to be a re-offer stays undiagnosed -- the
-                            # safety net blinded by the very mechanism that
-                            # proves it was needed. Through the CHANGE branch
-                            # above that holds: _observe_tick compares tokens
-                            # against THIS loop's own `previous`, which the
-                            # worker never touches, so an absorption downstream
-                            # cannot erase a divergence already observed.
+                            # HEALTH ACCOUNTING, AND v3.3 INVERTED WHAT THIS
+                            # PARAGRAPH WANTED. It used to open "THE DISCLOSED
+                            # GAP" and read: the v3.2 design REQUIRES a re-offer
+                            # seen by a signal-less poll to count toward the
+                            # two-tick dead-source verdict before
+                            # _consume_image_reoffer absorbs it, and a re-offer
+                            # arriving through THIS branch does not, so the gap
+                            # is real and left open. The mechanics were right
+                            # and the sign was wrong from Task 6 onward.
                             #
-                            # Through THIS branch it does not. A re-offer whose
-                            # offered type list happens to match the previous one
-                            # produces no token divergence at all, so it arrives
-                            # here rather than above, is absorbed by the worker,
-                            # and _observe_tick sees a settled token and arms
-                            # nothing. NOT CLOSED, deliberately: closing it needs
-                            # the WORKER to report what it found back into this
-                            # watcher, and that is the coupling this file removes
-                            # on purpose -- "signalled, never called" -- which
-                            # would hand a wedged worker the power to stop the
-                            # poll. The cost is bounded: the verdict is deferred
-                            # to the next change the token CAN see, never lost,
-                            # and every change is still reported throughout.
-                            # Recorded in the v3.2 design's acceptance list as
-                            # partially met, so it is inherited rather than
-                            # rediscovered.
+                            # WHAT CHANGED: a GPaste re-offer is now the
+                            # MEASURED false-positive input, not evidence of a
+                            # dead source. Spec 1.2 established that GPaste
+                            # re-offers an image one to six seconds after every
+                            # copy and emits no Update for it, which is what
+                            # produced the one production verdict this project
+                            # has RECONSTRUCTED to the second (2026-08-02T04:
+                            # 21:52Z) and is CONSISTENT WITH the other image
+                            # one -- two different strengths of evidence, and
+                            # spec 1.3 states them separately on purpose;
+                            # spec 4.2's answer is that on the slow
+                            # tier a settled token CLEARS an armed run, and
+                            # that signals are dropped from the predicate
+                            # entirely while the uuid tier is alive. So a
+                            # re-offer must NOT count toward the verdict. The
+                            # v3.2 requirement is superseded, not merely
+                            # unmet.
+                            #
+                            # WHICH MAKES THE SHAPE HERE CORRECT RATHER THAN
+                            # DEFERRED. A re-offer whose offered type list
+                            # happens to match the previous one produces no
+                            # token divergence, so it arrives here rather than
+                            # above, is absorbed by the worker, and
+                            # _observe_tick sees a settled token and arms
+                            # nothing. That is the outcome spec 4.2 asks for.
+                            # A re-offer that DOES move the type list -- the
+                            # measured one-entry-to-twenty-three case -- takes
+                            # the change branch above and arms a run, which the
+                            # next tick's settled token then clears; the uuid
+                            # never moved for it either way, so no verdict can
+                            # be reached from it.
+                            #
+                            # WHAT IS ACTUALLY STILL OPEN is narrower and is
+                            # not about re-offers at all: a genuinely dead
+                            # tracker whose first unsignalled change happens to
+                            # leave the type list identical is invisible to
+                            # this tier for that change. The fast tier is what
+                            # catches that user now (a dead tracker's uuid
+                            # never moves, whatever the type list does -- spec
+                            # 4.0's top row), which is why this is no longer
+                            # the safety net's problem to close. Still not
+                            # closed here, and closing it would still need the
+                            # WORKER to report what it found back into this
+                            # watcher -- the coupling this file removes on
+                            # purpose ("signalled, never called"), which would
+                            # hand a wedged worker the power to stop the poll.
                             self._event.set()
                     # AFTER the signal, which used to be load-bearing and is
                     # now merely conventional -- say so rather than leave the
@@ -6021,12 +6339,30 @@ class PollingWatcher:
 
 def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                  degraded=False, on_degrade=None, on_idle_tick=None):
-    """`fallback_interval_seconds` is the ONE knob for "how fast we poll when
-    signals cannot be relied on", and there are two ways to arrive there:
-    GPaste was never available, or its event source was diagnosed silent. It
-    therefore reaches both branches below -- as the GPaste watcher's degraded
-    rate and as the plain poller's interval -- so tuning it moves both and
-    neither can quietly keep a hardcoded rate the log line then misquotes.
+    """`fallback_interval_seconds` reaches BOTH branches below -- as the
+    GPaste watcher's degraded floor and as the plain poller's interval -- so
+    tuning it moves both, and neither can quietly keep a hardcoded rate the
+    log line then misquotes. That property is why it is one argument and not
+    two, and it is unchanged by v3.3.
+
+    IT IS NOT "THE ONE KNOB FOR HOW FAST WE POLL WHEN SIGNALS CANNOT BE
+    RELIED ON" ANY MORE, which is what this docstring said and what spec 8
+    names among the prose the release invalidates. Two things broke it:
+
+      - "signals cannot be relied on" no longer implies polling harder. The
+        state where the subscription is silent but GPaste is still tracking
+        is spec 6.1, and it is answered by FAST_TIER_SECONDS at zero focus
+        cost -- a log line, not a mode change. Nothing about this argument
+        is consulted for it.
+      - and on the GPaste branch this is no longer a RATE. Since spec 6.2's
+        backoff it is the FLOOR the degraded loop resets to after an
+        observed change; the loop doubles from there toward
+        SAFETY_NET_POLL_SECONDS while nothing changes. On the plain poller
+        it is still the flat rate, because spec 2 keeps that path untouched.
+
+    So the knob that decides "how fast we poll" is now a pair, and the
+    verdict line in _observe_tick reports both numbers for exactly that
+    reason.
 
     `degraded`/`on_degrade` carry the dead-event-source verdict in and out, so
     it belongs to the connection rather than to whichever watcher reached it --
@@ -6063,6 +6399,24 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                             read_tracking=gpaste_tracking)
     if watcher.available():
         if degraded:
+            # DEFECT, FOUND BY THE v3.3 DOC AUDIT AND NOT FIXED BY IT, because
+            # fixing it is an executable change and that task was comment-only.
+            # This line under-reports the poll rate the same way _observe_tick's
+            # verdict line did before Task 9: since spec 6.2's backoff,
+            # fallback_interval_seconds is the FLOOR the degraded loop resets to
+            # after an observed change, and the loop doubles from there toward
+            # SAFETY_NET_POLL_SECONDS while nothing changes. So "polling every
+            # 1.0s" is the fastest this connection will ever poll, stated as
+            # though it were the rate. _observe_tick's line now reports both
+            # numbers for exactly this reason and says so in its own comment;
+            # this one was missed, and it is the line a person reads on the
+            # connection AFTER the one that degraded.
+            #
+            # Second, smaller: %.1f, where every other interval-bearing line in
+            # this file now uses %g. At a harness's millisecond-scale interval
+            # this renders "every 0.0s" -- the same false statement %g was
+            # adopted to end, at the one call site that still spells it the old
+            # way. Production is unaffected (1.0 either way).
             log("watching the clipboard through GPaste, already diagnosed as silent "
                 "this connection, so polling every %.1fs" % fallback_interval_seconds)
         else:

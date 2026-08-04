@@ -430,6 +430,25 @@ class TestFastTier(unittest.TestCase):
 # What GPaste offers after it re-encodes an image, measured on the live
 # machine: one type becomes twenty-three, with no Update signal. Design doc
 # S1.2.
+#
+# IT HOLDS TWENTY-TWO, and the name is left alone. Counted: 22 entries, 22
+# distinct. Two readings, and nothing here can settle which is right, because
+# the list came off a live machine this project cannot reach:
+#
+#   - an off-by-one in the transcription, and the missing member is unknown;
+#   - or the spec's "twenty-three" counted a slightly different list. Four of
+#     these are X11 META-TARGETS rather than content types (MULTIPLE,
+#     SAVE_TARGETS, TARGETS, TIMESTAMP), and whether a given tool prints those
+#     is a property of the tool, not of the selection.
+#
+# NOT RENAMED ON A GUESS, and nothing rests on the count: what this fixture
+# has to be is a list `choose_kind` still reads as an image (pinned by a test
+# in test_watcher_gpaste_reoffer.py) and a list that DIFFERS from the
+# single-entry one, which is what makes the token move. Both hold at 22.
+# Renaming to TWENTY_TWO would assert the first reading; inventing a member
+# back would assert the second. The Swift fixture that mirrors this one
+# carries the same disclosure (PairingHarness.gpasteImageTypes) -- if either
+# list moves, move both.
 TWENTY_THREE = tuple(sorted([
     "image/webp", "image/tiff", "image/jpeg", "text/ico", "image/icon", "image/ico",
     "application/ico", "image/vnd.microsoft.icon", "image/x-win-bitmap", "image/x-ico",
@@ -953,16 +972,29 @@ class TestFastTierIntegration(unittest.TestCase):
 
     def test_start_runs_the_fast_tier_as_a_real_thread_and_survives_a_failing_tick(self):
         """Row 1: start() must launch a thread that reaches a real
-        observation on its own -- nobody here calls _fast_tick by hand. The
-        thread's existence is also checked directly (assertIsNotNone/
-        is_alive) immediately after start() returns, rather than inferred
-        only from an observation eventually happening: _fast_loop's very
-        first action is `self._stop.wait(self._fast_interval)`, which blocks
-        for at least fast_interval_seconds before doing anything else, so a
-        correctly launched thread is GUARANTEED still alive at that
-        checkpoint -- this assertion is not a timing gamble, and it pins row
-        1 even if some future change altered the pump or safety net's own
-        timing within the window this test does not otherwise rule out.
+        observation on its own -- nobody here calls _fast_tick by hand.
+
+        WHAT EACH OF THE TWO ASSERTIONS ACTUALLY CATCHES, stated separately
+        because an earlier revision of this docstring ran them together and
+        credited the cheap one with the expensive one's work.
+
+        assertIsNotNone/is_alive, immediately after start() returns, pins
+        that a thread object was created and started AT ALL -- that and no
+        more. It is not a timing gamble: _fast_loop's very first action is
+        `self._stop.wait(self._fast_interval)`, which blocks for at least
+        fast_interval_seconds, so a correctly launched thread is GUARANTEED
+        still alive at that checkpoint. But the guarantee runs one way only.
+        A thread started on the WRONG TARGET -- row 10's typo, some other
+        run-once callable -- is also alive at that instant, because
+        `is_alive()` is true for any thread that has been started and has
+        not yet returned. So is_alive() cannot tell a fast tier from
+        anything else that was started here.
+
+        What pins row 1, and what catches row 10, is the FINAL assertion
+        below: `changes == [1]`, reached only because a thread ran
+        _fast_tick, saw the uuid move, and set the shared event. Delete the
+        thread, point it at the wrong target, or break the loop, and that
+        assertion is the one that goes red.
 
         Row 6, in the same test: the FIRST scripted reading raises. A fast
         tier whose loop dies on an uncaught exception (deleting
@@ -1098,8 +1130,11 @@ class TestUuidTierFallback(unittest.TestCase):
         sibling class scrubbing only one of the two -- silently changes the
         derived count and fails this hardcoded 12 for a reason that has
         nothing to do with the code under test. TestIntervalInjection.setUp
-        and TestIntervalResolution.setUp use the identical save-restore
-        shape, for the reasons spelled out on the first of them.
+        and TestTierIntervalResolution.setUp use the identical save-restore
+        shape, for the reasons spelled out on the first of them. (The second
+        name was written as `TestIntervalResolution`, which is not a class in
+        this file -- a cross-reference nothing checks, so nothing announced
+        it.)
         mock.patch.dict restores whatever was there afterwards, so scrubbing
         here cannot leak into any other test either."""
         patcher = mock.patch.dict(os.environ)

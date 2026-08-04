@@ -615,6 +615,17 @@ class TestFailedReadDoesNotConsumeTheChange(unittest.TestCase):
         other script here starts with a token that answers, so nothing else
         reaches it.
 
+        THE METHOD NAME IS WRONG AND THE NAME IS WHAT TEST OUTPUT PRINTS.
+        `..._and_signals_nothing` is contradicted by this test's own second
+        assertion, `delivered.wait(...)`, which requires that it DID signal
+        -- the recovery tick delivers, and that delivery is half of what is
+        being pinned. What is true, and what the clause was reaching for, is
+        that the HUNG ticks signal nothing: the backoff engages on ticks
+        that deliver nothing at all. Not renamed here because a doc audit
+        may not change an executable line, and a method name is one; carried
+        as a finding instead. Read the name as
+        `..._backs_off_while_the_hang_lasts`.
+
         `previous` is None from the baseline probe onward, so `current !=
         previous` is FALSE on every hung tick -- the backoff engages on
         ticks that signal nothing at all, because it is computed before the

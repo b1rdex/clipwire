@@ -110,16 +110,22 @@ final class PairingHarness {
     let pasteboard = HarnessPasteboard()
 
     /// What the agent's own log says when it built the watcher this harness
-    /// requires. A PREFIX of the real line, deliberately, and there are now
-    /// TWO reasons rather than the one this comment used to give:
+    /// requires. A PREFIX of the real line, deliberately, and one reason
+    /// covers it: the rest of the line interpolates a NUMBER THAT VARIES PER
+    /// RUN, so there is no full line to match. A run at 0.4 s and a run at
+    /// production's 30 s log different sentences and both must satisfy this.
     ///
-    /// - a tuning change to SAFETY_NET_POLL_SECONDS, which the rest of the
-    ///   line interpolates, must not look like a broken harness;
-    /// - and since `tierSeconds.safetyNet` exists, the interpolated figure is
-    ///   no longer a constant at all -- it is whatever THIS harness injected.
-    ///   A run at 0.4 s and a run at production's 30 s log different
-    ///   sentences, and both must satisfy this, so a prefix is the only part
-    ///   there is to match.
+    /// WHAT THE LINE INTERPOLATES IS `watcher._safety_net_interval`, NOT
+    /// `SAFETY_NET_POLL_SECONDS` -- the resolved field, which merely
+    /// DEFAULTS FROM that constant when neither an argument nor
+    /// `CLIPWIRE_SAFETY_NET_SECONDS` supplied one. This comment gave two
+    /// reasons and its first named the constant as the thing interpolated,
+    /// while its second asserted the interpolated figure was not a constant
+    /// at all: two adjacent bullets of one list, saying both. It is
+    /// also the exact "is" / "defaults from" conflation `_env_seconds`'
+    /// docstring in the agent memorialises as the error that let a
+    /// capability gap survive five tasks, repeated at the site that gap was
+    /// closed at. One reason, stated once, is the repair.
     ///
     /// That second reason was briefly a worse one: the line reported the
     /// CONSTANT regardless of what the poller got, so a harness log read
@@ -701,8 +707,19 @@ final class PairingHarness {
                                     + types.joined(separator: " ") + "\n")
     }
 
-    /// Waits until the agent's FAST tier has ASKED GPaste for its history
-    /// uuid at least once, counted from the fakes' own invocation log.
+    /// Waits until the agent's FAST tier has asked GPaste for its history
+    /// uuid ONCE MORE THAN IT HAD AT ENTRY, counted from the fakes' own
+    /// invocation log.
+    ///
+    /// NOT "at least once", which is what this headline said and is weaker
+    /// than what the code does: it takes a baseline before waiting, so a
+    /// call made by an earlier connection -- or before this method was
+    /// reached -- does not satisfy it. The rationale below is written about
+    /// the FIRST call because that is the case it was built for, and it
+    /// still reads correctly for a harness whose one connection has just
+    /// started; the baseline is what makes it keep reading correctly for a
+    /// second one. See the counting note at the bottom, which is the same
+    /// decision from the other side.
     ///
     /// WHY IT IS WORTH WAITING FOR. The slow tier's verdict rests on
     /// `uuid_frozen`, a DELTA between two of its own ticks, and the earlier of
@@ -967,9 +984,13 @@ final class PairingHarness {
     /// is that the writer is GONE and the handler has had every write up to
     /// its exit to consume -- in practice everything, and it cannot make the
     /// window wider, but it is not a proof the way the probe counting above
-    /// is a proof. Its contribution was never isolated from the two fixes that
-    /// landed beside it (the probe arithmetic and the fast-tier ordering); the
-    /// 18-of-18 figure quoted in the test belongs to all three together.
+    /// is a proof. Its contribution was never isolated from the fixes that
+    /// landed beside it, and the 18-of-18 figure quoted in the test belongs
+    /// to all of them jointly: the probe arithmetic, the fast-tier ordering,
+    /// this drain, AND the interval halving, which the test's own docstring
+    /// credits separately as "the third fix". This sentence said "all three
+    /// together" and named only the first three -- a count that omitted the
+    /// one contributor the figure is quoted next to.
     ///
     /// DELIBERATELY NOT `stop()`, which does the same two things and then
     /// deletes the temp directory the log file lives in -- after which every
