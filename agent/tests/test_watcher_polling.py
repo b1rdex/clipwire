@@ -867,7 +867,16 @@ class TestSlowTierIdleGate(unittest.TestCase):
         Mutating `is not False` to a truthiness test in
         _slow_tier_should_probe is what this catches, and there is no
         comparison in pump to mutate instead -- which is why the assertion is
-        on OBSERVATIONS REACHED rather than on the predicate's return."""
+        on OBSERVATIONS REACHED rather than on the predicate's return.
+
+        TWO WATCHERS AND TWO ASSERTIONS, which the name covers only half of.
+        The first is the predicate asked DIRECTLY, and it is what reds for the
+        truthiness mutation. The second is a real poll loop gated by that same
+        production predicate, and it is what proves the first is not merely
+        correct-and-unreached -- the failure shape this whole release keeps
+        finding. Either alone is weaker: a direct assertion cannot see a gate
+        wired backwards into pump, and a loop assertion cannot say WHICH rule
+        let the ticks through."""
         watcher = GPasteWatcher(clipboard=None, read_idle_gate=lambda: None)
         self.addCleanup(watcher.stop)
         self.assertTrue(
