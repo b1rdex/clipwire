@@ -3209,32 +3209,50 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 #     unlocked, the same call returns in 0.023s". DATED, in prose, and the
 #     unlocked state is not incidental -- that entry exists to diagnose the
 #     lock-screen wedge.
-#   - and, for `--list-types` specifically, this release's own evidence
-#     directory (spec 10's) records the "kickstart measurement",
-#     `wl-paste --list-types` 3.004s (timeout) -> 0.020s, with its own note
-#     that the transition is most likely locked -> unlocked.
+#     THE CALL IS `--list-types`, corroborated LATER IN THAT SAME ENTRY,
+#     which calls the poll's own `--list-types` fork "a 23ms process" while
+#     explaining how to sample for it. Resolving that was necessary because
+#     the run's preceding entry -- "ACCEPTANCE BLOCKED", the wedge it is
+#     reporting the fix for -- names both `wl-paste -n` and `--list-types` as
+#     the calls that hung, so "the same call" is ambiguous read alone.
+#   - a SECOND ~20 ms reading, and it is dated too:
+#     2026-08-02-v3.2.1-test-split/progress.md records `--list-types` going
+#     3.004s (timeout) -> 0.020s on the reconnect after the 13:24:03 degrade,
+#     which this release's own evidence directory (cited by spec 10, not by
+#     spec 1) places on 2026-08-02.
 #
-# So the gap is EXACTLY TWO DAYS, 2026-08-01 to 2026-08-03, on one machine,
-# with nothing recorded in between to account for a difference of FOUR TO FIVE
-# TIMES (104/23 is 4.5, 104/20 is 5.2). An earlier revision of this paragraph
-# called the gap a FLOOR on the reasoning that only `git log -S` dated it and
-# the run itself was undated. The run is dated; nobody had searched the
-# previous cycle's ledger. Two days on one machine is harder to explain than
-# a longer gap, not easier, which is why the exact figure is the one worth
-# having.
+#     WHAT CAUSED THAT TRANSITION HAS BEEN RE-ATTRIBUTED TWICE AND THIS
+#     COMMENT CITED THE MIDDLE VERSION. The evidence directory reads it as
+#     "most likely locked -> unlocked", correcting an older "across a
+#     `launchctl kickstart`" -- and is ITSELF SUPERSEDED by the same
+#     directory's 2026-08-03 monitor finding, which says so in as many words
+#     ("This corrects HANDOFF.md"): HANDOFF.md now attributes the
+#     3.004s -> 0.020s reading to a monitor coming back ON rather than to a
+#     session being unlocked. The STATE is superseded; the FIGURE and the
+#     CALL are not, and only those two are load-bearing here.
+#
+# So the fast readings are 0.023s (2026-08-01) and 0.020s (2026-08-02),
+# against 104 ms on 2026-08-03: a difference of FOUR TO FIVE TIMES (104/23 is
+# 4.5, 104/20 is 5.2) across ONE TO TWO DAYS on one machine, with nothing
+# recorded in between to account for it. An earlier revision called the gap a
+# FLOOR on the reasoning that only `git log -S` dated it and the run itself
+# was undated. The run is dated; nobody had searched the previous cycle's
+# ledger. The short gap is what makes this worth flagging -- a fivefold jump
+# over one day on one machine is harder to explain than a longer one, not
+# easier.
 #
 # Neither is retracted here, and spec 1's is what this file uses, because it
 # is the better-EVIDENCED one -- but for a reason this paragraph also had
 # wrong. It is NOT that the 20 ms has no recorded conditions: the machine,
 # the call, the session state and the date are all recorded above. It is the
 # SAMPLE COUNT. The 104 ms was taken three times with the monitor state
-# varied as a control (spec 10's directory records "104, 104, 105 ms, rc=0"
-# monitor-on against a timeout monitor-off); each 20 ms reading is a single
-# number. Note also that spec 1's own ROW carries no count -- the three
-# samples are in the evidence directory it cites, and the "ten samples each"
-# in that section belongs to the 2026-08-04 gdbus table, which has no
-# wl-paste row. A first draft attributed those ten to the 104 ms; they are
-# not its either.
+# varied as a control (the evidence directory records "104, 104, 105 ms,
+# rc=0" monitor-on against a timeout monitor-off); each ~20 ms reading is a
+# single number. Note also that spec 1's own ROW carries no count -- the
+# three samples are in the evidence directory, which SPEC 10 cites and spec 1
+# does not -- and the "ten samples each" in spec 1 belongs to the 2026-08-04
+# gdbus table, which has no wl-paste row. A first draft attributed those ten
+# to the 104 ms; they are not its either.
 #
 # What a re-measurement could move is the
 # COST comparison below; the focus grab is measured either way and is the
