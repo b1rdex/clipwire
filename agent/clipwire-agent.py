@@ -3199,26 +3199,44 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 #
 # THE 104 ms HAS AN UNRECONCILED SIBLING, and the comparison below is what
 # rests on it, so it is named here rather than left in one file. README.md's
-# locked-PC section records `wl-paste --list-types` answering in ABOUT 20 ms
-# when the session is unlocked -- recorded 2026-08-01 out of the v3 acceptance
-# run, AT LEAST two days before spec 1's 104 ms of 2026-08-03, on the same
-# machine, with nothing recorded in between to account for a fivefold gap.
-# A FLOOR, NOT THE GAP: 2026-08-01 is when the figure was WRITTEN DOWN, and
-# the acceptance run it came out of is undated in prose, so the interval
-# between the two measurements can only be longer than that. The argument
-# does not need the exact number -- a fivefold gap over a floor of two days
-# on one machine already wants explaining -- but a bound stated as a
-# quantity is the shape this file keeps getting wrong. The earlier reading's
-# conditions were not written down and the two have never been run side by
-# side. Neither is retracted here: spec 1's is the better-EVIDENCED one --
-# spec 10 says that campaign's measurements are recorded with their
-# instrument, controls and failures in a named directory, where the 20 ms has
-# no recorded conditions at all -- and it is what this file uses. NOT the
-# better-SAMPLED one: spec 1 gives no sample count for the 104 ms row, and
-# the "ten samples each" in that section belongs to the 2026-08-04 gdbus
-# table, which does not include wl-paste. A first draft of this paragraph
-# attributed those ten samples to the 104 ms; they are not its. What a
-# re-measurement could move is the
+# locked-PC section records `wl-paste` answering in ABOUT 20 ms with the
+# session unlocked. WHERE THAT COMES FROM, since two rounds of this release's
+# doc audit guessed at it before anyone opened the file:
+#
+#   - .superpowers/sdd/2026-07-31-protocol-v3-implementation/progress.md, the
+#     PREVIOUS CYCLE's ledger, entry "ACCEPTANCE RUN COMPLETED 2026-08-01, PC
+#     UNLOCKED": "with the GNOME session locked, wl-paste hangs indefinitely;
+#     unlocked, the same call returns in 0.023s". DATED, in prose, and the
+#     unlocked state is not incidental -- that entry exists to diagnose the
+#     lock-screen wedge.
+#   - and, for `--list-types` specifically, this release's own evidence
+#     directory (spec 10's) records the "kickstart measurement",
+#     `wl-paste --list-types` 3.004s (timeout) -> 0.020s, with its own note
+#     that the transition is most likely locked -> unlocked.
+#
+# So the gap is EXACTLY TWO DAYS, 2026-08-01 to 2026-08-03, on one machine,
+# with nothing recorded in between to account for a difference of FOUR TO FIVE
+# TIMES (104/23 is 4.5, 104/20 is 5.2). An earlier revision of this paragraph
+# called the gap a FLOOR on the reasoning that only `git log -S` dated it and
+# the run itself was undated. The run is dated; nobody had searched the
+# previous cycle's ledger. Two days on one machine is harder to explain than
+# a longer gap, not easier, which is why the exact figure is the one worth
+# having.
+#
+# Neither is retracted here, and spec 1's is what this file uses, because it
+# is the better-EVIDENCED one -- but for a reason this paragraph also had
+# wrong. It is NOT that the 20 ms has no recorded conditions: the machine,
+# the call, the session state and the date are all recorded above. It is the
+# SAMPLE COUNT. The 104 ms was taken three times with the monitor state
+# varied as a control (spec 10's directory records "104, 104, 105 ms, rc=0"
+# monitor-on against a timeout monitor-off); each 20 ms reading is a single
+# number. Note also that spec 1's own ROW carries no count -- the three
+# samples are in the evidence directory it cites, and the "ten samples each"
+# in that section belongs to the 2026-08-04 gdbus table, which has no
+# wl-paste row. A first draft attributed those ten to the 104 ms; they are
+# not its either.
+#
+# What a re-measurement could move is the
 # COST comparison below; the focus grab is measured either way and is the
 # claim the release actually rests on.
 #

@@ -135,14 +135,18 @@ a new binary against an old agent does not sync at all.
 
 While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
 call returns quickly — and this file now carries **two figures** for that, which is worth
-naming rather than leaving for a reader to trip over. "About 20 ms" was recorded here on
-2026-08-01, out of the v3 acceptance run. The next section quotes about a tenth of a second,
-measured 2026-08-03 with the agent stopped. **At least** two days apart, on the same machine,
-with nothing recorded in between that would account for a fivefold difference — at least,
-because 2026-08-01 is when the earlier figure was written down, and the run it came out of is
-undated, so the true gap can only be larger. The later campaign wrote
-down its instrument and its controls; the earlier reading's conditions were not recorded at
-all. Nobody has re-run the two side by side, and neither is retracted on the strength of the
+naming rather than leaving for a reader to trip over. "About 20 ms" comes from the v3
+acceptance run of **2026-08-01**, which recorded `0.023s` with the session unlocked — that
+entry exists to diagnose the lock-screen wedge, so the unlocked state is the point of it.
+The next section quotes about a tenth of a second, from **2026-08-03**. **Two days apart**, on
+the same machine, with nothing recorded in between that would account for a difference of
+**four to five times**.
+
+What each reading has behind it is not equal, and that is the honest reason the later one is
+the one this project builds on: the 2026-08-03 figure was taken three times (104, 104, 105 ms)
+with the monitor state varied as a control, and the earlier one is a single number with no
+sample count. Nobody has re-run the two side by side, and neither is retracted on the strength
+of the
 other. What matters *in this section* is unaffected either
 way: the contrast is *answers* against *hangs indefinitely*. The next section flags the one
 claim that does depend on which figure is right.
@@ -186,10 +190,10 @@ call was twenty to thirty times cheaper until it was timed the way the agent act
 it, as a subprocess; that claim is retracted. The entire difference is the focus grab.
 
 **This is the claim that depends on the unreconciled figure above.** It rests on
-`wl-paste --list-types` costing about a tenth of a second, measured on
+`wl-paste --list-types` costing about a tenth of a second, measured three times on
 2026-08-03. Under the section above's older "about 20 ms" reading it would not hold: the
-D-Bus call would be several times *slower* in wall clock, and the difference would not be
-the focus grab alone. The focus grab itself is measured either way and is not in doubt —
+D-Bus call would be four to five times *slower* in wall clock, and the difference would not
+be the focus grab alone. The focus grab itself is measured either way and is not in doubt —
 what a re-measurement could move is the *cost* comparison, not the conclusion that this
 check stopped taking focus.
 
