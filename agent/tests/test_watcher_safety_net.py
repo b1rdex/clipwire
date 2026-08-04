@@ -1119,25 +1119,53 @@ class TestDivergenceReprobe(unittest.TestCase):
         self.assertEqual(watcher._safety_net.interval, 30.0,
                          "a run that can no longer be confirmed kept polling fast")
 
-    def test_a_run_that_stays_armed_does_not_ratchet_the_rate_down(self):
-        """The `is None` guard on the take. Without it a still-armed run would
-        snapshot its own re-probe rate as "what to give back" -- the interval
-        would be correct and the RESTORE would be permanently wrong, which is
-        a defect nothing in the fast path would ever surface."""
-        watcher = self.watcher(slow=30.0, reprobe=10.0, degraded=True)
-        watcher._observe_tick(("text", "a"), ("text", "b"))
-        watcher._degraded = False       # as if the latch had never fired
-        watcher._safety_net.interval = 30.0
+    def test_an_excursion_is_never_in_progress_while_a_run_is_still_armed(self):
+        """THE INVARIANT THAT MAKES TWO GUARDS REDUNDANT, and it is pinned
+        rather than the guards, because a mutation run proved the guards
+        cannot be pinned: deleting either the `is None` on the take or the
+        `not self._armed` on the give-back leaves the whole suite green, and
+        no test could do better -- both are EQUIVALENT MUTANTS today, not
+        holes. Reported in task-12-report.md rather than patched.
 
-        watcher._observe_tick(("text", "b"), ("text", "b"))   # settled -> clears
-        watcher._observe_tick(("text", "b"), ("text", "c"))   # arms again
-        self.assertEqual(watcher._safety_net.interval, 10.0)
-        watcher._observe_tick(("text", "c"), ("text", "c"))   # settles again
+        What they are redundant BY is this: _observe_tick can only leave
+        self._armed True while undegraded through the `else` branch, which is
+        reached only when self._armed was FALSE on entry -- so no excursion
+        can be in progress. Established by driving the real _observe_tick over
+        its whole reachable state space and recording the pair AS THE BLOCK
+        SEES IT (8192 runs, four ticks each); the state never occurs. This
+        test is the cheap standing version of that sweep.
 
-        self.assertEqual(
-            watcher._safety_net.interval, 30.0,
-            "the second excursion gave back its own re-probe rate instead of "
-            "the tier's")
+        So the guards are defensive, and this is what would go red if a later
+        edit made the state reachable -- at which point they stop being
+        redundant and start deciding, which is exactly when someone needs to
+        know."""
+        tokens = [(("t", "a"), ("t", "a")), (("t", "a"), ("t", "b")),
+                  (("t", "a"), None), (None, ("t", "a"))]
+        for degraded in (False, True):
+            for first in tokens:
+                for second in tokens:
+                    for third in tokens:
+                        watcher = self.watcher(degraded=degraded)
+                        for tick in (first, second, third):
+                            # THE PAIR AS THE BLOCK SEES IT, which is not the
+                            # pair left after the tick: self._armed is set by
+                            # THIS tick's decision, self._interval_before_
+                            # reprobe by the PREVIOUS tick's block. Reading
+                            # both afterwards would assert on the state the
+                            # block just WROTE -- (armed, excursion) is the
+                            # normal, correct outcome of an arming tick -- and
+                            # would fail against correct code, which is how
+                            # this test's first revision failed.
+                            excursion_before = (
+                                watcher._interval_before_reprobe is not None)
+                            watcher._observe_tick(*tick)
+                            if not watcher._degraded:
+                                self.assertFalse(
+                                    watcher._armed and excursion_before,
+                                    "an armed run with an excursion already in "
+                                    "progress reaches the re-probe block, where "
+                                    "two guards that never decided anything now "
+                                    "do: %r" % (tick,))
 
     def test_a_healthy_connection_that_never_diverges_keeps_its_budget(self):
         """The gate on the whole block. A tick that arms nothing must leave
@@ -1241,6 +1269,43 @@ class TestVerdictNamesTheCause(unittest.TestCase):
             watcher._degraded,
             "the verdict must be reached before the read, or a D-Bus that "
             "will not answer suppresses the diagnosis entirely")
+
+    def test_the_property_is_read_only_at_the_verdict_never_on_every_tick(self):
+        """A GAP A MUTATION RUN FOUND. Moving the read out of the
+        `confirmed and not self._degraded` branch left the whole suite green,
+        and the difference is not cosmetic: it turns one gdbus call per
+        CONNECTION into one per slow tick, each one able to stall the poll
+        thread for GPASTE_CALL_TIMEOUT. That is a 3s hang budget spent on
+        every tick of every healthy machine, to fill in a field only the
+        verdict line prints.
+
+        Counted rather than reasoned about: ticks that arm, clear, fail and
+        confirm, and the count must still be exactly one."""
+        calls = []
+        watcher = GPasteWatcher(clipboard=None,
+                                read_tracking=lambda: calls.append(True) or True)
+        self.addCleanup(watcher.stop)
+        watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
+
+        watcher._observe_tick(("t", "a"), ("t", "a"))    # quiet
+        watcher._observe_tick(("t", "a"), ("t", "b"))    # arms
+        watcher._observe_tick(("t", "b"), ("t", "b"))    # clears
+        watcher._observe_tick(("t", "b"), None)          # a failed probe
+        self.assertEqual(calls, [], "the property was read before any verdict")
+
+        watcher._observe_tick(("t", "b"), ("t", "c"))    # arms
+        watcher._observe_tick(("t", "c"), ("t", "d"))    # confirms
+        self.assertTrue(watcher._degraded, "test precondition: the verdict fired")
+        self.assertEqual(len(calls), 1, "the verdict must read it exactly once")
+
+        watcher._observe_tick(("t", "d"), ("t", "e"))    # more ticks, latched
+        watcher._observe_tick(("t", "e"), ("t", "f"))
+        self.assertEqual(
+            len(calls), 1,
+            "the read must be behind the same latch the log line is: it is "
+            "evidence for ONE verdict, not a per-tick charge on the poll "
+            "thread")
 
     def test_an_unwired_reader_reports_unavailable_rather_than_raising(self):
         """GPasteWatcher defaults read_tracking to None -- see its __init__ for
