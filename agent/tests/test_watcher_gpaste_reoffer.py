@@ -148,11 +148,18 @@ class TestAGPasteReofferIsNotADeadEventSource(unittest.TestCase):
     arming tick. That run needs FOUR edits this file does not carry, because
     58d3c60 predates what it passes and reads: drop the three constructor
     arguments `reprobe_interval_seconds`, `read_idle_gate` and
-    `read_tracking`, and wait on `_signals_at_last_tick == 1` in place of
+    `read_tracking`, and wait on
+    `_signals_at_last_tick == signals_after_the_copy` in place of
     `_uuid_at_last_tick is not None`, a field that does not exist until
-    `58196e9`. Merge-base `58321cf` reaches the same verdict, established
-    with a standalone driver rather than with this test: it has no fast tier
-    at all, so the uuid assertions below have nothing to read.
+    `58196e9`. That substitute expresses the same warm-up condition -- a slow
+    tick has run since the copy's Update was counted -- in terms every
+    version has. Re-measured after the priming loop was added below, because
+    it had to be: the substitute used to read `== 1`, which the priming's own
+    Update makes wrong, and a stale recipe here would have sent the next
+    reader to a green run and a false conclusion. Red 4 of 4 as written.
+    Merge-base `58321cf` reaches the same verdict, established with a
+    standalone driver rather than with this test: it has no fast tier at all,
+    so the uuid assertions below have nothing to read.
 
     WHICH HALF OF THE FIX THIS SCENARIO ACTUALLY RESTS ON, measured by
     mutation and stated because the answer is not the obvious one: SETTLED-
