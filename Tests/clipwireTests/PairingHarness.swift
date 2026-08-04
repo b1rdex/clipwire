@@ -681,6 +681,27 @@ final class PairingHarness {
                                     + types.joined(separator: " ") + "\n")
     }
 
+    /// Waits until the agent's FAST tier has read GPaste's history uuid at
+    /// least once, from the fakes' own invocation log.
+    ///
+    /// A precondition with teeth, not a settle. The slow tier's verdict rests
+    /// on `uuid_frozen`, which is a DELTA between two of its own ticks -- and
+    /// the earlier of the two records whatever the fast tier had read by
+    /// then, `None` included. So a slow tick that lands before the fast
+    /// tier's first successful call poisons the comparison: the next tick
+    /// sees "unmeasured", reaches no verdict, and a test asserting that no
+    /// verdict was reached passes WITHOUT THE SCENARIO HAVING RUN.
+    ///
+    /// Not hypothetical. Measured at roughly one run in six, and the cause is
+    /// documented in `Tests/fakes/fake_clipboard.py`: an agent's FIRST fork of
+    /// a fake has been seen taking 0.2-0.8 s, which at a sub-second fast tier
+    /// is several slow ticks. Waiting for the call itself removes the guess.
+    func waitForTheAgentsFastTierToReadAHistoryUuid() throws {
+        try wait(for: "the agent's fast tier to read a history uuid through gdbus") {
+            self.invocationLog().contains("call GetElementAtIndex(0) -> uuid")
+        }
+    }
+
     /// Waits until `count` of the agent's probes have come back offering
     /// exactly this list.
     ///
@@ -875,6 +896,44 @@ final class PairingHarness {
             guard let end = rest.firstIndex(of: " ") else { return String(rest) }
             return String(rest[..<end])
         }
+    }
+
+    // MARK: - draining, before asserting that something is absent
+
+    /// Hangs up and waits for the agent to exit, so that everything it wrote
+    /// to its stderr is in the shared log before a test asserts on what is
+    /// NOT in there.
+    ///
+    /// THE RACE THIS CLOSES IS NOT THEORETICAL AND WAS NOT CHEAP. `agentLog()`
+    /// flushes THIS side's queue, but a line the PC wrote reaches that file
+    /// only once `Channel.attempt`'s readability handler has read it -- so a
+    /// negative assertion can be evaluated microseconds before the very line
+    /// it denies arrives. Measured with the agent's fix deliberately removed:
+    /// `testAGPasteReofferDoesNotDegradeTheConnection` caught the regression
+    /// on 2 runs in 3, and reported success on the third. Counting the
+    /// agent's own probes proves the TICK happened and cannot prove its log
+    /// line crossed a pipe; only this can. The density test above documents
+    /// the same hazard and closes it by waiting for a later line from the PC,
+    /// which works only where a later line is guaranteed -- for a verdict
+    /// that must never be reached, there is none.
+    ///
+    /// `attempt()` drains that handler and tears it down before returning,
+    /// and this waits for exactly that.
+    ///
+    /// DELIBERATELY NOT `stop()`, which does the same two things and then
+    /// deletes the temp directory the log file lives in -- after which every
+    /// `logHolds` reads an empty string and every negative assertion in the
+    /// suite passes for the worst reason there is.
+    func hangUpAndDrainTheAgentsLog() throws {
+        channel.hangUp()
+        guard connectionEnded.wait(timeout: .now() + 10) != .timedOut else {
+            throw Refusal.timedOut("the agent to exit so its log could be read to the end",
+                                   diagnostics: diagnostics())
+        }
+        // Put the count back. `stop()` waits on this same semaphore, and a
+        // consumed one would leave it blocking for ten seconds and then
+        // reporting a leaked python3 that had in fact exited right here.
+        connectionEnded.signal()
     }
 
     // MARK: - shutting down

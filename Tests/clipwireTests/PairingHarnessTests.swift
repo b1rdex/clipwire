@@ -552,8 +552,24 @@ final class PairingHarnessTests: XCTestCase {
     /// `6ac6eec` brought in both the uuid discriminator and spec 4.2's
     /// settled-clears rule -- this test fails on the last assertion below,
     /// with the agent's own degrade line in the shared log.
+    ///
+    /// AND MEASURED REPEATEDLY, which is the part worth keeping, because the
+    /// first two versions of this test were red only SOMETIMES. THE ARMING
+    /// OPPORTUNITY IS ONE-SHOT: the token moves exactly once, so a run that
+    /// is armed and then cleared by any transient can never re-arm -- the
+    /// token never moves again. Every early-return in the waits above is
+    /// therefore not a slow test, it is a test that reports success against a
+    /// broken agent. Two such holes were found by re-running the mutation
+    /// table rather than re-reading it, both fixed above, and the intervals
+    /// below are the third fix: at `fast: 0.05` the agent forks `gdbus`
+    /// twenty times a second and a single failed fork clears the run. Halving
+    /// that pressure took the fix-deleted run from 8 of 10 caught to 18 of
+    /// 18, with the correct agent green 6 of 6. If this test is ever seen
+    /// flaking, it is measuring fork pressure, and the answer is longer
+    /// intervals -- never a retry, which would hide exactly the defect it is
+    /// here to catch.
     func testAGPasteReofferDoesNotDegradeTheConnection() throws {
-        let harness = try connected(tierSeconds: (fast: 0.05, slow: nil, safetyNet: 0.2))
+        let harness = try connected(tierSeconds: (fast: 0.1, slow: nil, safetyNet: 0.4))
 
         // --- positive evidence, before any claim about an absence ---------
         //
@@ -573,15 +589,24 @@ final class PairingHarnessTests: XCTestCase {
         try harness.copyOnThePC(png: PairingHarness.png)
         try harness.waitForTheMacsPasteboard(toHold: .image, PairingHarness.png)
 
-        // The agent's slow tier takes its baseline. Waited out rather than
-        // slept through, and the count is the reason: `uuid_frozen` is a
-        // delta against the LAST TICK, so a brand-new watcher's first tick can
-        // never reach a verdict by construction. Three probes of `image/png`
-        // -- the poller's baseline, the worker's own read of the clip that
-        // just crossed, and at least one tick -- guarantee that warm-up tick
-        // has happened, so a green run below cannot be the warm-up standing in
-        // for the fix.
-        try harness.waitForTheAgentToProbeAndSee(["image/png"], atLeast: 3)
+        // The agent's slow tier takes its baseline, and BOTH halves of that
+        // are waited for, in this order, because the scenario is unstageable
+        // without either.
+        //
+        // First the fast tier must have read a uuid at all: the slow tier's
+        // `uuid_frozen` is a delta between two of its own ticks, and the
+        // earlier one records whatever the fast tier had by then -- `None`
+        // included. Measured at about one run in six before this wait
+        // existed: the warm-up tick landed first, the divergence tick then
+        // read "unmeasured", no verdict could be reached, and this test
+        // passed WITH THE FIX DELETED FROM THE AGENT. See
+        // `waitForTheAgentsFastTierToReadAHistoryUuid`.
+        try harness.waitForTheAgentsFastTierToReadAHistoryUuid()
+        // Then a slow tick has to happen AFTER that reading -- hence a
+        // baseline taken here rather than an absolute count, which the probes
+        // already past would have satisfied on their own.
+        let baselineProbes = harness.probesThatSaw(["image/png"])
+        try harness.waitForTheAgentToProbeAndSee(["image/png"], atLeast: baselineProbes + 1)
 
         // --- GPaste takes the selection back, silently --------------------
         let entryBefore = harness.pcsClipboardGeneration()
@@ -604,9 +629,19 @@ final class PairingHarnessTests: XCTestCase {
         // Two ticks: the one that sees the divergence and arms, and the one
         // that would have confirmed it. Three probes guarantee both, since the
         // worker's read can inflate the count by at most one.
-        try harness.waitForTheAgentToProbeAndSee(PairingHarness.gpasteImageTypes, atLeast: 3)
+        try harness.waitForTheAgentToProbeAndSee(PairingHarness.gpasteImageTypes, atLeast: 4)
 
         // --- and the verdict that must not have been reached --------------
+        //
+        // The agent is hung up FIRST, and this is the difference between a
+        // regression test and a decoration. Counting the agent's own probes
+        // proves the ticks happened; it cannot prove a line the agent wrote
+        // has crossed the pipe this side reads it through. Measured with the
+        // fix removed from the agent: without this drain the assertion below
+        // reported success on one run in three, against an agent that had
+        // logged the verdict. See `hangUpAndDrainTheAgentsLog`.
+        try harness.hangUpAndDrainTheAgentsLog()
+
         XCTAssertFalse(harness.logHolds("GPaste reported no clipboard change"),
                        "GPaste's own re-offer was diagnosed as a dead event source. The PC is " +
                        "now polling wl-paste for the rest of this connection, taking keyboard " +
