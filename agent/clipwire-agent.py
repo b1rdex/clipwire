@@ -6066,8 +6066,24 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
             log("watching the clipboard through GPaste, already diagnosed as silent "
                 "this connection, so polling every %.1fs" % fallback_interval_seconds)
         else:
-            log("watching the clipboard through GPaste, with a safety-net poll every %.0fs"
-                % SAFETY_NET_POLL_SECONDS)
+            # THE INTERVAL THE POLLER ACTUALLY GOT, not the constant it used
+            # to default from. Spec 5.3's rule -- a line may not state
+            # something other than what the code did -- and this line broke it
+            # the moment CLIPWIRE_SAFETY_NET_SECONDS was wired: it went on
+            # rendering 30 while the safety net it had just built ran at the
+            # injected rate. Harness-only in reach, which is the AGGRAVATION
+            # rather than the mitigation: the harness log is what a person
+            # reads when a harness test fails, and this release spent a whole
+            # task establishing that the harness's own evidence is what tells
+            # a real regression from a silent pass.
+            #
+            # %g, not %.0f, and it is part of the same fix rather than tidying:
+            # %.0f renders a 0.4 s tier as "every 0s", which is a second false
+            # statement in the same sentence. The same choice, for the same
+            # reason, as _observe_tick's verdict line. Production output is
+            # unchanged either way -- both spell 30.0 as "30".
+            log("watching the clipboard through GPaste, with a safety-net poll every %gs"
+                % watcher._safety_net_interval)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
     return PollingWatcher(clipboard, fallback_interval_seconds,

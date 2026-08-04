@@ -115,14 +115,21 @@ final class PairingHarness {
     ///
     /// - a tuning change to SAFETY_NET_POLL_SECONDS, which the rest of the
     ///   line interpolates, must not look like a broken harness;
-    /// - and since `tierSeconds.safetyNet` exists, that interpolation can be
-    ///   WRONG rather than merely variable. `make_watcher` renders the
-    ///   CONSTANT while the poller it just built runs at the injected
-    ///   interval, so a harness run's agent log says "every 30s" during a
-    ///   0.4 s tier. Matching a prefix means this harness never depended on
-    ///   the number; the line itself is inaccurate under injection and is
-    ///   left that way deliberately -- it is agent code, out of scope for the
-    ///   task that noticed it, and reported rather than quietly changed.
+    /// - and since `tierSeconds.safetyNet` exists, the interpolated figure is
+    ///   no longer a constant at all -- it is whatever THIS harness injected.
+    ///   A run at 0.4 s and a run at production's 30 s log different
+    ///   sentences, and both must satisfy this, so a prefix is the only part
+    ///   there is to match.
+    ///
+    /// That second reason was briefly a worse one: the line reported the
+    /// CONSTANT regardless of what the poller got, so a harness log read
+    /// "every 30s" during a 0.4 s tier -- spec 5.3's own defect shape, in the
+    /// log a person reads when a harness test fails. Fixed in task 10's third
+    /// fix round and pinned by
+    /// `test_the_watcher_line_reports_the_interval_the_poller_actually_got`.
+    /// Recorded rather than deleted: this harness matched a prefix throughout
+    /// and so never depended on the number either way, which is the property
+    /// worth keeping.
     ///
     /// Internal rather than private because a test reads it: `start()`
     /// already refuses a world without this line, but a test whose subject is

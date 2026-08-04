@@ -76,6 +76,54 @@ class TestMakeWatcher(unittest.TestCase):
             "or the latch dies with the watcher that reached it",
         )
 
+    def test_the_watcher_line_reports_the_interval_the_poller_actually_got(self):
+        """Spec 5.3, applied to the line a person reads FIRST.
+
+        This line stated the SAFETY_NET_POLL_SECONDS constant while the poller
+        it had just built ran at whatever CLIPWIRE_SAFETY_NET_SECONDS resolved
+        to -- so a harness run's agent log said "every 30s" during a 0.4 s
+        tier. It was reachable only from a harness, which is the aggravation
+        and not the mitigation: that log is what somebody reads when a harness
+        test fails, and telling them the tier is 75x slower than it is costs
+        more than a line nobody reads.
+
+        ASSERTED AGAINST THE POLLER'S OWN INTERVAL rather than against a
+        literal, so this cannot be satisfied by a second hardcoded number
+        agreeing with the first. The env-var phase is the one that kills the
+        original defect: with the constant restored, the line reads "30s"
+        while `_safety_net.interval` is 0.4.
+
+        The FORMAT is pinned by the same phase, and deliberately: %.0f renders
+        0.4 as "0", so a line reading "every 0s" would be a second false
+        statement in the same sentence and this assertion would still pass if
+        it only compared numbers loosely.
+        """
+        self.addCleanup(os.environ.pop, "CLIPWIRE_SAFETY_NET_SECONDS", None)
+        os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS", None)
+
+        for injected, expected in ((None, "%g" % SAFETY_NET_POLL_SECONDS), ("0.4", "0.4")):
+            if injected is None:
+                os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS", None)
+            else:
+                os.environ["CLIPWIRE_SAFETY_NET_SECONDS"] = injected
+            lines = []
+            with mock.patch.object(clipwire_agent, "log", lines.append), \
+                    mock.patch.object(GPasteWatcher, "available", return_value=True):
+                watcher = make_watcher(clipboard=object())
+            watcher.stop()
+            reported = [line for line in lines if "safety-net poll every" in line]
+            self.assertEqual(
+                len(reported), 1,
+                "make_watcher must say once which watcher it built: %r" % lines)
+            self.assertIn(
+                "safety-net poll every %ss" % expected, reported[0],
+                "the line must report the interval the poller was given, not the "
+                "constant it defaults from (CLIPWIRE_SAFETY_NET_SECONDS=%r)" % injected)
+            self.assertEqual(
+                "%g" % watcher._safety_net.interval, expected,
+                "and the poller must actually be on it, or the line above is "
+                "agreeing with a number nothing runs at")
+
     def test_falls_back_to_polling_when_gpaste_unavailable(self):
         with mock.patch.object(GPasteWatcher, "available", return_value=False):
             watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)
