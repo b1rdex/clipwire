@@ -205,6 +205,26 @@ class TestGPasteSafetyNet(unittest.TestCase):
             "is the gnome-shell extension enabled?", line,
             "the verdict must not assert a cause it cannot know",
         )
+        # THE ASSERTION ABOVE WAS VACUOUS UNTIL TASK 12, and saying so is the
+        # point: the line it forbids ("is the gnome-shell extension enabled?")
+        # is the v2 wording, which this file replaced in the same commit that
+        # added the assertion -- while the REPLACEMENT went on saying "the
+        # gnome-shell extension being disabled is one possible cause", a
+        # different sentence making the identical unknowable claim, and this
+        # test stayed green through all of it. Spec 5.3 counted that as the
+        # project's third shipped guess. Matching the SUBSTRING both wordings
+        # share is what makes the check bite on the claim rather than on one
+        # phrasing of it.
+        self.assertNotIn(
+            "gnome-shell extension", line,
+            "the verdict named a cause measured false in all three incidents",
+        )
+        self.assertIn(
+            "gpaste_Tracking=", line,
+            "spec 5.3 replaces the guess with a READING -- an observed value, "
+            "or an honest 'unavailable', never a cause invented at the point "
+            "of reporting",
+        )
 
     def test_the_verdict_lands_on_the_tick_after_the_arming_one(self):
         """The rule, pinned by WHICH tick fires it rather than by "it degrades
@@ -950,3 +970,286 @@ class TestDegradedBackoff(unittest.TestCase):
         self.assertIn("at most 30s", line)
 
 
+
+class TestDivergenceReprobe(unittest.TestCase):
+    """Spec 4.2: "on divergence, re-probe within seconds instead of waiting a
+    full slow interval. A takeover settles; a dead tracker persists."
+
+    PLACED HERE, beside TestDegradedBackoff, and by the same rule that class
+    states for itself: the split is by SUBJECT, and this one's subject is the
+    POLL INTERVAL. TestSlowTierVerdict in test_watcher_uuid_tier.py owns
+    whether the predicate arms, clears and confirms; every _safety_net.interval
+    assertion in this suite lives in this file. The re-probe is the FIFTH
+    claimant on that interval and the second one written by _observe_tick, so
+    its tests belong next to the other one's.
+
+    Every test drives _observe_tick DIRECTLY on a watcher that is never
+    started -- no thread, no gdbus, no clipboard, no timing -- so an interval
+    assertion cannot be raced by a poll tick landing between two lines.
+
+    The intervals are passed EXPLICITLY rather than left at the production
+    constants because the call site takes min() with whatever the safety net
+    is on: a test at this suite's usual 0.01s would make every re-probe a
+    silent no-op and pin nothing at all."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def watcher(self, slow=30.0, reprobe=10.0, degraded=False):
+        watcher = GPasteWatcher(clipboard=None,
+                                safety_net_interval_seconds=slow,
+                                reprobe_interval_seconds=reprobe,
+                                degraded=degraded)
+        self.addCleanup(watcher.stop)
+        # The uuid pair primed to one value, the steady state every slow-tier
+        # test in this suite starts from: "frozen" is what makes a moving
+        # wl-paste token a DIVERGENCE rather than an ordinary copy. See
+        # TestGPasteSafetyNet.start_watcher for the full reasoning.
+        watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
+        return watcher
+
+    def test_a_divergence_re_probes_within_seconds(self):
+        watcher = self.watcher()
+        self.assertEqual(watcher._safety_net.interval, 30.0,
+                         "test precondition: the tier starts on its slow rate")
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+
+        self.assertTrue(watcher._armed, "test precondition: the run must be armed")
+        self.assertEqual(
+            watcher._safety_net.interval, 10.0,
+            "an armed run waited a full slow interval to find out whether the "
+            "token settled -- at spec 4.2's eventual 5-15 minutes that is the "
+            "difference between a diagnosis and a shrug")
+
+    def test_a_settled_token_gives_the_interval_back(self):
+        """The excursion is ONE-SHOT. A takeover settles, the run clears, and
+        the tier returns to its own rate rather than staying fast forever --
+        which on the composed slow tier would be a permanent focus-steal rate
+        bought with one benign re-offer."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        watcher._observe_tick(("text", "b"), ("text", "b"))   # settles, clears
+
+        self.assertFalse(watcher._armed, "test precondition: the run must have cleared")
+        self.assertEqual(watcher._safety_net.interval, 30.0,
+                         "the re-probe rate outlived the run that justified it")
+
+    def test_it_gives_back_what_it_TOOK_not_what_it_was_built_with(self):
+        """The interleaving the snapshot exists for: spec 4.3's fallback
+        writes SAFETY_NET_POLL_SECONDS from the FAST-TIER thread, and a
+        re-probe that restored a remembered __init__ figure would silently
+        undo that write. What was taken is what comes back."""
+        watcher = self.watcher(slow=5.0, reprobe=1.0)
+        watcher._safety_net.interval = SAFETY_NET_POLL_SECONDS   # as _fast_tick's fallback does
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        self.assertEqual(watcher._safety_net.interval, 1.0)
+        watcher._observe_tick(("text", "b"), ("text", "b"))   # clears
+
+        self.assertEqual(
+            watcher._safety_net.interval, SAFETY_NET_POLL_SECONDS,
+            "the give-back reverted a write this block never made")
+
+    def test_it_can_only_make_the_tier_faster(self):
+        """min(), not assignment, and the inversion it guards is REACHABLE
+        rather than theoretical: every test in this project builds the safety
+        net well below any sane re-probe rate, so a bare assignment would ship
+        a "re-probe" that slowed the tier by orders of magnitude -- in the
+        tests, silently, which is where it would never be noticed."""
+        watcher = self.watcher(slow=0.01, reprobe=10.0)
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+
+        self.assertEqual(
+            watcher._safety_net.interval, 0.01,
+            "the re-probe made the tier 1000x SLOWER than the rate it was "
+            "already polling at")
+
+    def test_a_confirmed_run_leaves_the_degraded_floor_not_the_re_probe_rate(self):
+        """The seam between the fifth claimant and spec 6.2's two, inside ONE
+        tick. The latch sets self._degraded BEFORE this block runs, so the
+        re-probe stands down on exactly the tick its question was answered --
+        and the connection is left on the floor its own log line promises,
+        not on a re-probe rate nothing announced."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms, re-probes
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # confirms
+
+        self.assertTrue(watcher._degraded, "test precondition: the verdict must have fired")
+        self.assertEqual(
+            watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+            "the degraded state is the more specific one and must win the wait")
+
+    def test_an_already_degraded_watcher_never_re_probes(self):
+        """`not self._degraded`, the same precedence rule spec 4.3's fallback
+        uses. It costs nothing to defer: DEGRADED_POLL_SECONDS is already
+        faster than any re-probe rate, so a re-probe there could only ever
+        slow the connection's only remaining sync down."""
+        watcher = self.watcher(slow=30.0, reprobe=10.0, degraded=True)
+        self.assertEqual(watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+                         "test precondition: it comes up on the floor")
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # would arm
+
+        self.assertTrue(watcher._armed, "test precondition: the run still arms")
+        self.assertEqual(
+            watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+            "spec 6.2's backoff resets to the floor on a moved token, and the "
+            "re-probe must not overwrite it")
+        self.assertIsNone(watcher._interval_before_reprobe,
+                          "no excursion may even have been recorded")
+
+    def test_a_failed_probe_clears_the_run_and_the_re_probe_with_it(self):
+        """Spec 5.1's retry and this re-probe can never be in force together,
+        and the exclusion is structural rather than ordered: an unresolved
+        tick is read_ok False, which clears self._armed on the same tick that
+        starts the retry run."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        self.assertEqual(watcher._safety_net.interval, 10.0)
+
+        watcher._observe_tick(("text", "b"), None)            # a hung wl-paste
+
+        self.assertFalse(watcher._armed)
+        self.assertEqual(watcher._safety_net.interval, 30.0,
+                         "a run that can no longer be confirmed kept polling fast")
+
+    def test_a_run_that_stays_armed_does_not_ratchet_the_rate_down(self):
+        """The `is None` guard on the take. Without it a still-armed run would
+        snapshot its own re-probe rate as "what to give back" -- the interval
+        would be correct and the RESTORE would be permanently wrong, which is
+        a defect nothing in the fast path would ever surface."""
+        watcher = self.watcher(slow=30.0, reprobe=10.0, degraded=True)
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._degraded = False       # as if the latch had never fired
+        watcher._safety_net.interval = 30.0
+
+        watcher._observe_tick(("text", "b"), ("text", "b"))   # settled -> clears
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # arms again
+        self.assertEqual(watcher._safety_net.interval, 10.0)
+        watcher._observe_tick(("text", "c"), ("text", "c"))   # settles again
+
+        self.assertEqual(
+            watcher._safety_net.interval, 30.0,
+            "the second excursion gave back its own re-probe rate instead of "
+            "the tier's")
+
+    def test_a_healthy_connection_that_never_diverges_keeps_its_budget(self):
+        """The gate on the whole block. A tick that arms nothing must leave
+        the detection budget alone -- a re-probe fired on every tick would be
+        a permanent focus-steal rate on a machine with nothing wrong."""
+        watcher = self.watcher()
+        watcher._last_uuid = "moved"        # the uuid tracked the copy: healthy
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertFalse(watcher._armed, "test precondition: nothing may arm")
+        self.assertEqual(watcher._safety_net.interval, 30.0,
+                         "a healthy connection was retuned by the re-probe")
+
+
+class TestVerdictNamesTheCause(unittest.TestCase):
+    """Spec 5.3: "read the Tracking property over D-Bus and put the observed
+    value in the log line. The current verdict line blames a disabled
+    gnome-shell extension; the extension was measured enabled and ACTIVE
+    during all three incidents. That makes three shipped guesses."
+
+    TestGPasteSafetyNet above already pins that the line carries evidence and
+    asserts no cause; this class pins what REPLACED the guess. Separate from
+    that class because these need no threads: the verdict is reached by
+    calling _observe_tick directly, so the reading is exact and the gdbus call
+    is a stub rather than a race."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def verdict_line(self, read_tracking=None):
+        watcher = GPasteWatcher(clipboard=None, read_tracking=read_tracking)
+        self.addCleanup(watcher.stop)
+        watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # confirms
+        lines = [l for l in self.log_lines if "reported no clipboard change" in l]
+        self.assertEqual(len(lines), 1, "the verdict must have fired exactly once")
+        return lines[0]
+
+    def test_a_tracking_daemon_is_reported_as_tracking(self):
+        line = self.verdict_line(read_tracking=lambda: True)
+        self.assertIn("gpaste_Tracking=true", line)
+
+    def test_a_daemon_that_stopped_tracking_is_reported_as_such(self):
+        """The reading this release was written to be able to make. Three
+        production incidents were diagnosed from a line that guessed instead."""
+        line = self.verdict_line(read_tracking=lambda: False)
+        self.assertIn("gpaste_Tracking=false", line)
+
+    def test_a_read_that_failed_is_reported_as_unavailable_and_never_as_false(self):
+        """"We could not ask" is DIFFERENT EVIDENCE from "GPaste says no", and
+        a line that rendered None as false would be a fourth shipped guess in
+        the place the third one was removed from."""
+        line = self.verdict_line(read_tracking=lambda: None)
+        self.assertIn("gpaste_Tracking=unavailable", line)
+        self.assertNotIn("gpaste_Tracking=false", line)
+
+    def test_the_property_name_is_in_the_line(self):
+        """The name could not be verified against a live GPaste at authoring
+        time, so the log line reports which property was asked for -- that is
+        what lets the first production line settle it, instead of an
+        unavailable reading being indistinguishable from a wrong name."""
+        line = self.verdict_line(read_tracking=lambda: True)
+        self.assertIn(clipwire_agent.GPASTE_TRACKING_PROPERTY, line)
+
+    def test_the_guess_is_gone(self):
+        line = self.verdict_line(read_tracking=lambda: True)
+        self.assertNotIn("gnome-shell extension", line)
+        self.assertNotIn("possible cause", line)
+
+    def test_every_evidence_field_survives_the_replacement(self):
+        """The incident reconstruction was built from these four. The Tracking
+        read is an ADDITION, and a replacement that quietly dropped one of
+        them would cost more than the guess did."""
+        line = self.verdict_line(read_tracking=lambda: True)
+        for field in ("signals=", "signals_at_last_tick=",
+                      "pump_alive=", "worker_alive="):
+            self.assertIn(field, line, "the verdict lost an evidence field")
+
+    def test_a_read_that_hangs_cannot_stop_the_verdict_being_reached(self):
+        """The read is on the poll thread and can block like every other gdbus
+        call in this file. self._degraded is assigned BEFORE it, so a slow
+        read delays the line -- once per connection, bounded by the call's own
+        timeout -- and cannot un-reach the verdict. Simulated by the extreme
+        case: a reader that raises, which is worse than one that hangs."""
+        watcher = GPasteWatcher(clipboard=None,
+                                read_tracking=_raise_gdbus_exploded)
+        self.addCleanup(watcher.stop)
+        watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        with self.assertRaises(RuntimeError):
+            watcher._observe_tick(("text", "b"), ("text", "c"))
+
+        self.assertTrue(
+            watcher._degraded,
+            "the verdict must be reached before the read, or a D-Bus that "
+            "will not answer suppresses the diagnosis entirely")
+
+    def test_an_unwired_reader_reports_unavailable_rather_than_raising(self):
+        """GPasteWatcher defaults read_tracking to None -- see its __init__ for
+        why this reader's absence is allowed and read_history_uuid's is not.
+        The line must degrade to "unavailable", not to a TypeError that takes
+        the poll thread's whole judgement with it."""
+        line = self.verdict_line(read_tracking=None)
+        self.assertIn("gpaste_Tracking=unavailable", line)
+
+
+def _raise_gdbus_exploded():
+    raise RuntimeError("gdbus exploded")

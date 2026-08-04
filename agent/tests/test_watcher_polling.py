@@ -784,3 +784,186 @@ class TestFailedReadDoesNotConsumeTheChange(unittest.TestCase):
             "fail together, so there is no consumed change to retry for")
 
 
+
+class TestSlowTierIdleGate(unittest.TestCase):
+    """Spec 4.2's second gate, composed with the poll loop: "the user has
+    been recently active via Mutter.IdleMonitor.GetIdletime (with nobody
+    copying there is no divergence to find, so an idle blink is pure cost)".
+
+    PLACED HERE because the gate is a `continue` in PollingWatcher.pump,
+    which is this file's subject -- the same loop, one screenful above, that
+    TestFailedReadDoesNotConsumeTheChange owns for spec 5.1, and beside the
+    spec 2 test that pins the standalone path untouched. The GATE FUNCTION
+    itself (_user_recently_active: parsing, the threshold, the three-valued
+    rule) is a module-level gdbus reader and is tested in
+    test_watcher_uuid_tier.py beside gpaste_history_uuid, which it mirrors.
+
+    THE TRAP THIS CLASS EXISTS FOR is test_an_unmeasured_gate_still_probes
+    below. A gate that failed CLOSED would disable the safety net on every
+    machine where org.gnome.Mutter.IdleMonitor is absent, renamed or slow --
+    and the safety net is the only thing that can see a dead tracker, which
+    is the failure this entire release is about. The gate would then have
+    caused, silently, the exact class of bug it was added to help find."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    def quiesce(self, watcher):
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+        self.assertFalse(watcher._thread.is_alive(),
+                         "the poll thread must be joined before its state is read")
+
+    def gated_watcher(self, idle_answers, script=(b"a", b"b", b"c")):
+        """A composed-shape poller (on_tick wired, as GPasteWatcher's safety
+        net is) gated by THE PRODUCTION PREDICATE -- a real GPasteWatcher's
+        _slow_tier_should_probe -- fed raw three-valued idle readings.
+
+        Composed rather than hand-written on purpose: `should_probe` takes a
+        bool and the None-proceeds rule lives one layer up, in that method,
+        so a test that passed None straight to the loop would be testing a
+        contract production never uses and would read `not None` as "skip" --
+        the exact inversion this class exists to forbid, passing.
+
+        The GPasteWatcher is never started; only its predicate is borrowed.
+        clipboard=None is safe there for the same reason TestDegradedBackoff
+        gives: nothing starts, and the predicate never touches a clipboard.
+
+        Returns (watcher, clipboard, observations, gate_calls); `observations`
+        is every (previous, current) pair on_tick was handed, which is what a
+        gated tick must produce NONE of."""
+        replies = list(idle_answers)
+        gate_calls = []
+
+        def read_idle_gate():
+            gate_calls.append(True)
+            return replies[min(len(gate_calls) - 1, len(replies) - 1)]
+
+        composer = GPasteWatcher(clipboard=None, read_idle_gate=read_idle_gate)
+        self.addCleanup(composer.stop)
+        clipboard = ProbeOnlyClipboard(script)
+        observations = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005,
+                                 on_tick=lambda p, c: observations.append((p, c)),
+                                 should_probe=composer._slow_tier_should_probe)
+        self.addCleanup(watcher.stop)
+        return watcher, clipboard, observations, gate_calls
+
+    def test_an_unmeasured_gate_still_probes(self):
+        """THE TRAP, pinned. _user_recently_active returns None when the call
+        failed, and GPasteWatcher._slow_tier_should_probe turns that into
+        True -- "not measured" PROCEEDS. Driven through the real loop with a
+        gate that only ever answers "unavailable", so a machine with no
+        IdleMonitor at all is what this test actually simulates.
+
+        Mutating `is not False` to a truthiness test in
+        _slow_tier_should_probe is what this catches, and there is no
+        comparison in pump to mutate instead -- which is why the assertion is
+        on OBSERVATIONS REACHED rather than on the predicate's return."""
+        watcher = GPasteWatcher(clipboard=None, read_idle_gate=lambda: None)
+        self.addCleanup(watcher.stop)
+        self.assertTrue(
+            watcher._slow_tier_should_probe(),
+            "an unmeasured idle reading must PROCEED: a gate that failed "
+            "closed would disable the safety net on every machine without "
+            "org.gnome.Mutter.IdleMonitor")
+
+        gated, clipboard, observations, _calls = self.gated_watcher([None])
+        gated.start(lambda: None)
+        self.wait_until(lambda: len(observations) >= 2)
+        self.quiesce(gated)
+
+        self.assertGreaterEqual(
+            len(observations), 2,
+            "an unmeasured gate suppressed the slow tier entirely")
+        self.assertGreater(clipboard.calls, 1, "no probe was ever made")
+
+    def test_an_active_user_probes(self):
+        watcher, clipboard, observations, _ = self.gated_watcher([True])
+        watcher.start(lambda: None)
+        self.wait_until(lambda: len(observations) >= 2)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(len(observations), 2)
+
+    def test_an_idle_user_costs_no_fork_and_no_observation(self):
+        """The saving the gate exists for, and BOTH halves are asserted
+        because either alone would pass against a half-implemented gate. No
+        probe (the fork, and before v3.3 the focus blink, is the whole cost),
+        and no on_tick -- which is not an optimisation but a correctness
+        rule: on_tick with an unchanged token would feed spec 6.2's backoff a
+        settled token, and that backoff DOUBLES on exactly that. Two idle
+        mechanisms compounding, one of them silent."""
+        watcher, clipboard, observations, gate_calls = self.gated_watcher([False])
+        watcher.start(lambda: None)
+        self.wait_until(lambda: len(gate_calls) >= 5)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            clipboard.calls, 1,
+            "a gated-out tick must fork no wl-paste at all -- 1 is the "
+            "baseline probe taken before the loop, which is not gated")
+        self.assertEqual(
+            observations, [],
+            "a gated-out tick must reach no observer: handing on_tick an "
+            "unchanged token would compound two idle mechanisms")
+
+    def test_the_gate_does_not_advance_the_baseline_across_an_idle_stretch(self):
+        """What a skipped tick PRESERVES, and it is why skipping is correct
+        rather than merely cheap. `previous` is not advanced, so a divergence
+        that happened during the idle stretch is still visible to the first
+        tick that runs after it -- the evidence survives the gap instead of
+        being consumed by a tick that observed nothing."""
+        watcher, clipboard, observations, gate_calls = self.gated_watcher(
+            [False, False, False, True], script=[b"a", b"z"])
+        watcher.start(lambda: None)
+        self.wait_until(lambda: observations)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            observations[0], (b"a", b"z"),
+            "the first ungated tick must compare against the pre-gap "
+            "baseline, or an idle stretch swallows the divergence inside it")
+
+    def test_the_standalone_poller_has_no_gate_to_consult(self):
+        """Spec 2: the machine with no GPaste at all is untouched. Its
+        clipboard may legitimately never move again, so gating its ticks on
+        user activity would be the wrong trade there even if it were free --
+        and make_watcher passes nothing, so there is nothing to consult."""
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        observed = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        self.assertIsNone(
+            watcher._should_probe,
+            "the standalone poller must default to ungated")
+        watcher.start(lambda: observed.append(clipboard.take()))
+
+        self.wait_until(lambda: observed)
+        self.quiesce(watcher)
+        self.assertTrue(observed, "the ungated path stopped ticking")
+
+    def test_the_gate_is_asked_before_the_probe_not_after_it(self):
+        """Ordering, pinned by counts rather than by reading the source. A
+        gate asked AFTER probe() would still skip on_tick and would pass
+        every other test in this class while saving exactly nothing -- the
+        fork is the cost the gate exists to avoid."""
+        watcher, clipboard, _, gate_calls = self.gated_watcher([False])
+        watcher.start(lambda: None)
+        self.wait_until(lambda: len(gate_calls) >= 5)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(len(gate_calls), 5,
+                                "the gate must be asked on every tick")
+        self.assertEqual(
+            clipboard.calls, 1,
+            "probe() ran on a gated tick: the gate is being asked after the "
+            "fork it exists to prevent")

@@ -123,6 +123,176 @@ class TestHistoryUuidProbe(unittest.TestCase):
         self.assertNotIn("hunter2", uuid)
 
 
+class TestIdleGate(unittest.TestCase):
+    """Spec 4.2's second gate: _user_recently_active, read from
+    org.gnome.Mutter.IdleMonitor.
+
+    PLACED HERE, beside TestHistoryUuidProbe above, and the reason is that
+    the two subjects are the same subject: a module-level three-valued gdbus
+    reader with a partial parse and a "None is not a value" rule. Task 12's
+    brief named this file for exactly this class and the naming is right for
+    _user_recently_active itself. Its COMPOSITION with the poll loop -- the
+    tick that does or does not happen -- is a different subject and lives in
+    test_watcher_polling.py's TestSlowTierIdleGate, because the gate is a
+    `continue` in PollingWatcher.pump and that file owns pump; and the
+    divergence re-probe, which writes an interval, lives in
+    test_watcher_safety_net.py beside TestDegradedBackoff, the suite's home
+    for every _safety_net.interval assertion. Three subjects, three homes,
+    stated because a single brief named a single file for all of it."""
+
+    def idle(self, stdout=b"", returncode=0, raises=None):
+        def run(argv, **kwargs):
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(argv, returncode, stdout, b"")
+        return agent._user_recently_active(run=run)
+
+    def test_a_recent_input_reads_as_active(self):
+        self.assertIs(self.idle(b"(uint64 1200,)\n"), True)
+
+    def test_a_long_idle_reads_as_inactive(self):
+        self.assertIs(self.idle(b"(uint64 600000,)\n"), False)
+
+    def test_a_failed_call_is_not_measured(self):
+        """None is 'we do not know', and the caller must PROCEED on it. A gate
+        that skipped the slow tier whenever IdleMonitor was unavailable would
+        silently disable the only thing that can see a dead tracker -- on every
+        machine without that D-Bus name."""
+        for failure in (dict(returncode=1), dict(stdout=b"junk"),
+                        dict(raises=subprocess.TimeoutExpired(["gdbus"], 3)),
+                        dict(raises=FileNotFoundError())):
+            self.assertIsNone(self.idle(**failure), failure)
+
+    def test_the_threshold_is_the_named_constant_and_not_a_literal(self):
+        """The number is a JUDGEMENT, so it has to be arguable in one place
+        rather than spelled at a comparison. Both sides of it are pinned FROM
+        the constant, so retuning USER_IDLE_GATE_SECONDS moves this test with
+        it instead of breaking it -- what is pinned is that the constant is
+        what decides, which is the property a literal would silently lose."""
+        just_inside = int((agent.USER_IDLE_GATE_SECONDS - 1) * 1000)
+        just_outside = int((agent.USER_IDLE_GATE_SECONDS + 1) * 1000)
+        self.assertIs(self.idle(b"(uint64 %d,)\n" % just_inside), True)
+        self.assertIs(self.idle(b"(uint64 %d,)\n" % just_outside), False)
+
+    def test_the_boundary_resolves_to_active(self):
+        """Exactly USER_IDLE_GATE_SECONDS of idle time PROCEEDS. Same
+        fail-open direction as the None rule, and chosen for the same reason:
+        an ambiguous reading should cost a fork, never a verdict. `<` instead
+        of `<=` is the one-character mutation this pins."""
+        exactly = int(agent.USER_IDLE_GATE_SECONDS * 1000)
+        self.assertIs(self.idle(b"(uint64 %d,)\n" % exactly), True)
+
+    def test_an_unrecognised_reply_shape_is_not_measured(self):
+        """A renamed method, a changed reply shape or a D-Bus error string must
+        read as 'not measured' -- which PROCEEDS -- and never as False.
+
+        Each value below is rejected by a DIFFERENT clause, which is what
+        makes this a mutation table rather than a repetition: no "uint64" at
+        all (the partition guard), "uint64" with nothing numeric after it,
+        and a signed value that int() would have accepted while isdigit()
+        does not."""
+        for junk in (b"", b"()\n", b"(true,)\n", b"(uint64 ,)\n",
+                     b"(uint64 -1,)\n", b"(uint64 abc,)\n"):
+            self.assertIsNone(self.idle(junk), "%r parsed as an idle time" % junk)
+
+    def test_zero_idle_time_is_active_rather_than_falsy(self):
+        """A user typing RIGHT NOW reads `(uint64 0,)`. The parse must not
+        treat that as "nothing to see": 0 is the most active reading there
+        is, and a truthiness test on the parsed value would invert it."""
+        self.assertIs(self.idle(b"(uint64 0,)\n"), True)
+
+    def test_the_call_asks_the_idle_monitor_and_never_gpaste(self):
+        """One gdbus call, and it must be the RIGHT one: the gate is
+        affordable only because GetIdletime takes no focus and costs
+        milliseconds. Also pins that the payload rule has nothing to fear
+        here -- the reply is a number, so there is no clipboard content in
+        this call's stdout to leak (spec 5.2)."""
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"(uint64 10,)\n", b"")
+
+        agent._user_recently_active(run=run)
+        argv, kwargs = seen[0]
+        self.assertEqual(argv[0], "gdbus")
+        self.assertIn(agent.IDLE_MONITOR_BUS_NAME, argv)
+        self.assertIn(agent.IDLE_MONITOR_OBJECT_PATH, argv)
+        self.assertIn("%s.GetIdletime" % agent.IDLE_MONITOR_INTERFACE, argv)
+        self.assertNotIn(agent.GPASTE_BUS_NAME, argv)
+        self.assertEqual(
+            kwargs["timeout"], agent.GPASTE_CALL_TIMEOUT,
+            "an ungated gdbus call on the poll thread can hang it forever")
+
+
+class TestTrackingProbe(unittest.TestCase):
+    """Spec 5.3: gpaste_tracking, the reading that replaced a guess.
+
+    The verdict line shipped "the gnome-shell extension being disabled is one
+    possible cause" through three production incidents where the extension was
+    measured Enabled/ACTIVE with track-changes true. This function is what the
+    line asks instead."""
+
+    def tracking(self, stdout=b"", returncode=0, raises=None):
+        def run(argv, **kwargs):
+            if raises is not None:
+                raise raises
+            return subprocess.CompletedProcess(argv, returncode, stdout, b"")
+        return agent.gpaste_tracking(run=run)
+
+    def test_a_true_reply_reads_as_true(self):
+        self.assertIs(self.tracking(b"(<true>,)\n"), True)
+
+    def test_a_false_reply_reads_as_false(self):
+        """The reading this whole change exists to make possible: GPaste
+        itself saying it stopped tracking."""
+        self.assertIs(self.tracking(b"(<false>,)\n"), False)
+
+    def test_a_failed_call_is_not_measured_and_is_never_false(self):
+        """THE DISTINCTION THAT MATTERS. "GPaste says it is not tracking" and
+        "we could not ask GPaste" are opposite pieces of evidence, and
+        collapsing them would re-commit the exact sin spec 5.3 exists to
+        undo -- reporting something the line does not know.
+
+        `returncode=1` is also where a WRONG PROPERTY NAME lands: gdbus exits
+        non-zero on "No such property", so a name this file guessed wrong
+        reports unavailable rather than false."""
+        for failure in (dict(returncode=1), dict(stdout=b"junk"),
+                        dict(stdout=b""),
+                        dict(raises=subprocess.TimeoutExpired(["gdbus"], 3)),
+                        dict(raises=FileNotFoundError())):
+            self.assertIsNone(self.tracking(**failure), failure)
+
+    def test_a_nonzero_exit_is_not_measured_even_with_a_true_shaped_reply(self):
+        """The returncode check must come BEFORE the parse. gdbus writes its
+        error to stderr and can still leave something on stdout; a parser
+        reached on a failed call would read a stale or partial reply as a
+        measurement."""
+        self.assertIsNone(self.tracking(b"(<true>,)\n", returncode=1))
+
+    def test_the_call_asks_gpaste_for_the_named_property(self):
+        """Pins the property name to the module constant rather than to a
+        literal in the argv, because that name is the one thing in this
+        function that could not be verified against a live GPaste at
+        authoring time -- so its correction must be one line, and the log
+        line reports it for exactly that reason (see the constant's own
+        comment). Also pins that this reads a PROPERTY and never
+        GetElementAtIndex, whose reply carries clipboard text (spec 5.2)."""
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 0, b"(<true>,)\n", b"")
+
+        agent.gpaste_tracking(run=run)
+        argv, kwargs = seen[0]
+        self.assertIn("org.freedesktop.DBus.Properties.Get", argv)
+        self.assertIn(agent.GPASTE_INTERFACE, argv)
+        self.assertIn(agent.GPASTE_TRACKING_PROPERTY, argv)
+        self.assertNotIn("%s.GetElementAtIndex" % agent.GPASTE_INTERFACE, argv)
+        self.assertEqual(kwargs["timeout"], agent.GPASTE_CALL_TIMEOUT)
+
+
 class TestFastTier(unittest.TestCase):
     def watcher(self, uuids):
         """A watcher whose fast tier reads `uuids` in order."""

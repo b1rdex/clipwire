@@ -141,6 +141,57 @@ class TestMakeWatcher(unittest.TestCase):
             "exactly where it is needed",
         )
 
+    def test_make_watcher_is_what_wires_the_idle_gate_and_the_tracking_read(self):
+        """THE OTHER END OF A DELIBERATE DEFAULT. GPasteWatcher defaults both
+        of these D-Bus readers to None -- see its __init__ for the rule (a
+        reader whose absence only COSTS may default off; one whose absence
+        breaks a verdict may not) -- and that default is only safe because
+        exactly one production path wires them.
+
+        Without this test the failure is silent and total: drop either
+        argument from make_watcher and every machine runs the slow tier
+        ungated and reports "gpaste_Tracking=unavailable" forever, with no
+        test red and no log line to say so. That is the same "correct code no
+        production path reaches" shape the idle-tick test above was written
+        for, which is why the two sit together.
+
+        Identity, not truthiness: `read_idle_gate=lambda: True` would pass a
+        truthiness check while gating nothing on the real IdleMonitor."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object())
+
+        self.assertIs(
+            watcher._read_idle_gate, clipwire_agent._user_recently_active,
+            "spec 4.2's idle gate is wired nowhere else, so an unwired "
+            "production watcher forks a wl-paste on every slow tick forever",
+        )
+        self.assertIs(
+            watcher._read_tracking, clipwire_agent.gpaste_tracking,
+            "spec 5.3's reading is wired nowhere else, so an unwired "
+            "production watcher reports the property it replaced a guess with "
+            "as permanently unavailable",
+        )
+        # assertEqual, not assertIs: bound methods compare equal by
+        # (__func__, __self__) but are fresh objects on every attribute
+        # lookup, so identity here would fail against correct code.
+        self.assertEqual(
+            watcher._safety_net._should_probe, watcher._slow_tier_should_probe,
+            "and the gate must actually reach the poll loop through the "
+            "None-proceeds predicate, not merely be stored on the watcher",
+        )
+
+    def test_the_standalone_poller_is_never_gated(self):
+        """Spec 2: the machine with no GPaste at all is untouched. Its
+        clipboard may legitimately never move again -- that is the machine the
+        re-offer hook above exists for -- so gating its ticks on user activity
+        would be the wrong trade there even if it were free."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            plain = make_watcher(clipboard=object())
+        self.assertIsNone(
+            plain._should_probe,
+            "the standalone path must reach the poll loop with no gate at all",
+        )
+
 
 class FlapRecordingWatcher:
     """Records the degraded-latch wiring make_watcher was handed, and can fire
