@@ -818,6 +818,61 @@ class TestTierIntervalResolution(unittest.TestCase):
         self.addCleanup(patcher.stop)
         os.environ.pop("CLIPWIRE_FAST_TIER_SECONDS", None)
         os.environ.pop("CLIPWIRE_SLOW_TIER_SECONDS", None)
+        os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS", None)
+
+    def test_the_safety_net_interval_resolves_argument_then_env_then_default(self):
+        """The THIRD variable, wired in task 10's fix round -- and the only
+        one of the three that starts a timer, so this asserts the resolved
+        value reaches the poller rather than merely landing in a field.
+
+        That distinction is the entire defect this closes. Until now
+        CLIPWIRE_SLOW_TIER_SECONDS resolved correctly into self._slow_interval
+        and the poller went on being built from the raw parameter, so a test
+        that checked only the field would have passed against a watcher whose
+        tick rate no environment could move. The assertion that matters here
+        is `_safety_net.interval`, every time.
+        """
+        # Phase 1: an explicit argument wins even with the environment set --
+        # the same precedence the other two follow, and load-bearing here
+        # because dozens of tests in this suite pass sub-second safety-net
+        # intervals by name and must not be second-guessed by a stray
+        # variable left in the shell that ran them.
+        os.environ["CLIPWIRE_SAFETY_NET_SECONDS"] = "9"
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard(),
+                                      safety_net_interval_seconds=0.5)
+        watcher.stop()
+        self.assertEqual(watcher._safety_net.interval, 0.5)
+
+        # Phase 2: no argument, no environment -- the constant, which is what
+        # production runs and what every existing caller of make_watcher got
+        # before this variable existed.
+        os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS")
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard())
+        watcher.stop()
+        self.assertEqual(watcher._safety_net.interval, agent.SAFETY_NET_POLL_SECONDS)
+
+        # Phase 3: no argument, environment set -- the override reaches the
+        # poller, which is the capability the Swift pairing harness needs and
+        # the plan's task 3 named without building.
+        os.environ["CLIPWIRE_SAFETY_NET_SECONDS"] = "0.25"
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard())
+        watcher.stop()
+        self.assertEqual(watcher._safety_net.interval, 0.25)
+        # And it carries into the slow tier's own number, which falls back to
+        # the RESOLVED interval rather than to the constant -- so a harness
+        # that sets one variable does not silently leave
+        # _uuid_failures_before_fallback derived from a 30 s tier it is not
+        # running.
+        self.assertEqual(watcher._slow_interval, 0.25)
+
+        # Phase 4: an already-degraded watcher ignores all of it and starts on
+        # the degraded interval, unchanged by this wiring -- coming up on the
+        # detection budget would leave PC->Mac half a minute behind on an
+        # installation already diagnosed.
+        watcher = agent.GPasteWatcher(clipboard=_StubClipboard(), degraded=True,
+                                      degraded_interval_seconds=0.75)
+        watcher.stop()
+        self.assertEqual(watcher._safety_net.interval, 0.75)
 
     def test_fast_and_slow_intervals_resolve_argument_then_env_then_default(self):
         # Phase 1: an explicit argument wins even with the environment set,

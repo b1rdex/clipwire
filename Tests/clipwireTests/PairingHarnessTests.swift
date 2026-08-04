@@ -65,9 +65,12 @@ final class PairingHarnessTests: XCTestCase {
     }
 
     private func connected(eventSource: PairingHarness.EventSource = .gpaste,
-                           substituting: Bool = false)
+                           substituting: Bool = false,
+                           tierSeconds: (fast: Double?, slow: Double?, safetyNet: Double?)
+                               = (nil, nil, nil))
     throws -> PairingHarness {
-        let harness = try PairingHarness(eventSource: eventSource, substituting: substituting)
+        let harness = try PairingHarness(eventSource: eventSource, substituting: substituting,
+                                         tierSeconds: tierSeconds)
         self.harness = harness
         try harness.start()
         return harness
@@ -501,6 +504,106 @@ final class PairingHarnessTests: XCTestCase {
         try harness.waitForTheMacsPasteboard(toHold: .text, Data(copiedOnThePC.utf8))
     }
 
+    // MARK: - GPaste re-offering its own clipboard is not a dead event source
+
+    /// THE REGRESSION THIS WHOLE RELEASE EXISTS FOR, between the two real
+    /// implementations. Production incident `2026-08-02T04:21:52Z`, spec 1.2,
+    /// spec 9.1's first acceptance criterion.
+    ///
+    /// An image lands on the PC, the agent syncs it here, and one to six
+    /// seconds later GPaste takes the selection back and re-offers the SAME
+    /// picture under its own long type list -- emitting no `Update` for it and
+    /// creating no history entry. Before v3.3 the safety net read that as
+    /// "the content changed and the event source said nothing", armed, and
+    /// confirmed on the next quiet tick: the connection dropped to 1 Hz
+    /// `wl-paste` polling, which on this installation TAKES KEYBOARD FOCUS on
+    /// every tick, for the rest of its life. On a machine where nothing was
+    /// wrong.
+    ///
+    /// WHY THE INTERVALS ARE INJECTED, since it is the reason this test can
+    /// exist at all. The verdict is reached on the safety net's poll thread,
+    /// and until task 10's fix round nothing outside the agent could move
+    /// that thread off `SAFETY_NET_POLL_SECONDS` -- the plan named
+    /// `CLIPWIRE_SAFETY_NET_SECONDS` and never built it, so this scenario
+    /// cost three 30-second ticks and was simply not written. `safetyNet`
+    /// below is that variable. `fast` has to come with it and is not
+    /// decoration: `uuid_frozen` is a delta between two slow ticks, so the
+    /// fast tier must have read a uuid before the first of them or the slow
+    /// tier reaches no verdict at all and this test would pass having proved
+    /// nothing. `slow` stays nil on purpose -- it starts no timer, and
+    /// setting it is the mistake the harness's own `tierSeconds` comment
+    /// documents.
+    ///
+    /// WHAT THIS SIDE CAN AND CANNOT SEE. `_armed` is a field of a Python
+    /// object in another process. What crosses is what the agent FORKED, so
+    /// "the slow tier saw the divergence" is asserted as its own
+    /// `wl-paste --list-types` coming back with the re-offered list -- a real
+    /// fork, a real observation, twice. The arming and clearing of the run
+    /// itself is pinned one altitude down, in
+    /// `agent/tests/test_watcher_gpaste_reoffer.py`, which drives the real
+    /// watcher against these same fakes. THE TWO ARE NOT DUPLICATES AND MUST
+    /// NOT BE DE-DUPLICATED: that one can read the watcher's state and goes
+    /// red at the exact commit boundary; this one is the only thing in the
+    /// project that puts a real Swift peer on the other end of the pipe while
+    /// it happens.
+    ///
+    /// MEASURED RED, without which the rest is decoration: against
+    /// `git checkout 58d3c60 -- agent/clipwire-agent.py` -- the commit before
+    /// `6ac6eec` brought in both the uuid discriminator and spec 4.2's
+    /// settled-clears rule -- this test fails on the last assertion below,
+    /// with the agent's own degrade line in the shared log.
+    func testAGPasteReofferDoesNotDegradeTheConnection() throws {
+        let harness = try connected(tierSeconds: (fast: 0.05, slow: nil, safetyNet: 0.2))
+
+        // --- positive evidence, before any claim about an absence ---------
+        //
+        // `start()` already refuses a world where this line is missing, but
+        // asserting it HERE is what stops this method green-lighting a run in
+        // which the agent never started, never connected, or wrote no log:
+        // every assertion below is about something NOT appearing, and all of
+        // them are satisfied by a dead harness.
+        XCTAssertTrue(harness.logHolds(PairingHarness.liveWatcherLine),
+                      "the agent never reported a GPaste watcher, so nothing below is " +
+                      "evidence about the event path -- it is evidence about silence")
+
+        // The image lands, and actually crosses: the fake gdbus monitor's
+        // Update, the agent's pump, its worker, the wire, and this side's
+        // `.imageClip` handling. A clip that never arrived would leave every
+        // absence below true for the wrong reason.
+        try harness.copyOnThePC(png: PairingHarness.png)
+        try harness.waitForTheMacsPasteboard(toHold: .image, PairingHarness.png)
+
+        // The agent's slow tier takes its baseline. Waited out rather than
+        // slept through, and the count is the reason: `uuid_frozen` is a
+        // delta against the LAST TICK, so a brand-new watcher's first tick can
+        // never reach a verdict by construction. Three probes of `image/png`
+        // -- the poller's baseline, the worker's own read of the clip that
+        // just crossed, and at least one tick -- guarantee that warm-up tick
+        // has happened, so a green run below cannot be the warm-up standing in
+        // for the fix.
+        try harness.waitForTheAgentToProbeAndSee(["image/png"], atLeast: 3)
+
+        // --- GPaste takes the selection back, silently --------------------
+        try harness.silentTakeover(types: PairingHarness.gpasteImageTypes)
+
+        // Two ticks: the one that sees the divergence and arms, and the one
+        // that would have confirmed it. Three probes guarantee both, since the
+        // worker's read can inflate the count by at most one.
+        try harness.waitForTheAgentToProbeAndSee(PairingHarness.gpasteImageTypes, atLeast: 3)
+
+        // --- and the verdict that must not have been reached --------------
+        XCTAssertFalse(harness.logHolds("GPaste reported no clipboard change"),
+                       "GPaste's own re-offer was diagnosed as a dead event source. The PC is " +
+                       "now polling wl-paste for the rest of this connection, taking keyboard " +
+                       "focus every tick, on a machine whose clipboard is working perfectly")
+        // The Mac still holds what the PC sent it. A degrade is not the only
+        // way this scenario can hurt: an agent that read the re-offer as a
+        // fresh copy would send the same picture back, and on this fixture
+        // that is invisible in the log and visible only here.
+        XCTAssertEqual(harness.pasteboard.read()?.data, PairingHarness.png,
+                       "the re-offer came back as a new clip and overwrote the Mac's own copy")
+    }
+
     // MARK: - the harness refuses a world it cannot honestly test
 
     /// Task 3's measurement, kept as a test instead of as a sentence in a
@@ -548,24 +651,31 @@ final class PairingHarnessTests: XCTestCase {
         // stopping the test, so a leak from a prior test shows up as THIS
         // test's own failure here, rather than as a silent pass below on
         // borrowed state it did not create.
-        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"],
-                     "already set before this test constructed a harness -- a prior test leaked it")
-        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"],
-                     "already set before this test constructed a harness -- a prior test leaked it")
+        for name in ["CLIPWIRE_FAST_TIER_SECONDS", "CLIPWIRE_SLOW_TIER_SECONDS",
+                     "CLIPWIRE_SAFETY_NET_SECONDS"] {
+            XCTAssertNil(ProcessInfo.processInfo.environment[name],
+                         "\(name) was already set before this test constructed a harness -- " +
+                         "a prior test leaked it")
+        }
 
-        let harness = try PairingHarness(tierSeconds: (fast: 0.25, slow: 3.5))
+        let harness = try PairingHarness(tierSeconds: (fast: 0.25, slow: 3.5, safetyNet: 7.5))
         self.harness = harness
 
         // The mechanism actually ran, not just "construction did not throw".
+        // All three, because all three are separate `exportEnvironment` calls
+        // and a fourth added below the snapshot would leak exactly as the
+        // third would have: this is the test that fails, and the only one.
         XCTAssertEqual(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"], "0.25")
         XCTAssertEqual(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"], "3.5")
+        XCTAssertEqual(ProcessInfo.processInfo.environment["CLIPWIRE_SAFETY_NET_SECONDS"], "7.5")
 
         harness.stop()
 
         // The regression this test exists for: gone, not "0.25" forever.
-        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_FAST_TIER_SECONDS"],
-                     "stop() did not restore this -- it will leak into every later test")
-        XCTAssertNil(ProcessInfo.processInfo.environment["CLIPWIRE_SLOW_TIER_SECONDS"],
-                     "stop() did not restore this -- it will leak into every later test")
+        for name in ["CLIPWIRE_FAST_TIER_SECONDS", "CLIPWIRE_SLOW_TIER_SECONDS",
+                     "CLIPWIRE_SAFETY_NET_SECONDS"] {
+            XCTAssertNil(ProcessInfo.processInfo.environment[name],
+                         "stop() did not restore \(name) -- it will leak into every later test")
+        }
     }
 }

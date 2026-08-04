@@ -78,6 +78,33 @@ final class PairingHarness {
     private static let textTypes = ["text/plain;charset=utf-8", "text/plain",
                                     "TEXT", "STRING", "UTF8_STRING"]
 
+    /// What GPaste re-offers an image under once it has taken the selection
+    /// back -- spec 1.2's "one entry becomes twenty-three".
+    ///
+    /// THE SAME MEMBERS as `TWENTY_THREE` in
+    /// `agent/tests/test_watcher_uuid_tier.py`, deliberately, so the one
+    /// scenario staged at two altitudes is staged with one fixture. Copied
+    /// rather than shared because nothing can import a Python constant into a
+    /// Swift test target; if either list moves, move both.
+    ///
+    /// IT HOLDS TWENTY-TWO, not the twenty-three the spec measured and the
+    /// Python constant's name claims. Said here rather than quietly rounded:
+    /// the missing member is not invented back, because the real list came off
+    /// a live machine and cannot be reconstructed from this side. Nothing in
+    /// the scenario rests on the count -- what has to be true is that the list
+    /// still reads as an IMAGE to the agent's `choose_kind`, since `probe()`
+    /// returns the offered TYPE LIST for an image and the unchanged BODY for
+    /// text, and a body cannot move across a re-offer. `text/ico` below is the
+    /// near miss; `choose_kind` matches `text/plain` prefixes only.
+    static let gpasteImageTypes = [
+        "MULTIPLE", "SAVE_TARGETS", "TARGETS", "TIMESTAMP", "application/ico",
+        "audio/x-riff", "image/avif", "image/bmp", "image/ico", "image/icon",
+        "image/jpeg", "image/jxl", "image/png", "image/tiff",
+        "image/vnd.microsoft.icon", "image/webp", "image/x-MS-bmp",
+        "image/x-bmp", "image/x-ico", "image/x-icon", "image/x-win-bitmap",
+        "text/ico",
+    ]
+
     let root: URL
     let agentURL: URL
     let pasteboard = HarnessPasteboard()
@@ -86,7 +113,12 @@ final class PairingHarness {
     /// requires. A PREFIX of the real line, deliberately: the rest of it
     /// interpolates SAFETY_NET_POLL_SECONDS, and pinning that here would make
     /// a tuning change to the agent look like a broken harness.
-    private static let liveWatcherLine = "watching the clipboard through GPaste"
+    ///
+    /// Internal rather than private because a test reads it: `start()`
+    /// already refuses a world without this line, but a test whose subject is
+    /// "the watcher stayed live" has to assert that in its OWN method, or it
+    /// green-lights a run where the agent never started at all.
+    static let liveWatcherLine = "watching the clipboard through GPaste"
     /// The one line both implementations log for a reconciliation, byte for
     /// byte -- `FreshnessDecision`'s raw values ARE the PC agent's SEND_MINE /
     /// WAIT_FOR_PEER / DO_NOTHING constants. Which is exactly why reading a
@@ -126,18 +158,38 @@ final class PairingHarness {
     private let framesLock = NSLock()
     private var received: [Frame] = []
 
-    /// `tierSeconds` overrides the spawned agent's fast/slow tier polling
-    /// intervals by exporting environment variables before the agent is
-    /// spawned -- see the `exportEnvironment` calls below, and `_env_seconds`
-    /// in the agent, which is what reads them back out. `nil` in either half
-    /// means "leave that one at production's constant," which is what every
-    /// call site gets from the default here: there is no separate
-    /// configuration type in this file to hang the option on (`eventSource`
-    /// and `substituting` are init parameters only, not stored properties,
-    /// for the same reason -- nothing after `init` needs either one back),
-    /// so the option lives here, beside them.
+    /// `tierSeconds` overrides the spawned agent's polling intervals by
+    /// exporting environment variables before the agent is spawned -- see the
+    /// `exportEnvironment` calls below, and `_env_seconds` in the agent, which
+    /// is what reads them back out. `nil` in any member means "leave that one
+    /// at production's constant," which is what every call site gets from the
+    /// default here: there is no separate configuration type in this file to
+    /// hang the option on (`eventSource` and `substituting` are init
+    /// parameters only, not stored properties, for the same reason -- nothing
+    /// after `init` needs either one back), so the option lives here, beside
+    /// them.
+    ///
+    /// THREE MEMBERS, AND `slow` IS NOT THE ONE THAT MAKES THE SLOW TIER
+    /// TICK. That trap cost this release a task: the names come from the
+    /// agent's own variables, and there they mean
+    ///
+    /// - `fast`      -- the fast tier's thread, `CLIPWIRE_FAST_TIER_SECONDS`;
+    /// - `safetyNet` -- the rate the SLOW TIER ACTUALLY TICKS AT,
+    ///   `CLIPWIRE_SAFETY_NET_SECONDS`. Every verdict `_observe_tick` reaches
+    ///   is measured in this one, so it is the only member that lets a test
+    ///   here exercise the safety net at all;
+    /// - `slow`      -- `CLIPWIRE_SLOW_TIER_SECONDS`, which starts no timer:
+    ///   its one consumer is the agent's uuid-failure fallback threshold. It
+    ///   defaults to whatever `safetyNet` resolved to, so a test that wants
+    ///   fast ticks sets `safetyNet` and leaves this `nil`.
+    ///
+    /// Spelled out rather than left to the names because setting `slow` alone
+    /// looks exactly like it should work, does nothing observable, and leaves
+    /// a safety-net test passing on a 30-second tick that never fired inside
+    /// its window.
     init(eventSource: EventSource = .gpaste, substituting: Bool = false,
-         tierSeconds: (fast: Double?, slow: Double?) = (nil, nil)) throws {
+         tierSeconds: (fast: Double?, slow: Double?, safetyNet: Double?)
+             = (nil, nil, nil)) throws {
         // Tests/clipwireTests/ -> Tests/ -> the repo root. The same walk
         // FixtureTests and ChannelTests already do; `#filePath` is the only
         // thing in a test binary that knows where the source tree is.
@@ -204,6 +256,9 @@ final class PairingHarness {
         }
         if let slow = tierSeconds.slow {
             exportEnvironment("CLIPWIRE_SLOW_TIER_SECONDS", "\(slow)", restoring: &restore)
+        }
+        if let safetyNet = tierSeconds.safetyNet {
+            exportEnvironment("CLIPWIRE_SAFETY_NET_SECONDS", "\(safetyNet)", restoring: &restore)
         }
         restoreEnvironment = restore
 
@@ -549,6 +604,38 @@ final class PairingHarness {
         try writeClipboardState(types: ["image/png"], body: png)
     }
 
+    /// GPaste taking the selection back and re-offering the same picture
+    /// under its own type list -- spec 1.2, and the production incident this
+    /// release exists to prevent. THREE things are true of it at once, and
+    /// each is load-bearing:
+    ///
+    /// - the offered TYPES change, so the agent's `probe()` token moves;
+    /// - `generation` does NOT, so the fake `gdbus`'s `history_uuid` -- which
+    ///   it derives from that field alone -- stays frozen. That is what makes
+    ///   this a re-offer rather than a copy: GPaste re-offering its own
+    ///   content creates no history entry;
+    /// - `body` does NOT, because the picture did not change;
+    /// - and `silent` is set, which makes the fake `gdbus monitor` absorb
+    ///   this one state change into its baseline and emit no `Update`.
+    ///
+    /// Deliberately NOT routed through `writeClipboardState`, which stamps a
+    /// fresh `generation` on every write: that is right for a person copying
+    /// and wrong here, and going through it would move the uuid, hand the
+    /// slow tier the very evidence it is supposed to be denied, and leave the
+    /// test passing for a reason unrelated to the fix.
+    ///
+    /// `silent` DOES NOT SELF-CLEAR. Only an agent write through `wl-copy`
+    /// clears it (`fake_clipboard.set_body`), and `mutateClipboardState`
+    /// carries every untouched key forward -- so this must be the last direct
+    /// clipboard write a test makes, or every later one is invisible to the
+    /// monitor too.
+    func silentTakeover(types: [String]) throws {
+        try mutateClipboardState { state in
+            state["types"] = types
+            state["silent"] = true
+        }
+    }
+
     /// A PC that comes back holding nothing: a reboot, or the locked session
     /// the README documents. An empty `types` list is the fake's own spelling
     /// of it -- `wl-paste` refuses with exit 1 ("No selection") for exactly
@@ -569,6 +656,46 @@ final class PairingHarness {
         try wait(for: "the PC's clipboard to hold \(describe(body)) as \(type)") {
             guard let state = self.pcClipboard() else { return false }
             return state.body == body && state.types.contains(type)
+        }
+    }
+
+    /// How many times the agent's own `wl-paste --list-types` came back
+    /// offering exactly this list, read from the fakes' invocation log.
+    ///
+    /// The only window this side has onto the agent's slow tier. `_armed`,
+    /// `_signals` and `_last_uuid` are fields of a Python object in another
+    /// process; what crosses the boundary is what the agent FORKED, and this
+    /// is the one fork whose recorded output says which selection the tier
+    /// actually saw. So it is two claims in one number: that the tier is
+    /// ticking at all, and that a tick observed the divergence rather than a
+    /// test merely having written one to a file.
+    ///
+    /// IT COUNTS PROBES, NOT TICKS, and the gap is not closable from here:
+    /// the worker's own clipboard read forks `--list-types` too, so a tick
+    /// that signals the worker contributes two. Every caller therefore asks
+    /// for a count that is safe under that inflation -- see
+    /// `waitForTheAgentToProbeAndSee`, which documents the arithmetic at the
+    /// one place it is relied on.
+    func probesThatSaw(_ types: [String]) -> Int {
+        invocationLog().occurrences(of: "wl-paste --list-types -> "
+                                    + types.joined(separator: " ") + "\n")
+    }
+
+    /// Waits until `count` of the agent's probes have come back offering
+    /// exactly this list.
+    ///
+    /// `count` is a number of PROBES and callers want a number of TICKS, so
+    /// the arithmetic lives here rather than at each call site. In a quiet
+    /// stretch every probe is a tick; the inflation is bounded, because the
+    /// only other thing that forks `--list-types` is the worker's clipboard
+    /// read, and the worker runs at most once per selection change (the tick
+    /// that observes a moved token signals it; the ticks that see a settled
+    /// one do not). So for a selection the agent has just started offering,
+    /// `n + 1` probes guarantee at least `n` ticks, and for one it has been
+    /// offering all along there is no worker read at all.
+    func waitForTheAgentToProbeAndSee(_ types: [String], atLeast count: Int) throws {
+        try wait(for: "\(count) of the agent's own probes to see \(types.count) offered types") {
+            self.probesThatSaw(types) >= count
         }
     }
 

@@ -3464,27 +3464,50 @@ def _env_seconds(name, default):
     """An interval overridden from the environment, or `default`.
 
     Exists for PairingHarness, which needs sub-second tiers to exercise in
-    seconds what production does in minutes. Called from the agent's own
-    code since v3.3's fast/slow tiers -- GPasteWatcher.__init__ resolves both
-    CLIPWIRE_FAST_TIER_SECONDS and CLIPWIRE_SLOW_TIER_SECONDS through here --
-    which is this paragraph's own forecast ("a later task wires one of them,
-    and will need to update this paragraph when it does") coming due rather
-    than going stale. SAFETY_NET_POLL_SECONDS and DEGRADED_POLL_SECONDS
-    themselves remain bare constants even so: CLIPWIRE_SLOW_TIER_SECONDS
-    overrides the safety_net_interval_seconds PARAMETER, itself only ever
-    defaulted from the former, never the constant directly, and nothing
-    overrides DEGRADED_POLL_SECONDS at all. None of that touches what
-    "production sets none of these" was ever a claim about -- the
-    environment a real deploy runs with, not which code exists to read it --
-    and that claim still holds, checked rather than assumed: grepping the
-    whole repository (not just this file) for CLIPWIRE_ finds nothing
-    outside the fakes/harness and this file's own test suite, and neither
-    the launchd plist nor the ssh arguments production actually invokes sets
-    an environment variable. ssh's own default
-    SendEnv/AcceptEnv forwards nothing beyond LANG/LC_*, which no CLIPWIRE_*
-    name matches, so even a variable set in the Mac-side shell would not
-    cross -- two independent reasons a real deploy never sees one of these
-    set, not one.
+    seconds what production does in minutes. Called from the agent's own code
+    since v3.3's fast/slow tiers, and there are now THREE names -- all three
+    resolved in GPasteWatcher.__init__, each by the same rule (argument, then
+    environment, then default), and each named here by WHAT IT REACHES,
+    because the previous revision of this paragraph got that wrong and the
+    error was expensive:
+
+        CLIPWIRE_FAST_TIER_SECONDS   -> self._fast_interval, the fast tier's
+                                        own thread.
+        CLIPWIRE_SAFETY_NET_SECONDS  -> self._safety_net_interval, the rate
+                                        the SLOW TIER ACTUALLY TICKS AT, and
+                                        so the interval every _observe_tick
+                                        verdict is measured in.
+        CLIPWIRE_SLOW_TIER_SECONDS   -> self._slow_interval, which starts NO
+                                        timer: its one consumer is
+                                        self._uuid_failures_before_fallback.
+                                        It falls back to the resolved
+                                        safety-net interval, so setting only
+                                        SAFETY_NET moves both together.
+
+    WHAT THE PREVIOUS REVISION CLAIMED, recorded rather than silently
+    replaced, because the sentence is a plausible candidate for why the gap
+    it described survived five tasks: "CLIPWIRE_SLOW_TIER_SECONDS overrides
+    the safety_net_interval_seconds PARAMETER". It did not. It was only ever
+    read as that parameter's DEFAULT, into a separate field, while the
+    poller went on being built from the parameter itself -- so anyone
+    checking whether the tick rate was injectable would have read that line,
+    concluded yes, and stopped. It was not, until task 10 needed it and
+    measured it. DEGRADED_POLL_SECONDS still has no override at all, and
+    SAFETY_NET_POLL_SECONDS remains a bare constant that is now the DEFAULT
+    of an overridable parameter rather than the value itself.
+
+    None of that touches what "production sets none of these" was ever a
+    claim about -- the environment a real deploy runs with, not which code
+    exists to read it -- and that claim still holds with the third name
+    added, re-checked rather than inherited: grepping the whole repository
+    (not just this file) for CLIPWIRE_ finds nothing outside the
+    fakes/harness and this file's own test suite, neither the launchd plist
+    nor the ssh arguments production actually invokes sets an environment
+    variable, and Channel passes no SendEnv/SetEnv of its own. ssh's own
+    default SendEnv/AcceptEnv forwards nothing beyond LANG/LC_*, which no
+    CLIPWIRE_* name matches, so even a variable set in the Mac-side shell
+    would not cross -- two independent reasons a real deploy never sees one
+    of these set, not one.
 
     Anything unparseable or non-positive returns the default rather than
     raising: a typo in a harness must not produce a zero-second poll that spins
@@ -3795,7 +3818,7 @@ class GPasteWatcher:
     """
 
     def __init__(self, clipboard,
-                 safety_net_interval_seconds=SAFETY_NET_POLL_SECONDS,
+                 safety_net_interval_seconds=None,
                  degraded_interval_seconds=DEGRADED_POLL_SECONDS,
                  degraded=False, on_degrade=None, on_idle_tick=None,
                  read_history_uuid=gpaste_history_uuid,
@@ -3917,24 +3940,52 @@ class GPasteWatcher:
         self._fast_interval = (fast_interval_seconds if fast_interval_seconds is not None
                                else _env_seconds("CLIPWIRE_FAST_TIER_SECONDS",
                                                  FAST_TIER_SECONDS))
+        # THE RATE THE SLOW TIER ACTUALLY TICKS AT, resolved by the identical
+        # three-step rule, and the ONLY one of the three that starts a timer:
+        # it is what the safety net below is built with, so every verdict
+        # _observe_tick reaches is measured in this interval.
+        #
+        # WIRED IN TASK 10's FIX ROUND, AND THE GAP IT CLOSES IS WORTH
+        # STATING RATHER THAN QUIETLY FILLING. The plan's task 3 named three
+        # variables; two shipped and this one did not, so until now nothing
+        # outside this file could move the interval at all -- `make_watcher`
+        # passes no safety_net_interval_seconds, so every production and
+        # harness connection alike got the constant. That made spec 9.1's own
+        # acceptance test unrunnable in the Swift pairing harness, which can
+        # set environment variables and nothing else: reproducing GPaste's
+        # re-offer there needs three ticks, and three ticks at the constant
+        # is a hundred seconds. See PairingHarness's `tierSeconds` for the
+        # other end, and test_watcher_gpaste_reoffer.py for the scenario.
+        #
+        # `None` is the parameter's default rather than SAFETY_NET_POLL_SECONDS
+        # so that "the caller said 30" stays tellable from "nobody said
+        # anything" -- without which an explicit argument could not take
+        # precedence over the environment, which is the whole rule below.
+        # Checked before changing it: no caller anywhere passes this
+        # positionally, and every test that passes it names it.
+        self._safety_net_interval = (
+            safety_net_interval_seconds if safety_net_interval_seconds is not None
+            else _env_seconds("CLIPWIRE_SAFETY_NET_SECONDS", SAFETY_NET_POLL_SECONDS))
         # NOT a second timer -- "the slow tier IS the existing safety net",
-        # so nothing below starts a thread from this value. It exists
-        # because a later task (the uuid-tier failure fallback, spec 4.3:
-        # "N consecutive failures... expressed as a DURATION, at least 2x
-        # the slow interval") needs that interval as a number to multiply,
-        # and safety_net_interval_seconds above is a constructor argument
-        # this instance would otherwise not retain anywhere. Resolved by the
-        # identical three-step rule as _fast_interval just above, mirrored
-        # on purpose so the two tiers cannot silently drift onto different
-        # override rules -- but note the default it falls back to is the
-        # PARAMETER, never SAFETY_NET_POLL_SECONDS directly, so a caller
-        # that already passed a non-default safety_net_interval_seconds
-        # (already-degraded watchers pass degraded_interval_seconds instead;
-        # see the PollingWatcher construction below) is not second-guessed
-        # by this constant a second time.
+        # so nothing below starts a thread from THIS value (the one directly
+        # above is the one that does). It exists because a later task (the
+        # uuid-tier failure fallback, spec 4.3: "N consecutive failures...
+        # expressed as a DURATION, at least 2x the slow interval") needs that
+        # interval as a number to multiply, and it would otherwise not be
+        # retained anywhere. Resolved by the identical three-step rule as
+        # _fast_interval just above, mirrored on purpose so the tiers cannot
+        # silently drift onto different override rules -- but note the default
+        # it falls back to is the RESOLVED safety-net interval, never
+        # SAFETY_NET_POLL_SECONDS directly. So a caller that already passed a
+        # non-default safety_net_interval_seconds (already-degraded watchers
+        # pass degraded_interval_seconds instead; see the PollingWatcher
+        # construction below) is not second-guessed by this constant a second
+        # time, and CLIPWIRE_SAFETY_NET_SECONDS moves both numbers together
+        # unless CLIPWIRE_SLOW_TIER_SECONDS is set to separate them -- which
+        # is the honest reading of "the slow tier IS the safety net".
         self._slow_interval = (slow_interval_seconds if slow_interval_seconds is not None
                                else _env_seconds("CLIPWIRE_SLOW_TIER_SECONDS",
-                                                 safety_net_interval_seconds))
+                                                 self._safety_net_interval))
         # The last MEASURED uuid, or None right after a failed call. Written
         # only by _fast_tick, below; nothing in THIS commit reads it back
         # (Tasks 6 and 7 do), but it is where spec 4.0.1's distinction is
@@ -4048,7 +4099,7 @@ class GPasteWatcher:
         # spec 2's rule -- there is no gate for it to consult.
         self._safety_net = PollingWatcher(
             clipboard,
-            degraded_interval_seconds if degraded else safety_net_interval_seconds,
+            degraded_interval_seconds if degraded else self._safety_net_interval,
             on_tick=self._observe_tick, event=self._event,
             on_idle_tick=on_idle_tick,
             should_probe=None if read_idle_gate is None else self._slow_tier_should_probe)
