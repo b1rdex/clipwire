@@ -1549,12 +1549,19 @@ class TestUuidPairWriteOrder(unittest.TestCase):
     nothing here schedules threads at that granularity.
 
     That conflated two different things, and the re-review was right to
-    split them. The INTERLEAVE is genuinely unschedulable, and a test that
-    tried would be testing CPython rather than this code. But what the
-    mutation actually changes is the WRITE ORDER, which is a property of a
-    single thread's execution and is therefore observable exactly, with no
-    scheduler involved at all. One failing tick, one succeeding tick, and a
-    recording __setattr__ is the whole apparatus.
+    split them. What the mutation actually changes is the WRITE ORDER, which
+    is a property of a single thread's execution and is therefore observable
+    exactly, with no scheduler involved at all. One failing tick, one
+    succeeding tick, and a recording __setattr__ is the whole apparatus.
+
+    THE OTHER HALF OF THAT SENTENCE WAS WRONG, and is corrected here rather
+    than left standing beside the test that disproves it: this docstring
+    said "the INTERLEAVE is genuinely unschedulable, and a test that tried
+    would be testing CPython rather than this code". TestUuidPairReadOrder
+    below schedules exactly that interleave, deterministically and without
+    threads, by making the reader's SECOND read run the writer. Nothing
+    about CPython is under test there -- what is under test is which of two
+    fields _observe_tick reads first.
 
     Worth the twenty lines for a reason beyond closing a table row: read
     together with the residual disclosure in _fast_tick's `else` branch,
@@ -1588,6 +1595,200 @@ class TestUuidPairWriteOrder(unittest.TestCase):
             "'no failure run in progress' beside a self._last_uuid still "
             "holding the stale pre-run value -- exactly the pair the "
             "failure-run guard exists to reject")
+
+
+class _RecoveryInsideTheReadersGap(agent.GPasteWatcher):
+    """Stages the cross-thread window _observe_tick's predicate discloses,
+    deterministically and with no scheduler involved.
+
+    self._uuid_failures becomes a property whose getter runs ONE _fast_tick
+    before answering -- so both of the writer's stores (self._last_uuid =
+    current, then self._uuid_failures = 0) land at exactly the instant the
+    reader asks for the count, which is the interleave a real fast-tier
+    thread can only hit by luck. Whether that instant falls BEFORE or AFTER
+    _observe_tick computes uuid_frozen is the entire subject of the test
+    below, and it is decided by the order of two lines in the reader.
+
+    Fires ONCE. self._uuid_failures is read again inside _fast_tick's own
+    failure branch and in the fallback log line, so an unguarded getter
+    recurses; the flag is set before the call, not after, so a re-entrant
+    read returns the stored value instead of running a second tick.
+
+    The property is a class-level data descriptor, so __init__'s own
+    `self._uuid_failures = 0` goes through the setter too -- hence the
+    separate backing attribute rather than the field itself."""
+
+    _recovery_fired = False
+
+    @property
+    def _uuid_failures(self):
+        if not self._recovery_fired:
+            self._recovery_fired = True
+            self._fast_tick()
+        return self._uuid_failures_value
+
+    @_uuid_failures.setter
+    def _uuid_failures(self, value):
+        self._uuid_failures_value = value
+
+
+class _MoveInsideTheTickBody(agent.GPasteWatcher):
+    """The other half of the same window: a uuid that moves AFTER the
+    predicate has judged it and BEFORE the bottom-of-tick snapshot.
+
+    Staged on self._signals_at_last_tick's setter, which _observe_tick
+    assigns on the line immediately above the uuid snapshot -- so one
+    _fast_tick fired from there lands inside that gap exactly. The
+    production gap is far wider: the whole verdict body sits in it,
+    including a gdbus property read measured at ~103 ms.
+
+    Armed by the test rather than by construction, because __init__ assigns
+    this field too and a getter that fired there would run _fast_tick before
+    the watcher had a clipboard to run it against."""
+
+    _arm_on_next_write = False
+
+    @property
+    def _signals_at_last_tick(self):
+        return self._signals_at_last_tick_value
+
+    @_signals_at_last_tick.setter
+    def _signals_at_last_tick(self, value):
+        self._signals_at_last_tick_value = value
+        if self._arm_on_next_write:
+            self._arm_on_next_write = False
+            self._fast_tick()
+
+
+class TestUuidPairReadOrder(unittest.TestCase):
+    """The READER side of the same pair, and the half a release was shipped
+    without.
+
+    _fast_tick's `else` branch used to disclose this window and name its
+    remedy as "one atomic snapshot of the pair (a single tuple field,
+    written once and read once), a design change this release is not
+    making". The disclosure was right that the window was real; the remedy
+    was wrong. It is a reader-side reorder -- read the failure count BEFORE
+    the frozen delta, so the uuid read is never older than the count that
+    licenses it -- under the same single-writer model the rest of the file
+    already relies on.
+
+    WHY THE OLD ORDER PRODUCED A FALSE VERDICT AND NOT MERELY A LATE ONE.
+    uuid_frozen was computed from a STALE self._last_uuid, the writer then
+    landed both stores, and the count read 0 nine lines later: "measured,
+    and unchanged since the last tick" assembled out of two readings that
+    were never simultaneously true. That is spec 6.2's exact predicate, on a
+    machine whose tracker had just moved its uuid -- and spec 6.2's verdict
+    latches for the rest of the connection, which is the failure this whole
+    release exists to stop.
+
+    ONE TICK, NOT TWO, and that is the point the parked disclosure got
+    wrong. It argued the two-tick confirmation would narrow this ("by which
+    point self._last_uuid has moved and uuid_frozen is False"). If the run
+    is ALREADY ARMED -- which is just "the previous tick saw divergence with
+    the uuid frozen", an ordinary state -- the interleaved tick IS the
+    confirming one and latches self._degraded on the spot.
+
+    THE MUTATION ROW: move `uuid_failures = self._uuid_failures` back below
+    the uuid_frozen assignment in _observe_tick and this test fails on its
+    one assertion, with the watcher degraded."""
+
+    def watcher(self):
+        w = _RecoveryInsideTheReadersGap(
+            clipboard=_StubClipboard(),
+            read_history_uuid=lambda: "uuid-fresh")
+        self.addCleanup(w.stop)
+        # A connection mid-failure-run: the last MEASURED uuid is stale, the
+        # slow tier's snapshot agrees with it -- so uuid_frozen reads True
+        # off that stale pair, which is the whole trap -- and a run of
+        # failed calls is in progress, well short of the fallback threshold.
+        w._last_uuid = "uuid-stale"
+        w._uuid_at_last_tick = "uuid-stale"
+        w._uuid_failures = 3
+        # Armed by a previous tick, so this one can confirm. Hand-set for
+        # the same reason the sibling tests above hand-set _uuid_failures
+        # and _uuid_tier_failed: it is the state the predicate is being
+        # judged in, not a scenario being reproduced end to end.
+        w._armed = True
+        return w
+
+    def test_a_uuid_that_moves_inside_the_readers_gap_reaches_no_verdict(self):
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertTrue(
+            watcher._recovery_fired,
+            "test precondition: the staged _fast_tick never ran, so nothing "
+            "landed in the reader's gap and this test proves nothing")
+        self.assertEqual(
+            watcher._last_uuid, "uuid-fresh",
+            "test precondition: the staged tick did not move the uuid, so "
+            "the tracker under test is not the healthy one this is about")
+        self.assertFalse(
+            watcher._degraded,
+            "a uuid that MOVED during the tick was judged frozen: the "
+            "predicate read the stale uuid and the fresh failure count as "
+            "if they were one reading, and latched spec 6.2's verdict on a "
+            "healthy connection")
+
+    def test_the_tick_still_judges_a_genuinely_frozen_uuid(self):
+        """The mirror, so the reorder cannot pass by reaching no verdict
+        ever. Same staging, except the fast tier re-reads the SAME uuid it
+        already had -- a tracker that really has stopped, under a user who
+        is really copying. The count still clears inside the gap, the uuid
+        still does not move, and the armed run must confirm."""
+        watcher = self.watcher()
+        watcher._read_history_uuid = lambda: "uuid-stale"
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertTrue(
+            watcher._recovery_fired,
+            "test precondition: the staged _fast_tick never ran")
+        self.assertTrue(
+            watcher._degraded,
+            "a genuinely frozen uuid under a moving clipboard reached no "
+            "verdict: the reorder bought its safety by never judging at all")
+
+    def test_a_uuid_that_moves_inside_the_tick_body_is_not_swallowed(self):
+        """The second read of self._last_uuid, which the same fix removed.
+
+        The field was read at the predicate and AGAIN at the bottom for the
+        snapshot, with the whole verdict body in between. A uuid that moved
+        inside that window was judged FROZEN at the top and then written to
+        self._uuid_at_last_tick as the new baseline at the bottom -- so the
+        next tick compared the fresh value against itself, read frozen a
+        second time, and the move was never seen as a delta by the slow tier
+        at all. Two ticks of a HEALTHY, tracking connection then arm and
+        confirm.
+
+        One local read, used for both, makes the snapshot literally "this
+        tick's reading" -- which is what the comment beside it always
+        claimed -- and pushes the move into the NEXT tick's delta, where it
+        clears the run instead of being absorbed.
+
+        THE MUTATION ROW: write `self._uuid_at_last_tick = self._last_uuid`
+        at the bottom of _observe_tick instead of the local, and this test
+        fails with the watcher degraded."""
+        watcher = _MoveInsideTheTickBody(
+            clipboard=_StubClipboard(),
+            read_history_uuid=lambda: "uuid-fresh")
+        self.addCleanup(watcher.stop)
+        watcher._last_uuid = "uuid-stale"
+        watcher._uuid_at_last_tick = "uuid-stale"
+
+        watcher._arm_on_next_write = True
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms; the uuid moves inside
+        self.assertEqual(
+            watcher._last_uuid, "uuid-fresh",
+            "test precondition: the staged _fast_tick never moved the uuid "
+            "inside the tick body, so there is nothing to swallow")
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # must CLEAR, not confirm
+
+        self.assertFalse(
+            watcher._degraded,
+            "a uuid that moved inside the tick body was snapshotted as the "
+            "new baseline, so the next tick compared the fresh value against "
+            "itself and read frozen: a healthy tracking connection degraded")
 
 
 if __name__ == "__main__":

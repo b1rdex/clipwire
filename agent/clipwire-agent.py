@@ -4643,7 +4643,7 @@ class GPasteWatcher:
         # of state that tells "genuinely idle" apart from "unknown because
         # nothing has been read since" -- a nonzero run means the most
         # recent fast-tier call(s) did not resolve, so whatever uuid_frozen
-        # above computed is judging a stale pair of readings, not a live
+        # computes below is judging a stale pair of readings, not a live
         # one. Read here on the safety net's poll thread; written only by
         # _fast_tick on the fast-tier thread, the identical single-writer
         # shape as self._last_uuid just above (see that field's own
@@ -4751,16 +4751,58 @@ class GPasteWatcher:
         # full stop, independent of how often they copy); this tier's own
         # job narrows to the GPaste-takeover false positive, not to being
         # the sole backstop for every dead-tracker shape.
-        uuid_frozen = (self._last_uuid is not None
+        # THE COUNT IS READ FIRST, AND THAT ORDER IS THE WHOLE FIX FOR THE
+        # READER-SIDE WINDOW _fast_tick's `else` branch discloses. Both
+        # fields are written by that branch, adjacently, from the other
+        # thread; this function used to read them NINE LINES APART with the
+        # delta first, so a single preemption in the gap could serve
+        # uuid_frozen the STALE uuid and then a count of 0 -- "measured, and
+        # unchanged" assembled out of two readings that were never true at
+        # the same instant, which is a spec 6.2 verdict on a machine whose
+        # tracker is fine. REPRODUCED, not argued: with self._uuid_failures
+        # staged as a property whose getter runs one _fast_tick, the old
+        # order latches self._degraded on an armed tick and this one reaches
+        # no verdict at all. See the test named for it.
+        #
+        # WHY THE REVERSED ORDER IS SAFE IN EVERY INTERLEAVING, since "read
+        # them the other way round" is not self-evidently a fix:
+        #
+        #   - count reads NONZERO -> no verdict this tick whatever the uuid
+        #     says. Deferred, never wrong, which is this file's standing
+        #     direction to fail in.
+        #   - count reads ZERO because the writer's SECOND store has landed
+        #     -> its first one landed before it, so the self._last_uuid read
+        #     below is the fresh value and uuid_frozen is False.
+        #   - count reads ZERO because no run was in progress, and the
+        #     writer then FAILS in the gap -> a failed call leaves
+        #     self._last_uuid untouched, so the pair below is exactly the
+        #     one that was true when the count was read. A call failing
+        #     AFTER that instant does not retroactively unmeasure the
+        #     reading; it is the next tick's evidence, and the next tick
+        #     reads the count that carries it. This is the subcase that
+        #     looks like a hole and is not.
+        #
+        # ONE READ EACH, into locals, for the same reason. self._last_uuid
+        # was read twice per tick -- here, and again at the bottom for the
+        # snapshot -- with the whole verdict body in between, including a
+        # gdbus property read that costs ~103 ms. A uuid that moved inside
+        # that window was judged as frozen HERE and then snapshotted as the
+        # new baseline THERE, so the move was swallowed: the next tick
+        # compared the fresh value against itself and read frozen again. The
+        # local makes the snapshot literally "this tick's reading", which is
+        # what the comment beside it has always claimed.
+        uuid_failures = self._uuid_failures
+        last_uuid = self._last_uuid
+        uuid_frozen = (last_uuid is not None
                        and self._uuid_at_last_tick is not None
-                       and self._last_uuid == self._uuid_at_last_tick)
+                       and last_uuid == self._uuid_at_last_tick)
         token_moved = previous != current
         if self._uuid_tier_failed:
             # "Still" as in since the previous tick: self._signals_at_last_tick
             # is assigned at the bottom of every one.
             tracking_looks_dead = signals == self._signals_at_last_tick
         else:
-            tracking_looks_dead = uuid_frozen and self._uuid_failures == 0
+            tracking_looks_dead = uuid_frozen and uuid_failures == 0
         if not read_ok or not tracking_looks_dead:
             confirmed = False
             self._armed = False
@@ -4887,8 +4929,10 @@ class GPasteWatcher:
         self._signals_at_last_tick = signals
         # Beside it, the same unconditional bottom-of-every-tick update, for
         # the same reason: next tick's delta needs THIS tick's reading,
-        # whether or not a verdict was reached from it.
-        self._uuid_at_last_tick = self._last_uuid
+        # whether or not a verdict was reached from it. THE LOCAL, not a
+        # second read of the field -- see the ordering comment above the
+        # predicate for what a second read swallowed.
+        self._uuid_at_last_tick = last_uuid
         # SPEC 6.2's BACKOFF, and BELOW BOTH SNAPSHOTS RATHER THAN BETWEEN
         # THEM. Those two are one pair -- the comment above says so -- and
         # they are the unconditional part of every tick; this is conditional
@@ -5378,26 +5422,12 @@ class GPasteWatcher:
                 if not self._degraded:
                     self._safety_net.interval = SAFETY_NET_POLL_SECONDS
         else:
-            # ORDER MATTERS, and costs nothing to get right -- but it
-            # NARROWS this window rather than closing it. Fix round 1 landed
-            # the swap with the stronger claim ("no verdict, deferred by one
-            # tick, never a wrong one"), which round 2 retracts: that is the
-            # same asserting-a-residual-out-of-existence this file gets
-            # wrong more often than it gets code wrong. The
-            # interval-write residual disclosed in the branch above -- the
-            # one that defers to self._degraded -- gets the identical
-            # question right, and is the shape to copy. (It said "in this
-            # very commit" until the doc audit: a claim about which commit
-            # is which cannot be checked from the file, and goes stale by
-            # construction the moment anything else lands. Point at the
-            # neighbouring paragraph, which a reader can actually go and
-            # read.)
-            #
-            # _observe_tick reads self._last_uuid and self._uuid_failures as
-            # a PAIR, from the poll thread, with no lock (single writer --
-            # see self._uuid_failures's __init__ comment), and it reads them
-            # NINE LINES APART: the uuid_frozen delta first, the failure-run
-            # guard after. Two windows, not one:
+            # ORDER MATTERS, and costs nothing to get right. These two
+            # stores are the write half of a pair _observe_tick consumes
+            # from the poll thread with no lock (single writer -- see
+            # self._uuid_failures's __init__ comment), so BOTH halves of the
+            # ordering question have to be answered, and for two rounds this
+            # comment answered only one of them.
             #
             #   - WRITER-SIDE, and this order CLOSES it. Preempted between
             #     its own two stores, the old order (reset first) left the
@@ -5407,54 +5437,45 @@ class GPasteWatcher:
             #     This order's intermediate state is the fresh value beside
             #     a still-nonzero count, which reads as "run in progress":
             #     no verdict, deferred, safe.
-            #   - READER-SIDE, and this order does NOT close it. The two
-            #     stores below are adjacent with no blocking call between
-            #     them, so a single preemption inside the READER's nine-line
-            #     gap lets both land there: uuid_frozen was already computed
-            #     from the stale value, and the count then reads 0. The bad
-            #     pair stays reachable, and it produces a FALSE spec 6.2
-            #     verdict on a machine whose tracking is fine.
+            #   - READER-SIDE, and THE READER CLOSES IT, not this order.
+            #     _observe_tick now reads the count BEFORE the uuid and each
+            #     of them exactly once, into locals; the argument for why
+            #     that makes every interleaving safe is written at the reads
+            #     themselves, which is where anyone tempted to swap them
+            #     back will be standing.
             #
-            # A first draft of this paragraph added that the two-tick
-            # confirmation narrows the reader-side case further, "by which
-            # point self._last_uuid has moved and uuid_frozen is False".
-            # MEASURED, and it is wrong twice over -- reproduced
-            # deterministically by making self._uuid_failures a property
-            # whose getter runs one _fast_tick, so both stores land between
-            # the reader's two reads with no scheduler involved:
+            # THIS PARAGRAPH USED TO END "the real fix is one atomic
+            # snapshot of the pair (a single tuple field, written once and
+            # read once), a design change this release is not making",
+            # and every clause of that was wrong. The window was REAL and
+            # reachable -- reproduced deterministically by making
+            # self._uuid_failures a property whose getter runs one
+            # _fast_tick, so both stores land between the reader's two reads
+            # with no scheduler involved -- and the remedy was a two-line
+            # reader-side reorder under the single-writer model this file
+            # already relies on everywhere else, not a redesign. It is
+            # recorded rather than deleted because the sentence did real
+            # damage: a residual was parked for a release on the strength of
+            # a cost estimate nobody had checked, and the estimate was in
+            # this comment. A disclosure that names its own remedy is making
+            # a claim, and it owes the same evidence as any other.
             #
-            #   - self._uuid_at_last_tick is caught up to self._last_uuid at
-            #     the BOTTOM OF THE SAME TICK, so the next tick reads
-            #     uuid_frozen True again, not False. The pair agrees; it is
-            #     merely agreeing on the wrong tick's value.
-            #   - and the second tick is not even needed. If the run was
-            #     already armed, the interleaved tick IS the confirming one
-            #     and latches self._degraded on the spot.
+            # WHAT REMAINS TRUE, and it is a bound rather than a residual:
+            # neither field reaches a DECISION once spec 4.3's fallback has
+            # engaged and the discriminator is the signal counter -- so even
+            # a torn pair could do no harm there. "Reaches the decision",
+            # not "is read": uuid_frozen is computed unconditionally at the
+            # top of _observe_tick, so self._last_uuid IS read on every
+            # post-fallback tick and the result is then thrown away by the
+            # `if self._uuid_tier_failed` branch. self._uuid_failures is the
+            # one that is genuinely not read there.
             #
-            # So the two-tick shape does not narrow this at all, and the
-            # sentence claiming it did is deleted rather than softened. The
-            # honest bound is narrower in a different place: this window
-            # exists ONLY while the uuid tier is alive, because neither of
-            # these two fields reaches the DECISION once the discriminator
-            # is the signal counter -- there is no pair left to tear.
-            #
-            # "Reaches the decision", not "is read", which is what this said
-            # and is false of one of the two: uuid_frozen is computed
-            # unconditionally at the top of _observe_tick, so self._last_uuid
-            # IS read on every post-fallback tick -- the result is then
-            # thrown away by the `if self._uuid_tier_failed` branch, which
-            # never looks at it. self._uuid_failures is the one that is
-            # genuinely not read there. The bound is the same either way,
-            # because a torn pair can only do harm through a verdict, and no
-            # verdict is computed from it in that regime.
-            #
-            # So: strictly non-worsening, strictly narrower, NOT a proof of
-            # safety. Disclosed rather than locked, on the same reasoning as
-            # the interval-write residual above -- a lock here would put the
-            # fast-tier thread behind a mutex the poll thread holds across a
-            # wl-paste fork. The real fix is one atomic snapshot of the pair
-            # (a single tuple field, written once and read once), a design
-            # change this release is not making.
+            # NO LOCK, and now for a better reason than "the residual is
+            # narrow": there is nothing left for one to buy. A lock here
+            # would put the fast-tier thread behind a mutex the poll thread
+            # holds across a wl-paste fork, which is the cost the
+            # interval-write residual in the branch above declines for the
+            # same reason.
             self._last_uuid = current
             self._uuid_failures = 0
         self._signals_at_last_fast_tick = signals
