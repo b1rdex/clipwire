@@ -5197,10 +5197,15 @@ class PollingWatcher:
         # agree, which is the whole reason both are spelled out: two of those
         # four WRITERS are one writer in two ASSIGNMENT STATEMENTS each (the
         # backoff's reset and double; the re-probe's take and give-back), so
-        # counting statements gives SIX. A previous revision of this sentence
-        # counted four statements and three writers and was wrong about the
-        # writers only -- an editor who updates one number here must check the
-        # other by grepping the assignments, not by scaling.
+        # counting statements gives SIX. The revision before this one said
+        # three writers in four statements, which was TRUE of the file it was
+        # written against -- Task 12 made it stale, it was never wrong. What
+        # WAS wrong there is the sentence below: it quoted pump's heading as
+        # "THREE CLAIMS" after that heading had already become four, so the
+        # cross-reference pointed at a paragraph title that no longer existed.
+        # Both failures are worth naming because they need different checks --
+        # a count is checked by grepping the assignments, a quotation by
+        # grepping the thing quoted.
         #
         # Which of the four wins when they disagree is settled in pump's
         # "WHICH OF THE FIVE CLAIMS ON THIS WAIT WINS" paragraph -- five, not
