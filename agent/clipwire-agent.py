@@ -3598,10 +3598,11 @@ class GPasteWatcher:
         # net's poll thread) need no lock either: the worst a read sees is
         # last tick's count, one moment longer. True of the COUNT on its own;
         # _observe_tick consumes the count and self._last_uuid as a PAIR,
-        # which is not written atomically, so the ORDER of the two stores is
-        # what actually keeps the pair safe rather than the single-writer
-        # shape alone -- see _fast_tick's `else` branch for which order and
-        # why.
+        # which is written non-atomically here and read non-atomically there
+        # (nine lines apart), so NEITHER the single-writer shape nor the
+        # store order makes that pair safe -- the order narrows the window
+        # and no more. See _fast_tick's `else` branch for both windows,
+        # which one the order closes, and which one it leaves open.
         self._uuid_failures = 0
         # Once True, stays True for the rest of the connection. Recovery --
         # the method starting to answer again -- is deliberately NOT
@@ -3620,8 +3621,9 @@ class GPasteWatcher:
         # spec 4.2's 5-15 minute slow-tier range -- 5 minutes, so 600s is
         # TWO of those ticks, not one 10-minute one -- it is
         # max(3, int(600/5)) == 120, the "well over a hundred" the spec text
-        # itself names, and the top of that range is four times larger again
-        # (max(3, int(1800/5)) == 360).
+        # itself names, and the top of that range (15 minutes, so 1800s for
+        # two ticks) is THREE times larger again, since 15/5 is 3:
+        # max(3, int(1800/5)) == 360.
         #
         # The floor of 3 covers the degenerate case where the slow tier is
         # configured no slower than the fast one (a test harness's own
@@ -3690,25 +3692,40 @@ class GPasteWatcher:
         ever sees a uuid MOVE rather than merely whether it is frozen).
 
         Runs on the safety net's own poll thread, after it has already
-        SIGNALLED any change -- see PollingWatcher.start. `signals` below
-        feeds only the verdict LINE's evidence fields now (spec 4.0 dropped
-        it from the predicate itself, below); read the grace period note in
-        PollingWatcher.start before trusting it as a precise count of what
-        happened strictly before this tick -- it is reported evidence, not
-        a decision input.
+        SIGNALLED any change -- see PollingWatcher.start. WHAT `signals`
+        BELOW IS FOR DEPENDS ON THE REGIME, and a reader who learns only
+        one half of this will break the other:
 
-        Order within a tick still matters, for a narrower reason than
-        before Task 6: the clipboard is probed FIRST, in PollingWatcher's
-        loop, and the counter is snapshotted below only afterwards. That
-        wl-paste fork hands a signal still in flight a millisecond of grace
-        before this tick's own snapshot. Still a fork after the loop moved
-        from read() to probe(): probe() is fewer wl-paste calls, never zero.
-        Reordering it now changes no verdict at all -- signals feed no
-        decision in this function any more -- only whether the verdict
-        line's `signals=`/`signals_at_last_tick=` fields undercount by one
-        preventable count. Kept in this order anyway: it is free, and a log
-        line that fires at most once per connection is still worth not
-        shipping slightly wrong.
+          - while the uuid tier is alive, it feeds only the verdict LINE's
+            evidence fields -- spec 4.0 dropped it from the predicate, and
+            the predicate comment below says why it must stay dropped;
+          - once spec 4.3's fallback has engaged, it IS the predicate.
+            Today's mechanics resume and the uuid terms feed nothing (spec
+            4.0.1's closing sentence).
+
+        So it is reported evidence in one regime and THE DECISION INPUT in
+        the other. Read the grace period note in PollingWatcher.start before
+        trusting it as a precise count of what happened strictly before this
+        tick.
+
+        ORDER WITHIN A TICK IS LOAD-BEARING -- DO NOT REORDER IT. The
+        clipboard is probed FIRST, in PollingWatcher's loop, and the counter
+        is snapshotted below only afterwards, so that wl-paste fork hands a
+        signal still in flight its chance to be counted before this tick's
+        own snapshot. Still a fork after the loop moved from read() to
+        probe(): probe() is fewer wl-paste calls, never zero.
+
+        Task 6 downgraded this to a cosmetic concern -- correctly AT THE
+        TIME, since signals then fed no decision here -- and this docstring
+        read "reordering it now changes no verdict at all" until fix round
+        2. That sentence is deleted rather than softened, because it was an
+        invitation: post-fallback, an in-flight signal missed by the
+        snapshot makes `signals == self._signals_at_last_tick` read "still
+        silent" on a tick where the source DID report, and that is a false
+        spec 6.2 verdict this release has no way to clear. Undercounting the
+        verdict line's own `signals=`/`signals_at_last_tick=` fields is now
+        the LESSER of the two things this ordering prevents, not the only
+        one.
 
         `previous`/`current` are probe() TOKENS, not content -- for an image
         they are the offered type list. This function only ever compares
@@ -3723,10 +3740,14 @@ class GPasteWatcher:
         # "dead" from the difference alone would degrade every healthy
         # installation to polling on the user's first copy, which is worse than
         # the bug this safety net exists to fix. The fast tier's uuid is the
-        # discriminator now (spec 4.0), not the signal count this sentence
-        # named before Task 6: the source is dead only if the wl-paste token
-        # moved while the uuid stayed frozen -- see the predicate comment
-        # below for the full rule and why signals were dropped from it.
+        # discriminator WHILE THAT TIER IS ALIVE (spec 4.0), rather than the
+        # signal count this sentence named before Task 6: the source is dead
+        # only if the wl-paste token moved while the uuid stayed frozen. The
+        # signal count is not retired, though -- it comes BACK as the sole
+        # discriminator once spec 4.3's fallback has engaged and there is no
+        # fast tier left to compare against. See the predicate comment below
+        # for both regimes, and for why signals were dropped from the first
+        # one and restored in the second.
         #
         # "Token", not "content", throughout this function: for an image these
         # values are the offered type list, so what this tick observes is that
@@ -4088,12 +4109,17 @@ class GPasteWatcher:
         """
         current = self._read_history_uuid()
         previous = self._last_uuid
-        # Snapshotted AFTER the probe, mirroring _observe_tick's own
-        # grace-period ordering (see its docstring, post-Task-6: evidence
-        # accuracy only, not a decision input there either -- the same is
-        # true here, this log line is not a verdict). The gdbus call this
-        # measures against is 3-5ms, not wl-paste's 104ms, so the window is
-        # smaller, not absent.
+        # Snapshotted AFTER the probe, the same shape as _observe_tick's own
+        # grace-period ordering -- but THE REASON DIFFERS BETWEEN THE TWO
+        # NOW, and this comment claimed they still matched until fix round
+        # 2. Over there the ordering became LOAD-BEARING once the
+        # post-fallback regime started deciding from the counter (see
+        # _observe_tick's docstring). HERE it stays evidence accuracy only,
+        # in both regimes: the only thing this snapshot feeds is spec 6.1's
+        # log line, which changes no interval and latches nothing, so a
+        # miscount costs one slightly wrong informational line and never a
+        # verdict. The gdbus call this measures against is 3-5ms, not
+        # wl-paste's 104ms, so the window is smaller here, not absent.
         signals = self._signals
         if current is not None and previous is not None and current != previous:
             self._event.set()
@@ -4192,18 +4218,68 @@ class GPasteWatcher:
                 if not self._degraded:
                     self._safety_net.interval = SAFETY_NET_POLL_SECONDS
         else:
-            # ORDER MATTERS, and costs nothing to get right. _observe_tick
-            # reads self._uuid_failures and self._last_uuid as a PAIR, from
-            # the poll thread, with no lock (single writer -- see
-            # self._uuid_failures's __init__ comment). Storing the reset
-            # FIRST, as this did until fix round 1, opens a window in which
-            # that reader sees "no failure run in progress" beside a
-            # self._last_uuid (and hence a self._uuid_at_last_tick) still
-            # holding the stale pre-run value -- the exact combination the
-            # failure-run guard exists to make impossible. Storing the VALUE
-            # first leaves the reader seeing a run still in progress one
-            # moment longer, which is the safe side of the same window: no
-            # verdict, deferred by one tick, never a wrong one.
+            # ORDER MATTERS, and costs nothing to get right -- but it
+            # NARROWS this window rather than closing it. Fix round 1 landed
+            # the swap with the stronger claim ("no verdict, deferred by one
+            # tick, never a wrong one"), which round 2 retracts: that is the
+            # same asserting-a-residual-out-of-existence this file gets
+            # wrong more often than it gets code wrong, and the
+            # interval-write residual disclosed a few lines above got the
+            # identical question RIGHT in this very commit.
+            #
+            # _observe_tick reads self._last_uuid and self._uuid_failures as
+            # a PAIR, from the poll thread, with no lock (single writer --
+            # see self._uuid_failures's __init__ comment), and it reads them
+            # NINE LINES APART: the uuid_frozen delta first, the failure-run
+            # guard after. Two windows, not one:
+            #
+            #   - WRITER-SIDE, and this order CLOSES it. Preempted between
+            #     its own two stores, the old order (reset first) left the
+            #     reset VISIBLE beside a self._last_uuid still holding the
+            #     stale pre-run value -- "no failure run in progress" next
+            #     to exactly the stale pair the guard exists to reject.
+            #     This order's intermediate state is the fresh value beside
+            #     a still-nonzero count, which reads as "run in progress":
+            #     no verdict, deferred, safe.
+            #   - READER-SIDE, and this order does NOT close it. The two
+            #     stores below are adjacent with no blocking call between
+            #     them, so a single preemption inside the READER's nine-line
+            #     gap lets both land there: uuid_frozen was already computed
+            #     from the stale value, and the count then reads 0. The bad
+            #     pair stays reachable, and it produces a FALSE spec 6.2
+            #     verdict on a machine whose tracking is fine.
+            #
+            # A first draft of this paragraph added that the two-tick
+            # confirmation narrows the reader-side case further, "by which
+            # point self._last_uuid has moved and uuid_frozen is False".
+            # MEASURED, and it is wrong twice over -- reproduced
+            # deterministically by making self._uuid_failures a property
+            # whose getter runs one _fast_tick, so both stores land between
+            # the reader's two reads with no scheduler involved:
+            #
+            #   - self._uuid_at_last_tick is caught up to self._last_uuid at
+            #     the BOTTOM OF THE SAME TICK, so the next tick reads
+            #     uuid_frozen True again, not False. The pair agrees; it is
+            #     merely agreeing on the wrong tick's value.
+            #   - and the second tick is not even needed. If the run was
+            #     already armed, the interleaved tick IS the confirming one
+            #     and latches self._degraded on the spot.
+            #
+            # So the two-tick shape does not narrow this at all, and the
+            # sentence claiming it did is deleted rather than softened. The
+            # honest bound is narrower in a different place: this window
+            # exists ONLY while the uuid tier is alive, because the
+            # post-fallback branch above reads neither of these two fields
+            # -- there is no pair left to tear once the discriminator is the
+            # signal counter.
+            #
+            # So: strictly non-worsening, strictly narrower, NOT a proof of
+            # safety. Disclosed rather than locked, on the same reasoning as
+            # the interval-write residual above -- a lock here would put the
+            # fast-tier thread behind a mutex the poll thread holds across a
+            # wl-paste fork. The real fix is one atomic snapshot of the pair
+            # (a single tuple field, written once and read once), a design
+            # change this release is not making.
             self._last_uuid = current
             self._uuid_failures = 0
         self._signals_at_last_fast_tick = signals
@@ -4513,6 +4589,18 @@ class PollingWatcher:
                     # the worst-case detection budget. Reintroducing a wait on
                     # this thread would re-couple the safety net to the handler
                     # and hand a wedged worker the power to stop the poll.
+                    #
+                    # That compensation is no longer hypothetical: Task 6's
+                    # two-tick confirmation implements exactly it. And HOW
+                    # MUCH the window above matters is now regime-dependent,
+                    # which is why _observe_tick's docstring sends readers
+                    # here -- while the uuid tier is alive the counter feeds
+                    # only that function's log line, but once spec 4.3's
+                    # fallback engages the counter IS its verdict, and a
+                    # signal still in flight when the snapshot is taken reads
+                    # as silence. See _observe_tick's own docstring for both
+                    # regimes and for why its probe-first ordering is
+                    # load-bearing rather than conventional.
                     #
                     # `before` is passed rather than a bare `changed` flag so
                     # the observer can tell a real change from a failed read

@@ -837,13 +837,14 @@ class TestUuidTierFallback(unittest.TestCase):
         boilerplate: this watcher is built with NO explicit intervals, so
         __init__ resolves both from _env_seconds, and a stray
         CLIPWIRE_FAST_TIER_SECONDS or CLIPWIRE_SLOW_TIER_SECONDS left in the
-        ambient environment -- by a developer's shell, a CI harness, or
-        TestIntervalInjection above losing a tearDown -- silently changes
-        the derived count and fails this hardcoded 12 for a reason that has
-        nothing to do with the code under test. This file already knows the
-        hazard: TestIntervalInjection.tearDown pops the fast one for exactly
-        this reason. mock.patch.dict restores whatever was there afterwards,
-        so scrubbing here cannot leak into any other test either."""
+        ambient environment -- by a developer's shell, a CI harness, or a
+        sibling class scrubbing only one of the two -- silently changes the
+        derived count and fails this hardcoded 12 for a reason that has
+        nothing to do with the code under test. TestIntervalInjection.setUp
+        and TestIntervalResolution.setUp use the identical save-restore
+        shape, for the reasons spelled out on the first of them.
+        mock.patch.dict restores whatever was there afterwards, so scrubbing
+        here cannot leak into any other test either."""
         patcher = mock.patch.dict(os.environ)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1180,6 +1181,28 @@ class TestUuidTierFallback(unittest.TestCase):
             "GPaste's own re-offer degraded the connection once the uuid "
             "tier's fallback had engaged")
 
+    def test_a_failed_probe_post_fallback_clears_an_armed_run(self):
+        """`not read_ok` gates BOTH regimes, which is what "today's mechanics
+        restored exactly" has to mean -- merge-base's predicate was `if not
+        read_ok or not still_silent:` and the read_ok half is not optional.
+
+        probe() returns None for a timed-out wl-paste and for an empty
+        selection alike, so it is evidence about nothing either way; a run
+        armed before it must CLEAR rather than confirm on the next
+        divergence. Fix round 1 disclosed this as the one hole its mutation
+        table could not see: the term is shared by both branches in the
+        source, so deleting it reds pre-existing alive-regime tests, and
+        nothing exercised a failed probe once the fallback had engaged.
+        Cheap to close, so closed rather than left as a disclosure."""
+        watcher = self.fallen_back()
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        watcher._observe_tick(("text", "b"), None)            # probe failed: must CLEAR
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # re-arms; must not confirm
+        self.assertFalse(
+            watcher._degraded,
+            "a failed wl-paste probe post-fallback was treated as evidence "
+            "of a dead tracker instead of clearing the armed run")
+
     def test_a_uuid_never_measured_even_once_behaves_the_same_post_fallback(self):
         """THE SECOND-ORDER FORK, closed by the same change. Before it,
         post-fallback behaviour depended on an irrelevant historical
@@ -1209,6 +1232,70 @@ class TestUuidTierFallback(unittest.TestCase):
             watcher._degraded,
             "a connection that never measured a uuid reached no verdict at "
             "all post-fallback, instead of today's mechanics")
+
+
+class _WriteOrderRecorder(agent.GPasteWatcher):
+    """Records the ORDER in which _fast_tick's success branch stores the
+    pair _observe_tick reads: self._last_uuid and self._uuid_failures.
+
+    Recording is off until a test arms it, so __init__'s own writes to both
+    fields (and the failure branch's increments) do not pollute the log."""
+
+    _recording = False
+    writes = None
+
+    def __setattr__(self, name, value):
+        if self._recording and name in ("_last_uuid", "_uuid_failures"):
+            self.writes.append(name)
+        object.__setattr__(self, name, value)
+
+
+class TestUuidPairWriteOrder(unittest.TestCase):
+    """Fix round 1 reported the write-order swap as an UNCATCHABLE guard --
+    a mutation (M23) that no test could red, because the defect it prevents
+    needs a poll-thread read to land between two fast-thread stores and
+    nothing here schedules threads at that granularity.
+
+    That conflated two different things, and the re-review was right to
+    split them. The INTERLEAVE is genuinely unschedulable, and a test that
+    tried would be testing CPython rather than this code. But what the
+    mutation actually changes is the WRITE ORDER, which is a property of a
+    single thread's execution and is therefore observable exactly, with no
+    scheduler involved at all. One failing tick, one succeeding tick, and a
+    recording __setattr__ is the whole apparatus.
+
+    Worth the twenty lines for a reason beyond closing a table row: read
+    together with the residual disclosure in _fast_tick's `else` branch,
+    the write order is the least-verified and most-strongly-argued part of
+    this task's diff, and an argument nothing checks is how the previous
+    two rounds each shipped their worst defect."""
+
+    def test_the_value_is_stored_before_the_run_is_reset(self):
+        readings = iter([None, "a"])   # one failure, then a real success
+        watcher = _WriteOrderRecorder(
+            clipboard=_StubClipboard(),
+            read_history_uuid=lambda: next(readings, None),
+            fast_interval_seconds=0.001, slow_interval_seconds=0.001)
+        self.addCleanup(watcher.stop)
+
+        watcher._fast_tick()   # the failure: builds a run to be reset
+        self.assertEqual(
+            watcher._uuid_failures, 1,
+            "test precondition: a run is in progress, so the success below "
+            "actually has something to reset")
+
+        watcher.writes = []
+        watcher._recording = True
+        watcher._fast_tick()   # the success: both stores happen in here
+        watcher._recording = False
+
+        self.assertEqual(
+            watcher.writes, ["_last_uuid", "_uuid_failures"],
+            "the success branch must store the VALUE before clearing the "
+            "failure count. The other order lets a poll-thread reader see "
+            "'no failure run in progress' beside a self._last_uuid still "
+            "holding the stale pre-run value -- exactly the pair the "
+            "failure-run guard exists to reject")
 
 
 if __name__ == "__main__":
