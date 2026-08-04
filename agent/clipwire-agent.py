@@ -3156,9 +3156,27 @@ GPASTE_BUS_NAME = "org.gnome.GPaste"
 # interface as a --dest, which has no owner -- so both names are spelled out.
 GPASTE_INTERFACE = "org.gnome.GPaste2"
 
-# What the fast tier costs, measured on the target machine: 3-5 ms per call,
-# with no Wayland client and therefore no focus grab. The wl-paste probe it
-# replaces measured 104 ms AND blinked the foreground app.
+# What the fast tier costs, RE-MEASURED on the target machine 2026-08-04, ten
+# samples: 103 ms per call, with no Wayland client and therefore no focus grab.
+# The wl-paste probe it replaces measured 104 ms AND blinked the foreground app.
+#
+# THE TWO ARE THE SAME PRICE IN WALL CLOCK, and this comment said 3-5 ms until
+# that was measured properly. The 3-5 ms was the D-Bus ROUND TRIP; the agent
+# does not make a round trip, it forks `gdbus`, and ~103 ms of that is gdbus's
+# own startup -- GIO init plus session-bus connect -- with the round trip lost
+# in its noise. Established by the control that settles it: `Peer.Ping`, which
+# does no work at all, costs 103-105 ms, and GetElementAtIndex costs 103-104.
+# `/bin/true` is 1-2 ms, so it is not process spawn either. See spec 1's
+# corrected table for the full set.
+#
+# WHAT THAT CHANGES, and it is a relocation rather than a weakening: the uuid
+# tier is NOT cheaper in time than the probe it replaces -- the two are within
+# a millisecond of each other -- so every argument for this release rests on
+# the one thing that IS different, that gdbus takes no focus and wl-paste does.
+# Any comment anywhere leaning on the fast tier being cheap in TIME is
+# unsupported; three in this file were, and all three are corrected in the same
+# commit as this one. The 3 s timeout is unaffected either way: 30x headroom
+# over 103 ms is still a timeout, not a budget.
 GPASTE_CALL_TIMEOUT = 3
 
 
@@ -3265,10 +3283,15 @@ def gpaste_tracking(run=subprocess.run):
     it after today's spelling of the answer rather than after the question,
     and this file already has one constant doing the spelling.
 
-    Cost, measured on the target machine with the rest of it: 103 ms. Two
-    orders above gpaste_history_uuid's 3-5 ms, which would be unaffordable
-    per tick and is nothing at once per connection -- see the paragraph on
-    the latch below, and the test that counts the calls.
+    Cost, measured on the target machine with the rest of it: 103 ms -- the
+    SAME as gpaste_history_uuid, not two orders above it. Both are `gdbus`
+    invocations and ~103 ms is what a `gdbus` invocation costs, whatever it
+    asks for; see GPASTE_CALL_TIMEOUT for the measurement and the Peer.Ping
+    control that establishes it. So the reason this one is affordable is not
+    that it is cheap -- it is that it runs ONCE PER CONNECTION, behind the
+    verdict's own latch, where the fast tier pays the identical price every
+    5 s. See the paragraph on the latch below, and the test that counts the
+    calls.
 
     SPEC 5.3, and it exists to delete a guess. The slow tier's verdict line
     shipped "the gnome-shell extension being disabled is one possible cause"
@@ -3354,8 +3377,8 @@ IDLE_MONITOR_INTERFACE = "org.gnome.Mutter.IdleMonitor"
 # FORWARD NOTE, and it is a note rather than a change: spec 4.2's slow tier is
 # eventually 5-15 MINUTES. At the BOTTOM of that range this constant equals the
 # interval, and at the TOP it is a THIRD of it (300 against 900) -- so the
-# first bullet's margin
-# is gone and a copy-then-idle user's next tick reads idle=900s and IS skipped.
+# first bullet's margin is gone and a copy-then-idle user's next tick reads
+# idle=900s and IS skipped.
 # Whoever raises that interval owns raising this with it (the rule being the
 # order of magnitude, not the number), or owns deciding the skip is acceptable.
 # Written down rather than derived from the interval here, because deriving it
@@ -3368,9 +3391,30 @@ def _user_recently_active(run=subprocess.run):
     """True/False for whether the user has touched an input device within
     USER_IDLE_GATE_SECONDS, or None when it was NOT MEASURED.
 
-    SPEC 4.2's second gate. Measured on the target machine: this call answers
-    in single-digit milliseconds and takes NO focus, which is what makes it
-    affordable on a tier whose entire purpose is to stop stealing focus.
+    SPEC 4.2's second gate. MEASURED on the target machine 2026-08-04, ten
+    samples: 103 ms, and NO focus grab.
+
+    THIS DOCSTRING SAID "single-digit milliseconds" AND NOTHING HAD EVER
+    MEASURED IT. Not a rounding error -- a provenance defect: the figure was
+    reached by analogy with a 3-5 ms number that turned out to be a D-Bus
+    round trip rather than a `gdbus` invocation, and then written down with
+    the word "measured" in front of it. Recorded rather than quietly replaced,
+    because the failure was the word, not the number.
+
+    WHAT THE REAL NUMBER MEANS FOR THIS GATE, since 103 ms is not free. The
+    probe it stands in front of costs 104 ms, so as a TIME optimisation this
+    gate is worthless -- break-even when it skips a tick, double cost when it
+    does not. It is a FOCUS optimisation and only that: gdbus takes no focus
+    and wl-paste does, so what a closed gate buys is a blink that never
+    happens, which matters to a user who is idle-but-present (watching,
+    presenting, recording) rather than absent. Priced per tier: ~0.3% duty
+    cycle on the 30 s slow tier, which is the tier it is wired to. It is NOT
+    wired to the 1 s degraded loop, where the same call would be ~10% -- see
+    GPasteWatcher._slow_tier_should_probe for why that is a separate decision
+    and not an oversight.
+
+    See spec 1's corrected table rather than restating any of these figures
+    somewhere new; they have drifted once already.
 
     THE ONE RULE THAT MATTERS HERE IS ABOUT None. It means "we do not know",
     and every caller must PROCEED on it. A gate that skipped the slow tier
@@ -3497,9 +3541,18 @@ DEGRADED_POLL_SECONDS = 1.0
 # the SIGNAL path has gone silent without saying so (spec 6.1) -- the
 # subscription remains the PRIMARY source and its own latency is effectively
 # zero, so this budgets only for noticing that it stopped. Below the
-# threshold at which a person notices a clipboard lag, and three orders of
-# magnitude above gpaste_history_uuid's measured 3-5 ms cost, so paying it
-# every tick is not the thing worth economizing.
+# threshold at which a person notices a clipboard lag.
+#
+# "AND THREE ORDERS OF MAGNITUDE ABOVE gpaste_history_uuid's MEASURED 3-5 ms
+# COST, SO PAYING IT EVERY TICK IS NOT THE THING WORTH ECONOMIZING" -- deleted,
+# because the measurement it rests on was wrong. The call costs 103 ms (see
+# GPASTE_CALL_TIMEOUT for the re-measurement and the control that explains it),
+# so 5 s is under TWO orders above it, not three, and the fast tier's real duty
+# cycle is ~2% rather than the ~0.1% that sentence implied. Still not the thing
+# worth economizing -- 2% of one core for the release's whole premise is a fine
+# trade -- but it is now a number someone could argue with, which the old one
+# was not. Nothing about this constant changes; what changes is that its
+# justification is true.
 FAST_TIER_SECONDS = 5.0
 
 # SPEC 4.2's DIVERGENCE RE-PROBE: "on divergence, re-probe within seconds
@@ -4024,7 +4077,71 @@ class GPasteWatcher:
         anywhere, so the loop waits exactly what it would have waited. See
         pump's arbiter paragraph, which enumerates the claimants and does not
         list this one -- deliberately, and stated in both places.
+
+        NOT WIRED TO THE DEGRADED LOOP, and this is a decision with a
+        measurement behind it rather than a scoping accident. `pump` is
+        SHARED: after spec 6.2's verdict the same loop runs at
+        DEGRADED_POLL_SECONDS and is, in exactly the state that verdict
+        describes, the connection's ONLY change detector. Three things go
+        wrong if the gate runs there, and the second is the one that decides
+        it:
+
+          1. It suppresses SYNC rather than a divergence probe. Spec 4.2's
+             whole justification -- "with nobody copying there is no
+             divergence to find, so an idle blink is pure cost" -- is about
+             the slow tier hunting for divergence. The degraded loop is not
+             hunting anything; it IS the sync, so a clipboard change made by
+             anything that is not a keystroke (a script, a build, a paste
+             from the peer's side of the world) waits for the user to come
+             back.
+          2. IT DEFEATS SPEC 6.2's BACKOFF, which exists for this exact
+             state. A gated tick `continue`s before _on_tick, so _observe_tick
+             never runs, so the backoff at the bottom of it never doubles --
+             and the loop stays PINNED at the floor for as long as the user
+             is idle. Measured, driving the real loop at a 5 ms floor for
+             250 ms: gate saying "active" -> 6 probes and the interval backed
+             off 0.005 -> 0.16; gate saying "idle" -> ONE probe (the
+             ungated baseline) and the interval still 0.005, forever. So the
+             gated connection polls the gate 200x more often than the ungated
+             one polls the clipboard, and syncs nothing while it does.
+          3. The price is the wrong way round. The gate costs 103 ms (see
+             _user_recently_active); on this loop that is ~10% duty cycle
+             against ~0.3% on the 30 s tier, to skip a 104 ms fork. Task 9's
+             backoff already solves "an idle degraded connection kept
+             blinking at the floor rate" -- its test says so by name -- and
+             solves it by polling LESS rather than by asking a question every
+             second.
+
+        THE COUNTER-ARGUMENT, weighed and not ignored: an idle-gated tick
+        skips a wl-paste fork that can cost up to SUBPROCESS_TIMEOUT when the
+        monitor is off, so the gate could pay for itself in the state it
+        fires. Spec 5.1 already answers it -- the monitor gate "applies ON
+        TOP, not as a substitute for the backoff" -- and Task 8's retry
+        backoff is what handles a hang here, scoped to this very poller by
+        `self._on_tick is not None`. A hang backs off to the 30 s cap with or
+        without this gate.
+
+        AND NOT EXTENDED TO SPEC 4.3's FALLBACK, which is the state a reader
+        will ask about next because it looks similar and is not. There the
+        UUID METHOD has failed, not the tracker: the gdbus Update pump may
+        still be delivering, so the slow tier is one detector among two rather
+        than the last one, the loop is at 30 s so the gate costs ~0.3% rather
+        than ~10%, and nothing there is defeated by skipping a tick -- spec
+        6.2's backoff is gated on self._degraded and does not run. All three
+        reasons above fail to apply, so the gate stays on. Stated because
+        "why only degraded?" is the obvious next question and leaving it
+        unanswered is how a scoping decision turns into a scoping accident.
+
+        Written as `self._degraded` rather than as a constructor-time scoping,
+        because the state ARRIVES MID-CONNECTION: the latch is set by
+        _observe_tick on a watcher that was built healthy, long after
+        __init__ chose what to hand the poller. The same precedence rule the
+        rest of this file already uses -- the degraded state is the most
+        specific and wins -- and the third place it is applied, after spec
+        4.3's fallback and spec 4.2's own re-probe.
         """
+        if self._degraded:
+            return True
         return self._read_idle_gate() is not False
 
     def _observe_tick(self, previous, current):
@@ -4414,6 +4531,31 @@ class GPasteWatcher:
             # budget ONCE PER CONNECTION and the line, the interval write and
             # on_degrade all arriving that much later. None of them is
             # skipped, and no lock is held across the call.
+            #
+            # A READER THAT RAISES IS THE ONE CASE THAT SENTENCE DOES NOT
+            # COVER, and it is disclosed rather than closed. An exception here
+            # propagates to pump's own guard, which logs it and keeps the poll
+            # thread alive -- but self._degraded is already latched on the line
+            # above while the log line, the interval write and on_degrade are
+            # all skipped, PERMANENTLY, since that latch never clears. A
+            # half-applied verdict, and the worst part of it is the missing
+            # on_degrade: Agent would never learn the verdict, so the next
+            # Wayland flap would rebuild an undegraded watcher and re-arm the
+            # whole detection budget.
+            #
+            # UNREACHABLE THROUGH PRODUCTION'S READER, which is why it is
+            # disclosed and not wrapped: gpaste_tracking catches
+            # TimeoutExpired and OSError and returns None for everything a
+            # failing gdbus can do. Only an INJECTED reader can raise, and the
+            # test that pins the ordering uses one deliberately -- a raise is
+            # strictly worse than the hang it stands in for. A try/except here
+            # would make the sentence above unconditionally true; it was
+            # weighed and rejected, because a bare `except Exception` on the
+            # verdict path is exactly the shape that hides the next real defect
+            # in the one function whose silence this whole release is about.
+            # If a future reader can raise for a reason production reaches,
+            # move the interval write and on_degrade ABOVE this call rather
+            # than swallowing it.
             #
             # THREE-VALUED, RENDERED IN THREE WORDS. `unavailable` is not a
             # synonym for false: it is "we could not ask", which is itself
@@ -4815,8 +4957,18 @@ class GPasteWatcher:
         # in both regimes: the only thing this snapshot feeds is spec 6.1's
         # log line, which changes no interval and latches nothing, so a
         # miscount costs one slightly wrong informational line and never a
-        # verdict. The gdbus call this measures against is 3-5ms, not
-        # wl-paste's 104ms, so the window is smaller here, not absent.
+        # verdict.
+        #
+        # THE WINDOW IS THE SAME SIZE AS _observe_tick's, NOT SMALLER. This
+        # said "the gdbus call this measures against is 3-5ms, not wl-paste's
+        # 104ms, so the window is smaller here, not absent" -- and the 3-5 ms
+        # was the D-Bus round trip, not the `gdbus` invocation this actually
+        # makes, which measures 103 ms against wl-paste's 104 (see
+        # GPASTE_CALL_TIMEOUT). So the two windows are within a millisecond of
+        # each other. What still makes this one cheaper to be wrong about is
+        # the CONSEQUENCE, not the duration: over there a miscount can produce
+        # a spec 6.2 verdict this release cannot clear, and here it produces
+        # one slightly wrong informational line.
         signals = self._signals
         if current is not None and previous is not None and current != previous:
             self._event.set()
@@ -5319,7 +5471,18 @@ class PollingWatcher:
                     # tick that observed nothing. A dead tracker persists, and
                     # so does the evidence for it.
                     #
-                    # ONE DISCLOSED COST, on the recovery path rather than the
+                    # TWO DISCLOSED COSTS, and this paragraph said "ONE" while
+                    # `pump` was already shared with the degraded loop -- a
+                    # completeness claim made about one of the two loops that
+                    # reach this line. The second is settled in
+                    # GPasteWatcher._slow_tier_should_probe rather than here
+                    # (the gate stands itself down once self._degraded, so the
+                    # connection's last change detector is never gated), and it
+                    # is named here because THIS is where a reader counts the
+                    # costs of gating a tick, and a count that is short by one
+                    # is worse than no count.
+                    #
+                    # THE FIRST, on the recovery path rather than the
                     # detection one. While spec 5.1's retry is backing off
                     # through a hang, a user who walks away gates these ticks
                     # out, so `recovered` does not fire until they come back --

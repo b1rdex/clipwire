@@ -1085,6 +1085,95 @@ class TestDivergenceReprobe(unittest.TestCase):
             watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
             "the degraded state is the more specific one and must win the wait")
 
+    def test_the_idle_gate_stands_down_once_the_connection_is_degraded(self):
+        """Spec 6.2's loop is the connection's LAST change detector, and
+        `pump` is shared with the slow tier, so the gate reaches it -- and
+        make_watcher wires the gate on the already-degraded path too.
+
+        THREE THINGS ARE PINNED, because the first alone would pass against a
+        gate scoped at construction time and this state ARRIVES MID-
+        CONNECTION:
+
+          1. a watcher built already degraded never consults the gate;
+          2. a watcher that degrades DURING the connection stops consulting it
+             from that tick on -- which a constructor-time scoping cannot do;
+          3. the gate is not merely ignored but never CALLED, since the call
+             itself costs 103 ms and would be ~10% duty cycle on a 1 s loop.
+
+        The measurement behind the decision, and the argument that settles it,
+        are in _slow_tier_should_probe's own docstring: a gated tick skips
+        _on_tick, so spec 6.2's backoff never runs, so an idle degraded
+        connection stays PINNED at the floor instead of doubling away from it
+        -- the gate defeating the mechanism Task 9 built for this exact
+        state."""
+        calls = []
+        watcher = GPasteWatcher(clipboard=None, degraded=True,
+                                read_idle_gate=lambda: calls.append(True) or False)
+        self.addCleanup(watcher.stop)
+        self.assertTrue(
+            watcher._slow_tier_should_probe(),
+            "a degraded connection's only change detector must not be gated")
+        self.assertEqual(
+            calls, [],
+            "the gate must not even be ASKED once degraded: the call costs "
+            "103 ms, which is ~10% duty cycle on the 1s degraded loop")
+
+        mid = GPasteWatcher(clipboard=None,
+                            read_idle_gate=lambda: calls.append(True) or False)
+        self.addCleanup(mid.stop)
+        mid._last_uuid = "frozen"
+        mid._uuid_at_last_tick = "frozen"
+        self.assertFalse(
+            mid._slow_tier_should_probe(),
+            "test precondition: an idle user gates a HEALTHY connection out")
+        mid._observe_tick(("t", "a"), ("t", "b"))    # arms
+        mid._observe_tick(("t", "b"), ("t", "c"))    # confirms -> degraded
+        self.assertTrue(mid._degraded, "test precondition: the verdict must have fired")
+
+        before = len(calls)
+        self.assertTrue(
+            mid._slow_tier_should_probe(),
+            "the gate must stand down the moment the verdict lands, not only "
+            "for watchers BUILT degraded -- the state arrives mid-connection")
+        self.assertEqual(len(calls), before,
+                         "and it must stop calling the gate, not just ignore it")
+
+    def test_a_degraded_loop_gated_by_an_idle_user_still_backs_off(self):
+        """The consequence the scoping exists for, driven through the REAL
+        poll loop rather than through the predicate. Spec 6.2's backoff runs
+        at the bottom of _observe_tick, and _observe_tick runs only from
+        _on_tick, which a gated tick skips -- so a gate that reached this loop
+        would pin an idle degraded connection at its floor forever, paying a
+        103 ms gate call every tick to sync nothing.
+
+        Asserted as "the interval moved off the floor", not as an exact value:
+        the number depends on how many ticks fit in the sleep, and pinning
+        that would be a timing test. The doubling itself already has an exact
+        test in TestDegradedBackoff."""
+        class Clip:
+            def __init__(self): self.calls = 0
+            def probe(self): self.calls += 1; return ("t", "a")
+            read = probe
+
+        watcher = GPasteWatcher(clipboard=None, degraded=True,
+                                degraded_interval_seconds=0.005,
+                                read_idle_gate=lambda: False)   # user long idle
+        self.addCleanup(watcher.stop)
+        clipboard = Clip()
+        watcher._safety_net.clipboard = clipboard
+        watcher._safety_net.start(lambda: None)
+        time.sleep(0.25)
+        watcher._safety_net.stop()
+
+        self.assertGreater(
+            clipboard.calls, 1,
+            "an idle user silenced the connection's only change detector")
+        self.assertGreater(
+            watcher._safety_net.interval, 0.005,
+            "the degraded backoff never ran: a gated tick skips _on_tick, so "
+            "the loop stays pinned at the floor for as long as the user is "
+            "idle -- polling the gate, syncing nothing")
+
     def test_an_already_degraded_watcher_never_re_probes(self):
         """`not self._degraded`, the same precedence rule spec 4.3's fallback
         uses. It costs nothing to defer: DEGRADED_POLL_SECONDS is already
@@ -1269,10 +1358,19 @@ class TestVerdictNamesTheCause(unittest.TestCase):
         self.assertEqual(clipwire_agent.GPASTE_BUS_NAME, "org.gnome.GPaste")
 
     def test_the_property_name_is_in_the_line(self):
-        """The name could not be verified against a live GPaste at authoring
-        time, so the log line reports which property was asked for -- that is
-        what lets the first production line settle it, instead of an
-        unavailable reading being indistinguishable from a wrong name."""
+        """THE NAME IS MEASURED -- see test_the_property_asked_for_is_the_one_
+        that_exists thirty lines above, and GPASTE_TRACKING_PROPERTY's own
+        comment. This docstring used to say it "could not be verified against
+        a live GPaste at authoring time", which was true of the round that
+        wrote it and false of the round that shipped it: the introspection
+        landed in the same commit as the sentence denying it.
+
+        The line still carries the property name, and the reason is now a
+        forward one rather than an open question: GPaste renames things
+        between releases (this file already carries the GPaste/GPaste2 bus-vs-
+        interface confusion for the same reason), so a future `unavailable`
+        stays legible as "we asked for something this GPaste does not have"
+        instead of being indistinguishable from "GPaste would not answer"."""
         line = self.verdict_line(read_tracking=lambda: True)
         self.assertIn(clipwire_agent.GPASTE_TRACKING_PROPERTY, line)
 
@@ -1295,9 +1393,26 @@ class TestVerdictNamesTheCause(unittest.TestCase):
         call in this file. self._degraded is assigned BEFORE it, so a slow
         read delays the line -- once per connection, bounded by the call's own
         timeout -- and cannot un-reach the verdict. Simulated by the extreme
-        case: a reader that raises, which is worse than one that hangs."""
+        case: a reader that RAISES, which is strictly worse than one that
+        hangs, since a hang eventually returns None and a raise never returns.
+
+        AND THIS TEST PINS THE HALF-APPLIED OUTCOME TOO, rather than only the
+        good half. Everything AFTER the read is skipped by a raise -- the log
+        line, the interval write and on_degrade -- permanently, because the
+        latch never clears. That is asserted below rather than left implied,
+        because the docstring used to stop at "the verdict is reached" and a
+        reader would have taken the rest for granted.
+
+        Unreachable through production's reader: gpaste_tracking returns None
+        for everything a failing gdbus can do, so only an injected reader can
+        raise. Disclosed rather than wrapped -- see _observe_tick's own
+        comment for why a bare `except Exception` on the verdict path was
+        weighed and rejected, and for what to do instead if this ever becomes
+        reachable."""
+        degrades = []
         watcher = GPasteWatcher(clipboard=None,
-                                read_tracking=_raise_gdbus_exploded)
+                                read_tracking=_raise_gdbus_exploded,
+                                on_degrade=lambda: degrades.append(True))
         self.addCleanup(watcher.stop)
         watcher._last_uuid = "frozen"
         watcher._uuid_at_last_tick = "frozen"
@@ -1309,6 +1424,31 @@ class TestVerdictNamesTheCause(unittest.TestCase):
             watcher._degraded,
             "the verdict must be reached before the read, or a D-Bus that "
             "will not answer suppresses the diagnosis entirely")
+        self.assertEqual(
+            [l for l in self.log_lines if "reported no clipboard change" in l], [],
+            "documented, not desired: a raise takes the log line with it")
+        # SHARPER THAN "the interval write is skipped", and found by writing
+        # the assertion rather than by reasoning about it: the raise happens
+        # inside the verdict branch, which is ABOVE the re-probe block at the
+        # bottom of _observe_tick, so that block is skipped too. The arming
+        # tick had already taken the excursion, so the connection is stranded
+        # on the RE-PROBE rate -- neither the detection budget it left nor the
+        # degraded floor its verdict called for, and with the give-back's own
+        # memory still holding, so nothing will ever hand it back.
+        self.assertEqual(
+            watcher._safety_net.interval,
+            min(SAFETY_NET_POLL_SECONDS, clipwire_agent.DIVERGENCE_REPROBE_SECONDS),
+            "documented, not desired: a raise skips the interval write AND "
+            "the re-probe's give-back, stranding the poller mid-excursion")
+        self.assertIsNotNone(
+            watcher._interval_before_reprobe,
+            "and the excursion's memory is left armed, so no later tick can "
+            "return the interval either -- the latch keeps them all out")
+        self.assertEqual(
+            degrades, [],
+            "documented, not desired, and the worst of the three: Agent never "
+            "learns the verdict, so the next Wayland flap rebuilds an "
+            "undegraded watcher and re-arms the whole detection budget")
 
     def test_the_property_is_read_only_at_the_verdict_never_on_every_tick(self):
         """A GAP A MUTATION RUN FOUND. Moving the read out of the

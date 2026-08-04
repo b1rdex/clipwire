@@ -223,6 +223,15 @@ class TestIdleGate(unittest.TestCase):
         self.assertEqual(
             kwargs["timeout"], agent.GPASTE_CALL_TIMEOUT,
             "an ungated gdbus call on the poll thread can hang it forever")
+        # env, because dropping it fails SILENTLY BY DESIGN: with no
+        # DBUS_SESSION_BUS_ADDRESS the call exits non-zero, this reader returns
+        # None, and the gate reads that as "not measured" and PROCEEDS. The
+        # machine would run permanently ungated with nothing red and nothing
+        # logged -- the inert-deliverable shape, arriving through the very
+        # fail-open rule that makes the gate safe. sshd starts this agent with
+        # no session-bus address of its own, so the env is what makes the call
+        # work at all, not a refinement.
+        self.assertEqual(kwargs["env"], agent.clipboard_env())
 
 
 class TestTrackingProbe(unittest.TestCase):
@@ -308,6 +317,12 @@ class TestTrackingProbe(unittest.TestCase):
         self.assertIn(agent.GPASTE_TRACKING_PROPERTY, argv)
         self.assertNotIn("%s.GetElementAtIndex" % agent.GPASTE_INTERFACE, argv)
         self.assertEqual(kwargs["timeout"], agent.GPASTE_CALL_TIMEOUT)
+        # Same silent-failure argument as the idle gate's own env assertion:
+        # without it the property read reports "unavailable" on every machine,
+        # forever, which is exactly the inert deliverable
+        # test_the_property_asked_for_is_the_one_that_exists prevents for the
+        # NAME. Two ways to reach the same nothing; both are pinned.
+        self.assertEqual(kwargs["env"], agent.clipboard_env())
 
 
 class TestFastTier(unittest.TestCase):
