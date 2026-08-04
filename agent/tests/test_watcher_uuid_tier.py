@@ -33,8 +33,24 @@ class _StubClipboard:
 
 
 class TestIntervalInjection(unittest.TestCase):
-    def tearDown(self):
+    def setUp(self):
+        """Scrub BEFORE, and restore rather than delete.
+
+        This was a pop-only tearDown, which is the wrong half of the
+        problem twice over -- found in fix round 1 by running the suite with
+        both variables set in the ambient environment and watching
+        test_defaults_when_unset, a test whose NAME is "when unset", fail
+        with 7.0 != 5.0. A tearDown cannot make a precondition true for the
+        test it follows, and popping destroys whatever the developer or CI
+        harness had deliberately exported instead of putting it back.
+        mock.patch.dict snapshots the whole mapping and restores it on
+        cleanup, so both halves are covered for every test in this class --
+        including the two below that set the variable on purpose."""
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         os.environ.pop("CLIPWIRE_FAST_TIER_SECONDS", None)
+        os.environ.pop("CLIPWIRE_SLOW_TIER_SECONDS", None)
 
     def test_defaults_when_unset(self):
         self.assertEqual(agent._env_seconds("CLIPWIRE_FAST_TIER_SECONDS", 5.0), 5.0)
@@ -329,17 +345,27 @@ class TestSlowTierVerdict(unittest.TestCase):
         forever in the ordinary case once the fallback has fired -- the
         method that broke does not fix itself, and recovery is explicitly
         out of scope this release (spec 4.3's closing paragraph: "next
-        cycle's latch work") -- so if the guard above did not LIFT once
-        self._uuid_tier_failed is True, _observe_tick could never reach a
+        cycle's latch work") -- so a failure-run guard that kept applying
+        past the fallback would leave _observe_tick unable to reach a
         verdict again for the rest of the connection: silently WORSE than
-        pre-v3.3, which had no uuid tier to get stuck behind at all, and a
-        direct contradiction of the sentence this test is named for.
+        pre-v3.3, which had no uuid tier to get stuck behind at all.
 
-        Once self._last_uuid stops being updated for good, uuid_frozen above
-        settles permanently True on its own -- which is what lets "today's
-        mechanics resume" fall out of the EXISTING wl-paste-divergence check
-        below rather than needing a second copy of the old signal-based
-        predicate reintroduced here."""
+        HOW that resumption works, corrected in fix round 1: _observe_tick
+        SWITCHES DISCRIMINATOR once self._uuid_tier_failed latches, back to
+        today's `signals == self._signals_at_last_tick` (merge-base
+        58321cf:3505). An earlier revision of this docstring claimed instead
+        that today's mechanics "fall out of the EXISTING wl-paste-divergence
+        check" once uuid_frozen settles permanently True -- which was FALSE,
+        and left this file asserting a parity the code did not have: every
+        uuid term went constant post-fallback, so the predicate degenerated
+        to `if not read_ok:` and the signal counter reached the decision
+        nowhere. See TestUuidTierFallback's three post-fallback tests, which
+        drive the real composed path this hand-set one cannot -- setting
+        both flags directly is exactly why the defect stayed invisible here.
+
+        Signals are pinned at 0 by construction in this class (no gdbus line
+        ever reaches these watchers), so the restored discriminator reads
+        "still silent" on both ticks below and the divergence confirms."""
         watcher = self.watcher()
         watcher._uuid_failures = 5
         watcher._uuid_tier_failed = True
@@ -578,7 +604,16 @@ class TestTierIntervalResolution(unittest.TestCase):
     something to report as a hole -- see task-5-report.md.
     """
 
-    def tearDown(self):
+    def setUp(self):
+        # Same save-restore shape as TestIntervalInjection.setUp above, and
+        # for the same two reasons stated there: scrubbing has to happen
+        # BEFORE the test that needs a clean environment, and an ambient
+        # value has to be put back rather than deleted. This class's phases
+        # set and pop both variables as they go, so it needs the restore
+        # more than most.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         os.environ.pop("CLIPWIRE_FAST_TIER_SECONDS", None)
         os.environ.pop("CLIPWIRE_SLOW_TIER_SECONDS", None)
 
@@ -796,7 +831,24 @@ class TestUuidTierFallback(unittest.TestCase):
         2 * 30 / 5 == 12, smaller than the spec text's own illustrative
         "well over a hundred" (which describes a 5-minute slow tier nothing
         in this codebase currently configures by default). Pinned against
-        the actual constants rather than the spec's illustrative figure."""
+        the actual constants rather than the spec's illustrative figure.
+
+        The environment is scrubbed first, and that is not defensive
+        boilerplate: this watcher is built with NO explicit intervals, so
+        __init__ resolves both from _env_seconds, and a stray
+        CLIPWIRE_FAST_TIER_SECONDS or CLIPWIRE_SLOW_TIER_SECONDS left in the
+        ambient environment -- by a developer's shell, a CI harness, or
+        TestIntervalInjection above losing a tearDown -- silently changes
+        the derived count and fails this hardcoded 12 for a reason that has
+        nothing to do with the code under test. This file already knows the
+        hazard: TestIntervalInjection.tearDown pops the fast one for exactly
+        this reason. mock.patch.dict restores whatever was there afterwards,
+        so scrubbing here cannot leak into any other test either."""
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("CLIPWIRE_FAST_TIER_SECONDS", None)
+        os.environ.pop("CLIPWIRE_SLOW_TIER_SECONDS", None)
         watcher = agent.GPasteWatcher(clipboard=_StubClipboard())
         self.addCleanup(watcher.stop)
         self.assertEqual(watcher._uuid_failures_before_fallback, 12)
@@ -938,7 +990,9 @@ class TestUuidTierFallback(unittest.TestCase):
         self.assertEqual(
             before, agent.DEGRADED_POLL_SECONDS,
             "test precondition: an already-degraded watcher starts on the "
-            "degraded interval, per make_watcher's own convention")
+            "degraded interval, per GPasteWatcher.__init__'s own ternary "
+            "when it builds self._safety_net -- NOT make_watcher, which is "
+            "the never-had-GPaste path and is not what this test drives")
         for _ in range(watcher._uuid_failures_before_fallback + 2):
             watcher._fast_tick()
         self.assertTrue(watcher._uuid_tier_failed)
@@ -1003,6 +1057,158 @@ class TestUuidTierFallback(unittest.TestCase):
             watcher._degraded,
             "a real uuid failure run, read by a real slow tick, was "
             "diagnosed as a dead tracker")
+
+    def fallen_back(self, ever_measured=True):
+        """A watcher driven into spec 4.3's POST-fallback state through the
+        real composed path -- N real failing _fast_tick calls -- rather than
+        by hand-setting self._uuid_tier_failed.
+
+        `ever_measured` picks between the two histories a post-fallback
+        connection can have, and they are not interchangeable: they used to
+        produce OPPOSITE post-fallback behaviour from the same state, which
+        is the second-order defect the tests below exist to pin. With a
+        first successful reading, self._last_uuid holds it forever (the
+        failures that follow never overwrite it) and a settling slow tick
+        catches self._uuid_at_last_tick up to the same value, so the old
+        uuid_frozen read permanently True. With NO successful reading ever,
+        self._last_uuid stays None and the same expression read permanently
+        FALSE. Post-fallback the uuid terms feed no decision at all, so both
+        histories must now behave identically -- hence one helper, two
+        callers, and a parameter rather than two near-copies.
+        """
+        readings = iter(["a"] if ever_measured else [])
+        watcher = agent.GPasteWatcher(
+            clipboard=_StubClipboard(),
+            read_history_uuid=lambda: next(readings, None),
+            fast_interval_seconds=0.001, slow_interval_seconds=0.001)
+        self.addCleanup(watcher.stop)
+        self.assertEqual(
+            watcher._uuid_failures_before_fallback, 3,
+            "test precondition: the floor, so the run below is short enough "
+            "to read at a glance")
+        if ever_measured:
+            watcher._fast_tick()   # one real success: self._last_uuid = "a"
+            # A settled slow tick, so self._uuid_at_last_tick catches up to
+            # "a" as a real prior tick would have left it.
+            watcher._observe_tick(("text", "x"), ("text", "x"))
+        for _ in range(watcher._uuid_failures_before_fallback):
+            watcher._fast_tick()
+        self.assertTrue(
+            watcher._uuid_tier_failed,
+            "test precondition: the fallback engaged through real ticks")
+        self.assertFalse(
+            watcher._degraded,
+            "test precondition: nothing has been diagnosed about the TRACKER "
+            "yet -- only that the uuid call is failing")
+        return watcher
+
+    def test_a_live_signal_path_post_fallback_reaches_no_verdict(self):
+        """THE DEFECT fix round 1 found, and the one the hand-set
+        test_verdicts_resume_once_the_fallback_has_engaged could not see.
+
+        Once self._uuid_tier_failed latched, every uuid term in the slow
+        tier's predicate went constant: the failure-run guard was written to
+        lift there, and self._last_uuid stops being updated so the frozen
+        delta settles permanently True. The predicate degenerated to `if not
+        read_ok:` -- the signal counter reached the decision NOWHERE -- so
+        any two consecutive ticks in which the wl-paste token moved
+        confirmed, whatever the signal path was doing.
+
+        That is strictly WEAKER than both the predicate it claimed parity
+        with (merge-base: `signals == self._signals_at_last_tick`) and the
+        v3.3 one it replaced, and it re-creates the exact failure spec 4.0.1
+        exists to prevent -- "a failing GetElementAtIndex plus an active user
+        reads as 'uuid frozen while wl-paste moves' ... all because a method
+        was renamed" -- merely displaced past the fallback boundary. Concrete
+        shape: GetElementAtIndex breaks while the signal path is perfectly
+        healthy (spec 4.3's own "a renamed method, an older interface"), and
+        the user's next two copies across two consecutive slow ticks latch
+        self._degraded permanently on a healthy machine.
+
+        Signals arriving is what the restored discriminator sees here; the
+        token moving on both ticks is what the broken one saw instead."""
+        watcher = self.fallen_back()
+        watcher._signals = 1   # the signal path is alive and reporting
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._signals = 2   # and it reports this copy too
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertFalse(
+            watcher._degraded,
+            "a healthy signal path was diagnosed as a dead tracker once the "
+            "uuid tier's own fallback had engaged")
+
+    def test_a_silent_signal_path_post_fallback_still_reaches_a_verdict(self):
+        """THE MIRROR, and the reason the rule above is not "no verdict once
+        the fallback engages" -- spec 4.0.1's closing sentence is "today's
+        mechanics RESUME", not "detection stops". Today's mechanics
+        (merge-base 58321cf:3505/3549) are the signal-gated predicate, and
+        with the signal counter unmoved across two diverging ticks they
+        confirm, exactly as they did before v3.3 existed."""
+        watcher = self.fallen_back()
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertTrue(
+            watcher._degraded,
+            "today's mechanics did not resume once the fallback engaged")
+
+    def test_a_takeover_post_fallback_still_does_not_degrade(self):
+        """ONLY THE DISCRIMINATOR REVERTS -- the confirmation SHAPE does not.
+
+        Merge-base's armed branch was `confirmed = True; self._armed =
+        False`: a settled second tick CONFIRMED. Task 6 replaced that with
+        settled-clears (spec 4.2), and fix round 1's ruling keeps it in BOTH
+        regimes rather than reverting it along with the discriminator. The
+        reason is that the false positive it kills -- GPaste taking the
+        selection back and re-offering it one to six seconds after every
+        copy, so an armed tick is followed by a settled one -- has nothing
+        to do with the uuid tier and is present whether that tier is alive
+        or dead. "Today's mechanics resume" cannot sensibly be read as
+        "reintroduce the defect this release exists to remove."
+
+        Without this test the both-regimes half of that ruling is only
+        structural (one shared branch, so it must hold): a mutant that
+        restored merge-base's shape for the post-fallback case alone would
+        go uncaught, since test_a_takeover_does_not_degrade above drives the
+        ALIVE regime only. Signals stay silent throughout, so the restored
+        discriminator says "looks dead" on both ticks and the settle is the
+        only thing standing between this connection and a false verdict."""
+        watcher = self.fallen_back()
+        watcher._observe_tick(("image", ("image/png",)), ("image", TWENTY_THREE))
+        watcher._observe_tick(("image", TWENTY_THREE), ("image", TWENTY_THREE))
+        self.assertFalse(
+            watcher._degraded,
+            "GPaste's own re-offer degraded the connection once the uuid "
+            "tier's fallback had engaged")
+
+    def test_a_uuid_never_measured_even_once_behaves_the_same_post_fallback(self):
+        """THE SECOND-ORDER FORK, closed by the same change. Before it,
+        post-fallback behaviour depended on an irrelevant historical
+        accident: whether a uuid had ever been measured successfully at all.
+
+          - measured once, then persistent failure: self._last_uuid holds
+            that value forever, the frozen delta settles permanently True,
+            and the tier OVER-degraded (the test above).
+          - never measured (GetElementAtIndex renamed before this connection
+            ever started -- spec 4.3's own scenario, and the likelier of the
+            two): self._last_uuid stays None, the frozen delta reads
+            permanently FALSE, and the slow tier reached NO VERDICT AT ALL
+            for the rest of the connection. Silently worse than pre-v3.3,
+            which had no uuid tier to get stuck behind.
+
+        Neither fork was "today's mechanics". Dropping the uuid terms out of
+        the post-fallback decision closes both at once, which is what this
+        test and the two above assert TOGETHER: identical setup apart from
+        the one reading, identical outcome."""
+        watcher = self.fallen_back(ever_measured=False)
+        self.assertIsNone(
+            watcher._last_uuid,
+            "test precondition: no uuid was ever measured on this connection")
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        watcher._observe_tick(("text", "b"), ("text", "c"))
+        self.assertTrue(
+            watcher._degraded,
+            "a connection that never measured a uuid reached no verdict at "
+            "all post-fallback, instead of today's mechanics")
 
 
 if __name__ == "__main__":
