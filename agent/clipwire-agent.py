@@ -3277,10 +3277,12 @@ SAFETY_NET_POLL_SECONDS = 30.0
 # lifts a poll off it lives in GPasteWatcher._observe_tick, which the plain
 # poller does not have.
 #
-# That sharing is also why this constant is 1.0 rather than the "~5 s" spec
-# 6.2 names for the backoff's start: raising it here would move the machine
-# with no GPaste at all, which spec 2 forbids. See _observe_tick's backoff for
-# the deviation, stated there rather than assumed away.
+# That sharing is also why this constant stays 1.0 rather than the "~5 s"
+# spec 6.2 names for the backoff's start: raising it here would move the
+# machine with no GPaste at all, which spec 2 forbids. The owner ruled on that
+# deviation and accepted it, sending the 5 s question to hardware acceptance
+# where it can be measured; see _observe_tick's backoff, which records the
+# ruling rather than leaving it open.
 DEGRADED_POLL_SECONDS = 1.0
 
 # The fast tier's interval: the worst-case PC->Mac latency in the state where
@@ -4102,56 +4104,116 @@ class GPasteWatcher:
         # second copy of a burst still lands within the floor.
         #
         # THE FLOOR IS self._degraded_interval, WHERE SPEC 6.2 SAYS "start
-        # ~5 s" -- a deviation, disclosed rather than quietly taken. In
-        # production that field is DEGRADED_POLL_SECONDS, 1.0, and raising the
-        # constant would move make_watcher's plain poller too, which spec 2
-        # forbids in as many words ("the standalone PollingWatcher path is not
-        # touched at all"). A separate 5-second constant is worse, not better:
-        # this floor is also what an already-degraded watcher comes up on and
-        # what the verdict line above quotes, so a second value would have to
-        # win or lose against those in two more places. What the spec's
-        # sentence is emphatic about -- "it must not be today's flat 1 s" -- is
-        # met either way: 1 s is paid only by a tick that follows an OBSERVED
-        # CHANGE, so a user who keeps copying keeps it and an idle connection
-        # stops paying it within seconds. If ~5 s is wanted as the floor it
-        # needs a constant of its own plus rulings on both of those call
-        # sites, which is a task, not a line.
+        # ~5 s". A KNOWN DEVIATION, RULED ON AND ACCEPTED by the owner rather
+        # than an open question anyone should feel invited to close: 1.0 is
+        # the value, responsiveness right after a copy was chosen over the
+        # slower start, and whether ~5 s would in fact be better goes to
+        # hardware acceptance, where it can be MEASURED instead of argued.
+        # Do not "fix" this to 5.0 on the strength of the spec sentence alone.
+        #
+        # Two reasons the ruling had to be about the floor rather than about
+        # the constant. Raising DEGRADED_POLL_SECONDS would move
+        # make_watcher's plain poller too, which spec 2 forbids in as many
+        # words ("the standalone PollingWatcher path is not touched at all").
+        # And a separate 5-second constant is worse, not better: this floor is
+        # also what an already-degraded watcher comes up on and what the
+        # verdict line above quotes, so a second value would have to win or
+        # lose against those in two more places. Either route is a task, not a
+        # line.
+        #
+        # What the spec's sentence is emphatic about -- "it must not be
+        # today's flat 1 s" -- is met regardless: 1 s is paid only by a tick
+        # that follows an OBSERVED CHANGE, so a user who keeps copying keeps
+        # it and an idle connection stops paying it within seconds.
         #
         # read_ok, NOT a bare `previous != current`, and this is a correctness
-        # gate rather than tidiness. probe() answers None for a wl-paste that
-        # timed out -- a powered-off monitor does exactly that (spec 1.4) --
-        # and pump's own comment settles what that means here: "`before` is
-        # passed rather than a bare `changed` flag so the observer can tell a
-        # real change from a failed read and its recovery -- both are `!=`
-        # here, and neither involves a selection change at all." Without this
-        # gate every tick of a hang would read as an observed change and pin
-        # the floor, and so would the recovery.
+        # gate rather than tidiness. ITS TWO HALVES DO DIFFERENT JOBS and only
+        # one of them is about a hang; conflating them is what a first draft
+        # of this paragraph did, and it made two neighbouring claims describe
+        # one tick two different ways.
         #
-        # NEITHER RESET NOR DOUBLED on such a tick, deliberately: an
-        # unresolved tick is evidence of nothing, which is already pump's own
-        # rule for it ("AND NOTHING ELSE ON THIS TICK"), and freezing is what
-        # keeps the pre-hang backoff state across a hang instead of having the
-        # screen coming back on decide the poll rate. It is also what keeps
-        # pump's precedence paragraph literally true rather than nearly so --
-        # see the clause there naming this write. Measured through the real
-        # loop rather than argued: a degraded connection idling at 4s through
-        # a three-tick hang resumes at 8s afterwards, not at the floor and
-        # not at the cap.
+        # `current is not None` IS THE HANG HALF. probe() answers None for a
+        # wl-paste that timed out -- a powered-off monitor does exactly that
+        # (spec 1.4) -- and spec 5.1 holds pump's baseline across the run, so
+        # every tick of a hang arrives as (held token, None). Each is `!=`,
+        # and pump's own comment says what that is worth: "`before` is passed
+        # rather than a bare `changed` flag so the observer can tell a real
+        # change from a failed read and its recovery -- both are `!=` here,
+        # and neither involves a selection change at all." Without this half
+        # every tick of a hang would read as an observed change and pin the
+        # floor. This is also the half pump's "AND NOTHING ELSE ON THIS TICK"
+        # rule justifies, exactly and only: `unresolved` is `current is None`,
+        # so that rule has nothing to say about the other half below.
         #
-        # THE ONE CASE WHERE pump SIGNALS AN OBSERVATION AND THIS BLOCK DOES
-        # NOT CALL IT A CHANGE, disclosed because only a walk finds it: on the
-        # tick that ends a failure run pump signals unconditionally
-        # (`recovered`), because for an image the offered type list can come
-        # back EQUAL to the pre-hang one while the content did change -- spec
-        # 5.1's whole reason for that signal. This block sees only the tokens,
-        # so it reads that tick as settled and takes the doubling branch. The
-        # clip is still delivered (the signal is what delivers it); what it
-        # costs is one backoff step of latency for the NEXT copy. Left as is
-        # rather than plumbed through: `recovered` is asserted on the strength
-        # of the run having ended and NOT of the token having moved (pump says
-        # so in as many words), so spending the floor on it would contradict
-        # the reason it exists, and spec 6.2's rule is "reset on an observed
-        # CHANGE".
+        # NOT the recovery, though. Under that held baseline the tick that
+        # ends an ordinary mid-connection run arrives as (T, T') with BOTH
+        # readings present, so this gate does not touch it: it is judged on
+        # its tokens like any other tick, and a settled T' doubles rather than
+        # pinning anything -- which is what the walk measured (a run recovering
+        # onto an unchanged token goes to 8s, not to 1s). Only a run that
+        # started at CONNECT, before the baseline probe ever answered, recovers
+        # through this gate, and that sub-case is the other half's:
+        #
+        # `previous is not None` IS NOT A HANG HALF AT ALL, and it needs its
+        # own reason rather than the one above. `unresolved` is `current is
+        # None`, so a (None, token) tick is a full change to pump: it takes the
+        # change branch, signals, and advances its baseline. What such a tick
+        # actually is, is the FIRST tick after a baseline probe that found
+        # nothing -- an empty clipboard at connect, or a wl-paste already
+        # hanging then. Two reasons it is gated out anyway:
+        #
+        #   - read_ok is used WHOLE so the rate and the verdict agree about
+        #     which ticks are evidence, the same reason token_moved is reused
+        #     rather than respelled. The predicate above already declines to
+        #     count that None->token change as evidence ("deferred, never
+        #     lost", in read_ok's own comment); a rate that counted it would
+        #     make read_ok mean two things in one function.
+        #   - AND IT COSTS NOTHING, structurally rather than by luck. For this
+        #     composed tier a (None, token) tick can only ever be the FIRST
+        #     RESOLVED tick of the connection: `previous = current` sits in
+        #     pump's resolved branch, and `unresolved` is true whenever
+        #     `current is None` for a poller with an on_tick, so `previous`
+        #     holds the baseline's None across however many unresolved ticks
+        #     follow and can never be put back to None once it advances. Every
+        #     tick before that one was gated out here too, so on it a degraded
+        #     watcher is necessarily still on the floor (__init__'s
+        #     already-degraded ternary, with nothing since that could move it
+        #     -- the latch needs read_ok, and _fast_tick's fallback defers to
+        #     self._degraded). Freezing and resetting write the same number.
+        #
+        # NEITHER RESET NOR DOUBLED on a gated tick, deliberately: freezing is
+        # what keeps the pre-hang backoff state across a hang instead of
+        # letting the screen coming back on decide the poll rate. It is also
+        # what keeps pump's precedence paragraph literally true rather than
+        # nearly so -- see the clause there naming this write. Measured
+        # through the real loop rather than argued: a degraded connection
+        # idling at 4s through a three-tick hang resumes at 8s afterwards, not
+        # at the floor and not at the cap.
+        #
+        # THE TWO CASES WHERE pump SIGNALS AN OBSERVATION AND THIS BLOCK DOES
+        # NOT CALL IT A CHANGE. This paragraph is the file's inventory of
+        # where the rate and the signal disagree, so it lists the cheap entry
+        # as well as the costly one; an earlier draft said "THE ONE CASE" and
+        # was wrong by one.
+        #
+        #   - `recovered`, and only a walk finds it. On the tick that ends a
+        #     failure run pump signals unconditionally, because for an image
+        #     the offered type list can come back EQUAL to the pre-hang one
+        #     while the content did change -- spec 5.1's whole reason for that
+        #     signal. This block sees only the tokens, so it reads that tick
+        #     as settled and doubles. The clip is still delivered (the signal
+        #     is what delivers it); what it costs is one backoff step of
+        #     latency for the NEXT copy. Left as is rather than plumbed
+        #     through: `recovered` is asserted on the strength of the run
+        #     having ended and NOT of the token having moved (pump says so in
+        #     as many words), so spending the floor on it would contradict the
+        #     reason it exists, and spec 6.2's rule is "reset on an observed
+        #     CHANGE".
+        #   - (None, token), the first-tick case above. pump signals and
+        #     advances its baseline; this block freezes. It costs nothing, for
+        #     the structural reason given there -- the interval is already on
+        #     the floor -- which is why it is an entry in this list rather than
+        #     a second disclosed price.
         #
         # token_moved is the local computed for the predicate above, not a
         # second `previous != current`. Two spellings of one term is this
@@ -4870,14 +4932,39 @@ class PollingWatcher:
                     # closed, and the gate keeps it off the path where it
                     # would bite.
                     #
-                    # WHICH OF THE THREE CLAIMS ON THIS WAIT WINS -- two
-                    # remote writers of self.interval, plus this backoff,
-                    # and __init__ sends readers here for the answer. They
-                    # are not three writers of one field, which is exactly
-                    # why there is no `if` deciding between them. Short
-                    # version: the backoff wins only while probes are
-                    # returning nothing, and it cannot outlast that by even
-                    # one tick.
+                    # WHICH OF THE FOUR CLAIMS ON THIS WAIT WINS -- THREE
+                    # remote writers of self.interval (spec 6.2's degraded
+                    # latch and, since Task 9, its backoff, both on the poll
+                    # thread; spec 4.3's uuid-tier fallback on the fast-tier
+                    # thread), plus this backoff on self._retry_interval --
+                    # and __init__ sends readers here for the answer.
+                    #
+                    # THREE OF THEM REALLY DO WRITE ONE FIELD. This paragraph
+                    # said the opposite -- "they are not three writers of one
+                    # field, which is exactly why there is no `if` deciding
+                    # between them" -- and Task 9 landed the third writer and
+                    # left that sentence standing. It is deleted rather than
+                    # softened: what was true of it is only that no `if` HERE
+                    # decides anything, and the reason is that each pair is
+                    # settled somewhere else.
+                    #
+                    # The two bullets below settle every pair that involves
+                    # THIS backoff, which is all this paragraph was ever
+                    # written to do -- the first covers BOTH spec 6.2 writes
+                    # at once, since one gate makes the argument for them
+                    # jointly. The one pair that does not involve it at all is
+                    # the closing paragraph's, below the bullets. And the
+                    # newest pair -- 6.2's latch against 6.2's own backoff --
+                    # needs no rule anywhere, which is worth one sentence
+                    # rather than a bullet: they are the same thread in one
+                    # function in a fixed order, and the latch is reached only
+                    # when `confirmed`, which IS `token_moved`, so the backoff
+                    # that follows it always takes the reset branch and writes
+                    # the same floor.
+                    #
+                    # Short version for the bullets: the retry wins only while
+                    # probes are returning nothing, and it cannot outlast that
+                    # by even one tick.
                     #
                     #   - SPEC 6.2's degraded latch (_observe_tick, this
                     #     file) always takes effect on the very next wait,

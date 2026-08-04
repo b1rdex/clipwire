@@ -434,8 +434,19 @@ class TestGPasteSafetyNet(unittest.TestCase):
         Three values, not two (Task 6): a two-value script settles after one
         change and would never reach the switch under the new settled-clears
         rule -- see test_the_verdict_reports_evidence_and_does_not_assert_a_cause's
-        identical note."""
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        identical note.
+
+        A script that keeps MOVING, for the same reason as
+        test_after_switching_the_loop_actually_ticks_at_the_degraded_rate
+        below (Task 9), and it makes this equality DETERMINISTIC rather than
+        merely usually right. With a settled script an idle tick landing
+        between the switch log appearing and quiesce() would back the interval
+        off to 0.1 and fail this assertion; that needs a ~50ms stall of this
+        thread against a 1ms wait_until loop, and it never fired in 540 runs
+        under parallel load -- but "rare" is not "impossible", and the fix
+        costs one line and weakens nothing, since every post-switch tick then
+        takes the reset branch and re-writes 0.05."""
+        clipboard = ScriptedReadClipboard([b"v%d" % i for i in range(64)])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=0.01, degraded_interval_seconds=0.05)
 
@@ -828,20 +839,38 @@ class TestDegradedBackoff(unittest.TestCase):
         recovery -- both are `!=` here, and neither involves a selection
         change at all."
 
-        Both halves of read_ok are exercised, because they fail on different
-        ticks of one real hang. probe() returns None for a wl-paste that timed
-        out -- a powered-off monitor does exactly that, spec 1.4 -- and spec
-        5.1 holds pump's baseline across the run, so the hang's ticks arrive
-        as (held token, None). The (None, token) shape is the other one a real
-        connection produces: pump's own baseline probe returns None on an
-        empty clipboard, so the first tick after that compares None against a
-        real token.
+        Both halves of read_ok are exercised, and they belong to TWO DIFFERENT
+        SHAPES rather than to two ticks of one hang -- no single hang produces
+        both, and an earlier revision of this docstring said it did while its
+        own next two sentences said otherwise.
 
-        Frozen, not doubled: an unresolved tick is evidence of nothing, and
-        pump already treats it that way ("AND NOTHING ELSE ON THIS TICK"). It
-        is also what keeps pump's precedence paragraph true -- that argument
-        turns on this write happening only on RESOLVED ticks, which are
-        exactly the ticks where self._retry_interval has just been cleared."""
+          - (held token, None) is the hang. probe() returns None for a
+            wl-paste that timed out -- a powered-off monitor does exactly
+            that, spec 1.4 -- and spec 5.1 holds pump's baseline across the
+            run, so every tick of one arrives in this shape.
+          - (None, token) is NOT a hang: `unresolved` is `current is None`,
+            so pump treats this tick as a full change, signals it and
+            advances its baseline. It is the first tick after a baseline
+            probe that found nothing -- an empty clipboard at connect.
+
+        The second call below therefore pins the GUARD rather than
+        reproducing a production state, the same convention
+        test_no_verdict_while_the_uuid_is_unknown in test_watcher_uuid_tier.py
+        uses for the identical reason: in production a (None, token) tick can
+        only be the FIRST loop tick (pump's `previous = current` sits in its
+        resolved branch, so nothing after the baseline can put None back), and
+        a degraded watcher is still on the floor there -- so freezing and
+        resetting would write the same number and the guard would be
+        invisible. Backing the interval off first is what makes the two
+        outcomes distinguishable at all.
+
+        Frozen, not doubled. For the hang half that is pump's own rule ("AND
+        NOTHING ELSE ON THIS TICK"); for the other half it is that read_ok is
+        used WHOLE, so the rate and the verdict agree about which ticks are
+        evidence. It is also what keeps pump's precedence paragraph true --
+        that argument turns on this write happening only on RESOLVED ticks,
+        which are exactly the ticks where self._retry_interval has just been
+        cleared."""
         watcher = self.degraded_watcher()
         watcher._observe_tick(("text", "a"), ("text", "a"))
         self.assertEqual(watcher._safety_net.interval, 2 * DEGRADED_POLL_SECONDS,
