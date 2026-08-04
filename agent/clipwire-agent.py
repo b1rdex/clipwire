@@ -4428,11 +4428,15 @@ class GPasteWatcher:
         THE COUNTER-ARGUMENT, weighed and not ignored: an idle-gated tick
         skips a wl-paste fork that can cost up to SUBPROCESS_TIMEOUT when the
         monitor is off, so the gate could pay for itself in the state it
-        fires. Spec 5.1 already answers it -- the monitor gate "applies ON
-        TOP, not as a substitute for the backoff" -- and Task 8's retry
-        backoff is what handles a hang here, scoped to this very poller by
-        `self._on_tick is not None`. A hang backs off to the 30 s cap with or
-        without this gate.
+        fires. Task 8's retry backoff is what handles a hang here, scoped to
+        this very poller by `self._on_tick is not None`: a hang backs off to
+        the 30 s cap with or without this gate. This paragraph used to answer
+        the objection by citing spec 5.1's point 3 -- the monitor gate
+        "applies ON TOP, not as a substitute for the backoff" -- which is
+        exactly backwards on shipped code, and the spec now says so. No
+        monitor gate was built at all, because PowerSaveMode's monitor-OFF
+        branch was never measured; the backoff IS the substitute, which is
+        why it is the only thing this answer can lean on.
 
         AND NOT EXTENDED TO SPEC 4.3's FALLBACK, which is the state a reader
         will ask about next because it looks similar and is not. There the
@@ -5991,20 +5995,25 @@ class PollingWatcher:
                     # a hang backs off from the re-probe rate, doubling toward
                     # the same cap.
                     #
-                    # This is also where the FIRST of spec 4.2's two gates --
-                    # "the monitor is on" -- actually lives: the timeout
-                    # observed directly, which needs no new API and covers
-                    # every other cause of a hanging wl-paste (a locked
-                    # session, for one) that a PowerSaveMode check would miss.
-                    # See this release's plan for why that proxy was measured
-                    # and rejected. The SECOND gate -- "the user has been
-                    # recently active" -- is a different mechanism in a
-                    # different place, self._should_probe at the top of this
-                    # try, and the two are not substitutes: this one paces a
-                    # tier that is already failing, that one stops a tick that
-                    # has nothing to find. Spec 5.1 says so in as many words
-                    # ("the monitor gate applies ON TOP, not as a substitute
-                    # for the backoff").
+                    # This is also where spec 4.2's "the monitor is on" gate
+                    # actually lives: the timeout observed directly, which
+                    # needs no new API and covers every other cause of a
+                    # hanging wl-paste (a locked session, for one) that a
+                    # PowerSaveMode check would miss. See this release's plan
+                    # for why that proxy was measured and rejected. SPEC 4.2
+                    # ASKED FOR A GATE AND GOT A BACKOFF -- a substitution,
+                    # and one gate of the two it names therefore does not
+                    # exist. Spec 5.1's point 3 said the monitor gate applies
+                    # "ON TOP, not as a substitute for the backoff", which is
+                    # exactly backwards on this code; both sections now carry
+                    # a correction block saying so, and this comment used to
+                    # cite that sentence approvingly.
+                    #
+                    # THE IDLE GATE IS A DIFFERENT MECHANISM IN A DIFFERENT
+                    # PLACE -- self._should_probe at the top of this try --
+                    # and THOSE two are genuinely not substitutes: this one
+                    # paces a tier that is already failing, that one declines
+                    # a tick that has nothing to find.
                     #
                     # SCOPED TO THE COMPOSED SLOW TIER by `self._on_tick is
                     # not None`, which is what GPasteWatcher passes and
