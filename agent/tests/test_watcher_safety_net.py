@@ -467,7 +467,22 @@ class TestGPasteSafetyNet(unittest.TestCase):
         # needs the wl-paste token to diverge on two CONSECUTIVE ticks
         # (settled-clears, spec 4.2), so the script must keep changing
         # through the second tick too, not settle after the first.
-        clipboard = ScriptedReadClipboard([b"a", b"b", b"c"])
+        #
+        # A script that keeps MOVING for the whole window, not three values
+        # and then "c" forever (Task 9). This test's premise was that the
+        # degraded rate is FLAT, so three ticks cost 3 x degraded; spec 6.2's
+        # backoff makes that true only while ticks keep observing changes --
+        # a settled token doubles the interval, and three ticks then cost
+        # 7 x degraded from the floor, or 28 x if `at_switch` is sampled a
+        # tick or two late. MEASURED, not predicted: the old script failed
+        # this assertion 7 times in 160 runs under parallel load, and 0 in
+        # 180 at the previous commit. So the fix restores the premise instead
+        # of widening the window -- window must stay under `budget` for "a
+        # loop still on the budget delivers none" to hold, which leaves no
+        # room to widen. An always-moving clipboard is also the degraded
+        # state that actually matters: the floor exists for a user who is
+        # copying, and it is only an idle one that is supposed to back off.
+        clipboard = ScriptedReadClipboard([b"v%d" % i for i in range(64)])
         watcher, _ = self.start_watcher(
             clipboard, safety_net_interval_seconds=budget,
             degraded_interval_seconds=degraded)
@@ -475,10 +490,10 @@ class TestGPasteSafetyNet(unittest.TestCase):
         self.wait_until(lambda: self.switch_log_lines())
         self.assertEqual(len(self.switch_log_lines()), 1, "the switch must have happened")
 
-        # From here the script is exhausted and repeats "c" forever, so every
-        # tick still reads, change or not, and this count needs nothing
-        # further from it -- only how many ticks it took to REACH the switch
-        # changed above, not this part of the claim.
+        # From here every tick still reads and still sees a NEW value, so the
+        # backoff resets on each one and the rate stays the floor -- which is
+        # what this count is about. Only how many ticks it took to REACH the
+        # switch changed above, not this part of the claim.
         at_switch = clipboard.calls
         deadline = time.monotonic() + window
         while clipboard.calls < at_switch + 3 and time.monotonic() < deadline:
@@ -710,5 +725,194 @@ class TestGPasteSafetyNet(unittest.TestCase):
             watcher._safety_net._thread.is_alive(),
             "stop() must end the safety-net poll, not only the gdbus pump",
         )
+
+
+class TestDegradedBackoff(unittest.TestCase):
+    """Spec 6.2: degraded mode is the ONE state where a wl-paste interval is
+    still a focus-steal knob, and a flat rate there is the measured pain this
+    whole release exists to remove -- `wl-paste --list-types` blinks the
+    foreground app (spec 1's blind A/B) and probe() runs on EVERY tick, so the
+    blink rate IS the poll rate (spec 1.1).
+
+    Placed HERE rather than in test_watcher_uuid_tier.py's TestSlowTierVerdict,
+    and the split is by SUBJECT rather than by which function is called: that
+    class owns _observe_tick's VERDICT (spec 4.0/4.0.1/4.2 -- does the
+    predicate arm, clear, confirm), this one owns the poll INTERVAL, which is
+    what every other _safety_net.interval assertion in the suite already lives
+    beside (TestGPasteSafetyNet above: the production defaults, the switch's
+    interval, the already-degraded watcher's). The brief named
+    test_watcher.py, which is stale twice over -- v3.2.1's split moved
+    _observe_tick's tests out of it, and it contains zero _observe_tick
+    references today; see task-6-report.md, which settled the same question
+    for the verdict half.
+
+    Its own class rather than more methods on TestGPasteSafetyNet: every test
+    below drives _observe_tick DIRECTLY on a watcher that is never started, so
+    no thread, no gdbus, no clipboard and no timing is involved, and an
+    interval assertion cannot be raced by a poll tick landing between the
+    wait and the assertion. TestGPasteSafetyNet's own fixture starts threads
+    for all of its tests, which is what those tests are about and what these
+    deliberately are not."""
+
+    def setUp(self):
+        """The verdict path logs, and one test below reads that line back. A
+        watcher that is never started still reaches _observe_tick's verdict
+        when it is called by hand, so the patch is needed for every test here
+        whether or not it asserts on the output -- otherwise a stray verdict
+        line prints to the real log during an unrelated test run."""
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def degraded_watcher(self):
+        """A connection already past spec 6.2's verdict, at the production
+        constants: an already-degraded watcher comes up ON the degraded
+        interval (GPasteWatcher.__init__'s own ternary), which is the floor
+        this backoff resets to.
+
+        clipboard=None is safe and deliberate, following
+        test_production_defaults_are_a_thirty_second_budget_and_a_one_second_degraded_poll:
+        nothing here is ever started, and _observe_tick only ever compares the
+        two TOKENS it is handed -- it never touches the clipboard."""
+        watcher = GPasteWatcher(clipboard=None, degraded=True)
+        self.addCleanup(watcher.stop)
+        return watcher
+
+    def test_an_idle_degraded_connection_backs_off_and_a_change_resets_it(self):
+        """The task, in one script. Exact equalities rather than the
+        assertGreater the brief asked for: "greater than the floor" passes
+        against a x1.5 backoff, against a backoff that jumps straight to the
+        cap, and against one that adds a constant -- three different rates,
+        one assertion, no way to tell them apart. The doubling is the shape
+        spec 6.2 names, so the shape is what is pinned."""
+        watcher = self.degraded_watcher()
+        self.assertEqual(
+            watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+            "an already-degraded watcher must start on the floor")
+
+        watcher._observe_tick(("text", "a"), ("text", "a"))
+        self.assertEqual(
+            watcher._safety_net.interval, 2 * DEGRADED_POLL_SECONDS,
+            "an idle degraded connection kept blinking at the floor rate")
+        watcher._observe_tick(("text", "a"), ("text", "a"))
+        self.assertEqual(
+            watcher._safety_net.interval, 4 * DEGRADED_POLL_SECONDS,
+            "the backoff stopped after one step instead of compounding")
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        self.assertEqual(
+            watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+            "a real change did not restore responsiveness")
+
+    def test_the_backoff_stops_at_the_detection_budget(self):
+        """The cap, and it is SAFETY_NET_POLL_SECONDS the CONSTANT -- the same
+        rule and the same constant Task 8's retry backoff uses for the same
+        wait, so the two claims on this loop cannot drift onto different
+        ceilings. 20 idle ticks is far past the 6 that reach it from the
+        production floor (1 -> 2 -> 4 -> 8 -> 16 -> 30), so this pins "never
+        exceeds" rather than "reaches"."""
+        watcher = self.degraded_watcher()
+        for _ in range(20):
+            watcher._observe_tick(("text", "a"), ("text", "a"))
+        self.assertEqual(
+            watcher._safety_net.interval, SAFETY_NET_POLL_SECONDS,
+            "an uncapped doubling would leave a degraded connection polling "
+            "once a fortnight")
+
+    def test_a_tick_that_read_nothing_neither_resets_nor_backs_off(self):
+        """A failed probe is NOT an observed change, and the brief's snippet
+        (`if previous != current`) read it as one. pump's own comment says why
+        in as many words: "`before` is passed rather than a bare `changed`
+        flag so the observer can tell a real change from a failed read and its
+        recovery -- both are `!=` here, and neither involves a selection
+        change at all."
+
+        Both halves of read_ok are exercised, because they fail on different
+        ticks of one real hang. probe() returns None for a wl-paste that timed
+        out -- a powered-off monitor does exactly that, spec 1.4 -- and spec
+        5.1 holds pump's baseline across the run, so the hang's ticks arrive
+        as (held token, None). The (None, token) shape is the other one a real
+        connection produces: pump's own baseline probe returns None on an
+        empty clipboard, so the first tick after that compares None against a
+        real token.
+
+        Frozen, not doubled: an unresolved tick is evidence of nothing, and
+        pump already treats it that way ("AND NOTHING ELSE ON THIS TICK"). It
+        is also what keeps pump's precedence paragraph true -- that argument
+        turns on this write happening only on RESOLVED ticks, which are
+        exactly the ticks where self._retry_interval has just been cleared."""
+        watcher = self.degraded_watcher()
+        watcher._observe_tick(("text", "a"), ("text", "a"))
+        self.assertEqual(watcher._safety_net.interval, 2 * DEGRADED_POLL_SECONDS,
+                         "test precondition: one idle tick must have backed off")
+
+        watcher._observe_tick(("text", "a"), None)
+        self.assertEqual(
+            watcher._safety_net.interval, 2 * DEGRADED_POLL_SECONDS,
+            "a probe that answered nothing was read as an observed change")
+
+        watcher._observe_tick(None, ("text", "a"))
+        self.assertEqual(
+            watcher._safety_net.interval, 2 * DEGRADED_POLL_SECONDS,
+            "a probe recovering from nothing was read as an observed change")
+
+    def test_a_healthy_connection_keeps_its_detection_budget(self):
+        """The gate. This backoff belongs to spec 6.2 alone -- 6.1 ("signal
+        path silent, tracking alive") is explicitly not a degraded state and
+        changes no interval, and a healthy connection's 30s is a DETECTION
+        budget rather than a rate anything is allowed to retune.
+
+        The CHANGE tick is what catches a deleted `self._degraded` gate, not
+        the idle one: doubling from the 30s budget is inert by construction
+        (min() of two thirty-second figures), exactly as Task 8's retry
+        backoff is at the same rate, so an ungated backoff would look
+        identical on an idle tick and only betray itself by resetting a
+        healthy poller down to the degraded floor."""
+        watcher = GPasteWatcher(clipboard=None)   # never started, never degraded
+        self.addCleanup(watcher.stop)
+        self.assertEqual(watcher._safety_net.interval, SAFETY_NET_POLL_SECONDS,
+                         "test precondition: a healthy watcher polls the budget")
+
+        watcher._observe_tick(("text", "a"), ("text", "a"))
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+        self.assertFalse(watcher._degraded,
+                         "test precondition: no verdict may have been reached")
+        self.assertEqual(
+            watcher._safety_net.interval, SAFETY_NET_POLL_SECONDS,
+            "the degraded backoff retuned a connection that is not degraded")
+
+    def test_the_verdict_tick_lands_on_the_floor_its_own_log_line_promises(self):
+        """The seam between the two writers of this field inside ONE tick:
+        _observe_tick's degrade latch assigns the floor, and the backoff below
+        it runs on that same tick. The latch is reached only when `confirmed`
+        is true, and `confirmed` is `token_moved`, so the backoff necessarily
+        takes its reset branch and re-writes the same floor -- but nothing
+        about the two lines says so on its face, and a backoff that doubled
+        here would leave the connection polling at twice the rate the line it
+        just logged promises.
+
+        The log line is read back for the same reason: this project's
+        single most-recorded defect is a correct line paired with prose that
+        overstates it, and spec 8 names this very line ("the verdict line's
+        wording") as one the release invalidates. %g renders the production
+        constants as "1" and "30"."""
+        watcher = GPasteWatcher(clipboard=None)
+        self.addCleanup(watcher.stop)
+        watcher._last_uuid = "frozen"
+        watcher._uuid_at_last_tick = "frozen"
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))   # arms
+        watcher._observe_tick(("text", "b"), ("text", "c"))   # confirms
+        self.assertTrue(watcher._degraded,
+                        "test precondition: the verdict must have fired")
+
+        self.assertEqual(
+            watcher._safety_net.interval, DEGRADED_POLL_SECONDS,
+            "the verdict tick must leave the poll on the floor, not one "
+            "backoff step above it")
+        line = [l for l in self.log_lines if "reported no clipboard change" in l][0]
+        self.assertIn("every 1s", line)
+        self.assertIn("at most 30s", line)
 
 

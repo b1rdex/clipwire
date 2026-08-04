@@ -2089,12 +2089,17 @@ class Agent:
                 if self._reoffer_is_overdue(expectation):
                     # SAFETY_NET_POLL_SECONDS, the CONSTANT, never whatever
                     # interval the poll happens to be running at. After the
-                    # dead-source verdict that interval is
+                    # dead-source verdict that interval STARTS at
                     # DEGRADED_POLL_SECONDS -- one second, shorter than the
-                    # takeover this waits for -- so a window meaning "the
+                    # takeover this waits for -- and backs off from there
+                    # (spec 6.2, _observe_tick), so a window meaning "the
                     # current interval" would disarm deterministically
-                    # BEFORE the re-offer, in the mode a connection stays in
-                    # for the rest of its life once the verdict ever fired.
+                    # BEFORE the re-offer whenever the poll is anywhere near
+                    # that floor, in the mode a connection stays in for the
+                    # rest of its life once the verdict ever fired. The
+                    # backoff does not rescue that reading: it makes the
+                    # window a MOVING one, so the same expectation would be
+                    # judged against a different threshold on each tick.
                     #
                     # What it costs when it is wrong is re-priced honestly
                     # by v3.2 and is why the threshold is generous: a false
@@ -3258,12 +3263,24 @@ def _env_seconds(name, default):
 # events being absent. This is the detection budget for that state -- an
 # acceptable worst case for NOTICING a broken subscription.
 SAFETY_NET_POLL_SECONDS = 30.0
-# What the safety net polls at once it has concluded the event source is dead.
-# Deliberately NOT SAFETY_NET_POLL_SECONDS: 30 seconds is a detection budget,
-# and leaving it as the OPERATING interval would keep PC->Mac sync half a
-# minute behind while reporting itself as working. This is also make_watcher's
-# fallback interval, shared from one place so degraded mode and the
-# never-had-GPaste mode cannot drift apart.
+# The FLOOR of what the safety net polls at once it has concluded the event
+# source is dead -- not a flat rate since spec 6.2's backoff (_observe_tick):
+# a tick that observes a change resets to this, and an idle one doubles toward
+# SAFETY_NET_POLL_SECONDS. Deliberately NOT SAFETY_NET_POLL_SECONDS itself: 30
+# seconds is a detection budget, and coming out of a change at that rate would
+# keep PC->Mac sync half a minute behind while reporting itself as working.
+#
+# STILL FLAT on the never-had-GPaste path, and that asymmetry is the spec's
+# (2: "the standalone PollingWatcher path is not touched at all"), not an
+# oversight: this is also make_watcher's fallback interval, shared from one
+# place so the two modes' floors cannot drift apart, and the backoff that ever
+# lifts a poll off it lives in GPasteWatcher._observe_tick, which the plain
+# poller does not have.
+#
+# That sharing is also why this constant is 1.0 rather than the "~5 s" spec
+# 6.2 names for the backoff's start: raising it here would move the machine
+# with no GPaste at all, which spec 2 forbids. See _observe_tick's backoff for
+# the deviation, stated there rather than assumed away.
 DEGRADED_POLL_SECONDS = 1.0
 
 # The fast tier's interval: the worst-case PC->Mac latency in the state where
@@ -4032,14 +4049,24 @@ class GPasteWatcher:
             # %g, not %.1f: this is exercised with millisecond-scale intervals
             # in tests, where %.1f renders "0.0s" and the line would misstate
             # what the code actually did.
+            #
+            # BOTH numbers, because the rate is no longer one number. "Polling
+            # every %gs for the rest of this connection" was true of the flat
+            # rate this line shipped with and is false of spec 6.2's backoff
+            # below -- spec 8 names this line specifically among the prose the
+            # release invalidates, and a line that under-reports its own poll
+            # rate by up to 30x is the shape of misdirection spec 5.3 was
+            # written about, in a line that has already misdirected three
+            # incidents once.
             log("GPaste reported no clipboard change while the content changed "
                 "(signals=%d signals_at_last_tick=%d pump_alive=%s worker_alive=%s); "
                 "the gnome-shell extension being disabled is one possible cause. "
-                "Polling every %gs for the rest of this connection."
+                "Polling every %gs after each observed change and doubling to at "
+                "most %gs while nothing changes, for the rest of this connection."
                 % (signals, self._signals_at_last_tick,
                    self._thread.is_alive() if self._thread else False,
                    self.worker_alive(),  # dead, not wedged -- see worker_alive()
-                   self._degraded_interval))
+                   self._degraded_interval, SAFETY_NET_POLL_SECONDS))
             self._safety_net.interval = self._degraded_interval
             if self._on_degrade is not None:
                 # Last, so this watcher's own state is fully consistent before
@@ -4050,6 +4077,154 @@ class GPasteWatcher:
         # the same reason: next tick's delta needs THIS tick's reading,
         # whether or not a verdict was reached from it.
         self._uuid_at_last_tick = self._last_uuid
+        # SPEC 6.2's BACKOFF, and BELOW BOTH SNAPSHOTS RATHER THAN BETWEEN
+        # THEM. Those two are one pair -- the comment above says so -- and
+        # they are the unconditional part of every tick; this is conditional
+        # and writes a different object, so putting it first would let a raise
+        # here strand next tick's delta on a stale reading. Nothing here reads
+        # either snapshot, so the order costs nothing to get right.
+        #
+        # THE ONE PLACE A wl-paste INTERVAL IS STILL A FOCUS-STEAL RATE. Spec
+        # 1 measured `wl-paste --list-types` taking keyboard focus in a blind
+        # A/B (2 Hz, 15 s per phase, phases unlabelled), with `xclip -o -t
+        # TARGETS` as the negative control, and probe() forks it on EVERY tick
+        # -- so the blink rate IS the poll rate (spec 1.1), and a flat rate
+        # here is the measured pain this whole release exists to remove. From
+        # the production floor the shape below is 1 -> 2 -> 4 -> 8 -> 16 -> 30:
+        # four probing ticks in the 30 seconds after a copy where the flat
+        # rate spent thirty (ticks, not forks -- probe() is one wl-paste call
+        # for an image and two for text, see its docstring, so the fork count
+        # is that number times one or two either way). What it costs is
+        # worst-case PC->Mac latency at the cap, 30s, which is the number spec
+        # 6.2 itself chose ("cap at today's 30 s") -- the same budget a
+        # HEALTHY connection already accepts for noticing a broken
+        # subscription, now paid by a connection with nothing better left. The
+        # second copy of a burst still lands within the floor.
+        #
+        # THE FLOOR IS self._degraded_interval, WHERE SPEC 6.2 SAYS "start
+        # ~5 s" -- a deviation, disclosed rather than quietly taken. In
+        # production that field is DEGRADED_POLL_SECONDS, 1.0, and raising the
+        # constant would move make_watcher's plain poller too, which spec 2
+        # forbids in as many words ("the standalone PollingWatcher path is not
+        # touched at all"). A separate 5-second constant is worse, not better:
+        # this floor is also what an already-degraded watcher comes up on and
+        # what the verdict line above quotes, so a second value would have to
+        # win or lose against those in two more places. What the spec's
+        # sentence is emphatic about -- "it must not be today's flat 1 s" -- is
+        # met either way: 1 s is paid only by a tick that follows an OBSERVED
+        # CHANGE, so a user who keeps copying keeps it and an idle connection
+        # stops paying it within seconds. If ~5 s is wanted as the floor it
+        # needs a constant of its own plus rulings on both of those call
+        # sites, which is a task, not a line.
+        #
+        # read_ok, NOT a bare `previous != current`, and this is a correctness
+        # gate rather than tidiness. probe() answers None for a wl-paste that
+        # timed out -- a powered-off monitor does exactly that (spec 1.4) --
+        # and pump's own comment settles what that means here: "`before` is
+        # passed rather than a bare `changed` flag so the observer can tell a
+        # real change from a failed read and its recovery -- both are `!=`
+        # here, and neither involves a selection change at all." Without this
+        # gate every tick of a hang would read as an observed change and pin
+        # the floor, and so would the recovery.
+        #
+        # NEITHER RESET NOR DOUBLED on such a tick, deliberately: an
+        # unresolved tick is evidence of nothing, which is already pump's own
+        # rule for it ("AND NOTHING ELSE ON THIS TICK"), and freezing is what
+        # keeps the pre-hang backoff state across a hang instead of having the
+        # screen coming back on decide the poll rate. It is also what keeps
+        # pump's precedence paragraph literally true rather than nearly so --
+        # see the clause there naming this write. Measured through the real
+        # loop rather than argued: a degraded connection idling at 4s through
+        # a three-tick hang resumes at 8s afterwards, not at the floor and
+        # not at the cap.
+        #
+        # THE ONE CASE WHERE pump SIGNALS AN OBSERVATION AND THIS BLOCK DOES
+        # NOT CALL IT A CHANGE, disclosed because only a walk finds it: on the
+        # tick that ends a failure run pump signals unconditionally
+        # (`recovered`), because for an image the offered type list can come
+        # back EQUAL to the pre-hang one while the content did change -- spec
+        # 5.1's whole reason for that signal. This block sees only the tokens,
+        # so it reads that tick as settled and takes the doubling branch. The
+        # clip is still delivered (the signal is what delivers it); what it
+        # costs is one backoff step of latency for the NEXT copy. Left as is
+        # rather than plumbed through: `recovered` is asserted on the strength
+        # of the run having ended and NOT of the token having moved (pump says
+        # so in as many words), so spending the floor on it would contradict
+        # the reason it exists, and spec 6.2's rule is "reset on an observed
+        # CHANGE".
+        #
+        # token_moved is the local computed for the predicate above, not a
+        # second `previous != current`. Two spellings of one term is this
+        # file's recorded drift shape, and this one would drift in the
+        # direction where the verdict and the rate disagree about what a
+        # change is.
+        #
+        # WHAT CAN BE IN self._safety_net.interval WHEN THIS DOUBLES IT, since
+        # it is shared mutable state serving as its own accumulator and not a
+        # private counter. Exactly three values, all bounded:
+        #   - self._degraded_interval, from the latch above or from __init__'s
+        #     already-degraded ternary;
+        #   - self._degraded_interval * 2^n, this line's own previous output;
+        #   - SAFETY_NET_POLL_SECONDS, from _fast_tick's uuid-tier fallback in
+        #     the one interleaving its `if not self._degraded` cannot catch
+        #     (that branch discloses it).
+        # min() clamps all three to the cap, so no starting value produces a
+        # rate outside the range this state would already have produced -- and
+        # the third case is now REPAIRED rather than permanent: the next
+        # observed change resets it to the floor. _fast_tick's disclosure of
+        # that residual was updated in the same commit, because it said
+        # "nothing ever writes the interval again", which this line makes false.
+        #
+        # THE CAP IS THE CONSTANT, NOT self._degraded_interval * anything --
+        # the same rule, the same constant and the same disclosed inversion as
+        # Task 8's retry backoff on this very wait (see pump): a caller that
+        # passed a degraded_interval_seconds ABOVE SAFETY_NET_POLL_SECONDS
+        # would find the first idle tick making the poll FASTER. No production
+        # path can (1.0 against 30.0) and no test needs it; left unguarded and
+        # written down rather than max()-ed, so that "capped at
+        # SAFETY_NET_POLL_SECONDS" stays unconditionally true.
+        #
+        # ON THE SAME THREAD as everything else that paces this loop: this
+        # function is pump's own on_tick, so this write, Task 8's
+        # self._retry_interval and the wait itself are one thread in one
+        # order. The one REMOTE writer is _fast_tick's fallback, which defers
+        # to self._degraded. No lock is owed here; the interleaving that is
+        # real is the same-thread one enumerated above. (The plan's pre-flight
+        # note calls Tasks 7 and 9 "DIFFERENT THREADS", which is true of that
+        # PAIR and not of this write against the retry backoff.)
+        #
+        # AND THE COUPLING RUNS BOTH WAYS: spec 5.1's retry seeds itself from
+        # `(self._retry_interval or self.interval) * 2`, so the first
+        # unresolved tick of a hang doubles from whatever this line last
+        # wrote. That is the intended direction -- a hang cannot make the tier
+        # retry FASTER than the rate it was already polling at -- and both are
+        # clamped to the same cap, so the pair cannot compound past it.
+        #
+        # A REAL CHANGE, NOT NECESSARILY A COPY, and the difference is bounded
+        # rather than absent. Spec 1.2's benign class -- GPaste re-offering its
+        # own image one to six seconds after a copy, changing the offered type
+        # list with no Update -- resets this too. In a TRUE spec 6.2 the
+        # tracker is dead, so there is nothing to take the selection back and
+        # no re-offer to see; on a connection here by the FALSE POSITIVE this
+        # file discloses (the post-fallback spec 6.1 case, first bullet of the
+        # predicate comment's re-inherited pair above -- its second bullet is
+        # a false NEGATIVE and is not this) the tracker is fine and re-offers
+        # do arrive, each one buying one extra tick at the floor before the
+        # doubling resumes. A TEXT re-offer is not expected to reach
+        # here -- for text the token IS the body, and GPaste's text takeover
+        # was measured leaving that body identical (spec 1.3, with trim-items
+        # false), so it compares equal -- but "not observed", not "cannot":
+        # that is ONE measurement plus a GPaste setting, and spec 1.3's own
+        # text incident is the one whose mechanism it says is still
+        # unestablished. Not gated either way: one floor tick per re-offer is
+        # cheaper than a gate that would have to tell a re-offer from a copy,
+        # which is the discrimination this tier gave up by design.
+        if self._degraded and read_ok:
+            if token_moved:
+                self._safety_net.interval = self._degraded_interval
+            else:
+                self._safety_net.interval = min(
+                    SAFETY_NET_POLL_SECONDS, self._safety_net.interval * 2)
 
     def _fast_tick(self):
         """One fast-tier iteration: measure the history uuid and signal iff it
@@ -4202,13 +4377,20 @@ class GPasteWatcher:
                 # the range either state alone would already produce -- this
                 # `if` decides which of two already-safe values wins a race,
                 # never whether the result stays safe. DISCLOSED residual,
-                # accepted rather than closed: both writers are ONE-SHOT
-                # latches, so in the interleave where this thread reads
-                # self._degraded before the poll thread sets it and then
-                # stores 30s after that thread stored self._degraded_interval,
-                # nothing ever writes the interval again and the connection
-                # spends its remaining life at 30s instead of the degraded
-                # 1s. A slower poll on a connection already diagnosed and
+                # accepted rather than closed, and NARROWER since Task 9 than
+                # when this paragraph was written: in the interleave where
+                # this thread reads self._degraded before the poll thread sets
+                # it and then stores 30s after that thread stored
+                # self._degraded_interval, the connection is left at 30s
+                # instead of the degraded floor. This used to be permanent --
+                # both writers were ONE-SHOT latches and nothing ever wrote the
+                # interval again -- and is not any more: spec 6.2's backoff at
+                # the bottom of _observe_tick writes this field on EVERY
+                # degraded tick that read something, so the next observed
+                # change resets it to the floor. What survives is the stretch
+                # until that change, which is bounded by the same cap the
+                # backoff would have reached on its own anyway. A slower poll
+                # for one idle stretch on a connection already diagnosed and
                 # already logged -- worth a sentence, not a lock, which would
                 # put the fast-tier thread behind a mutex the poll thread
                 # holds across a wl-paste fork. The log line above is
@@ -4518,8 +4700,10 @@ class PollingWatcher:
         # None means "observations are resolving, wait self.interval". Only
         # pump() below ever touches it -- one writer and one reader, both the
         # poll thread -- which is why it needs no lock, unlike self.interval,
-        # whose two REMOTE writers (spec 6.2's degraded latch and spec 4.3's
-        # uuid-tier fallback, on the poll and fast-tier threads respectively)
+        # whose THREE REMOTE WRITE SITES on TWO threads (spec 6.2's degraded
+        # latch and, since Task 9, its backoff, both on the poll thread; spec
+        # 4.3's uuid-tier fallback on the fast-tier thread -- and only that
+        # last one makes this a cross-thread question at all)
         # are why that one is re-read every iteration. Which of the three
         # wins when they disagree is settled in pump's "WHICH OF THE THREE
         # CLAIMS ON THIS WAIT WINS" paragraph, by ordering and by the cap
@@ -4704,7 +4888,14 @@ class PollingWatcher:
                     #     already cleared self._retry_interval, before
                     #     _on_tick runs at the bottom of this try. Nothing
                     #     sets it again before the loop waits, so the wait
-                    #     reads the interval the latch just wrote.
+                    #     reads the interval the latch just wrote. Spec
+                    #     6.2's BACKOFF, added beneath that latch, is
+                    #     covered by this same sentence unchanged and for
+                    #     the same reason: it is gated on read_ok too, so
+                    #     it writes only on the ticks where the `else`
+                    #     below has just cleared the retry. That gate is
+                    #     what keeps this bullet true of both writes
+                    #     rather than only of the latch.
                     #   - SPEC 4.3's uuid-tier fallback (_fast_tick, on the
                     #     fast tier's thread) writes SAFETY_NET_POLL_SECONDS
                     #     -- exactly this backoff's cap. So the backoff can
