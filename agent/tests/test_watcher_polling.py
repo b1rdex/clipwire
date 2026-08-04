@@ -610,6 +610,41 @@ class TestFailedReadDoesNotConsumeTheChange(unittest.TestCase):
             "not settle on one slower fixed rate")
         self.assertLessEqual(watcher._retry_interval, SAFETY_NET_POLL_SECONDS)
 
+    def test_a_watcher_that_starts_during_a_hang_backs_off_and_signals_nothing(self):
+        """The one tick shape a reader is most likely to misread, and every
+        other script here starts with a token that answers, so nothing else
+        reaches it.
+
+        `previous` is None from the baseline probe onward, so `current !=
+        previous` is FALSE on every hung tick -- the backoff engages on
+        ticks that signal nothing at all, because it is computed before the
+        comparison rather than inside it. Both halves are correct and
+        neither is obvious: the probe really is timing out and forking it at
+        full rate is pure cost, while no token was ever measured, so no
+        change can have been consumed and there is nothing to catch up.
+
+        Then the recovery still signals, and here `recovered` and the
+        comparison agree -- which is exactly why this case cannot stand in
+        for the equal-token one above, and why both are pinned."""
+        delivered = threading.Event()
+        clipboard = ScriptedReadClipboard([None, None, None, b"a"])
+        watcher = PollingWatcher(clipboard, interval_seconds=1.0,
+                                 on_tick=lambda before, current: None)
+        watcher._stop = RecordingStop(4)
+        self.addCleanup(watcher.stop)
+        watcher.start(delivered.set)
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertEqual(
+            watcher._stop.waits[:3], [1.0, 2.0, 4.0],
+            "a hang that is already in progress at startup must back off "
+            "even though it has no baseline to differ from; got %r"
+            % (watcher._stop.waits[:3],))
+        self.assertTrue(
+            delivered.wait(JOIN_TIMEOUT),
+            "and the first probe to answer must still be delivered: %r"
+            % self.log_lines)
+
     def test_the_backoff_is_what_the_loop_actually_waits_on(self):
         """Storing the backed-off interval is not the same as pacing the
         loop with it, and every other assertion in this class reads the

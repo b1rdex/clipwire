@@ -364,8 +364,21 @@ class TestGPasteSafetyNet(unittest.TestCase):
         judging a None transition as a missed change needs no race at all to
         fire, and one flaky wl-paste on a healthy, idle system would
         permanently degrade the connection while blaming the gnome-shell
-        extension for it. Both the failure (a->None) and the recovery
-        (None->a) look like changes to the comparison."""
+        extension for it.
+
+        WHAT REACHES THE VERDICT CHANGED UNDER v3.3's SPEC 5.1 RULE, and
+        this test now passes for a different reason than it used to. It
+        used to be that both the failure (a->None) and the recovery
+        (None->a) looked like changes to the comparison, and the point was
+        that neither may be read as a missed change. On the composed
+        watcher this builds, neither reaches the comparison at all: the
+        failing tick is `unresolved`, so it holds the baseline and observes
+        nothing, and the recovery tick compares b"a" against a still-held
+        b"a" and signals through `recovered` instead of through `!=`. The
+        assertion below is unchanged and still the one that matters -- a
+        failed read and its recovery must produce no verdict -- so this is
+        kept as the regression check it always was, now covering the
+        held-baseline path rather than the None-transition one."""
         clipboard = ScriptedReadClipboard([b"a", None, b"a", b"a"])
         watcher, _ = self.start_watcher(clipboard)
 

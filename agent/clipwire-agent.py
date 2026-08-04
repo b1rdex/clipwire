@@ -4438,12 +4438,29 @@ class PollingWatcher:
     `interval` is re-read on every iteration, so a caller can change the poll
     rate mid-flight -- GPasteWatcher does exactly that when its safety net
     concludes the event source is dead -- without stopping and restarting the
-    loop. With one deferral, stated because it is the only way a caller's
-    retune does not take effect on the very next wait: while spec 5.1's retry
-    backoff is engaged (self._retry_interval, below), that value is waited on
-    instead. It is cleared by the next probe that answers, so a retune lands
-    then rather than never, and the backoff can only ever be pacing a tier
-    whose probes are timing out anyway.
+    loop. With one deferral: while spec 5.1's retry backoff is engaged
+    (self._retry_interval, below), that value is waited on instead, and a
+    retune lands on the probe that clears it rather than on the next wait.
+    That deferral is the cheap half: neither remote writer of `interval` can
+    be bitten by it, one by ordering and one by the cap -- see pump's own
+    precedence paragraph, where all three claims on this loop's wait are
+    reconciled.
+
+    THE COST THAT IS REAL is on the way back, and it is not the deferral:
+    with the backoff at SAFETY_NET_POLL_SECONDS, the tick that would notice
+    the probes answering again is itself that far away. In degraded mode,
+    where this poll is the connection's only sync, recovery detection
+    therefore stretches from DEGRADED_POLL_SECONDS to that cap. Spec 5.1
+    makes the backoff mandatory; the cap is this task's own choice, so that
+    the tier can never end up rarer than the plain safety net it is. The
+    price belongs to the rule rather than being a defect in it -- but it is
+    the number to weigh when tuning either constant.
+
+    And "engaged" means the probes are returning no token, which is NOT the
+    same as timing out: probe() answers None for a timed-out wl-paste and for
+    a genuinely empty selection alike and cannot tell them apart. An emptied
+    clipboard therefore backs this tier off exactly as a hang does, which is
+    why the rule is scoped to the composed slow tier -- pump says why.
 
     `on_tick` is an optional pure observer, invoked with (previous, current)
     after EVERY tick, change or not. Those two are probe() TOKENS, never
@@ -4504,7 +4521,9 @@ class PollingWatcher:
         # whose two REMOTE writers (spec 6.2's degraded latch and spec 4.3's
         # uuid-tier fallback, on the poll and fast-tier threads respectively)
         # are why that one is re-read every iteration. Which of the three
-        # wins when they disagree is settled in pump's own comment.
+        # wins when they disagree is settled in pump's "WHICH OF THE THREE
+        # CLAIMS ON THIS WAIT WINS" paragraph, by ordering and by the cap
+        # rather than by an `if`.
         self._retry_interval = None
 
     def available(self):
@@ -4565,12 +4584,35 @@ class PollingWatcher:
                     # time one of them CAN answer, the token may be equal to
                     # the pre-hang one. For text it cannot be -- the token IS
                     # the body -- but for an image it is the offered type
-                    # list, and probe()'s own docstring discloses that two
-                    # copies from the same source application inside
-                    # GPaste's takeover window can present identical lists.
-                    # It expects them to alternate and says plainly that the
-                    # expectation is unverified, so this is the disclosed
-                    # branch of it rather than the normal case.
+                    # list, and TWO SEPARATE ROUTES get there. Do not read
+                    # only the first and conclude this is a corner case:
+                    #
+                    #   - probe()'s docstring discloses that two copies from
+                    #     the same source application inside GPaste's
+                    #     takeover window can present identical lists. It
+                    #     expects them to alternate and says plainly that
+                    #     the expectation is unverified, so this route is
+                    #     the disclosed branch of an open question.
+                    #   - The alternation HOLDING does not remove the
+                    #     exposure, which is the part a first draft of this
+                    #     comment missed. Alternation says each copy shows
+                    #     the application's list and then GPaste's, so two
+                    #     samples both taken after a takeover are both
+                    #     GPaste's own list. That list is GPaste's, not the
+                    #     picture's -- nothing in probe()'s account makes it
+                    #     vary with the image -- so on this route two
+                    #     different images compare EQUAL. And a tier polling
+                    #     every 30s lands after the takeover (measured at
+                    #     one to six seconds) far more often than inside it,
+                    #     which makes this the common sampling regime rather
+                    #     than the rare one.
+                    #
+                    # Stated at the strength the evidence supports: neither
+                    # route is verified on hardware, and they fail
+                    # independently, so verifying one does not retire
+                    # `recovered`. Anyone who does verify alternation on a
+                    # real machine and reads this as licence to delete it
+                    # should read the second bullet again first.
                     #
                     # So the recovery is signalled on the strength of the RUN
                     # HAVING ENDED rather than of the token having moved
@@ -4593,8 +4635,19 @@ class PollingWatcher:
                     # deliver. Detecting that needs the worker to report what
                     # it found back into this loop, which is the coupling
                     # this file removes on purpose ("signalled, never
-                    # called") -- so it stays open, bounded by the next real
-                    # token move, exactly as it was before v3.3.
+                    # called"), so it stays open.
+                    #
+                    # NARROWER THAN IT SOUNDS, and say so rather than bank
+                    # the pessimism: probe and read are the same binary, so
+                    # a hang that outlives one read almost always fails this
+                    # loop's NEXT probe too, which starts a run and makes
+                    # `recovered` fire after all. What is left is the
+                    # monitor dying and returning entirely inside a single
+                    # worker read -- and in that sub-case pre-v3.3 lost the
+                    # change as well, since its own probe never saw a None
+                    # to collapse the baseline onto either. So: unchanged
+                    # from before v3.3, and rarer than the paragraph above
+                    # reads on its own.
                     #
                     # AND IT BACKS OFF, which is not optional: an unresolved
                     # tick still costs a wl-paste fork that will time out, so
@@ -4632,6 +4685,42 @@ class PollingWatcher:
                     # exactly what GPaste does. Disclosed rather than
                     # closed, and the gate keeps it off the path where it
                     # would bite.
+                    #
+                    # WHICH OF THE THREE CLAIMS ON THIS WAIT WINS -- two
+                    # remote writers of self.interval, plus this backoff,
+                    # and __init__ sends readers here for the answer. They
+                    # are not three writers of one field, which is exactly
+                    # why there is no `if` deciding between them. Short
+                    # version: the backoff wins only while probes are
+                    # returning nothing, and it cannot outlast that by even
+                    # one tick.
+                    #
+                    #   - SPEC 6.2's degraded latch (_observe_tick, this
+                    #     file) always takes effect on the very next wait,
+                    #     and the ordering is what guarantees it rather
+                    #     than luck. It is reached only past `if not
+                    #     read_ok`, and read_ok needs `current is not None`
+                    #     -- a RESOLVED tick, on which the `else` below has
+                    #     already cleared self._retry_interval, before
+                    #     _on_tick runs at the bottom of this try. Nothing
+                    #     sets it again before the loop waits, so the wait
+                    #     reads the interval the latch just wrote.
+                    #   - SPEC 4.3's uuid-tier fallback (_fast_tick, on the
+                    #     fast tier's thread) writes SAFETY_NET_POLL_SECONDS
+                    #     -- exactly this backoff's cap. So the backoff can
+                    #     never make the loop SLOWER than that write asks
+                    #     for; at worst it polls sooner, and only until the
+                    #     next probe that answers. The two cannot disagree
+                    #     in the direction that would matter.
+                    #
+                    # The remaining pair -- degraded latch against uuid-tier
+                    # fallback, both writing self.interval -- is a DIFFERENT
+                    # question and is settled elsewhere, by the explicit
+                    # `if not self._degraded` in _fast_tick and the reasoning
+                    # beside it. Do not read the two as one ruling: that one
+                    # needed a guard because both really do write the same
+                    # field, and this one needs none because the backoff
+                    # never outlives the condition that raised it.
                     unresolved = current is None and self._on_tick is not None
                     # Read BEFORE the assignments below, and self._retry_interval
                     # doubles as the run's memory rather than earning a second
@@ -4651,6 +4740,20 @@ class PollingWatcher:
                         # armed run -- which is what it already did for the
                         # first failed probe of every hang before v3.3, now
                         # for all of them.
+                        # THE CAP IS THE CONSTANT, NOT self.interval, and
+                        # that inverts if the two ever cross. Every interval
+                        # this poller is built with today is <= 30s
+                        # (SAFETY_NET_POLL_SECONDS itself, or
+                        # DEGRADED_POLL_SECONDS), so min() can only ever
+                        # slow the loop down. Spec 4.2's slow tier is
+                        # 5-15 MINUTES; the day that becomes this poller's
+                        # interval rather than only self._slow_interval,
+                        # min() starts making the RETRY faster than the
+                        # base rate. Left unguarded deliberately -- the spec
+                        # says "capped at SAFETY_NET_POLL_SECONDS" and a
+                        # max() would make that sentence conditionally false
+                        # -- so it is written down instead, for whoever sets
+                        # that interval.
                         self._retry_interval = min(
                             SAFETY_NET_POLL_SECONDS,
                             (self._retry_interval or self.interval) * 2)
