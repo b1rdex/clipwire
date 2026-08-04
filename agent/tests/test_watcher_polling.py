@@ -658,6 +658,61 @@ class TestFailedReadDoesNotConsumeTheChange(unittest.TestCase):
             "and the run's memory must be cleared with it, or the next tick to "
             "answer would report itself a recovery")
 
+    def test_the_rule_is_active_on_the_watcher_production_actually_builds(self):
+        """Every other test here hands `on_tick` to a bare PollingWatcher, so
+        together they prove the rule works GIVEN it is switched on -- and
+        nothing proves that GPasteWatcher's safety net is the poller that
+        has it switched on. That gap is this project's shipped history, not
+        a hypothetical: spec 2 cites "a fix sited in a watcher that is never
+        constructed on the target machine", and the file's own
+        test_the_composed_safety_net_never_calls_read_either exists because
+        "a fix applied only to the standalone poller would have left the
+        reported defect untouched".
+
+        The wiring is otherwise protected only incidentally. Dropping
+        `on_tick=self._observe_tick` from GPasteWatcher's PollingWatcher
+        does go red in test_watcher_safety_net.py -- but for "no verdict was
+        reached", not for "spec 5.1's rule was off". A restructure that kept
+        a verdict observer while moving the slow tier out from under the
+        rule would stay green everywhere else, and spec 4.2's divergence
+        re-probe is exactly such a restructure.
+
+        Both halves are asserted at the real composition, and they fail to
+        different mutations: the backoff engaged (only true if the composed
+        safety net satisfies the gate) and the change was delivered across a
+        hang the token does not record (only true if `recovered` fires).
+
+        The fast tier is pushed out of reach rather than stubbed, so the
+        only thing that can signal the worker here is the safety net's own
+        pump -- which is what makes the delivery assertion evidence about
+        this rule rather than about the uuid tier. Its uuid baseline is left
+        unseeded for the same reason: uuid_frozen stays False, so
+        _observe_tick reaches no verdict and cannot change the interval
+        underneath the wait sequence."""
+        clipboard = ScriptedReadClipboard([b"a", None, None, b"a"])
+        delivered = threading.Event()
+        process = FakeGPasteProcess()
+        self.addCleanup(process.close)
+        watcher = GPasteWatcher(clipboard, safety_net_interval_seconds=1.0,
+                                degraded_interval_seconds=1.0,
+                                fast_interval_seconds=JOIN_TIMEOUT * 100)
+        watcher._safety_net._stop = RecordingStop(5)
+        self.addCleanup(watcher.stop)
+        with mock.patch("subprocess.Popen", return_value=process):
+            watcher.start(delivered.set)
+        watcher._safety_net._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertEqual(
+            watcher._safety_net._stop.waits[:3], [1.0, 2.0, 4.0],
+            "spec 5.1's backoff must be active on the poller GPasteWatcher "
+            "actually composes, not only on one built by hand; got %r"
+            % (watcher._safety_net._stop.waits[:3],))
+        self.assertTrue(
+            delivered.wait(JOIN_TIMEOUT),
+            "and the change the hung read could not deliver must reach the "
+            "worker there too, on a token equal across the hang: %r"
+            % self.log_lines)
+
     def test_the_standalone_poller_keeps_todays_behaviour_exactly(self):
         """Spec 2's constraint: a machine with no GPaste is untouched.
         There is no fast tier there to consume a change behind this loop's
