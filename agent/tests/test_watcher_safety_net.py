@@ -850,17 +850,22 @@ class TestDegradedBackoff(unittest.TestCase):
             run, so every tick of one arrives in this shape.
           - (None, token) is NOT a hang: `unresolved` is `current is None`,
             so pump treats this tick as a full change, signals it and
-            advances its baseline. It is the first tick after a baseline
-            probe that found nothing -- an empty clipboard at connect.
+            advances its baseline. It is the first tick to RESOLVE after a
+            baseline probe that found nothing -- an empty clipboard at
+            connect, or a wl-paste already hanging then, in which case any
+            number of unresolved ticks come between the two.
 
         The second call below therefore pins the GUARD rather than
         reproducing a production state, the same convention
         test_no_verdict_while_the_uuid_is_unknown in test_watcher_uuid_tier.py
         uses for the identical reason: in production a (None, token) tick can
-        only be the FIRST loop tick (pump's `previous = current` sits in its
-        resolved branch, so nothing after the baseline can put None back), and
-        a degraded watcher is still on the floor there -- so freezing and
-        resetting would write the same number and the guard would be
+        only be the first RESOLVED tick -- not the first loop tick, which an
+        earlier revision of this docstring said and the hang-at-connect case
+        above disproves. (pump's `previous = current` sits in its resolved
+        branch, so `previous` holds the baseline's None across however many
+        unresolved ticks follow and can never be put back to None once it
+        advances.) A degraded watcher is still on the floor there, so freezing
+        and resetting would write the same number and the guard would be
         invisible. Backing the interval off first is what makes the two
         outcomes distinguishable at all.
 

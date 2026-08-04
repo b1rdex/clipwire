@@ -1372,10 +1372,17 @@ class Agent:
         OVERDUE, not merely armed, and the difference is a cost the file
         already ruled on. An observation means a full clipboard.read() --
         --list-types plus the whole image body -- and "armed" stays true from
-        the write until the disarm, which in degraded mode is thirty ticks a
-        second apart: up to MAX_IMAGE_BYTES down a pipe thirty times per
-        applied image, which is precisely the expense probe() was introduced
-        to delete. Nothing is lost by waiting: a real re-offer changes the
+        the write until the disarm, which spans the whole detection budget: on
+        a GPaste-less machine that is thirty ticks a second apart, and in
+        degraded mode about five (spec 6.2's backoff resets on the write's own
+        token change and then doubles: 1, 2, 4, 8, 16). Either way it is up to
+        MAX_IMAGE_BYTES down a pipe once per tick per applied image, which is
+        precisely the expense probe() was introduced to delete. The ruling
+        does not turn on which number it is -- five full image reads to learn
+        nothing is already the thing being refused -- but the number is
+        written down correctly rather than left at the pre-backoff one.
+
+        Nothing is lost by waiting: a real re-offer changes the
         offered type list, so it arrives through the CHANGE branch and never
         needed this one, and the disarm needs exactly one look -- the first
         tick past the budget. The only case that shifts is a re-offer whose
@@ -4190,11 +4197,25 @@ class GPasteWatcher:
         # idling at 4s through a three-tick hang resumes at 8s afterwards, not
         # at the floor and not at the cap.
         #
-        # THE TWO CASES WHERE pump SIGNALS AN OBSERVATION AND THIS BLOCK DOES
-        # NOT CALL IT A CHANGE. This paragraph is the file's inventory of
-        # where the rate and the signal disagree, so it lists the cheap entry
-        # as well as the costly one; an earlier draft said "THE ONE CASE" and
-        # was wrong by one.
+        # WHERE THE RATE AND THE SIGNAL DISAGREE -- AS A RULE, NOT AS A LIST.
+        # Two consecutive review rounds found this paragraph's count wrong,
+        # the second time while it was asserting its own completeness and
+        # taking credit for having fixed the first off-by-one. A hand-kept
+        # enumeration here has to be revisited whenever pump grows a branch or
+        # a caller passes a new hook, and nothing announces when that happens.
+        # So the rule is the thing to trust, and the list under it is a
+        # DERIVATION to be recomputed rather than a fact to be cited:
+        #
+        #   pump signals on a RESOLVED tick in two places -- the change branch
+        #   (`current != previous or recovered`) and the idle branch (the
+        #   token settled and on_idle_tick() answered True). This block calls
+        #   a tick a change only when `read_ok and token_moved`. Every
+        #   disagreement is therefore a tick pump signalled where that
+        #   conjunction is False, and there are no others.
+        #
+        # Working that through TODAY'S callers gives three, and if you are
+        # reading this after pump or on_idle_tick changed, redo it rather than
+        # trusting the three:
         #
         #   - `recovered`, and only a walk finds it. On the tick that ends a
         #     failure run pump signals unconditionally, because for an image
@@ -4209,11 +4230,26 @@ class GPasteWatcher:
         #     as many words), so spending the floor on it would contradict the
         #     reason it exists, and spec 6.2's rule is "reset on an observed
         #     CHANGE".
-        #   - (None, token), the first-tick case above. pump signals and
-        #     advances its baseline; this block freezes. It costs nothing, for
-        #     the structural reason given there -- the interval is already on
-        #     the floor -- which is why it is an entry in this list rather than
-        #     a second disclosed price.
+        #   - (None, token), the first-resolved-tick case above. pump takes
+        #     the change branch, signals and advances its baseline; this block
+        #     freezes on read_ok. It costs nothing, for the structural reason
+        #     given there -- the interval is already on the floor -- which is
+        #     why it is an entry in this derivation rather than a second
+        #     disclosed price.
+        #   - THE IDLE BRANCH, which is live in degraded mode rather than
+        #     theoretical: Agent passes on_idle_tick=self._reoffer_pending,
+        #     make_watcher forwards it to both watcher shapes, and
+        #     GPasteWatcher hands it to this very safety net. When an applied
+        #     image is still waiting for GPaste to re-offer it, that predicate
+        #     answers True on a SETTLED token, pump signals -- its own
+        #     docstring calls that "signal an observation anyway" -- and this
+        #     block, seeing token_moved False, doubles. Correct as spec 6.2 is
+        #     written: the token did not move, and an observation asked for by
+        #     a flag on this side of the process is not evidence that the
+        #     user's clipboard did anything. The cost is one backoff step,
+        #     bounded the same way `recovered` is, and it lands only while an
+        #     expectation is armed. Missed by BOTH earlier drafts of this
+        #     paragraph, which is the argument for the rule above it.
         #
         # token_moved is the local computed for the predicate above, not a
         # second `previous != current`. Two spellings of one term is this
@@ -4762,10 +4798,11 @@ class PollingWatcher:
         # None means "observations are resolving, wait self.interval". Only
         # pump() below ever touches it -- one writer and one reader, both the
         # poll thread -- which is why it needs no lock, unlike self.interval,
-        # whose THREE REMOTE WRITE SITES on TWO threads (spec 6.2's degraded
-        # latch and, since Task 9, its backoff, both on the poll thread; spec
-        # 4.3's uuid-tier fallback on the fast-tier thread -- and only that
-        # last one makes this a cross-thread question at all)
+        # whose THREE REMOTE WRITERS on TWO threads (spec 6.2's degraded latch
+        # and, since Task 9, its backoff, both on the poll thread; spec 4.3's
+        # uuid-tier fallback on the fast-tier thread -- and only that last one
+        # makes this a cross-thread question at all; the backoff is one writer
+        # in two assignment statements, so counting STATEMENTS gives four)
         # are why that one is re-read every iteration. Which of the three
         # wins when they disagree is settled in pump's "WHICH OF THE THREE
         # CLAIMS ON THIS WAIT WINS" paragraph, by ordering and by the cap
@@ -4948,19 +4985,34 @@ class PollingWatcher:
                     # decides anything, and the reason is that each pair is
                     # settled somewhere else.
                     #
-                    # The two bullets below settle every pair that involves
-                    # THIS backoff, which is all this paragraph was ever
-                    # written to do -- the first covers BOTH spec 6.2 writes
-                    # at once, since one gate makes the argument for them
-                    # jointly. The one pair that does not involve it at all is
-                    # the closing paragraph's, below the bullets. And the
-                    # newest pair -- 6.2's latch against 6.2's own backoff --
-                    # needs no rule anywhere, which is worth one sentence
-                    # rather than a bullet: they are the same thread in one
-                    # function in a fixed order, and the latch is reached only
-                    # when `confirmed`, which IS `token_moved`, so the backoff
-                    # that follows it always takes the reset branch and writes
-                    # the same floor.
+                    # FOUR CLAIMANTS MAKE SIX PAIRS, and saying which of them
+                    # this paragraph owns is the whole of its job. Counted,
+                    # not estimated -- a first repair of this text said "the
+                    # one pair that does not involve it" and then immediately
+                    # described a second one:
+                    #
+                    #   - THREE pairs involve this retry backoff (against each
+                    #     of the three writers of self.interval). The two
+                    #     bullets below settle all three: the first covers
+                    #     BOTH spec 6.2 writes at once, since one gate makes
+                    #     the argument for them jointly. That is all this
+                    #     paragraph was ever written to do.
+                    #   - 6.2's latch against 4.3's fallback: the closing
+                    #     paragraph below the bullets.
+                    #   - 6.2's BACKOFF against 4.3's fallback: the same
+                    #     `if not self._degraded` in _fast_tick, for the same
+                    #     reason -- both 6.2 writes need self._degraded True,
+                    #     and that guard is what keeps the fallback off the
+                    #     field while it is. Its surviving race is disclosed
+                    #     beside the guard.
+                    #   - 6.2's latch against 6.2's own backoff: no rule
+                    #     anywhere, and none is owed. Same thread, one
+                    #     function, fixed order, and the latch is reached only
+                    #     when `confirmed`, which IMPLIES `token_moved` (it is
+                    #     assigned from it in the one branch that can make it
+                    #     True; the converse does not hold, and does not need
+                    #     to), so the backoff that follows a latch always
+                    #     takes the reset branch and writes the same floor.
                     #
                     # Short version for the bullets: the retry wins only while
                     # probes are returning nothing, and it cannot outlast that
@@ -4991,14 +5043,18 @@ class PollingWatcher:
                     #     next probe that answers. The two cannot disagree
                     #     in the direction that would matter.
                     #
-                    # The remaining pair -- degraded latch against uuid-tier
-                    # fallback, both writing self.interval -- is a DIFFERENT
-                    # question and is settled elsewhere, by the explicit
-                    # `if not self._degraded` in _fast_tick and the reasoning
-                    # beside it. Do not read the two as one ruling: that one
-                    # needed a guard because both really do write the same
-                    # field, and this one needs none because the backoff
-                    # never outlives the condition that raised it.
+                    # The pairs that do NOT involve this backoff -- spec 4.3's
+                    # fallback against EITHER spec 6.2 write, which since Task
+                    # 9 is two of them rather than "the remaining pair" this
+                    # sentence said while there were only three claimants --
+                    # are a DIFFERENT question and are settled elsewhere, by
+                    # the explicit `if not self._degraded` in _fast_tick and
+                    # the reasoning beside it. One guard covers both, because
+                    # both 6.2 writes require self._degraded to be True. Do
+                    # not read that ruling and this one as one: there a guard
+                    # was needed because those really do write the same field,
+                    # and here none is because the backoff never outlives the
+                    # condition that raised it.
                     unresolved = current is None and self._on_tick is not None
                     # Read BEFORE the assignments below, and self._retry_interval
                     # doubles as the run's memory rather than earning a second
@@ -5022,8 +5078,12 @@ class PollingWatcher:
                         # that inverts if the two ever cross. Every interval
                         # this poller is built with today is <= 30s
                         # (SAFETY_NET_POLL_SECONDS itself, or
-                        # DEGRADED_POLL_SECONDS), so min() can only ever
-                        # slow the loop down. Spec 4.2's slow tier is
+                        # DEGRADED_POLL_SECONDS), and since Task 9 that is no
+                        # longer the whole basis -- spec 6.2's backoff assigns
+                        # self.interval after construction -- but it holds
+                        # anyway, because that writer caps itself at this same
+                        # constant. So min() can only ever slow the loop down.
+                        # Spec 4.2's slow tier is
                         # 5-15 MINUTES; the day that becomes this poller's
                         # interval rather than only self._slow_interval,
                         # min() starts making the RETRY faster than the
