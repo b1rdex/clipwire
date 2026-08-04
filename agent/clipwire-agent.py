@@ -3201,8 +3201,14 @@ GPASTE_INTERFACE = "org.gnome.GPaste2"
 # rests on it, so it is named here rather than left in one file. README.md's
 # locked-PC section records `wl-paste --list-types` answering in ABOUT 20 ms
 # when the session is unlocked -- recorded 2026-08-01 out of the v3 acceptance
-# run, two days before spec 1's 104 ms, on the same machine, with nothing
-# recorded in between to account for a fivefold gap. The earlier reading's
+# run, AT LEAST two days before spec 1's 104 ms of 2026-08-03, on the same
+# machine, with nothing recorded in between to account for a fivefold gap.
+# A FLOOR, NOT THE GAP: 2026-08-01 is when the figure was WRITTEN DOWN, and
+# the acceptance run it came out of is undated in prose, so the interval
+# between the two measurements can only be longer than that. The argument
+# does not need the exact number -- a fivefold gap over a floor of two days
+# on one machine already wants explaining -- but a bound stated as a
+# quantity is the shape this file keeps getting wrong. The earlier reading's
 # conditions were not written down and the two have never been run side by
 # side. Neither is retracted here: spec 1's is the better-EVIDENCED one --
 # spec 10 says that campaign's measurements are recorded with their

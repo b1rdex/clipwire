@@ -137,8 +137,10 @@ While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocke
 call returns quickly — and this file now carries **two figures** for that, which is worth
 naming rather than leaving for a reader to trip over. "About 20 ms" was recorded here on
 2026-08-01, out of the v3 acceptance run. The next section quotes about a tenth of a second,
-measured 2026-08-03 with the agent stopped. Two days apart, on the same machine, with nothing
-recorded in between that would account for a fivefold difference. The later campaign wrote
+measured 2026-08-03 with the agent stopped. **At least** two days apart, on the same machine,
+with nothing recorded in between that would account for a fivefold difference — at least,
+because 2026-08-01 is when the earlier figure was written down, and the run it came out of is
+undated, so the true gap can only be larger. The later campaign wrote
 down its instrument and its controls; the earlier reading's conditions were not recorded at
 all. Nobody has re-run the two side by side, and neither is retracted on the strength of the
 other. What matters *in this section* is unaffected either
@@ -184,7 +186,7 @@ call was twenty to thirty times cheaper until it was timed the way the agent act
 it, as a subprocess; that claim is retracted. The entire difference is the focus grab.
 
 **This is the claim that depends on the unreconciled figure above.** It rests on
-`wl-paste --list-types` costing about a tenth of a second, measured over ten samples on
+`wl-paste --list-types` costing about a tenth of a second, measured on
 2026-08-03. Under the section above's older "about 20 ms" reading it would not hold: the
 D-Bus call would be several times *slower* in wall clock, and the difference would not be
 the focus grab alone. The focus grab itself is measured either way and is not in doubt —
