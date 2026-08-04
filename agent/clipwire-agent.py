@@ -4234,13 +4234,20 @@ class GPasteWatcher:
         # last tick's count, one moment longer. True of the COUNT on its own;
         # _observe_tick consumes the count and self._last_uuid as a PAIR,
         # which is written non-atomically in _fast_tick's `else` branch (two
-        # adjacent stores, nothing blocking between them) and read
-        # non-atomically in _observe_tick (nine lines apart) -- NOT "here",
+        # adjacent stores, nothing blocking between them) -- NOT "here",
         # which is what this said while sitting in __init__, where neither
-        # the write nor the read is. So NEITHER the single-writer shape nor the
-        # store order makes that pair safe -- the order narrows the window
-        # and no more. See _fast_tick's `else` branch for both windows,
-        # which one the order closes, and which one it leaves open.
+        # the write nor the read is.
+        #
+        # THE PAIR IS SAFE, AND IT IS THE READ ORDER THAT MAKES IT SO, not
+        # the single-writer shape and not the store order. This paragraph
+        # used to end "the order narrows the window and no more", pointing
+        # at _fast_tick for "which one the order closes, and which one it
+        # leaves open" -- and the open one was a MEASURED false spec 6.2
+        # verdict on a healthy machine, parked for a release on a remedy
+        # estimate nobody had checked. _observe_tick now reads the COUNT
+        # FIRST and each field exactly once, into locals; the case analysis
+        # is at those reads. Both windows are closed and both are pinned by
+        # tests that go red on reversion.
         self._uuid_failures = 0
         # Once True, stays True for the rest of the connection. Recovery --
         # the method starting to answer again -- is deliberately NOT
@@ -4809,10 +4816,11 @@ class GPasteWatcher:
         #
         # ONE READ EACH, into locals, for the same reason. self._last_uuid
         # was read twice per tick -- here, and again at the bottom for the
-        # snapshot -- with the whole verdict body in between, including a
-        # gdbus property read that costs ~103 ms. A uuid that moved inside
-        # that window was judged as frozen HERE and then snapshotted as the
-        # new baseline THERE, so the move was swallowed: the next tick
+        # snapshot -- with the whole verdict body in between; on the tick
+        # that CONFIRMS, that body includes a gdbus property read measured
+        # at ~103 ms, which is the widest this gap ever gets. A uuid that
+        # moved inside it was judged as frozen HERE and then snapshotted as
+        # the new baseline THERE, so the move was swallowed: the next tick
         # compared the fresh value against itself and read frozen again. The
         # local makes the snapshot literally "this tick's reading", which is
         # what the comment beside it has always claimed.
@@ -5489,11 +5497,15 @@ class GPasteWatcher:
             # neither field reaches a DECISION once spec 4.3's fallback has
             # engaged and the discriminator is the signal counter -- so even
             # a torn pair could do no harm there. "Reaches the decision",
-            # not "is read": uuid_frozen is computed unconditionally at the
-            # top of _observe_tick, so self._last_uuid IS read on every
-            # post-fallback tick and the result is then thrown away by the
-            # `if self._uuid_tier_failed` branch. self._uuid_failures is the
-            # one that is genuinely not read there.
+            # not "is read", and the reorder made that distinction SYMMETRIC
+            # where it used to apply to one of the two: both fields are now
+            # read unconditionally at the top of _observe_tick, and in the
+            # post-fallback regime both results are thrown away by the `if
+            # self._uuid_tier_failed` branch, which looks at neither. This
+            # said self._uuid_failures was "the one that is genuinely not
+            # read there", which was true while the count was read inside
+            # that branch's `else` and stopped being true in the same commit
+            # that rewrote this paragraph.
             #
             # NO LOCK, and now for a better reason than "the residual is
             # narrow": there is nothing left for one to buy. A lock here
