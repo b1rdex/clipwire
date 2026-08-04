@@ -381,3 +381,316 @@ class TestPollingWatcherAsksForATokenNotTheContent(unittest.TestCase):
         self.assertEqual([line for line in self.log_lines if "poll error" in line], [])
 
 
+class RecordingStop:
+    """A drop-in for PollingWatcher._stop that records the timeout the poll
+    loop asks to wait for, and then does not wait at all -- it returns
+    immediately for `ticks` iterations and stops the loop after that.
+
+    TWO JOBS, and both were learned the hard way here.
+
+    It records because of a mutation nothing else in this suite caught:
+    with the loop's wait reverted to `self._stop.wait(self.interval)`, the
+    whole of spec 5.1's backoff is still computed and still stored, so every
+    assertion about self._retry_interval goes on passing while the loop
+    retries at full rate -- the exact failure the backoff exists to prevent,
+    behind an attribute reporting it fixed. Asserting on a value is not the
+    same as asserting it is USED.
+
+    It does not sleep because a backoff test otherwise has to choose between
+    intervals too small to distinguish and a suite that takes twenty seconds
+    -- and the third option, patching SAFETY_NET_POLL_SECONDS down, is worse
+    than both: the constant is module-global and daemon poll threads from
+    earlier tests outlive the cleanup that stopped them, so the patch is
+    visible to code no test in the file is looking at. Free-running instead,
+    the whole compounding sequence up to the REAL cap is observable in one
+    exact list with no clock involved.
+
+    Deliberately not a threading.Event subclass: wrapping one means the three
+    methods the watcher actually calls have to be named here, which is what
+    makes this break loudly rather than silently if the loop ever starts
+    using a fourth."""
+
+    def __init__(self, ticks):
+        self._event = threading.Event()
+        self._ticks = ticks
+        self.waits = []
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self._event.is_set() or len(self.waits) > self._ticks
+
+    def set(self):
+        self._event.set()
+
+    def is_set(self):
+        return self._event.is_set()
+
+
+class TestFailedReadDoesNotConsumeTheChange(unittest.TestCase):
+    """Spec 5.1, and the sharpest regression risk in v3.3.
+
+    Before the uuid tier, this loop's probe and the worker's read failed
+    TOGETHER -- both are wl-paste, and a powered-off monitor makes wl-paste
+    time out (spec 1.4) -- so a copy the hung read could not deliver was
+    caught up by accident: the baseline collapsed to None, and any later
+    probe that answered differed from it and re-signalled. The fast tier
+    breaks that. Its uuid keeps answering with the screen off, so it
+    signals the copy, advances its own baseline and is done with it
+    forever, while the worker's read delivers nothing.
+
+    So this loop becomes the only thing that can still catch that change
+    up, and all three halves of the rule are tested separately below,
+    because any two without the third are worse than none: the baseline
+    that does not advance, the signal that fires anyway, and the backoff
+    that paces the pair.
+
+    `on_tick` is passed by every test here that exercises the rule and
+    withheld by the one that pins the standalone path, because being
+    non-None is the discriminator pump() uses -- see PollingWatcher's own
+    docstring."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    def quiesce(self, watcher):
+        """Stopped AND joined before anything reads self._retry_interval: it
+        is written on the poll thread, so a test that sampled it while that
+        thread was still running would be asserting on a value the loop was
+        free to change underneath it."""
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+        self.assertFalse(watcher._thread.is_alive(),
+                         "the poll thread must be joined before its state is read")
+
+    def test_a_probe_that_never_answered_does_not_consume_the_baseline(self):
+        """The first half. `previous` must still hold the last MEASURED
+        token, so the change that arrives when the read recovers is still a
+        change relative to what was last actually seen.
+
+        Asserted through on_tick rather than through on_change because it
+        is the only deterministic window onto `previous`: the observer is
+        handed (before, current) on EVERY tick, changed or not, while
+        signals to the worker collapse. Under the unconditional advance
+        this replaces, the second hanging tick reports (None, None) -- the
+        baseline eaten by a probe that answered nothing."""
+        clipboard = ScriptedReadClipboard([b"a", None])
+        ticks = []
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.005,
+            on_tick=lambda before, current: ticks.append((before, current)))
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(len(ticks), 3,
+                                "the poll must have run past the first failed probe")
+        self.assertEqual(
+            ticks[:3], [(b"a", None)] * 3,
+            "every unresolved tick must still be judged against the last token "
+            "actually measured; got %r" % (ticks[:3],))
+
+    def test_a_hang_that_ends_signals_even_when_the_token_did_not_move(self):
+        """The second half, and the one nothing else in the suite catches.
+
+        The recovery signal cannot be conditioned on the token having MOVED
+        across the hang, because the case that loses a change is exactly
+        the one where it did not. probe()'s token for an image is the
+        offered TYPE LIST, and its docstring discloses that two copies from
+        the same source application inside GPaste's takeover window can
+        present identical lists -- it expects them to alternate and says
+        plainly that the expectation is unverified. On that branch the
+        token recovers EQUAL to the pre-hang one while the body behind it
+        is a different picture, one the fast tier already consumed and the
+        hung read never delivered.
+
+        That is why it is the run ENDING that signals, not the comparison.
+        Before v3.3 the same catch-up happened by accident, because the
+        baseline collapsed to None and any later answer differed from it;
+        holding the last measured token without this makes the loop
+        strictly worse than what shipped, in the release's headline
+        scenario. Measured against the composed watcher, not argued.
+
+        The script is that shape exactly: b"a", a hang, then b"a" again."""
+        clipboard = ScriptedReadClipboard([b"a", None, None, b"a"])
+        delivered = threading.Event()
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005,
+                                 on_tick=lambda before, current: None)
+        self.addCleanup(watcher.stop)
+        watcher.start(delivered.set)
+
+        self.assertTrue(
+            delivered.wait(JOIN_TIMEOUT),
+            "the first probe to answer after a hang must offer the worker an "
+            "observation whether or not the token moved across it: %r"
+            % self.log_lines)
+
+    def test_an_unresolved_tick_asks_for_no_observation_at_all(self):
+        """The other side of the same rule, and the reason the retry is not
+        simply "signal on every unresolved tick". probe() and read() are the
+        same wl-paste binary, so while it is not answering a read is
+        guaranteed to find nothing: every signal raised here would buy one
+        more timed-out fork and no information. The idle-tick predicate is
+        skipped for the same reason -- an armed re-offer expectation cannot
+        be resolved by a read that cannot run, and Agent._reoffer_is_overdue
+        gives such an expectation up on its own clock regardless.
+
+        So a hang is silent, and the tick's whole output is the backoff.
+        `on_tick` still runs (asserted, because the safety net must keep
+        judging through a hang), which is what makes this "quiet" rather
+        than "skipped"."""
+        clipboard = ScriptedReadClipboard([b"a", None])
+        observations = []
+        asked = []
+        ticks = []
+        watcher = PollingWatcher(
+            clipboard, interval_seconds=0.005,
+            on_tick=lambda before, current: ticks.append((before, current)),
+            on_idle_tick=lambda: asked.append(1) or True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observations.append(1))
+
+        self.wait_until(lambda: len(ticks) >= 3)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(len(ticks), 3,
+                                "the safety net must go on being handed every "
+                                "tick through a hang, or this proves nothing")
+        self.assertEqual(observations, [],
+                         "a wl-paste that is not answering must not be asked to "
+                         "read; got %d observations" % len(observations))
+        self.assertEqual(asked, [],
+                         "the idle-tick predicate must not be consulted on a "
+                         "tick whose read could not run either")
+
+    def free_running(self, script, ticks, interval=1.0, on_idle_tick=None):
+        """A composed-tier poller driven through exactly `ticks` iterations
+        with no clock: RecordingStop returns instead of waiting, so the
+        production interval and the production cap are the real ones and the
+        test still finishes instantly. Returns the watcher, joined."""
+        clipboard = ScriptedReadClipboard(script)
+        watcher = PollingWatcher(clipboard, interval_seconds=interval,
+                                 on_tick=lambda before, current: None,
+                                 on_idle_tick=on_idle_tick)
+        watcher._stop = RecordingStop(ticks)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: None)
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+        self.assertFalse(watcher._thread.is_alive(),
+                         "the free-running loop must have finished its budget")
+        return watcher
+
+    def test_an_unresolved_observation_backs_off(self):
+        """Spec 5.1: without this the fix costs twelve 3-second timeout
+        forks a minute against today's two. This is also where spec 4.2's
+        "the monitor is on" gate actually lives -- the timeout observed
+        directly rather than proxied through PowerSaveMode, which this
+        release measured only in its monitor-ON state and deliberately
+        rejected.
+
+        Read through the stored attribute, which is the shape the rest of
+        this class asserts on; the test below reads the same run through
+        what the loop did with it, and both are needed."""
+        watcher = self.free_running([b"a", None], ticks=3)
+
+        self.assertIsNotNone(watcher._retry_interval,
+                             "an unresolved observation retried at full rate")
+        self.assertEqual(
+            watcher._retry_interval, 8.0,
+            "three unresolved ticks from a 1s interval must compound to 8s, "
+            "not settle on one slower fixed rate")
+        self.assertLessEqual(watcher._retry_interval, SAFETY_NET_POLL_SECONDS)
+
+    def test_the_backoff_is_what_the_loop_actually_waits_on(self):
+        """Storing the backed-off interval is not the same as pacing the
+        loop with it, and every other assertion in this class reads the
+        stored value. Reverting the wait to `self.interval` leaves all of
+        them green while the loop retries a hanging probe at full rate --
+        spec 5.1's fork storm, behind an attribute reporting it fixed. So
+        this one asserts on the argument the loop passed, and nothing else.
+
+        The whole sequence, exactly, against the REAL cap: the first wait
+        precedes the first probe and so must still be the plain interval
+        (which is what tells a backoff apart from a loop that merely starts
+        slow), then it doubles, then it is HELD at SAFETY_NET_POLL_SECONDS
+        rather than going on past it -- so however long a hang lasts, the
+        slow tier never ends up rarer than the plain safety net it is."""
+        watcher = self.free_running([b"a", None], ticks=7)
+
+        self.assertEqual(
+            watcher._stop.waits[:7],
+            [1.0, 2.0, 4.0, 8.0, 16.0, SAFETY_NET_POLL_SECONDS,
+             SAFETY_NET_POLL_SECONDS],
+            "the loop must WAIT on the backed-off interval and stop doubling "
+            "at the cap; got %r" % (watcher._stop.waits[:7],))
+
+    def test_the_backoff_clears_on_a_probe_that_answers_without_a_change(self):
+        """The reset belongs to "the probe answered", never to "the token
+        moved" -- and the difference is not academic. Nothing can be copied
+        while the screen is off, so a hang that recovers with the clipboard
+        SETTLED is the common shape, not the corner one. Reset only inside
+        the change branch and that recovery leaves the elevated interval in
+        place until the next real copy: harmless at the healthy rate, and a
+        permanent silent 30x regression in degraded mode, where
+        DEGRADED_POLL_SECONDS is the connection's only sync path.
+
+        The recovery here is deliberately the SETTLED one -- b"a" before the
+        hang and b"a" after it -- so the reset cannot be reached through the
+        change branch even by accident."""
+        watcher = self.free_running([b"a", None, None, b"a"], ticks=5)
+
+        self.assertEqual(
+            watcher._stop.waits[:5], [1.0, 2.0, 4.0, 1.0, 1.0],
+            "a probe that answered must hand the interval back even when the "
+            "clipboard it answered about did not move; got %r"
+            % (watcher._stop.waits[:5],))
+        self.assertIsNone(
+            watcher._retry_interval,
+            "and the run's memory must be cleared with it, or the next tick to "
+            "answer would report itself a recovery")
+
+    def test_the_standalone_poller_keeps_todays_behaviour_exactly(self):
+        """Spec 2's constraint: a machine with no GPaste is untouched.
+        There is no fast tier there to consume a change behind this loop's
+        back -- the probe and the read fail together, as they always did --
+        and None also means "the selection is empty", which on that machine
+        is the normal end state once a selection owner exits and nothing
+        repopulates. Applying the rule there would retry an empty clipboard
+        forever.
+
+        Both halves are asserted, because the gate feeds both and a
+        mutation could drop it from either: the baseline still collapses to
+        None (proved by the recovery re-signalling on a token equal to the
+        pre-hang one, which only a None baseline can differ from), and the
+        backoff never engages.
+
+        Paced, because this asserts WHICH values were observed -- see
+        ScriptedReadClipboard."""
+        clipboard = ScriptedReadClipboard([b"a", None, b"a"], paced=True)
+        observed = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: observed.append(clipboard.take()))
+
+        self.wait_until(lambda: len(observed) >= 2)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            observed, [None, b"a"],
+            "the standalone path must keep advancing its baseline through a "
+            "failed probe, so the recovery is a change against None")
+        self.assertIsNone(
+            watcher._retry_interval,
+            "the standalone path must never back off: its probe and its read "
+            "fail together, so there is no consumed change to retry for")
+
+

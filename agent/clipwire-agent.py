@@ -4438,7 +4438,12 @@ class PollingWatcher:
     `interval` is re-read on every iteration, so a caller can change the poll
     rate mid-flight -- GPasteWatcher does exactly that when its safety net
     concludes the event source is dead -- without stopping and restarting the
-    loop.
+    loop. With one deferral, stated because it is the only way a caller's
+    retune does not take effect on the very next wait: while spec 5.1's retry
+    backoff is engaged (self._retry_interval, below), that value is waited on
+    instead. It is cleared by the next probe that answers, so a retune lands
+    then rather than never, and the backoff can only ever be pacing a tier
+    whose probes are timing out anyway.
 
     `on_tick` is an optional pure observer, invoked with (previous, current)
     after EVERY tick, change or not. Those two are probe() TOKENS, never
@@ -4447,6 +4452,17 @@ class PollingWatcher:
     stays the file's only compare-and-notify loop, with a single owner of
     `previous`: the safety net judges the event source from these
     observations rather than running a second comparison of its own.
+
+    It carries a SECOND job it does not name, and a reader who misses this
+    will misread pump(): being non-None is also what marks this poller as
+    GPasteWatcher's composed slow tier rather than make_watcher's plain
+    poller, and spec 5.1's failed-read rule is scoped to that. The two
+    coincide exactly -- the only construction that passes on_tick is the one
+    that composes a fast tier above it, and that fast tier is the whole
+    reason the rule is needed -- so it is an existing discriminator rather
+    than a new flag. Wire on_tick into a standalone poller and you get the
+    slow tier's retry semantics with it, deliberately: that IS the composed
+    shape, minus the composer.
 
     `on_idle_tick` is an optional PREDICATE, asked only on ticks where the
     token did not move, and answering True makes this loop signal an
@@ -4481,6 +4497,15 @@ class PollingWatcher:
         self._event = threading.Event() if event is None else event
         self._owns_the_worker = event is None
         self._worker = None
+        # Spec 5.1's retry backoff, and deliberately NOT a second interval:
+        # None means "observations are resolving, wait self.interval". Only
+        # pump() below ever touches it -- one writer and one reader, both the
+        # poll thread -- which is why it needs no lock, unlike self.interval,
+        # whose two REMOTE writers (spec 6.2's degraded latch and spec 4.3's
+        # uuid-tier fallback, on the poll and fast-tier threads respectively)
+        # are why that one is re-read every iteration. Which of the three
+        # wins when they disagree is settled in pump's own comment.
+        self._retry_interval = None
 
     def available(self):
         return True
@@ -4505,67 +4530,214 @@ class PollingWatcher:
                 previous = self.clipboard.probe()
             except Exception as error:
                 _handle_observer_error(error, "poll")
-            while not self._stop.wait(self.interval):
+            # self._retry_interval, never a fixed rate, for the same reason
+            # self.interval is re-read here rather than captured above: a
+            # tick that could not resolve slows the NEXT wait down. None --
+            # the steady state, and the only value the standalone path ever
+            # holds -- falls through to self.interval, so this reads exactly
+            # as it always did whenever nothing is backing off.
+            while not self._stop.wait(self._retry_interval or self.interval):
                 try:
                     current = self.clipboard.probe()
                     before = previous
-                    if current != previous:
-                        previous = current
-                        # Signalled, never called: a reader thread that ran the
-                        # handler could block on Agent._observe_lock and could
-                        # die of anything it raised -- see _start_observer.
-                        self._event.set()
-                    elif self._on_idle_tick is not None and self._on_idle_tick():
-                        # THE NO-CHANGE BRANCH, and the one place in this file
-                        # where an observation is asked for without the token
-                        # having moved. Agent._reoffer_pending is the only
-                        # caller's predicate: while an applied image is still
-                        # waiting for GPaste to re-offer it, the clipboard may
-                        # sit perfectly still forever -- on a machine with no
-                        # GPaste it certainly does -- and an expectation that
-                        # is never looked at again is never disarmed, so the
-                        # user's next image copy is absorbed as the re-offer
-                        # that never came.
-                        #
-                        # Still a signal, never a call, and still no clipboard
-                        # read on this thread: the predicate is a bare flag
-                        # test, and the WORKER's single read is what decides
-                        # between "the re-offer arrived" and "there is no
-                        # GPaste here" -- one read, two outcomes separated by
-                        # content. Deliberately NOT `previous = current` (there
-                        # was no change to absorb) and deliberately below the
-                        # real-change branch, which must always win.
-                        #
-                        # THE DISCLOSED GAP, health accounting. The v3.2
-                        # design requires a re-offer seen by a signal-less
-                        # poll to count toward the two-tick dead-source
-                        # verdict BEFORE _consume_image_reoffer absorbs it,
-                        # or a dead extension whose first unsignalled change
-                        # happens to be a re-offer stays undiagnosed -- the
-                        # safety net blinded by the very mechanism that
-                        # proves it was needed. Through the CHANGE branch
-                        # above that holds: _observe_tick compares tokens
-                        # against THIS loop's own `previous`, which the
-                        # worker never touches, so an absorption downstream
-                        # cannot erase a divergence already observed.
-                        #
-                        # Through THIS branch it does not. A re-offer whose
-                        # offered type list happens to match the previous one
-                        # produces no token divergence at all, so it arrives
-                        # here rather than above, is absorbed by the worker,
-                        # and _observe_tick sees a settled token and arms
-                        # nothing. NOT CLOSED, deliberately: closing it needs
-                        # the WORKER to report what it found back into this
-                        # watcher, and that is the coupling this file removes
-                        # on purpose -- "signalled, never called" -- which
-                        # would hand a wedged worker the power to stop the
-                        # poll. The cost is bounded: the verdict is deferred
-                        # to the next change the token CAN see, never lost,
-                        # and every change is still reported throughout.
-                        # Recorded in the v3.2 design's acceptance list as
-                        # partially met, so it is inherited rather than
-                        # rediscovered.
-                        self._event.set()
+                    # SPEC 5.1, AND BOTH HALVES ARE REQUIRED -- the baseline
+                    # that does not advance, and the backoff that paces the
+                    # tier while it cannot.
+                    #
+                    # WHAT GOES WRONG WITHOUT IT. probe() returns None for a
+                    # wl-paste that timed out, and a powered-off monitor
+                    # makes wl-paste time out -- measured, spec 1.4. The
+                    # fast tier's uuid keeps answering right through that
+                    # (gdbus, 0.102s with the screen off), so _fast_tick
+                    # signals the copy, advances self._last_uuid and is done
+                    # with it forever -- a uuid that already moved is frozen
+                    # from then on -- while the worker's read hangs and
+                    # delivers nothing. THIS loop is the only thing left
+                    # that can catch that change up.
+                    #
+                    # HOW THE CATCH-UP ACTUALLY WORKS, and it is NOT the
+                    # token comparison below. While the screen is off there
+                    # is nothing to be gained by signalling: probe() and
+                    # read() open with the same _list_kind call on the same
+                    # binary, so a read raised from a tick whose probe just
+                    # timed out is asking the same question a moment later
+                    # and has no independent chance of an answer. And by the
+                    # time one of them CAN answer, the token may be equal to
+                    # the pre-hang one. For text it cannot be -- the token IS
+                    # the body -- but for an image it is the offered type
+                    # list, and probe()'s own docstring discloses that two
+                    # copies from the same source application inside
+                    # GPaste's takeover window can present identical lists.
+                    # It expects them to alternate and says plainly that the
+                    # expectation is unverified, so this is the disclosed
+                    # branch of it rather than the normal case.
+                    #
+                    # So the recovery is signalled on the strength of the RUN
+                    # HAVING ENDED rather than of the token having moved
+                    # (`recovered` below). That is spec 5.1's "today's
+                    # structure gets the retry by accident; this must
+                    # reproduce it deliberately": today the baseline
+                    # collapses to None, so any later answer differs from it
+                    # and re-signals. Holding the last measured token without
+                    # that unconditional recovery signal would drop the
+                    # accident with nothing in its place and lose the image
+                    # -- measured against this exact scenario end to end, not
+                    # argued, and the first draft of this task shipped that
+                    # loss until the walk found it.
+                    #
+                    # WHAT IT DOES NOT CLOSE, and cannot from here. If the
+                    # monitor dies in the window between THIS thread's probe
+                    # and the WORKER's read, the probe answered, no run ever
+                    # starts, `recovered` never fires, and the baseline
+                    # legitimately advanced past a change the read did not
+                    # deliver. Detecting that needs the worker to report what
+                    # it found back into this loop, which is the coupling
+                    # this file removes on purpose ("signalled, never
+                    # called") -- so it stays open, bounded by the next real
+                    # token move, exactly as it was before v3.3.
+                    #
+                    # AND IT BACKS OFF, which is not optional: an unresolved
+                    # tick still costs a wl-paste fork that will time out, so
+                    # at a 5-second rate that is twelve wasted 3-second forks
+                    # a minute against the 30-second net's two. At the
+                    # 30-second net itself the cap makes this inert by
+                    # construction -- min() of two thirty-second figures --
+                    # which is consistent with the production log spec 1.4
+                    # cites: 3.004s timeouts at exactly 33s spacing. It bites
+                    # where the tier is polled faster: degraded mode's
+                    # DEGRADED_POLL_SECONDS, and spec 4.2's divergence
+                    # re-probe. This is also where spec 4.2's "the monitor is
+                    # on" gate actually lives -- the timeout observed
+                    # directly, which needs no new API and covers every other
+                    # cause of a hanging wl-paste (a locked session, for one)
+                    # that a PowerSaveMode check would miss. See this
+                    # release's plan for why that proxy was measured and
+                    # rejected.
+                    #
+                    # SCOPED TO THE COMPOSED SLOW TIER by `self._on_tick is
+                    # not None`, which is what GPasteWatcher passes and
+                    # make_watcher's plain poller does not. Two reasons, and
+                    # the second is not the first restated. (1) The spec
+                    # keeps the standalone path untouched: there `unresolved`
+                    # is False on every tick, so self._retry_interval stays
+                    # None, `recovered` stays False, and every line below is
+                    # today's, reached by today's route. (2) None also means
+                    # "the selection is empty", indistinguishably (see
+                    # WaylandClipboard.probe), so a clipboard that empties
+                    # and STAYS empty holds this tier at the cap for the
+                    # rest of the connection. On a machine with no GPaste
+                    # that is the normal end state once a selection owner
+                    # exits and nothing repopulates; behind GPaste it is
+                    # unlikely, because taking the selection back over is
+                    # exactly what GPaste does. Disclosed rather than
+                    # closed, and the gate keeps it off the path where it
+                    # would bite.
+                    unresolved = current is None and self._on_tick is not None
+                    # Read BEFORE the assignments below, and self._retry_interval
+                    # doubles as the run's memory rather than earning a second
+                    # field: it is non-None exactly while a run of unresolved
+                    # ticks is in progress.
+                    recovered = self._retry_interval is not None and not unresolved
+                    if unresolved:
+                        # AND NOTHING ELSE ON THIS TICK -- no baseline
+                        # advance, no signal, no idle-tick predicate. There
+                        # is nothing this loop can learn or deliver through
+                        # a wl-paste that is not answering, and every branch
+                        # below would only spend another fork finding that
+                        # out. `before`/`current` still reach _on_tick at the
+                        # bottom, so the tick is quiet rather than skipped:
+                        # _observe_tick sees current=None, reads it as
+                        # read_ok False, reaches no verdict and clears any
+                        # armed run -- which is what it already did for the
+                        # first failed probe of every hang before v3.3, now
+                        # for all of them.
+                        self._retry_interval = min(
+                            SAFETY_NET_POLL_SECONDS,
+                            (self._retry_interval or self.interval) * 2)
+                    else:
+                        # HERE, so that "the run ended" and "the interval is
+                        # handed back" are one event rather than two that
+                        # have to agree. The alternative -- resetting inside
+                        # the change branch below -- turns out to behave
+                        # IDENTICALLY, and the reason is worth stating
+                        # because it is not obvious and a mutation run is
+                        # what established it rather than a reading: the
+                        # only way self._retry_interval is non-None is that
+                        # a run was in progress, and `recovered` then forces
+                        # that very branch, so the reset could not be
+                        # stranded there. Kept here anyway, because that
+                        # equivalence is a property of `recovered`'s current
+                        # definition and nothing would announce its loss:
+                        # narrow `recovered` later and a hang that recovers
+                        # with the clipboard SETTLED -- the common shape,
+                        # since nothing can be copied while the screen is
+                        # off -- would sit at the cap until the next real
+                        # copy. That is harmless at SAFETY_NET_POLL_SECONDS,
+                        # the healthy rate anyway, and a silent 30x
+                        # regression in degraded mode, where
+                        # DEGRADED_POLL_SECONDS is the connection's only
+                        # sync. So: defensive placement, stated as such
+                        # rather than dressed up as the mechanism.
+                        self._retry_interval = None
+                        if current != previous or recovered:
+                            previous = current
+                            # Signalled, never called: a reader thread that ran
+                            # the handler could block on Agent._observe_lock and
+                            # could die of anything it raised -- see
+                            # _start_observer.
+                            self._event.set()
+                        elif self._on_idle_tick is not None and self._on_idle_tick():
+                            # THE NO-CHANGE BRANCH, and the one place in this
+                            # file where an observation is asked for without the
+                            # token having moved. Agent._reoffer_pending is the
+                            # only caller's predicate: while an applied image is
+                            # still waiting for GPaste to re-offer it, the
+                            # clipboard may sit perfectly still forever -- on a
+                            # machine with no GPaste it certainly does -- and an
+                            # expectation that is never looked at again is never
+                            # disarmed, so the user's next image copy is absorbed
+                            # as the re-offer that never came.
+                            #
+                            # Still a signal, never a call, and still no
+                            # clipboard read on this thread: the predicate is a
+                            # bare flag test, and the WORKER's single read is
+                            # what decides between "the re-offer arrived" and
+                            # "there is no GPaste here" -- one read, two outcomes
+                            # separated by content. Deliberately NOT `previous =
+                            # current` (there was no change to absorb) and
+                            # deliberately below the real-change branch, which
+                            # must always win.
+                            #
+                            # THE DISCLOSED GAP, health accounting. The v3.2
+                            # design requires a re-offer seen by a signal-less
+                            # poll to count toward the two-tick dead-source
+                            # verdict BEFORE _consume_image_reoffer absorbs it,
+                            # or a dead extension whose first unsignalled change
+                            # happens to be a re-offer stays undiagnosed -- the
+                            # safety net blinded by the very mechanism that
+                            # proves it was needed. Through the CHANGE branch
+                            # above that holds: _observe_tick compares tokens
+                            # against THIS loop's own `previous`, which the
+                            # worker never touches, so an absorption downstream
+                            # cannot erase a divergence already observed.
+                            #
+                            # Through THIS branch it does not. A re-offer whose
+                            # offered type list happens to match the previous one
+                            # produces no token divergence at all, so it arrives
+                            # here rather than above, is absorbed by the worker,
+                            # and _observe_tick sees a settled token and arms
+                            # nothing. NOT CLOSED, deliberately: closing it needs
+                            # the WORKER to report what it found back into this
+                            # watcher, and that is the coupling this file removes
+                            # on purpose -- "signalled, never called" -- which
+                            # would hand a wedged worker the power to stop the
+                            # poll. The cost is bounded: the verdict is deferred
+                            # to the next change the token CAN see, never lost,
+                            # and every change is still reported throughout.
+                            # Recorded in the v3.2 design's acceptance list as
+                            # partially met, so it is inherited rather than
+                            # rediscovered.
+                            self._event.set()
                     # AFTER the signal, which used to be load-bearing and is
                     # now merely conventional -- say so rather than leave the
                     # old claim standing. While this loop CALLED on_change,
