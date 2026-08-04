@@ -4404,6 +4404,27 @@ class GPasteWatcher:
              solves it by polling LESS rather than by asking a question every
              second.
 
+        WHAT IT DEFERS IN HEALTHY MODE, which is a different argument from
+        all three above and was made NOWHERE until the final review asked
+        for it. The three reasons are about the DEGRADED loop, where the
+        gate would suppress the connection's only detector; in healthy mode
+        the fast tier is still running and still catching every recorded
+        clip, so spec 4.2's "with nobody copying there is no divergence to
+        find" holds -- for clips GPaste RECORDS. It does not hold for the
+        one class GPaste refuses to record (spec 1.3's reading 1: a
+        password manager's sensitive hint, an exclusion pattern). For those
+        there is no Update and no history movement, so THIS tier is the only
+        detector even while everything is healthy, and a gated tick defers
+        the clip rather than merely declining to hunt for a divergence.
+        ACCEPTED, and bounded twice over: a copy made with the user's own
+        hands resets the idle counter, so the gate can only close over a
+        clip put on the clipboard by something that is NOT an input event (a
+        script, a build, the peer); and `continue` advances no baseline, so
+        the first ungated tick compares across the whole gap and still sees
+        it. Deferred by the length of the user's absence -- which is the same
+        absence that makes the fork not worth paying for -- never lost. The
+        README says this in the excluded-clip section, in as many words.
+
         THE COUNTER-ARGUMENT, weighed and not ignored: an idle-gated tick
         skips a wl-paste fork that can cost up to SUBPROCESS_TIMEOUT when the
         monitor is off, so the gate could pay for itself in the state it

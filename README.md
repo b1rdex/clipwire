@@ -131,9 +131,12 @@ The `install` step is not optional on an upgrade that changes the wire protocol.
 sides negotiate a version in their `hello` frames and refuse to talk across a mismatch, so
 a new binary against an old agent does not sync at all.
 
-## A locked PC cannot serve its clipboard
+## A dark or locked PC cannot serve its clipboard
 
-While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
+While the PC's session is locked, `wl-paste` hangs instead of answering. **The lock is not
+required, and this heading claimed it was:** with the monitor powered off the same call times
+out on a session measuring `Active=yes`, `LockedHint=no` and `ScreenSaver.GetActive=false` —
+awake, unlocked, and still unable to answer. Unlocked *and lit*, the same
 call returns quickly — and this file now carries **two figures** for that, which is worth
 naming rather than leaving for a reader to trip over. "About 20 ms" comes from the v3
 acceptance run of **2026-08-01**, which recorded `0.023s` with the session unlocked — that
@@ -151,10 +154,10 @@ other. What matters *in this section* is unaffected either
 way: the contrast is *answers* against *hangs indefinitely*. The next section flags the one
 claim that does depend on which figure is right.
 
-*Why* the lock screen has this effect
+*Why* a dark or locked screen has this effect
 was not established, and the GPaste daemon, the session bus and the compositor all keep
 answering normally throughout — so the usual health checks all pass while nothing works.
-Nothing syncs in either direction until the screen is unlocked, and the Mac's log fills with
+Nothing syncs in either direction until the screen is back, and the Mac's log fills with
 lines like:
 
 ```
@@ -164,7 +167,7 @@ remote: wl-paste failed: TimeoutExpired(['wl-paste', '--list-types'], 3)
 This is a property of the desktop, not a fault in the sync, and it is why those timeouts
 appear in bursts overnight. Left-over `wl-copy` and `wl-paste` processes belonging to reads
 that could never finish are part of the same picture; they clear on their own once the
-session is unlocked and the selection can change hands again.
+screen is back and the selection can change hands again.
 
 Nothing degrades as a result: a read that fails proves nothing about whether the event
 source is alive, so it never counts toward the verdict that switches the agent to faster
@@ -183,7 +186,7 @@ that was never sensitive enough. Mutter implements no
 `wlr-data-control`/`ext-data-control`, so a focus grab is how wl-clipboard reads a selection
 here in the first place.
 
-**The five-second history check** no longer forks that call. It asks GPaste over D-Bus for
+**The five-second history check** never forks that call. It asks GPaste over D-Bus for
 the identifier of the newest item in its history instead, and that takes no focus. **It is
 not faster** — both calls cost about a tenth of a second. The design doc claimed the D-Bus
 call was twenty to thirty times cheaper until it was timed the way the agent actually makes
@@ -209,7 +212,8 @@ What that changes, and what it does not:
   reconstructed; the third involved text and has no established cause. That mechanism no
   longer reaches a verdict.
 - 30-second poll ticks are skipped entirely once nobody has touched the keyboard or mouse for
-  five minutes. With nobody copying there is nothing for them to find.
+  five minutes. With nobody copying there is nothing for them to find — with one exception,
+  which the excluded-clip section below states and bounds.
 - **Where the blinking survives, first:** the 30-second clipboard poll itself is **unchanged**
   and still forks `wl-paste` on every tick it is not gated out of. It is the only thing that
   can tell a clipboard manager that has stopped recording from a clipboard nobody is using,
@@ -239,7 +243,16 @@ A single excluded copy raises a suspicion that the next look drops, because by t
 clipboard has settled.
 
 The clip itself still reaches the Mac, through the same 30-second clipboard poll that
-carried it before — that part is unchanged. What is worth knowing is that a *run* of
+carried it before — that part is unchanged, **once you touch the keyboard again.** This is
+the one class of clip for which that poll is the *only* detector: GPaste records nothing for
+it, so neither the signal nor the history identifier ever moves. And poll ticks are skipped
+while nobody has touched an input device for five minutes, per the bullet above. Copying with
+your own hands resets that timer, so the ordinary case is still caught within 30 seconds;
+what waits is an excluded clip put on the clipboard by something that is not a keystroke — a
+script, a build — while you are away. Deferred, not lost: a skipped tick advances nothing, so
+the first tick after you come back compares across the whole gap and still sees the change.
+
+What is worth knowing next is that a *run* of
 excluded copies, landing on consecutive poll ticks with the clipboard moving each
 time, still looks exactly like a clipboard manager that has stopped recording, and still
 produces the fallback. Nothing is lost when it does; the clips keep syncing, the poll just
@@ -292,6 +305,19 @@ moment the verdict is reached — `true`, `false`, or `unavailable` when the que
 not be asked. The line used to end "the gnome-shell extension being disabled is one possible
 cause", and that clause is gone: the extension was measured enabled and active during every
 incident it was ever printed for, so it named a cause it could not know.
+
+**How to read it, because the sample above says `true` under a heading about a tracker that
+has stopped — and `true` is the likelier production reading.** `Active` is a *daemon-level*
+property, not a fact about the shell extension: GPaste 45.3 exposes it read-only, and
+`Track(b)` is the method that sets it — so it is best read as the daemon's own setting rather
+than as a measurement that clips are arriving. Inferred from the interface, and never measured
+with the extension disabled. So a `true` here is not evidence against the
+verdict beside it; it points at the *signal path* rather than at the tracker. And there is a
+second way to reach this verdict on a tracker that is genuinely fine: if the five-second
+history check itself stops answering, the agent says so in the log and goes back to judging
+on signals alone — pre-v3.3 behaviour, deliberately restored for the one state where the
+evidence that told the two apart is no longer available, and there a silent signal path looks
+exactly like a dead tracker again.
 
 The command above is still worth running when this line appears, because a disabled
 extension does produce this state — the log simply no longer claims that is what happened.
