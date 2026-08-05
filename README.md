@@ -134,7 +134,7 @@ a new binary against an old agent does not sync at all.
 ## A dark or locked PC cannot serve its clipboard
 
 While the PC's session is locked, `wl-paste` hangs instead of answering. **The lock is not
-required, and this heading claimed it was:** with the monitor powered off the same call times
+required, and this heading used to claim it was:** with the monitor powered off the same call times
 out on a session measuring `Active=yes`, `LockedHint=no` and `ScreenSaver.GetActive=false` —
 awake, unlocked, and still unable to answer. Unlocked *and lit*, the same
 call returns quickly — and this file now carries **two figures** for that, which is worth
