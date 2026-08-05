@@ -20,7 +20,9 @@ an `Update` per agent write would have covered only the echo direction.
       "generation": "<opaque token, changed by every writer>",
       "types": ["image/png"],          # what --list-types prints, in order
       "body": "<base64>",              # served for ANY offered type
-      "substitute": false              # see SUBSTITUTION below
+      "substitute": false,             # see SUBSTITUTION below
+      "silent": false                  # see EMPTY_STATE below: makes the NEXT
+                                        # state change invisible to the gdbus monitor
     }
 
 One body for the whole selection, not one per type, because that is what the
@@ -160,7 +162,14 @@ STATE_ENV = "CLIPWIRE_FAKE_CLIPBOARD_STATE"
 # directly should offer at least that one.
 TEXT_ALIASES = ("text/plain;charset=utf-8", "text/plain", "TEXT", "STRING", "UTF8_STRING")
 
-EMPTY_STATE = {"generation": "0", "types": [], "body": "", "substitute": False}
+EMPTY_STATE = {"generation": "0", "types": [], "body": "", "substitute": False,
+               # Set by a harness (never by a fake) to make the NEXT state
+               # change invisible to the gdbus monitor. That is GPaste taking
+               # the selection back and re-offering it under its own type list:
+               # measured on the live machine, one entry becomes twenty-three,
+               # and no Update is emitted for it. Without this the harness
+               # cannot reproduce v3.3's false verdict at all.
+               "silent": False}
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +269,22 @@ def set_body(state, types, data):
     this mutates the state it was handed instead of building a fresh one.
     A fresh object would silently clear substitution mode on the agent's first
     write, and the image half of the harness would then pass while proving
-    nothing."""
+    nothing.
+
+    `silent` is the one key that does NOT survive: it is cleared here rather
+    than carried over. It marks exactly one harness-simulated state change --
+    GPaste re-offering its own content -- as invisible to the gdbus monitor,
+    and a write that reaches this function came from the agent's own
+    wl-copy, which is never that change. Without this clear, a harness that
+    set `silent` once would leave every LATER agent write silent too, not
+    just the one state change it meant to hide.
+    """
     state["types"] = list(types)
     state["body"] = base64.b64encode(data).decode("ascii")
     state["generation"] = "%d" % time.time_ns()
+    # A real write is never silent. Only a harness sets this, and only for the
+    # one state change it is simulating.
+    state["silent"] = False
     return state
 
 

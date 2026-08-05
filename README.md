@@ -131,13 +131,33 @@ The `install` step is not optional on an upgrade that changes the wire protocol.
 sides negotiate a version in their `hello` frames and refuse to talk across a mismatch, so
 a new binary against an old agent does not sync at all.
 
-## A locked PC cannot serve its clipboard
+## A dark or locked PC cannot serve its clipboard
 
-While the PC's session is locked, `wl-paste` hangs instead of answering. Unlocked, the same
-call returns in about 20 ms. That much is measured; *why* the lock screen has this effect
+While the PC's session is locked, `wl-paste` hangs instead of answering. **The lock is not
+required, and this heading used to claim it was:** with the monitor powered off the same call times
+out on a session measuring `Active=yes`, `LockedHint=no` and `ScreenSaver.GetActive=false` —
+awake, unlocked, and still unable to answer. Unlocked *and lit*, the same
+call returns quickly — and this file now carries **two figures** for that, which is worth
+naming rather than leaving for a reader to trip over. "About 20 ms" comes from the v3
+acceptance run of **2026-08-01**, which recorded `0.023s` with the session unlocked — that
+entry exists to diagnose the lock-screen wedge, so the unlocked state is the point of it.
+The next section quotes about a tenth of a second, from **2026-08-03**, measured with the agent
+stopped. **Two days apart**, on the same machine, with nothing recorded in between that would
+account for a difference of **four to five times**.
+
+What each reading has behind it is not equal, and that is the honest reason the later one is
+the one this project builds on: the 2026-08-03 figure was taken three times (104, 104, 105 ms)
+with the monitor state varied as a control, and the earlier one is a single number with no
+sample count. Nobody has re-run the two side by side, and neither is retracted on the strength
+of the
+other. What matters *in this section* is unaffected either
+way: the contrast is *answers* against *hangs indefinitely*. The next section flags the one
+claim that does depend on which figure is right.
+
+*Why* a dark or locked screen has this effect
 was not established, and the GPaste daemon, the session bus and the compositor all keep
 answering normally throughout — so the usual health checks all pass while nothing works.
-Nothing syncs in either direction until the screen is unlocked, and the Mac's log fills with
+Nothing syncs in either direction until the screen is back, and the Mac's log fills with
 lines like:
 
 ```
@@ -147,11 +167,96 @@ remote: wl-paste failed: TimeoutExpired(['wl-paste', '--list-types'], 3)
 This is a property of the desktop, not a fault in the sync, and it is why those timeouts
 appear in bursts overnight. Left-over `wl-copy` and `wl-paste` processes belonging to reads
 that could never finish are part of the same picture; they clear on their own once the
-session is unlocked and the selection can change hands again.
+screen is back and the selection can change hands again.
 
 Nothing degrades as a result: a read that fails proves nothing about whether the event
 source is alive, so it never counts toward the verdict that switches the agent to faster
 polling.
+
+## Watching the clipboard steals much less keyboard focus
+
+Not *none*, and the last two bullets below say exactly where it survives.
+
+Measured on this PC: `wl-paste --list-types` **takes keyboard focus while it runs**, which
+shows up as the foreground window blinking. Blind A/B, 2 Hz for 15 seconds a phase, phases
+unlabelled until they had been judged; `xclip -o -t TARGETS` against the same selection does
+not blink. The `wl-paste` phase is the **positive control** — it is what proves the observer
+could see the effect at all, so xclip's silence is a real negative rather than an instrument
+that was never sensitive enough. Mutter implements no
+`wlr-data-control`/`ext-data-control`, so a focus grab is how wl-clipboard reads a selection
+here in the first place.
+
+**The five-second history check** never forks that call. It asks GPaste over D-Bus for
+the identifier of the newest item in its history instead, and that takes no focus. **It is
+not faster** — both calls cost about a tenth of a second. The design doc claimed the D-Bus
+call was twenty to thirty times cheaper until it was timed the way the agent actually makes
+it, as a subprocess; that claim is retracted. The entire difference is the focus grab.
+
+**This is the claim that depends on the unreconciled figure above.** It rests on
+`wl-paste --list-types` costing about a tenth of a second, measured three times on
+2026-08-03. Under the section above's older "about 20 ms" reading it would not hold: the
+D-Bus call would be four to five times *slower* in wall clock, and the difference would not
+be the focus grab alone. The focus grab itself is measured either way and is not in doubt —
+what a re-measurement could move is the *cost* comparison, not the conclusion that this
+check stopped taking focus.
+
+What that changes, and what it does not:
+
+- The blinking that actually hurt was never **the 30-second clipboard poll**, which costs one
+  blink every 30 seconds. It was the *fallback*:
+  once the agent concluded GPaste had stopped working it polled `wl-paste` once a second for
+  the rest of the connection, blinking on every tick and dropping keystrokes while typing.
+  It fired three times, ever. One of the three was reconstructed to the second and was
+  caused by GPaste re-offering its own image a few seconds after a copy, on a machine where
+  nothing was wrong; a second is consistent with the same mechanism without having been
+  reconstructed; the third involved text and has no established cause. That mechanism no
+  longer reaches a verdict.
+- 30-second poll ticks are skipped entirely once nobody has touched the keyboard or mouse for
+  five minutes. With nobody copying there is nothing for them to find — with one exception,
+  which the excluded-clip section below states and bounds.
+- **Where the blinking survives, first:** the 30-second clipboard poll itself is **unchanged**
+  and still forks `wl-paste` on every tick it is not gated out of. It is the only thing that
+  can tell a clipboard manager that has stopped recording from a clipboard nobody is using,
+  so it stays.
+- **And second:** when a verdict *is* reached, that poll keeps running and keeps blinking.
+  What changed is the rate — it now starts at one second after each observed change and
+  doubles toward 30 seconds while nothing changes, instead of staying at one second forever.
+  It is **not** true that the poll is then the connection's only way of seeing a change, and
+  a first draft of this bullet said so: the agent goes on listening for GPaste's signals
+  through the switch and never tears that subscription down, and one of the two ways this
+  verdict can be reached — the excluded-clip case in the next section — leaves GPaste tracking
+  and signalling normally. The poll is the only detector left **in the state the verdict
+  describes**, where the clipboard manager really has stopped recording; the verdict can also
+  be reached when it has not.
+
+## A clip GPaste refuses to record still syncs
+
+GPaste does not add everything to its history. A password manager can mark its selection
+sensitive, and GPaste can be configured to exclude clips outright. Nothing is broken when
+that happens — GPaste simply records nothing and signals nothing for that clip, by design.
+
+Before v3.3 that was indistinguishable from a broken clipboard manager: the clipboard had
+changed, no signal had arrived, and a single such copy at the wrong moment could tip the
+agent into the permanent one-second polling described above. Now the two are told apart by
+GPaste's own history, which moves for a recorded clip and stands still for an excluded one.
+A single excluded copy raises a suspicion that the next look drops, because by then the
+clipboard has settled.
+
+The clip itself still reaches the Mac, through the same 30-second clipboard poll that
+carried it before — that part is unchanged, **once you touch the keyboard again.** This is
+the one class of clip for which that poll is the *only* detector: GPaste records nothing for
+it, so neither the signal nor the history identifier ever moves. And poll ticks are skipped
+while nobody has touched an input device for five minutes, per the bullet above. Copying with
+your own hands resets that timer, so the ordinary case is still caught within 30 seconds;
+what waits is an excluded clip put on the clipboard by something that is not a keystroke — a
+script, a build — while you are away. Deferred, not lost: a skipped tick advances nothing, so
+the first tick after you come back compares across the whole gap and still sees the change.
+
+What is worth knowing next is that a *run* of
+excluded copies, landing on consecutive poll ticks with the clipboard moving each
+time, still looks exactly like a clipboard manager that has stopped recording, and still
+produces the fallback. Nothing is lost when it does; the clips keep syncing, the poll just
+runs faster for that connection.
 
 ## After a GNOME upgrade
 
@@ -166,22 +271,62 @@ Nothing looks broken when it happens: the GPaste daemon keeps running and keeps 
 on the session bus, so every liveness check that probes the bus still passes — but the
 `Update` signal the agent watches for never fires again.
 
-The agent notices on its own and keeps working: its safety-net poll compares the clipboard
-every 30 seconds, and once it sees content change with no signal to account for it, it
-falls back to polling every second for the rest of the connection. It says so in the Mac's
-log (`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than
-guessing why:
+The agent notices on its own and keeps working, and since v3.3 it has two independent ways
+of noticing, which behave very differently. Which one applies turns on whether GPaste is
+still *recording* clips or only failing to *announce* them — a disabled extension stops
+both, so it lands in the second case, but the two are worth telling apart because the log
+lines are different and only one of them changes how the agent behaves.
+
+**If GPaste is still recording clips and only the signal is missing,** the agent sees it
+within five seconds and changes nothing else. It asks GPaste over D-Bus for the identifier
+of the newest item in its history, every five seconds; that identifier moves whenever a clip
+is recorded, whether or not a signal was ever sent. Syncing carries on at that pace, no
+polling speeds up, and the Mac's log gets one line:
 
 ```
-remote: GPaste reported no clipboard change while the content changed (signals=0 signals_at_last_tick=0 pump_alive=True worker_alive=True); the gnome-shell extension being disabled is one possible cause. Polling every 1s for the rest of this connection.
+remote: the uuid tier saw the clipboard history move while the accepted-signal count held at 0; the signal path may be silent, but tracking itself is alive -- the fast tier is already this connection's sync, every 5s, at zero focus cost. Informational only; no interval changes because of this line.
 ```
 
-The command above is how you check that possible cause. It prints nothing when the extension is
-off; drop `--enabled` to get its name, then `gnome-extensions enable <name>`.
+**If GPaste has stopped recording clips at all,** that identifier stops moving too, so the
+only thing left that can tell is a direct look at the clipboard. That is the 30-second
+clipboard poll — the safety net, and the same one the two sections above describe. When it sees the clipboard change twice running while GPaste's history
+stands still, it concludes the tracker is dead and falls back to polling — starting one
+second after each change it observes and doubling toward 30 seconds while nothing changes,
+for the rest of the connection. It says so in the Mac's log
+(`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than guessing
+why:
+
+```
+remote: GPaste reported no clipboard change while the content changed (signals=0 signals_at_last_tick=0 pump_alive=True worker_alive=True gpaste_Active=true). Polling every 1s after each observed change and doubling to at most 30s while nothing changes, for the rest of this connection.
+```
+
+`gpaste_Active=` is GPaste's own answer to "are you tracking the clipboard", read at the
+moment the verdict is reached — `true`, `false`, or `unavailable` when the question could
+not be asked. The line used to end "the gnome-shell extension being disabled is one possible
+cause", and that clause is gone: the extension was measured enabled and active during every
+incident it was ever printed for, so it named a cause it could not know.
+
+**How to read it, because the sample above says `true` under a heading about a tracker that
+has stopped — and `true` is the likelier production reading.** `Active` is a *daemon-level*
+property, not a fact about the shell extension: GPaste 45.3 exposes it read-only, and
+`Track(b)` is the method that sets it — so it is best read as the daemon's own setting rather
+than as a measurement that clips are arriving. Inferred from the interface, and never measured
+with the extension disabled. So a `true` here is not evidence against the
+verdict beside it; it points at the *signal path* rather than at the tracker. And there is a
+second way to reach this verdict on a tracker that is genuinely fine: if the five-second
+history check itself stops answering, the agent says so in the log and goes back to judging
+on signals alone — pre-v3.3 behaviour, deliberately restored for the one state where the
+evidence that told the two apart is no longer available, and there a silent signal path looks
+exactly like a dead tracker again.
+
+The command above is still worth running when this line appears, because a disabled
+extension does produce this state — the log simply no longer claims that is what happened.
+It prints nothing when the extension is off; drop `--enabled` to get its name, then
+`gnome-extensions enable <name>`.
 
 Re-enabling it is the actual fix, and reconnecting is not. The fallback never stops
-listening for signals — it only speeds the safety-net poll up from 30 seconds to 1 — and
-that faster interval is scoped to one connection, so the next connection starts back at 30
+listening for signals — it only changes how often the safety-net poll looks — and that
+faster interval is scoped to one connection, so the next connection starts back at 30
 seconds whether or not anything was repaired. With the extension still disabled, the agent
 just spends another detection budget before reaching the same conclusion again.
 
@@ -190,10 +335,12 @@ byte for byte; for an image it compares only the list of formats the clipboard i
 and fetches the picture itself only once that list changes. Pulling a 4 MiB screenshot back
 out of the clipboard on every tick is not a price worth paying to notice a copy a little
 sooner — every 30 seconds on a healthy connection, where this poll is only a safety net, and
-once a second once it has fallen back. The trade is that while signals are dead, one image
-replacing another is noticed when the offered formats change rather than the instant the
-pixels do; in normal operation the `Update` signal carries that change and nothing waits at
-all.
+between one and 30 seconds once it has fallen back. The trade is that while the tracker is
+dead, one image replacing another is noticed when the offered formats change rather than the
+instant the pixels do. That only bites while the tracker is dead, which is the one state
+nothing else covers: in normal operation the `Update` signal carries the change and nothing
+waits at all, and if only the signal has stopped, the five-second history check carries it
+instead.
 
 ## GPaste trims whitespace, and that is not clipwire
 

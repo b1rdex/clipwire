@@ -450,7 +450,10 @@ class TestImageReofferIsOurOwnWrite(ImageAgentTestCase):
 
     No sleeps anywhere here, and none in the implementation either: the
     takeover was measured between one and four seconds, on one machine, on
-    one day, so a fixed wait would be a race dressed as a constant. The
+    one day -- and re-measured wider by v3.3 (spec 1.2, "one to six
+    seconds"; the canonical account of the window is gpaste_history_uuid's
+    docstring in the agent) -- so a fixed wait would be a race dressed as a
+    constant. The
     agent consumes the first DIFFERING image observation as its own
     re-offer instead."""
 
@@ -811,7 +814,9 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
 
     NOT BY A CLOCK, and the two mines are both in the phrase "30 seconds":
 
-      * the takeover happens at one to four seconds, but the window must
+      * the takeover happens at one to six seconds (spec 1.2; see
+        gpaste_history_uuid in the agent for the two campaigns behind that
+        range), but the window must
         cover when it is OBSERVED, and with the event source dead only the
         safety-net poll sees it -- up to a full interval later. A wall-clock
         deadline and the tick carrying the observation then race, and the
@@ -861,11 +866,19 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
                         "a bug: %r" % self.logged)
 
     def test_our_own_bytes_before_the_threshold_leave_it_armed(self):
-        """The control. GPaste's takeover was measured at one to four
-        seconds, and the observation of our own write lands before it every
-        time -- disarming there would ship the re-encode to the Mac live,
-        as a genuine local change, with no origin recorded. That is the
-        original bug, delivered faster."""
+        """The control. GPaste's takeover was measured at one to six seconds
+        (spec 1.2; gpaste_history_uuid in the agent carries the range and
+        both campaigns behind it), and the observation of our own write is
+        expected to land before it -- disarming there would ship the
+        re-encode to the Mac live, as a genuine local change, with no origin
+        recorded. That is the original bug, delivered faster.
+
+        "EXPECTED TO", not "every time", which is what this said while
+        quoting the narrower range. v3.3's four samples of the same window
+        include two under a twentieth of a second, so an observation racing
+        the takeover is not ruled out by the measurement. Nothing here rests
+        on winning that race: the disarm is gated on OVERDUE rather than on
+        ordering, which is what this control exists to pin."""
         agent_obj, clip = self.armed()
         self.observe(agent_obj, clip, (KIND_IMAGE, self.WRITTEN),
                      at=1000.0 + SAFETY_NET_POLL_SECONDS - 0.1)
@@ -1054,8 +1067,9 @@ class TestTheExpectationIsDisarmedByObservation(ImageAgentTestCase):
 
     def test_a_look_that_fails_before_the_budget_leaves_it_armed(self):
         """The control, and the reason giving up is gated on OVERDUE rather
-        than on the read having failed. GPaste's takeover was measured
-        between one and four seconds; a transient wl-paste failure inside
+        than on the read having failed. GPaste's takeover was measured at
+        one to six seconds (spec 1.2, and gpaste_history_uuid in the agent
+        for its provenance); a transient wl-paste failure inside
         that window is not evidence about the machine, and disarming on it
         would ship the re-encode to the Mac live with no origin recorded --
         the original bug, for that image.

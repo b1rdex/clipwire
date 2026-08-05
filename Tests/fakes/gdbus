@@ -70,7 +70,8 @@ def parse(argv):
     if not argv:
         fake.die(PROGRAM, "no subcommand")
     command, options = argv[0], argv[1:]
-    dest = object_path = None
+    dest = object_path = method = None
+    positionals = []
     index = 0
     while index < len(options):
         argument = options[index]
@@ -84,12 +85,25 @@ def parse(argv):
                 dest = options[index]
             else:
                 object_path = options[index]
+        elif argument == "--method" and command == "call":
+            index += 1
+            if index >= len(options):
+                fake.die(PROGRAM, "%s wants a value" % argument)
+            method = options[index]
+        elif not argument.startswith("-") and command == "call":
+            # `call` takes the method's arguments positionally. Scoped to
+            # `call` specifically: introspect and monitor take none, so a
+            # stray word there falls through to the `fake.die` below, same
+            # as it always has.
+            positionals.append(argument)
         else:
-            # Loud rather than ignored: an unmodelled flag means the agent is
-            # asking for something this fake does not represent.
+            # Loud rather than ignored: an unmodelled flag, or an argument
+            # this subcommand does not take at all -- --method or a bare
+            # positional outside `call` -- means the agent is asking for
+            # something this fake does not represent.
             fake.die(PROGRAM, "unmodelled argument %r" % argument)
         index += 1
-    return command, dest, object_path
+    return command, dest, object_path, method, positionals
 
 
 def digest(path):
@@ -145,20 +159,96 @@ def monitor(path, silent=False):
         current = digest(path)
         if current != seen:
             seen = current
-            if not silent:
+            # A silent change is absorbed into the baseline above and NOT
+            # announced -- the next real change is still seen, because `seen`
+            # already moved. This is GPaste's re-offer: it takes the
+            # selection back and re-offers it under its own type list
+            # (measured on the live machine, one entry becomes twenty-three)
+            # and emits no Update for it. See fake_clipboard.EMPTY_STATE
+            # ["silent"] for where a harness sets this.
+            #
+            # `silent` here (this function's own parameter) is a different
+            # thing -- "nobody owns this bus name", set in main() -- so both
+            # have to allow it before a line is actually printed.
+            try:
+                announce = not fake.load(path).get("silent")
+            except Exception:
+                announce = True     # an unreadable state file is not evidence of silence
+            if announce and not silent:
                 say(UPDATE_LINE)
 
 
+def history_uuid(state):
+    """The uuid of the top history entry.
+
+    Derived from `generation` -- which set_body() stamps on every WRITE -- and
+    NOT from the whole state file, so a harness (or the substitution path) that
+    rewrites `types` without making a new entry leaves this alone. That is the
+    property the v3.3 fast tier rests on, so the fake must have it too: GPaste's
+    re-offer of its own content changes the offered types and adds no history
+    entry.
+
+    A harness that wants to move the uuid without touching `generation` -- an
+    entry deleted from the GPaste UI, say -- sets `history_uuid` explicitly.
+    """
+    explicit = state.get("history_uuid")
+    if explicit:
+        return str(explicit)
+    digest = hashlib.sha256(("gpaste-history-%s" % state.get("generation", "0"))
+                            .encode("utf-8")).hexdigest()
+    return "%s-%s-%s-%s-%s" % (digest[0:8], digest[8:12], digest[12:16],
+                               digest[16:20], digest[20:32])
+
+
+def call_get_element_at_index(path):
+    """`GetElementAtIndex(0)` -- (uuid, text) for the top of history.
+
+    The text is deliberately included and deliberately NOT what the agent is
+    allowed to use: the real method returns it, so a fake that omitted it would
+    let a payload-logging regression pass unseen (spec 5.2).
+    """
+    state = fake.load(path)
+    body = fake.body_bytes(state)
+    # Truncated to 40 characters: enough to prove a real body travelled
+    # (the whole point per spec 5.2), short enough that a multi-megabyte
+    # clipboard image or paste does not get written byte-for-byte into the
+    # invocation log every time `call` runs -- fake.note() below logs this
+    # same line, and that log is what the harness reads back.
+    text = body.decode("utf-8", "replace")[:40] if body else ""
+    # Quotes stripped so the printed line is always a well-formed Python
+    # tuple literal of two single-quoted strings, parseable with
+    # ast.literal_eval. A real clipboard body could contain a quote; this
+    # fake does not model escaping it, only proving the field arrived.
+    say("('%s', '%s')" % (history_uuid(state), text.replace("'", "")))
+    fake.note(PROGRAM, "call GetElementAtIndex(0) -> uuid")
+    return 0
+
+
+def refuse_unowned_name(command, dest, object_path):
+    """The wrong-name refusal `introspect` and `call` share verbatim: the
+    same stderr message a real gdbus prints for a name with no owner, and a
+    log line so the harness can tell "refused" from "never ran" apart.
+    `monitor` hits the same condition (see main()) but answers it by running
+    silently instead of exiting, so it is not routed through here.
+
+    Returns True if it refused (the caller should exit 1); False if the name
+    matches and the caller should proceed.
+    """
+    if dest == BUS_NAME and object_path == OBJECT_PATH:
+        return False
+    print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
+          "The name %s was not provided by any .service files" % dest,
+          file=sys.stderr, flush=True)
+    fake.note(PROGRAM, "%s %s %s -> exit 1, not this fake's name"
+              % (command, dest, object_path))
+    return True
+
+
 def main(argv):
-    command, dest, object_path = parse(argv)
+    command, dest, object_path, method, positionals = parse(argv)
     path = fake.state_path(PROGRAM)
     if command == "introspect":
-        if dest != BUS_NAME or object_path != OBJECT_PATH:
-            print("Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: "
-                  "The name %s was not provided by any .service files" % dest,
-                  file=sys.stderr, flush=True)
-            fake.note(PROGRAM, "introspect %s %s -> exit 1, not this fake's name"
-                      % (dest, object_path))
+        if refuse_unowned_name(command, dest, object_path):
             return 1
         sys.stdout.write(INTROSPECTION)
         sys.stdout.flush()
@@ -170,6 +260,16 @@ def main(argv):
         # a silent monitor is otherwise indistinguishable from a clipboard
         # nobody touched.
         return monitor(path, silent=(dest != BUS_NAME or object_path != OBJECT_PATH))
+    if command == "call":
+        if refuse_unowned_name(command, dest, object_path):
+            return 1
+        if method != "org.gnome.GPaste2.GetElementAtIndex":
+            fake.die(PROGRAM, "unmodelled method %r" % method)
+        if positionals != ["0"]:
+            # Only the top of history is modelled. Anything else is the agent
+            # asking for something this fake does not represent.
+            fake.die(PROGRAM, "unmodelled index %r" % positionals)
+        return call_get_element_at_index(path)
     fake.die(PROGRAM, "unmodelled subcommand %r" % command)
 
 

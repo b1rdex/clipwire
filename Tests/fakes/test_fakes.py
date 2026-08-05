@@ -15,6 +15,7 @@ The end-to-end proof is not here and cannot be: it is running the real agent
 against these, watching its log say it is on the event path, and watching a
 clip cross. That was done before they were handed over.
 """
+import ast
 import base64
 import importlib.util
 import json
@@ -376,6 +377,80 @@ class EventSourceTests(ToolTestCase):
     DEST = ("--session", "--dest", "org.gnome.GPaste",
             "--object-path", "/org/gnome/GPaste")
 
+    def gdbus_call(self):
+        """(uuid, text) for the top of history, parsed as the Python tuple
+        literal `call_get_element_at_index` prints. Safe to parse with
+        `ast.literal_eval` because that function strips every quote from the
+        text first, so the two quoted fields can never contain one and the
+        line is always well-formed Python syntax.
+
+        Asserts the shape (exactly two fields) as well as returning them: a
+        fake that printed one field, or three, would otherwise fail with a
+        bare ValueError from the tuple-unpack at some call site far from
+        here, instead of a named assertion at the point that actually saw
+        the malformed output.
+        """
+        result = self.run_fake("gdbus", "call", *self.DEST,
+                               "--method", "org.gnome.GPaste2.GetElementAtIndex", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        parsed = ast.literal_eval(result.stdout.decode())
+        self.assertEqual(len(parsed), 2, result.stdout)
+        return parsed
+
+    def gdbus_uuid(self):
+        return self.gdbus_call()[0]
+
+    def start_gdbus_monitor(self):
+        """A `gdbus monitor` subprocess of our own, stdout made non-blocking
+        so `drain()` below can prove a NEGATIVE -- that nothing arrived in a
+        window -- which a blocking `readline()` (as the other monitor tests
+        use) cannot do without hanging forever on silence.
+
+        The 0.2s sleep is generous next to POLL_SECONDS (0.05s in the fake):
+        it has to outlast both process startup and the fake taking its
+        baseline digest, or the first write a test makes could land before
+        the fake has anything to compare it against, and be missed as "no
+        change yet" rather than caught as a change.
+        """
+        process = subprocess.Popen([str(HERE / "gdbus"), "monitor"] + list(self.DEST),
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, env=self.env())
+        # Registered in the order that makes cleanup -- LIFO -- terminate,
+        # then reap, then release the pipe: the same order
+        # test_monitor_emits_on_a_change_nobody_asked_it_to_watch uses below.
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.terminate)
+        os.set_blocking(process.stdout.fileno(), False)
+        # 0.2s is generous next to POLL_SECONDS (0.05s), but this file's own
+        # measured numbers (fake_clipboard.py, "WHAT THEY COST") say a cold
+        # first invocation can take 0.2-0.8s -- so this drain, not a bare
+        # read, is what keeps a slow-starting fake from raising instead of
+        # just returning "nothing yet". Its return value (Update lines, of
+        # which there cannot be any yet) is discarded along with the banner.
+        self.drain(process, seconds=0.2)
+        return process
+
+    def drain(self, process, seconds):
+        """Every Update line the monitor emitted within `seconds`.
+
+        `TextIOWrapper.read()` -- what `text=True` on Popen wraps stdout in
+        -- does NOT return None the way the raw/buffered binary layers do
+        when a non-blocking read has nothing available: it RAISES
+        BlockingIOError instead (message "read() returned None", confirmed
+        empirically against this Python; a bare `read() or ""` crashes on
+        the very first call, before anything has been written). When SOME
+        text is already available it still returns that text normally --
+        only the zero-bytes-available case raises -- so this catches
+        exactly that one case rather than swallowing a real error.
+        """
+        time.sleep(seconds)
+        try:
+            text = process.stdout.read() or ""
+        except BlockingIOError:
+            text = ""
+        return [line for line in text.splitlines() if "Update" in line]
+
     def test_introspect_is_answered(self):
         """The decisive one. Serve only `monitor` and available() is false,
         make_watcher picks the plain poller, and every harness run passes
@@ -389,6 +464,62 @@ class EventSourceTests(ToolTestCase):
                  "--object-path", "/org/gnome/GPaste")
         self.assertEqual(self.run_fake("gdbus", "introspect", *wrong).returncode, 1)
 
+    def test_introspect_refuses_a_stray_positional(self):
+        """Positional arguments belong to `call` alone -- GetElementAtIndex's
+        index. Scoping their acceptance to `call` must not reopen the door for
+        introspect: a stray word after its flags is exactly the unmodelled
+        input the bare `else` used to catch before `call` needed positionals
+        at all."""
+        self.assertEqual(self.run_fake("gdbus", "introspect", *self.DEST,
+                                       "stray").returncode, 2)
+
+    def test_call_refuses_a_name_this_fake_does_not_own(self):
+        """The same wrong-name guard as introspect (see
+        test_introspect_refuses_a_name_this_fake_does_not_own), on `call`'s
+        route through refuse_unowned_name(). Unexercised until now: the other
+        `call` tests all pass *self.DEST, so nothing had ever run this path,
+        let alone proven its exit code. Both halves of the compound check are
+        tried -- wrong dest, then wrong object-path -- since
+        `dest == BUS_NAME and object_path == OBJECT_PATH` is one condition
+        that a test hitting only one half cannot fully pin."""
+        for wrong in (("--session", "--dest", "org.gnome.GPaste2",
+                       "--object-path", "/org/gnome/GPaste"),
+                      ("--session", "--dest", "org.gnome.GPaste",
+                       "--object-path", "/org/gnome/GPaste2")):
+            with self.subTest(wrong=wrong):
+                self.assertEqual(self.run_fake("gdbus", "call", *wrong, "--method",
+                                               "org.gnome.GPaste2.GetElementAtIndex",
+                                               "0").returncode, 1)
+
+    def test_gdbus_call_returns_a_uuid_and_the_top_text(self):
+        """The fast tier's whole input. Shape is byte-compatible with real gdbus:
+        a tuple literal, uuid first. Checks BOTH fields: a fake that returned
+        the uuid with an empty or truncated text would satisfy a uuid-only
+        check and hide exactly the payload-logging regression spec 5.2 warns
+        about -- which is why the body below is built to a specific value
+        rather than merely a non-empty one."""
+        state = {"generation": "17", "types": list(fake.TEXT_ALIASES),
+                 "body": base64.b64encode(b"hello").decode("ascii")}
+        fake.save(self.state, state)
+        uuid, text = self.gdbus_call()
+        # history_uuid()'s fixed 8-4-4-4-12 shape, not just "some hex and
+        # dashes" -- the loose form would also accept a bare "-".
+        self.assertRegex(uuid, r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                               r"[0-9a-f]{4}-[0-9a-f]{12}$")
+        self.assertEqual(text, "hello")
+
+    def test_gdbus_call_uuid_changes_only_when_the_history_changes(self):
+        """The property the whole design rests on: our own re-offer of the SAME
+        content must not move the uuid, while a new copy must."""
+        fake.save(self.state, {"generation": "1", "types": ["image/png"], "body": ""})
+        first = self.gdbus_uuid()
+        fake.save(self.state, {"generation": "1", "types": ["image/png", "image/webp"],
+                               "body": ""})
+        self.assertEqual(self.gdbus_uuid(), first,
+                         "a type-list change with no new history entry moved the uuid")
+        fake.save(self.state, {"generation": "2", "types": ["image/png"], "body": ""})
+        self.assertNotEqual(self.gdbus_uuid(), first, "a new copy did not move the uuid")
+
     def test_the_update_line_is_the_one_the_agent_parses(self):
         line = load("fake_gdbus", HERE / "gdbus").UPDATE_LINE
         self.assertEqual(line, "/org/gnome/GPaste: org.gnome.GPaste2.Update "
@@ -396,6 +527,14 @@ class EventSourceTests(ToolTestCase):
         parse = load("clipwire_agent_for_fakes", AGENT).parse_gpaste_line
         self.assertTrue(parse(line))
         self.assertTrue(parse(line + "\n"))     # how the pump actually sees it
+
+    def test_monitor_refuses_a_method_flag(self):
+        """--method belongs to `call` alone. A monitor that silently accepted
+        it would run forever having ignored an argument it does not model --
+        the one shape of bug this file's loudness rule exists to make
+        impossible."""
+        self.assertEqual(self.run_fake("gdbus", "monitor", *self.DEST, "--method",
+                                       "org.gnome.GPaste2.Whatever").returncode, 2)
 
     def test_monitor_emits_on_a_change_nobody_asked_it_to_watch(self):
         """Any change by anyone, not just the agent's own writes -- otherwise
@@ -418,6 +557,46 @@ class EventSourceTests(ToolTestCase):
         self.assertEqual(line.rstrip("\n"),
                          load("fake_gdbus", HERE / "gdbus").UPDATE_LINE)
         self.assertLess(time.time() - started, 5, "the line was not flushed promptly")
+
+    def test_a_silent_state_change_emits_no_update(self):
+        """GPaste's re-offer, which is the whole v3.3 defect: the offered
+        types change and no signal is emitted.
+
+        The third write below (reverting to the exact pre-silent bytes) is
+        the assertion that actually proves the silent change MOVED the
+        monitor's baseline, rather than merely proving it swallowed one
+        announcement -- the two are not the same claim. The digest check is
+        a boolean inequality against a stored reference, so an ORDINARY
+        different change after the silent one (a new generation, new types,
+        as below) differs from a stale never-updated baseline exactly as
+        surely as it differs from a correctly-advanced one, and would be
+        announced exactly once either way; it cannot tell the two
+        implementations apart, which is why it is not the only write here.
+        A revert to BYTE-IDENTICAL content is the one write that can: it
+        differs from an advanced baseline (so it must fire) and is IDENTICAL
+        to a frozen one (so a frozen baseline would wrongly see no change at
+        all, and stay silent a second time) -- confirmed by running this
+        test's original three assertions (no revert step) against a build
+        with the baseline-advance deliberately broken: all three still pass,
+        which is why the revert step is not optional here.
+        """
+        baseline = {"generation": "1", "types": ["image/png"], "body": ""}
+        fake.save(self.state, dict(baseline))
+        monitor = self.start_gdbus_monitor()
+        self.assertEqual(self.drain(monitor, seconds=0.3), [],
+                         "the monitor spoke before anything changed")
+        fake.save(self.state, {"generation": "1", "types": ["image/png", "image/webp"],
+                               "body": "", "silent": True})
+        self.assertEqual(self.drain(monitor, seconds=0.5), [],
+                         "a silent takeover emitted an Update")
+        fake.save(self.state, dict(baseline))
+        self.assertEqual(len(self.drain(monitor, seconds=0.5)), 1,
+                         "reverting to the pre-silent bytes emitted no Update -- "
+                         "the silent change never advanced the monitor's baseline")
+        fake.save(self.state, {"generation": "2", "types": ["image/png"], "body": ""})
+        self.assertEqual(len(self.drain(monitor, seconds=0.5)), 1,
+                         "a real copy after a silent one emitted no Update")
+        monitor.terminate()
 
     def test_monitor_leaves_when_its_parent_does(self):
         """The Mac has no PR_SET_PDEATHSIG and the agent's normal exit path

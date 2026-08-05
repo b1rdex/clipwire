@@ -76,6 +76,54 @@ class TestMakeWatcher(unittest.TestCase):
             "or the latch dies with the watcher that reached it",
         )
 
+    def test_the_watcher_line_reports_the_interval_the_poller_actually_got(self):
+        """Spec 5.3, applied to the line a person reads FIRST.
+
+        This line stated the SAFETY_NET_POLL_SECONDS constant while the poller
+        it had just built ran at whatever CLIPWIRE_SAFETY_NET_SECONDS resolved
+        to -- so a harness run's agent log said "every 30s" during a 0.4 s
+        tier. It was reachable only from a harness, which is the aggravation
+        and not the mitigation: that log is what somebody reads when a harness
+        test fails, and telling them the tier is 75x slower than it is costs
+        more than a line nobody reads.
+
+        ASSERTED AGAINST THE POLLER'S OWN INTERVAL rather than against a
+        literal, so this cannot be satisfied by a second hardcoded number
+        agreeing with the first. The env-var phase is the one that kills the
+        original defect: with the constant restored, the line reads "30s"
+        while `_safety_net.interval` is 0.4.
+
+        The FORMAT is pinned by the same phase, and deliberately: %.0f renders
+        0.4 as "0", so a line reading "every 0s" would be a second false
+        statement in the same sentence and this assertion would still pass if
+        it only compared numbers loosely.
+        """
+        self.addCleanup(os.environ.pop, "CLIPWIRE_SAFETY_NET_SECONDS", None)
+        os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS", None)
+
+        for injected, expected in ((None, "%g" % SAFETY_NET_POLL_SECONDS), ("0.4", "0.4")):
+            if injected is None:
+                os.environ.pop("CLIPWIRE_SAFETY_NET_SECONDS", None)
+            else:
+                os.environ["CLIPWIRE_SAFETY_NET_SECONDS"] = injected
+            lines = []
+            with mock.patch.object(clipwire_agent, "log", lines.append), \
+                    mock.patch.object(GPasteWatcher, "available", return_value=True):
+                watcher = make_watcher(clipboard=object())
+            watcher.stop()
+            reported = [line for line in lines if "safety-net poll every" in line]
+            self.assertEqual(
+                len(reported), 1,
+                "make_watcher must say once which watcher it built: %r" % lines)
+            self.assertIn(
+                "safety-net poll every %ss" % expected, reported[0],
+                "the line must report the interval the poller was given, not the "
+                "constant it defaults from (CLIPWIRE_SAFETY_NET_SECONDS=%r)" % injected)
+            self.assertEqual(
+                "%g" % watcher._safety_net.interval, expected,
+                "and the poller must actually be on it, or the line above is "
+                "agreeing with a number nothing runs at")
+
     def test_falls_back_to_polling_when_gpaste_unavailable(self):
         with mock.patch.object(GPasteWatcher, "available", return_value=False):
             watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)
@@ -139,6 +187,57 @@ class TestMakeWatcher(unittest.TestCase):
             "and the no-GPaste fallback must get it too: that is the machine whose "
             "re-offer never comes, so a hook it never receives is a fix that is inert "
             "exactly where it is needed",
+        )
+
+    def test_make_watcher_is_what_wires_the_idle_gate_and_the_tracking_read(self):
+        """THE OTHER END OF A DELIBERATE DEFAULT. GPasteWatcher defaults both
+        of these D-Bus readers to None -- see its __init__ for the rule (a
+        reader whose absence only COSTS may default off; one whose absence
+        breaks a verdict may not) -- and that default is only safe because
+        exactly one production path wires them.
+
+        Without this test the failure is silent and total: drop either
+        argument from make_watcher and every machine runs the slow tier
+        ungated and reports "gpaste_Active=unavailable" forever, with no
+        test red and no log line to say so. That is the same "correct code no
+        production path reaches" shape the idle-tick test above was written
+        for, which is why the two sit together.
+
+        Identity, not truthiness: `read_idle_gate=lambda: True` would pass a
+        truthiness check while gating nothing on the real IdleMonitor."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object())
+
+        self.assertIs(
+            watcher._read_idle_gate, clipwire_agent._user_recently_active,
+            "spec 4.2's idle gate is wired nowhere else, so an unwired "
+            "production watcher forks a wl-paste on every slow tick forever",
+        )
+        self.assertIs(
+            watcher._read_tracking, clipwire_agent.gpaste_tracking,
+            "spec 5.3's reading is wired nowhere else, so an unwired "
+            "production watcher reports the property it replaced a guess with "
+            "as permanently unavailable",
+        )
+        # assertEqual, not assertIs: bound methods compare equal by
+        # (__func__, __self__) but are fresh objects on every attribute
+        # lookup, so identity here would fail against correct code.
+        self.assertEqual(
+            watcher._safety_net._should_probe, watcher._slow_tier_should_probe,
+            "and the gate must actually reach the poll loop through the "
+            "None-proceeds predicate, not merely be stored on the watcher",
+        )
+
+    def test_the_standalone_poller_is_never_gated(self):
+        """Spec 2: the machine with no GPaste at all is untouched. Its
+        clipboard may legitimately never move again -- that is the machine the
+        re-offer hook above exists for -- so gating its ticks on user activity
+        would be the wrong trade there even if it were free."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            plain = make_watcher(clipboard=object())
+        self.assertIsNone(
+            plain._should_probe,
+            "the standalone path must reach the poll loop with no gate at all",
         )
 
 

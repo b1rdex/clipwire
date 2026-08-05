@@ -78,15 +78,73 @@ final class PairingHarness {
     private static let textTypes = ["text/plain;charset=utf-8", "text/plain",
                                     "TEXT", "STRING", "UTF8_STRING"]
 
+    /// What GPaste re-offers an image under once it has taken the selection
+    /// back -- spec 1.2's "one entry becomes twenty-three".
+    ///
+    /// THE SAME MEMBERS as `TWENTY_THREE` in
+    /// `agent/tests/test_watcher_uuid_tier.py`, deliberately, so the one
+    /// scenario staged at two altitudes is staged with one fixture. Copied
+    /// rather than shared because nothing can import a Python constant into a
+    /// Swift test target; if either list moves, move both.
+    ///
+    /// IT HOLDS TWENTY-TWO, not the twenty-three the spec measured and the
+    /// Python constant's name claims. Said here rather than quietly rounded:
+    /// the missing member is not invented back, because the real list came off
+    /// a live machine and cannot be reconstructed from this side. Nothing in
+    /// the scenario rests on the count -- what has to be true is that the list
+    /// still reads as an IMAGE to the agent's `choose_kind`, since `probe()`
+    /// returns the offered TYPE LIST for an image and the unchanged BODY for
+    /// text, and a body cannot move across a re-offer. `text/ico` below is the
+    /// near miss; `choose_kind` matches `text/plain` prefixes only.
+    static let gpasteImageTypes = [
+        "MULTIPLE", "SAVE_TARGETS", "TARGETS", "TIMESTAMP", "application/ico",
+        "audio/x-riff", "image/avif", "image/bmp", "image/ico", "image/icon",
+        "image/jpeg", "image/jxl", "image/png", "image/tiff",
+        "image/vnd.microsoft.icon", "image/webp", "image/x-MS-bmp",
+        "image/x-bmp", "image/x-ico", "image/x-icon", "image/x-win-bitmap",
+        "text/ico",
+    ]
+
     let root: URL
     let agentURL: URL
     let pasteboard = HarnessPasteboard()
 
     /// What the agent's own log says when it built the watcher this harness
-    /// requires. A PREFIX of the real line, deliberately: the rest of it
-    /// interpolates SAFETY_NET_POLL_SECONDS, and pinning that here would make
-    /// a tuning change to the agent look like a broken harness.
-    private static let liveWatcherLine = "watching the clipboard through GPaste"
+    /// requires. A PREFIX of the real line, deliberately, and one reason
+    /// covers it: the rest of the line interpolates a NUMBER THAT VARIES PER
+    /// RUN, so there is no full line to match. A run at 0.4 s and a run at
+    /// production's 30 s log different sentences and both must satisfy this.
+    ///
+    /// WHAT THE LINE INTERPOLATES IS `watcher._safety_net_interval`, NOT
+    /// `SAFETY_NET_POLL_SECONDS` -- the resolved field, which merely
+    /// DEFAULTS FROM that constant when neither an argument nor
+    /// `CLIPWIRE_SAFETY_NET_SECONDS` supplied one. This comment gave two
+    /// reasons and its first named the constant as the thing interpolated,
+    /// while its second asserted the interpolated figure was not a constant
+    /// at all: two adjacent bullets of one list, saying both. It is
+    /// also the exact "is" / "defaults from" conflation `_env_seconds`'
+    /// docstring in the agent memorialises as the error that let a
+    /// capability gap survive five tasks, repeated at the site that gap was
+    /// closed at. One reason, stated once, is the repair.
+    ///
+    /// That second reason was briefly a worse one: the line reported the
+    /// CONSTANT regardless of what the poller got, so a harness log read
+    /// "every 30s" during a 0.4 s tier -- spec 5.3's own defect shape, in the
+    /// log a person reads when a harness test fails. Fixed in task 10's third
+    /// fix round and pinned by
+    /// `test_the_watcher_line_reports_the_interval_the_poller_actually_got`.
+    /// Recorded rather than deleted: this harness matched a prefix throughout
+    /// and so never depended on the number either way, which is the property
+    /// worth keeping.
+    ///
+    /// Internal rather than private because a test reads it: `start()`
+    /// already refuses a world without this line, but a test whose subject is
+    /// "the watcher stayed live" has to assert that in its OWN method, or it
+    /// green-lights a run where the agent never started at all.
+    static let liveWatcherLine = "watching the clipboard through GPaste"
+    /// What the fake `gdbus` logs for one fast-tier probe of GPaste's history
+    /// uuid. Counted, never searched for -- see `occurrences`.
+    private static let historyUuidCall = "call GetElementAtIndex(0) -> uuid"
     /// The one line both implementations log for a reconciliation, byte for
     /// byte -- `FreshnessDecision`'s raw values ARE the PC agent's SEND_MINE /
     /// WAIT_FOR_PEER / DO_NOTHING constants. Which is exactly why reading a
@@ -126,7 +184,38 @@ final class PairingHarness {
     private let framesLock = NSLock()
     private var received: [Frame] = []
 
-    init(eventSource: EventSource = .gpaste, substituting: Bool = false) throws {
+    /// `tierSeconds` overrides the spawned agent's polling intervals by
+    /// exporting environment variables before the agent is spawned -- see the
+    /// `exportEnvironment` calls below, and `_env_seconds` in the agent, which
+    /// is what reads them back out. `nil` in any member means "leave that one
+    /// at production's constant," which is what every call site gets from the
+    /// default here: there is no separate configuration type in this file to
+    /// hang the option on (`eventSource` and `substituting` are init
+    /// parameters only, not stored properties, for the same reason -- nothing
+    /// after `init` needs either one back), so the option lives here, beside
+    /// them.
+    ///
+    /// THREE MEMBERS, AND `slow` IS NOT THE ONE THAT MAKES THE SLOW TIER
+    /// TICK. That trap cost this release a task: the names come from the
+    /// agent's own variables, and there they mean
+    ///
+    /// - `fast`      -- the fast tier's thread, `CLIPWIRE_FAST_TIER_SECONDS`;
+    /// - `safetyNet` -- the rate the SLOW TIER ACTUALLY TICKS AT,
+    ///   `CLIPWIRE_SAFETY_NET_SECONDS`. Every verdict `_observe_tick` reaches
+    ///   is measured in this one, so it is the only member that lets a test
+    ///   here exercise the safety net at all;
+    /// - `slow`      -- `CLIPWIRE_SLOW_TIER_SECONDS`, which starts no timer:
+    ///   its one consumer is the agent's uuid-failure fallback threshold. It
+    ///   defaults to whatever `safetyNet` resolved to, so a test that wants
+    ///   fast ticks sets `safetyNet` and leaves this `nil`.
+    ///
+    /// Spelled out rather than left to the names because setting `slow` alone
+    /// looks exactly like it should work, does nothing observable, and leaves
+    /// a safety-net test passing on a 30-second tick that never fired inside
+    /// its window.
+    init(eventSource: EventSource = .gpaste, substituting: Bool = false,
+         tierSeconds: (fast: Double?, slow: Double?, safetyNet: Double?)
+             = (nil, nil, nil)) throws {
         // Tests/clipwireTests/ -> Tests/ -> the repo root. The same walk
         // FixtureTests and ChannelTests already do; `#filePath` is the only
         // thing in a test binary that knows where the source tree is.
@@ -183,6 +272,20 @@ final class PairingHarness {
         // suite -- the same rule agent/tests already follows by injecting
         // `clip_state_path`.
         exportEnvironment("XDG_STATE_HOME", stateHome.path, restoring: &restore)
+        // Sub-second tiers, so a test can exercise in seconds what production
+        // does in minutes. Only set when `tierSeconds` asks: an unset
+        // variable is what production runs, and a harness that always
+        // overrode them would never exercise the real defaults, only ever
+        // its own substitute for them.
+        if let fast = tierSeconds.fast {
+            exportEnvironment("CLIPWIRE_FAST_TIER_SECONDS", "\(fast)", restoring: &restore)
+        }
+        if let slow = tierSeconds.slow {
+            exportEnvironment("CLIPWIRE_SLOW_TIER_SECONDS", "\(slow)", restoring: &restore)
+        }
+        if let safetyNet = tierSeconds.safetyNet {
+            exportEnvironment("CLIPWIRE_SAFETY_NET_SECONDS", "\(safetyNet)", restoring: &restore)
+        }
         restoreEnvironment = restore
 
         log = Log(path: logPath)
@@ -527,6 +630,38 @@ final class PairingHarness {
         try writeClipboardState(types: ["image/png"], body: png)
     }
 
+    /// GPaste taking the selection back and re-offering the same picture
+    /// under its own type list -- spec 1.2, and the production incident this
+    /// release exists to prevent. Four things are true of it at once, and
+    /// each is load-bearing:
+    ///
+    /// - the offered TYPES change, so the agent's `probe()` token moves;
+    /// - `generation` does NOT, so the fake `gdbus`'s `history_uuid` -- which
+    ///   it derives from that field alone -- stays frozen. That is what makes
+    ///   this a re-offer rather than a copy: GPaste re-offering its own
+    ///   content creates no history entry;
+    /// - `body` does NOT, because the picture did not change;
+    /// - and `silent` is set, which makes the fake `gdbus monitor` absorb
+    ///   this one state change into its baseline and emit no `Update`.
+    ///
+    /// Deliberately NOT routed through `writeClipboardState`, which stamps a
+    /// fresh `generation` on every write: that is right for a person copying
+    /// and wrong here, and going through it would move the uuid, hand the
+    /// slow tier the very evidence it is supposed to be denied, and leave the
+    /// test passing for a reason unrelated to the fix.
+    ///
+    /// `silent` DOES NOT SELF-CLEAR. Only an agent write through `wl-copy`
+    /// clears it (`fake_clipboard.set_body`), and `mutateClipboardState`
+    /// carries every untouched key forward -- so this must be the last direct
+    /// clipboard write a test makes, or every later one is invisible to the
+    /// monitor too.
+    func silentTakeover(types: [String]) throws {
+        try mutateClipboardState { state in
+            state["types"] = types
+            state["silent"] = true
+        }
+    }
+
     /// A PC that comes back holding nothing: a reboot, or the locked session
     /// the README documents. An empty `types` list is the fake's own spelling
     /// of it -- `wl-paste` refuses with exit 1 ("No selection") for exactly
@@ -547,6 +682,115 @@ final class PairingHarness {
         try wait(for: "the PC's clipboard to hold \(describe(body)) as \(type)") {
             guard let state = self.pcClipboard() else { return false }
             return state.body == body && state.types.contains(type)
+        }
+    }
+
+    /// How many times the agent's own `wl-paste --list-types` came back
+    /// offering exactly this list, read from the fakes' invocation log.
+    ///
+    /// The only window this side has onto the agent's slow tier. `_armed`,
+    /// `_signals` and `_last_uuid` are fields of a Python object in another
+    /// process; what crosses the boundary is what the agent FORKED, and this
+    /// is the one fork whose recorded output says which selection the tier
+    /// actually saw. So it is two claims in one number: that the tier is
+    /// ticking at all, and that a tick observed the divergence rather than a
+    /// test merely having written one to a file.
+    ///
+    /// IT COUNTS PROBES, NOT TICKS, and the gap is not closable from here:
+    /// the worker's own clipboard read forks `--list-types` too, so a tick
+    /// that signals the worker contributes two. Every caller therefore asks
+    /// for a count that is safe under that inflation -- see
+    /// `waitForTheAgentToProbeAndSee`, which documents the arithmetic at the
+    /// one place it is relied on.
+    func probesThatSaw(_ types: [String]) -> Int {
+        invocationLog().occurrences(of: "wl-paste --list-types -> "
+                                    + types.joined(separator: " ") + "\n")
+    }
+
+    /// Waits until the agent's FAST tier has asked GPaste for its history
+    /// uuid ONCE MORE THAN IT HAD AT ENTRY, counted from the fakes' own
+    /// invocation log.
+    ///
+    /// NOT "at least once", which is what this headline said and is weaker
+    /// than what the code does: it takes a baseline before waiting, so a
+    /// call made by an earlier connection -- or before this method was
+    /// reached -- does not satisfy it. The rationale below is written about
+    /// the FIRST call because that is the case it was built for, and it
+    /// still reads correctly for a harness whose one connection has just
+    /// started; the baseline is what makes it keep reading correctly for a
+    /// second one. See the counting note at the bottom, which is the same
+    /// decision from the other side.
+    ///
+    /// WHY IT IS WORTH WAITING FOR. The slow tier's verdict rests on
+    /// `uuid_frozen`, a DELTA between two of its own ticks, and the earlier of
+    /// the two records whatever the fast tier had read by then -- `None`
+    /// included. A slow tick that lands before the fast tier's first
+    /// successful call therefore poisons the comparison: the next tick sees
+    /// "unmeasured", reaches no verdict, and a test asserting that no verdict
+    /// was reached passes WITHOUT THE SCENARIO HAVING RUN. Measured at roughly
+    /// one run in six, and the cause is in `Tests/fakes/fake_clipboard.py`: an
+    /// agent's FIRST fork of a fake has been seen taking 0.2-0.8 s, which at a
+    /// sub-second fast tier is several slow ticks.
+    ///
+    /// WHAT IT DOES NOT PROVE, stated because an earlier revision called this
+    /// "a precondition with teeth" and that was a notch stronger than the
+    /// mechanism. The fake writes its log line while SERVING the call -- the
+    /// same "logged before the caller consumed it" shape
+    /// `waitForTheAgentToProbeAndSee` exists to absorb -- so this returning
+    /// says the fast tier asked, not that `_last_uuid` has been assigned. What
+    /// actually closes the window is the two further slow probes its one
+    /// caller waits for next; this only moves the start of that wait past the
+    /// slow first fork. Both are needed, and the ordering is the point.
+    ///
+    /// THAT MATTERS MOST IF SOMEONE SHORTENS THE INTERVALS. The disclosed
+    /// remedy for a flake in the test above is a LONGER interval; shortening
+    /// them narrows the gap this pair of waits is covering and brings the
+    /// one-in-six back.
+    ///
+    /// Counted rather than `contains`, which is this file's standing rule (see
+    /// `occurrences` and `Marks`): the invocation log accumulates across
+    /// connections, so a `contains` here would answer instantly -- and on the
+    /// previous agent's evidence -- for anything staged after a `reconnect()`.
+    /// No caller reconnects today; the method is written so that one could.
+    func waitForTheAgentsFastTierToReadAHistoryUuid() throws {
+        let asked = invocationLog().occurrences(of: PairingHarness.historyUuidCall)
+        try wait(for: "the agent's fast tier to ask gdbus for a history uuid") {
+            self.invocationLog().occurrences(of: PairingHarness.historyUuidCall) > asked
+        }
+    }
+
+    /// Waits until `count` of the agent's probes have come back offering
+    /// exactly this list, AND one further probe has followed them -- so the
+    /// predicate below waits for `count + 1`, and the tick that made the
+    /// `count`-th probe has provably finished judging it.
+    ///
+    /// `count` is a number of PROBES and callers want a number of TICKS, so
+    /// the arithmetic lives here rather than at each call site. In a quiet
+    /// stretch every probe is a tick; the inflation is bounded, because the
+    /// only other thing that forks `--list-types` is the worker's clipboard
+    /// read, and the worker runs at most once per selection change (the tick
+    /// that observes a moved token signals it; the ticks that see a settled
+    /// one do not). So for a selection the agent has just STARTED offering,
+    /// `count` probes guarantee at least `count - 1` ticks; for one it has
+    /// been offering all along there is no worker read to absorb and the two
+    /// numbers are equal.
+    ///
+    /// THE `+ 1` BELOW IS NOT SLACK, and it was measured rather than
+    /// reasoned into existence: without it this wait returns too early and
+    /// the test above it goes GREEN AGAINST AN AGENT WITH THE FIX REMOVED.
+    /// The fake writes its invocation-log line while it is SERVING the probe,
+    /// which is strictly before the agent has read the result, let alone
+    /// judged it -- so the count reaching its target says the probe happened,
+    /// never that a verdict followed. Waiting for one further probe is what
+    /// closes it, and it closes it exactly rather than probably: the poll
+    /// thread is strictly sequential -- probe, `_on_tick`, wait, probe -- so
+    /// a LATER probe existing is proof that the previous one's verdict has
+    /// already been reached and logged. A sleep would have been a guess about
+    /// the same thing.
+    func waitForTheAgentToProbeAndSee(_ types: [String], atLeast count: Int) throws {
+        try wait(for: "\(count) of the agent's own probes to see \(types.count) offered types, "
+                 + "and a further probe proving the last of them was judged") {
+            self.probesThatSaw(types) >= count + 1
         }
     }
 
@@ -714,6 +958,56 @@ final class PairingHarness {
         }
     }
 
+    // MARK: - draining, before asserting that something is absent
+
+    /// Hangs up and waits for the agent to exit, so that everything it wrote
+    /// to its stderr is in the shared log before a test asserts on what is
+    /// NOT in there.
+    ///
+    /// THE RACE THIS NARROWS IS NOT THEORETICAL AND WAS NOT CHEAP.
+    /// `agentLog()` flushes THIS side's queue, but a line the PC wrote reaches
+    /// that file only once `Channel.attempt`'s readability handler has read
+    /// it -- so a negative assertion can be evaluated microseconds before the
+    /// very line it denies arrives. Measured with the agent's fix deliberately
+    /// removed: `testAGPasteReofferDoesNotDegradeTheConnection` caught the
+    /// regression on 2 runs in 3, and reported success on the third. Counting
+    /// the agent's own probes proves the TICK happened and cannot prove its
+    /// log line crossed a pipe. The density test above documents the same
+    /// hazard and closes it by waiting for a LATER line from the PC, which
+    /// works only where a later line is guaranteed -- for a verdict that must
+    /// never be reached, there is none, which is why this exists at all.
+    ///
+    /// NARROWS, NOT PROVES, and the difference is stated because an earlier
+    /// revision claimed the stronger thing. What `attempt()` actually does is
+    /// `waitUntilExit()` and then `readabilityHandler = nil`
+    /// (`Channel.swift`); there is no final read of its own. So what this buys
+    /// is that the writer is GONE and the handler has had every write up to
+    /// its exit to consume -- in practice everything, and it cannot make the
+    /// window wider, but it is not a proof the way the probe counting above
+    /// is a proof. Its contribution was never isolated from the fixes that
+    /// landed beside it, and the 18-of-18 figure quoted in the test belongs
+    /// to all of them jointly: the probe arithmetic, the fast-tier ordering,
+    /// this drain, AND the interval halving, which the test's own docstring
+    /// credits separately as "the third fix". This sentence said "all three
+    /// together" and named only the first three -- a count that omitted the
+    /// one contributor the figure is quoted next to.
+    ///
+    /// DELIBERATELY NOT `stop()`, which does the same two things and then
+    /// deletes the temp directory the log file lives in -- after which every
+    /// `logHolds` reads an empty string and every negative assertion in the
+    /// suite passes for the worst reason there is.
+    func hangUpAndDrainTheAgentsLog() throws {
+        channel.hangUp()
+        guard connectionEnded.wait(timeout: .now() + 10) != .timedOut else {
+            throw Refusal.timedOut("the agent to exit so its log could be read to the end",
+                                   diagnostics: diagnostics())
+        }
+        // Put the count back. `stop()` waits on this same semaphore, and a
+        // consumed one would leave it blocking for ten seconds and then
+        // reporting a leaked python3 that had in fact exited right here.
+        connectionEnded.signal()
+    }
+
     // MARK: - shutting down
 
     /// Hangs up, waits for the connection thread to finish, and puts the
@@ -783,6 +1077,22 @@ final class PairingHarness {
 
     private func invocationLog() -> String {
         (try? String(contentsOfFile: invocationLogPath, encoding: .utf8)) ?? ""
+    }
+
+    /// The PC clipboard's opaque change token -- the field the fake `gdbus`
+    /// derives GPaste's history uuid from, and therefore the difference
+    /// between "a new entry was created" and "the same entry was re-offered".
+    ///
+    /// Exposed so a test can pin that its own staging stayed the scenario it
+    /// meant to stage. `silentTakeover` leaves this alone by construction;
+    /// a version that stopped doing so would turn the re-offer into a COPY,
+    /// the agent's uuid would move, no verdict could be reached for a reason
+    /// unrelated to the fix, and every assertion downstream would still pass.
+    func pcsClipboardGeneration() -> String? {
+        guard let data = FileManager.default.contents(atPath: statePath),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return state["generation"] as? String
     }
 
     private func pcClipboard() -> (types: [String], body: Data)? {
