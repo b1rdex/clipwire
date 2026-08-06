@@ -1124,6 +1124,13 @@ DEGRADED_POLL_SECONDS = 1.0
 FAST_TIER_SECONDS = 5.0
 DIVERGENCE_REPROBE_SECONDS = 10.0
 
+# How long a connection that found GPaste silent keeps asking whether it has
+# turned up after all, and how often. The window is generous because the thing
+# it waits out is a desktop session finishing its login, not a timeout: asking
+# costs one gdbus call, while giving up too early costs the whole connection.
+GPASTE_WAIT_SECONDS = 60.0
+GPASTE_PROBE_SECONDS = 1.0
+
 
 def parse_gpaste_line(line):
     """True when a gdbus monitor line is a GPaste Update signal."""
@@ -1486,9 +1493,95 @@ class PollingWatcher:
             self._event.set()
 
 
+class UpgradingWatcher(PollingWatcher):
+    """The polling fallback, plus a thread that keeps asking whether GPaste has
+    turned up after all.
+
+    sshd answers earlier in a boot than a desktop session finishes coming up,
+    so the Mac's connect can land in the window where GPaste has not yet taken
+    its bus name. make_watcher's verdict was final for the connection, so that
+    window cost the whole of it: the observed case polled every 1s for minutes,
+    with clipboard reads taking 1.5-3.0s and timing out, against a GPaste that
+    had been answering since seconds after the connect.
+
+    The asking cannot be a wait inside make_watcher. That runs on the protocol
+    loop, and one ask costs up to SUBPROCESS_TIMEOUT -- so the poll starts
+    immediately and the asking happens behind it. Being a PollingWatcher rather
+    than a wrapper around one is what keeps that true for every caller: until
+    the promotion lands, this IS the fallback, with nothing delegating."""
+
+    def __init__(self, clipboard, interval_seconds, gpaste,
+                 wait_seconds=None, probe_interval_seconds=None, **kwargs):
+        super().__init__(clipboard, interval_seconds, **kwargs)
+        self._gpaste = gpaste
+        self._wait_seconds = (
+            _env_seconds("CLIPWIRE_GPASTE_WAIT_SECONDS", GPASTE_WAIT_SECONDS)
+            if wait_seconds is None else wait_seconds)
+        self._probe_interval = (GPASTE_PROBE_SECONDS
+                                if probe_interval_seconds is None
+                                else probe_interval_seconds)
+        self._promotion = None
+        self._promotion_lock = threading.Lock()
+        self._promotion_over = threading.Event()
+        self._promoted = None
+        self._on_change = None
+
+    def start(self, on_change=None):
+        self._on_change = on_change
+        super().start(on_change)
+        self._promotion = threading.Thread(target=self._await_gpaste, daemon=True)
+        self._promotion.start()
+
+    def stop(self):
+        self._promotion_over.set()
+        with self._promotion_lock:
+            promoted = self._promoted
+        if promoted is not None:
+            promoted.stop()
+        super().stop()
+
+    def _await_gpaste(self):
+        """Ask on a timer until GPaste answers or the window closes. The first
+        wait comes before the first ask on purpose: make_watcher just asked."""
+        deadline = time.monotonic() + self._wait_seconds
+        while not self._promotion_over.wait(self._probe_interval):
+            try:
+                answered = self._gpaste.available()
+            except Exception as error:
+                _handle_observer_error(error, "GPaste promotion")
+                return
+            if answered:
+                self._promote()
+                return
+            if time.monotonic() >= deadline:
+                log("GPaste has not answered in %gs; staying on the %gs poll"
+                    % (self._wait_seconds, self.interval))
+                return
+
+    def _promote(self):
+        """Hand observation to GPaste and stop the poll -- REPLACING it, not
+        joining it. Claiming `_promoted` under the lock before starting is what
+        lets a stop() racing this find something to stop; the start itself is
+        outside the lock because stop() runs on the protocol loop and this
+        spawns a subprocess."""
+        with self._promotion_lock:
+            if self._promotion_over.is_set():
+                return
+            self._promoted = self._gpaste
+        super().stop()
+        self._gpaste.start(self._on_change)
+        if self._promotion_over.is_set():
+            # stop() ran between the claim and here, so it either saw no
+            # promotion or stopped one that had not started. Undo it.
+            self._gpaste.stop()
+            return
+        log("GPaste answered late; promoted from the %gs poll to GPaste signals"
+            % self.interval)
+
+
 def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                  degraded=False, on_degrade=None, on_idle_tick=None):
-    """Build a GPasteWatcher if GPaste answers, else a plain PollingWatcher -- the production factory, wiring the real idle-gate and tracking readers."""
+    """Build a GPasteWatcher if GPaste answers, else an UpgradingWatcher that polls now and promotes itself if GPaste turns up -- the production factory, wiring the real idle-gate and tracking readers."""
     watcher = GPasteWatcher(clipboard, degraded_interval_seconds=fallback_interval_seconds,
                             degraded=degraded, on_degrade=on_degrade,
                             on_idle_tick=on_idle_tick,
@@ -1503,8 +1596,11 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                 % watcher._safety_net_interval)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)
-    return PollingWatcher(clipboard, fallback_interval_seconds,
-                          on_idle_tick=on_idle_tick)
+    # `watcher` is reused rather than rebuilt: available() does not mutate it,
+    # and it already carries the degraded state and the D-Bus readers this
+    # factory is the only place to wire.
+    return UpgradingWatcher(clipboard, fallback_interval_seconds, gpaste=watcher,
+                            on_idle_tick=on_idle_tick)
 
 
 def main(argv):

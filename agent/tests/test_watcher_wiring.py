@@ -30,6 +30,7 @@ from agent_under_test import (
     TYPE_CLIP,
     TYPE_CLIP_STATE,
     TYPE_IMAGE_CLIP,
+    UpgradingWatcher,
     decode_clip_payload,
     decode_clip_state,
     decode_image_payload,
@@ -375,4 +376,154 @@ class TestWatcherLifecycleWiring(unittest.TestCase):
             "user's next image copy to be absorbed as a re-offer that never came",
         )
 
+
+class _StaticClipboard:
+    """probe() is the only thing PollingWatcher's pump asks of a clipboard. A
+    constant token means the poll never signals a change, so what these tests
+    observe is the promotion and nothing else."""
+
+    def probe(self):
+        return "unchanged"
+
+    def read(self):
+        return None
+
+
+class _FakeGPaste:
+    """Stands in for GPasteWatcher: answers available() from a script, and
+    records the start()/stop() the promotion is supposed to drive. Nothing
+    here spawns a subprocess, so the wait window is the test's to control."""
+
+    def __init__(self, available_at_call=1, gate=None):
+        self._available_at_call = available_at_call
+        self._gate = gate
+        self.calls = 0
+        self.started_with = None
+        self.stopped = False
+        self.started = threading.Event()
+
+    def available(self):
+        if self._gate is not None:
+            self._gate.wait(5.0)
+        self.calls += 1
+        return self.calls >= self._available_at_call
+
+    def start(self, on_change=None):
+        self.started_with = on_change
+        self.started.set()
+
+    def stop(self):
+        self.stopped = True
+
+
+class TestUpgradingWatcher(unittest.TestCase):
+    """A BOOT RACE, NOT AN ABSENT GPASTE. sshd answers while GNOME is still
+    coming up, so the Mac's connect can land seconds before GPaste takes its
+    bus name -- and make_watcher's verdict was final for the whole connection.
+    The observed cost was not theoretical: one connection spent its life on
+    the 1s fallback poll, where reads that take 0.02s through GPaste took
+    1.5-3.0s and timed out, against a GPaste that had been answering for
+    minutes.
+
+    The fix cannot be a wait inside make_watcher: it is called from
+    clipboard_became_ready(), on the protocol loop, and available() costs up
+    to SUBPROCESS_TIMEOUT per ask. So the poll starts immediately and the
+    asking happens behind it."""
+
+    def _watcher(self, gpaste, wait_seconds=5.0, probe_interval_seconds=0.01):
+        return UpgradingWatcher(
+            _StaticClipboard(), 1.0, gpaste=gpaste,
+            wait_seconds=wait_seconds,
+            probe_interval_seconds=probe_interval_seconds)
+
+    def test_promotes_itself_once_gpaste_answers(self):
+        gpaste = _FakeGPaste(available_at_call=3)
+        on_change = object()
+        watcher = self._watcher(gpaste)
+        self.addCleanup(watcher.stop)
+
+        watcher.start(on_change)
+
+        self.assertTrue(
+            gpaste.started.wait(5.0),
+            "GPaste answered on the third ask, so the watcher must promote "
+            "itself to it rather than keep the fallback poll for the whole "
+            "connection")
+        self.assertIs(
+            gpaste.started_with, on_change,
+            "and the promoted watcher must get the same observation funnel the "
+            "poll had, or changes stop reaching the agent at the moment the "
+            "promotion looks like it succeeded")
+
+    def test_the_promotion_stops_the_poll_it_replaces(self):
+        """Otherwise the promotion ADDS a watcher instead of replacing one, and
+        the 1s poll that caused the symptom keeps running underneath the fix."""
+        gpaste = _FakeGPaste(available_at_call=1)
+        watcher = self._watcher(gpaste)
+        self.addCleanup(watcher.stop)
+
+        watcher.start(object())
+
+        self.assertTrue(gpaste.started.wait(5.0), "precondition: it promoted")
+        self.assertTrue(
+            watcher._stop.is_set(),
+            "the fallback poll must be stopped by the promotion, or both it and "
+            "GPaste observe the clipboard at once")
+
+    def test_the_wait_is_bounded_and_the_poll_survives_it(self):
+        """A machine that genuinely has no GPaste must not be left with a
+        thread asking forever, and must keep the only watcher it can have."""
+        gpaste = _FakeGPaste(available_at_call=10 ** 6)
+        watcher = self._watcher(gpaste, wait_seconds=0.05)
+        self.addCleanup(watcher.stop)
+
+        watcher.start(object())
+        watcher._promotion.join(5.0)
+
+        self.assertFalse(
+            watcher._promotion.is_alive(),
+            "the wait must be bounded, not a thread that asks for the life of "
+            "the connection")
+        self.assertFalse(gpaste.started.is_set())
+        self.assertFalse(
+            watcher._stop.is_set(),
+            "and the fallback poll must survive the giving-up: GPaste never "
+            "came, so the poll is all this machine has")
+
+    def test_a_stop_that_races_the_promotion_leaves_nothing_running(self):
+        """stop() runs on the protocol loop when the connection drops. A
+        promotion resolving just after it must not leave a GPaste watcher
+        running behind the agent's back -- that one would outlive the
+        connection that owns it."""
+        gate = threading.Event()
+        gpaste = _FakeGPaste(available_at_call=1, gate=gate)
+        watcher = self._watcher(gpaste)
+
+        watcher.start(object())
+        watcher.stop()
+        gate.set()
+        watcher._promotion.join(5.0)
+
+        self.assertTrue(
+            gpaste.stopped or not gpaste.started.is_set(),
+            "after stop() the promoted watcher must either never have started "
+            "or have been stopped too")
+
+    def test_make_watcher_builds_the_promotable_fallback(self):
+        """The wiring end: the class above only matters if the production
+        factory is what returns it."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)
+
+        self.assertIsInstance(
+            watcher, UpgradingWatcher,
+            "a GPaste that is silent at connect time is the boot race until "
+            "proven otherwise, so the fallback has to keep asking")
+        self.assertIsInstance(
+            watcher, PollingWatcher,
+            "and it must still BE the polling fallback, not a wrapper around "
+            "one: every caller and test that treats it as a poller still does")
+        self.assertEqual(
+            watcher.interval, 2.5,
+            "on the interval the caller asked for, promotion or not")
 
