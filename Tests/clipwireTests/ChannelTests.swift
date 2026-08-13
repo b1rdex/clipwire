@@ -214,4 +214,156 @@ final class ChannelTests: XCTestCase {
     func testBackoffNeverResetsForAConnectionThatWasNeverEstablished() {
         XCTAssertFalse(Channel.shouldResetBackoff(establishedAt: nil, now: Date()))
     }
+
+    // MARK: - File descriptor ownership
+    //
+    // Found in production, not by a test: the shipped agent ran for 3 days 19
+    // hours across 1168 reconnects and accumulated 2556 open PIPE descriptors,
+    // filling its descriptor table solid (fds 0…2559 of a 2560 ceiling). Past
+    // saturation `Pipe()` can no longer allocate, so `Process.run()` dup2's
+    // fd −1 and throws `NSPOSIXErrorDomain Code=9 "Bad file descriptor"` —
+    // logged as "failed to start ssh", with `status.json` stuck on
+    // `"reason": "cannot start ssh"`. Partial allocations are worse than the
+    // clean failure: a half-built stdin pipe gives the remote agent immediate
+    // EOF, so it prints "stdin closed, exiting" and returns 0, and the log
+    // reads like a healthy connection that keeps closing rather than like the
+    // resource exhaustion it is.
+    //
+    // `attempt()` opened three `Pipe()`s per connection and closed none of
+    // them; the only `close()` in Channel.swift lives in `hangUp()`, which
+    // production never calls. Three parent-side ends leak per successful
+    // attempt (stdin-write, stdout-read, stderr-read — `Process` closes the
+    // child ends itself); all six leak when the spawn throws, plus a live
+    // dispatch source behind the uncleared `readabilityHandler`.
+    //
+    // Counting `/dev/fd` rather than shelling out to `lsof` keeps this to one
+    // directory listing. The absolute count includes whatever XCTest itself
+    // holds open, so only the delta across a fixed number of attempts is
+    // meaningful, and one warm-up attempt runs first so that per-Channel and
+    // per-Log one-time state is already allocated when the baseline is taken.
+    private func openFileDescriptorCount() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1
+    }
+
+    // The grace period is not slack for flakiness: teardown of the stderr read
+    // end is deliberately EOF-driven from inside the readability handler
+    // itself, because cancelling a dispatch source is asynchronous and an
+    // already-running handler invocation would hit `availableData` on a
+    // descriptor the run thread had just closed — an ObjC
+    // `NSFileHandleOperationException`, which Swift cannot catch, taking the
+    // whole agent down. Closing from the handler's own last invocation is
+    // race-free by construction, and costs this wait.
+    private func settleAsyncDescriptorTeardown() {
+        Thread.sleep(forTimeInterval: 0.3)
+    }
+
+    private func assertNoDescriptorLeak(
+        executablePath: String, attempts: Int = 20,
+        _ message: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let channel = Channel(config: config(), log: tempLog(),
+                              executablePath: executablePath, arguments: { _, _ in [] })
+        _ = channel.attempt(host: "pc")
+        settleAsyncDescriptorTeardown()
+
+        let before = openFileDescriptorCount()
+        for _ in 0..<attempts { _ = channel.attempt(host: "pc") }
+        settleAsyncDescriptorTeardown()
+        let after = openFileDescriptorCount()
+
+        // Two descriptors of headroom absorbs the log file's open/close churn
+        // racing the listing, without coming close to hiding a per-attempt
+        // leak: the smallest one this catches is 3 per attempt over 20.
+        XCTAssertLessThanOrEqual(
+            after - before, 2,
+            "\(message) — \(attempts) attempts leaked \(after - before) descriptors "
+            + "(\(before) open before, \(after) after)",
+            file: file, line: line)
+    }
+
+    func testRepeatedConnectionsDoNotLeakFileDescriptors() {
+        // `/usr/bin/true` exits immediately with no output, which is the same
+        // shape as the production drop this has to survive: stdout reaches EOF
+        // and `attempt()` falls through to `waitUntilExit()`.
+        assertNoDescriptorLeak(
+            executablePath: "/usr/bin/true",
+            "a connection that opens and closes must return its pipes")
+    }
+
+    // MARK: - Autorelease pools on the reconnect thread
+    //
+    // Sibling of the descriptor leak above, found while fixing it, and the
+    // reason both are pinned here: `run()` is a `while true` loop on the main
+    // thread of a plain Swift executable, which never drains an autorelease
+    // pool of its own. Every ObjC object the loop touches — `Process`,
+    // `Pipe`, and one `NSData` per `availableData` — therefore accumulates
+    // for the life of the process. Measured on this machine at 400 spawn/
+    // wait cycles: +2128 KB and +2112 KB of RSS across two bare runs, versus
+    // +736 KB and +128 KB with a pool. Roughly 5 KB per reconnect, and the
+    // inner read loop is the worse of the two, because a connection that
+    // stays up for hours never leaves `attempt()` at all — it just keeps
+    // appending `NSData` to a pool nothing will drain.
+    //
+    // Pinned against the source rather than by observing behavior, which is
+    // this file's existing convention when neither is available at runtime:
+    // `testRunCallsIgnoreSIGPIPEBeforeItsReconnectLoop` above does the same,
+    // for the same reason. `run()` never returns and needs a live ssh peer,
+    // and the inner loop only iterates more than once against a peer that
+    // streams — so an RSS assertion here would be measuring allocator noise,
+    // not the pool. What a regression would actually do is delete these
+    // calls from the source, and that is what these tests watch.
+    private func channelSource() throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try String(
+            contentsOf: root.appendingPathComponent("Sources/clipwire/Channel.swift"), encoding: .utf8)
+    }
+
+    func testTheReconnectLoopDrainsAnAutoreleasePoolPerAttempt() throws {
+        let source = try channelSource()
+        guard let runRange = source.range(of: "func run() {"),
+              let loopRange = source.range(of: "while true {", range: runRange.upperBound..<source.endIndex),
+              let bodyEnd = source.range(of: "\n    }", range: loopRange.upperBound..<source.endIndex)
+        else { return XCTFail("could not locate run()'s reconnect loop -- has it been restructured?") }
+
+        let loopBody = source[loopRange.upperBound..<bodyEnd.lowerBound]
+        XCTAssertTrue(
+            loopBody.contains("autoreleasepool"),
+            "run()'s reconnect loop must drain an autorelease pool each time round -- "
+            + "it is a bare `while true` on a thread with no pool of its own, so without "
+            + "this every Process and Pipe it creates is retained until the agent exits")
+    }
+
+    func testTheReadLoopDrainsAnAutoreleasePoolPerChunk() throws {
+        let source = try channelSource()
+        // Anchored on the assignment itself, not on the first `availableData`
+        // in range: the surrounding comments discuss `availableData` in prose,
+        // and matching one of those would pass or fail on the wording of a
+        // comment rather than on what the loop executes.
+        guard let loopRange = source.range(of: "outer: while task.isRunning {"),
+              let chunkRange = source.range(of: "let chunk =", range: loopRange.upperBound..<source.endIndex),
+              let lineEnd = source.range(of: "\n", range: chunkRange.upperBound..<source.endIndex)
+        else { return XCTFail("could not locate attempt()'s read loop -- has it been restructured?") }
+
+        let readStatement = source[chunkRange.lowerBound..<lineEnd.lowerBound]
+        XCTAssertTrue(
+            readStatement.contains("availableData"),
+            "the read loop's chunk must still come from availableData -- otherwise this "
+            + "test is pinning a statement that no longer reads the channel")
+        XCTAssertTrue(
+            readStatement.contains("autoreleasepool"),
+            "each availableData in attempt()'s read loop must drain an autorelease pool -- "
+            + "a connection that stays up for hours never returns from attempt(), so its "
+            + "per-read NSData would pile up with nothing to release it")
+    }
+
+    func testAFailedSpawnDoesNotLeakFileDescriptors() {
+        // The throw path leaks hardest — six ends and a live readability
+        // handler — and it is the path production ends up pinned on once the
+        // table is full, so it is also the path that decides whether the agent
+        // can ever recover on its own instead of needing a restart.
+        assertNoDescriptorLeak(
+            executablePath: "/nonexistent/clipwire-no-such-executable",
+            "a spawn that throws must still return its pipes")
+    }
 }
