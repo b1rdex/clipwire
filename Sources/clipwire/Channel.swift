@@ -202,7 +202,13 @@ final class Channel: @unchecked Sendable {
         while true {
             let host = useFallback ? (config.fallbackIP ?? config.host) : config.host
             log.line("connecting to \(config.user)@\(host)")
-            let alive = attempt(host: host)
+            // This loop is the main thread of a plain Swift executable, and
+            // nothing here ever drains an autorelease pool — no AppKit, no
+            // run loop, and `run()` by design never returns. Without this,
+            // every `Process` and `Pipe` an attempt creates stays alive until
+            // the agent exits, which for this agent means days. Measured at
+            // ~5 KB per reconnect before this pool existed.
+            let alive = autoreleasepool { attempt(host: host) }
             if alive {
                 if Channel.shouldResetBackoff(establishedAt: establishedAt, now: Date()) {
                     backoff.reset()
@@ -237,6 +243,85 @@ final class Channel: @unchecked Sendable {
         establishedAt = nil
 
         let stdin = Pipe(), stdout = Pipe(), stderr = Pipe()
+
+        // Whether `task.run()` got far enough to hand the child ends to a
+        // real child process. It decides which descriptors the `defer` below
+        // may touch, and getting it wrong is worse than the leak it replaces
+        // — see there.
+        var spawned = false
+
+        // Three `Pipe()`s per connection is six descriptors, and until this
+        // `defer` existed not one of them was ever closed: the only `close()`
+        // in this file lives in `hangUp()`, which production never calls.
+        // `Pipe`'s handles carry `closeOnDealloc`, so the intent was that ARC
+        // would do it — it did not, and the shipped agent proved it over 3
+        // days and 1168 reconnects, ending with 2556 open pipes and its
+        // descriptor table full solid (fds 0…2559 of a 2560 ceiling). Past
+        // saturation `Pipe()` cannot allocate, `Process.run()` dup2's fd −1,
+        // and every reconnect fails with `NSPOSIXErrorDomain Code=9` forever:
+        // the agent cannot recover on its own, it has to be restarted.
+        //
+        // Deliberately a `defer` in this synchronous scope rather than a
+        // wrapper type with a `deinit`. The attempt already has an owner —
+        // this function's scope — and lifetime-based release is precisely the
+        // mechanism that just failed; swapping one implicit `deinit` for
+        // another would reproduce the bug with more ceremony.
+        //
+        // Only the three PARENT ends are unconditionally ours. After a
+        // successful spawn `Process` has already closed the parent's copies
+        // of the child ends, and the `FileHandle` objects go on holding those
+        // stale numbers — closing them again would close whatever unrelated
+        // descriptor has since reused the number, in the worst case a live
+        // pipe belonging to the next attempt. Verified directly rather than
+        // assumed: after `run()` succeeds, `fcntl(F_GETFD)` on all three
+        // child ends returns EBADF while all three parent ends stay valid;
+        // after `run()` throws, all six are still open. Hence `!spawned`.
+        //
+        // stderr's read end is missing here on purpose: it is closed by its
+        // own readability handler on EOF (see below), because closing it from
+        // this thread can crash the process.
+        defer {
+            // Through `writeQueue`, the one queue `stdinPipe` is ever touched
+            // from, for the same reason `hangUp()` does it: a concurrent
+            // `send()` must not have the handle closed out from under its
+            // `write(contentsOf:)`. Niling `stdinPipe` inside the same block
+            // is what makes that safe in the other direction too — a `send`
+            // enqueued after this close finds nil and reports `false`,
+            // instead of writing into a closed (or, worse, recycled)
+            // descriptor. No deadlock: the run thread is never `writeQueue`
+            // itself, and an in-flight write cannot block forever because
+            // this runs after `waitUntilExit()`, so the reader is already
+            // gone and the kernel fails the write with EPIPE — which
+            // `ignoreSIGPIPE()` plus `send()`'s `catch` already handle.
+            // Closing twice is fine, and the pairing harness does exactly
+            // that: it calls `hangUp()` to end a connection, which closes
+            // this same handle and nils `stdinPipe`, and then this `defer`
+            // closes it again on the way out. Unlike the child ends above,
+            // that is safe, because it is the same `FileHandle` object doing
+            // both closes — `Pipe` caches its handles (verified: two property
+            // accesses are identical objects) so the second `close()` finds
+            // the handle already closed and does nothing. Checked against the
+            // exact hazard rather than assumed: with the freed number
+            // deliberately recycled by another `open()` in between, the
+            // second close leaves that descriptor untouched. The child ends
+            // are the opposite case only because `Process` closes them
+            // behind the handle's back, leaving it holding a number it no
+            // longer owns and no way to know it.
+            writeQueue.sync { [self] in
+                try? stdin.fileHandleForWriting.close()
+                stdinPipe = nil
+            }
+            try? stdout.fileHandleForReading.close()
+            if !spawned {
+                try? stdin.fileHandleForReading.close()
+                try? stdout.fileHandleForWriting.close()
+                // Also the EOF that retires the readability handler below:
+                // with no child to close its fd 2, this is the last writer,
+                // so nothing else would ever wake that source.
+                try? stderr.fileHandleForWriting.close()
+            }
+        }
+
         let task = Process()
         task.executableURL = URL(fileURLWithPath: executablePath)
         task.arguments = makeArguments(config, host)
@@ -252,9 +337,37 @@ final class Channel: @unchecked Sendable {
         // lines still get logged even if `Channel` itself were ever torn
         // down before the handler fires, instead of silently going missing.
         let log = self.log
+        // Retires itself on EOF, from inside its own last invocation, and
+        // that placement is load-bearing. The obvious alternative — the run
+        // thread setting `readabilityHandler = nil` and closing the handle
+        // after `waitUntilExit()` — crashes the agent: cancelling a dispatch
+        // source is asynchronous, so an invocation already in flight goes on
+        // to call `availableData` on the descriptor the run thread just
+        // closed, and `FileHandle` answers that with an ObjC
+        // `NSFileHandleOperationException`, which Swift cannot catch. The
+        // window is microseconds wide and this loop reconnects a few hundred
+        // times a day. The same race has a second, quieter outcome: a late
+        // invocation reading a descriptor number already recycled by the NEXT
+        // connection's stderr, stealing its lines into this one's log.
+        //
+        // Closing from the final invocation has neither problem — the source
+        // is serial, so nothing else is running inside it, and once the
+        // handler has cleared itself it cannot fire again. EOF is guaranteed
+        // on both paths: after a successful spawn the child's death closes
+        // the last writer (`Process` having already closed the parent's copy),
+        // and on the throw path the `defer` above closes it explicitly.
+        //
+        // The empty read is also the only stop condition this source has —
+        // before, an EOF that nobody acted on left it re-arming and firing on
+        // a dead descriptor for the rest of the attempt.
         stderr.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                try? handle.close()
+                return
+            }
+            guard let text = String(data: data, encoding: .utf8) else { return }
             for line in text.split(separator: "\n") where !line.isEmpty {
                 log.line("remote: \(line)")
             }
@@ -266,6 +379,7 @@ final class Channel: @unchecked Sendable {
             return false
         }
 
+        spawned = true
         self.process = task
         self.stdinPipe = stdin
         var established = false
@@ -280,7 +394,13 @@ final class Channel: @unchecked Sendable {
         // arrived next into the just-cleared buffer at an arbitrary offset —
         // resynchronising against a corrupt stream instead of dropping it.
         outer: while task.isRunning {
-            let chunk = stdout.fileHandleForReading.availableData
+            // The pool in `run()` drains once per reconnect, which is no help
+            // to a connection that stays up for hours: this loop never leaves
+            // `attempt()`, so without a pool of its own every `availableData`
+            // adds an `NSData` that nothing will release until the channel
+            // finally drops. Draining per read is safe — `chunk` is a Swift
+            // `Data`, which owns its bytes past the pool's scope.
+            let chunk = autoreleasepool { stdout.fileHandleForReading.availableData }
             if chunk.isEmpty { break }
             buffer.append(chunk)
             while true {
@@ -302,8 +422,11 @@ final class Channel: @unchecked Sendable {
         }
 
         task.waitUntilExit()
-        stderr.fileHandleForReading.readabilityHandler = nil
-        self.stdinPipe = nil
+        // Both the handler teardown and `stdinPipe = nil` used to happen
+        // here; they now live in this function's `defer` — the handler
+        // retires itself on EOF, and the pipe is closed and niled together
+        // under `writeQueue`. See the two comments above for why neither
+        // belongs on this thread.
         self.process = nil
         log.line("ssh exited with status \(task.terminationStatus)")
         return established
