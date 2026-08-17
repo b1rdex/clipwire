@@ -797,10 +797,40 @@ def sha256_hex(data):
 
 def resolve_current_clip_state(clipboard, stored, now):
     """Reconciles what the clipboard holds now against what was last persisted."""
-    read = clipboard.read()
-    if read is None:
+    return _resolve_readable_clip_state(clipboard.read(), stored, now)
+
+
+def announce_clip_state(send, clipboard, now=None, path=None):
+    """Builds, persists, and sends this side's clip-state announcement, reconciled
+    against the store so unchanged content keeps its true recorded age. An
+    unreadable clipboard announces the store untouched: fabricating "empty" out
+    of a failed read is what turned one dark screen into a resend per reconnect."""
+    if now is None:
+        now = time.time()
+    stored = load_clip_state(path=path)
+    outcome, payload = classify_read(clipboard)
+    if outcome == READ_UNKNOWN:
+        log("announcing from the store: clipboard unreadable")
+        resolved = tuple(stored) if stored is not None else (None, now, None, None)
+        send(TYPE_CLIP_STATE, encode_clip_state(*resolved))
+        return resolved
+    resolved = _resolve_readable_clip_state(payload, stored, now)
+    if resolved[0] is not None and (stored is None or stored[0] != resolved[0]):
+        log("clipboard changed while apart")
+    try:
+        save_clip_state(*resolved, path=path)
+    except (OSError, ClipStateError) as error:
+        log("could not persist clip state: %r" % error)
+    send(TYPE_CLIP_STATE, encode_clip_state(*resolved))
+    return resolved
+
+
+def _resolve_readable_clip_state(payload, stored, now):
+    """resolve_current_clip_state's readable half: payload is (kind, data) or
+    None for a definitely-empty clipboard."""
+    if payload is None:
         return resolve_startup_state(None, None, stored, now)
-    current_kind, data = read
+    current_kind, data = payload
     if not data:
         return resolve_startup_state(None, None, stored, now)
     if current_kind == KIND_IMAGE and len(data) > MAX_IMAGE_BYTES:
@@ -810,23 +840,6 @@ def resolve_current_clip_state(clipboard, stored, now):
         log("not announcing a clip of %d bytes: over the text limit" % len(data))
         return resolve_startup_state(None, None, stored, now)
     return resolve_startup_state(sha256_hex(data), current_kind, stored, now)
-
-
-def announce_clip_state(send, clipboard, now=None, path=None):
-    """Builds, persists, and sends this side's clip-state announcement, reconciled
-    against the store so unchanged content keeps its true recorded age."""
-    if now is None:
-        now = time.time()
-    stored = load_clip_state(path=path)
-    resolved = resolve_current_clip_state(clipboard, stored, now)
-    if resolved[0] is not None and (stored is None or stored[0] != resolved[0]):
-        log("clipboard changed while apart")
-    try:
-        save_clip_state(*resolved, path=path)
-    except (OSError, ClipStateError) as error:
-        log("could not persist clip state: %r" % error)
-    send(TYPE_CLIP_STATE, encode_clip_state(*resolved))
-    return resolved
 
 
 def classify_read(clipboard):
