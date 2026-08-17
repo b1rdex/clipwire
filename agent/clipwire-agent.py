@@ -1334,6 +1334,29 @@ def parse_gpaste_line(line):
     return "Update" in line and GPASTE_OBJECT_PATH in line
 
 
+def parse_logind_monitor_line(line, session_path):
+    """"locked"/"unlocked" for a PropertiesChanged LockedHint flip on the
+    watched session; "resolve" when the session table itself changed
+    (SessionNew/SessionRemoved -- a relogin); else None.
+
+    Substring matching only, SYNTHETIC until Task 2 step 5's real capture
+    lands (spec v3.5 §3.2 step 5) -- a real capture can only tighten this,
+    never loosen it. `session_path` may be None (unresolved/fail-open): the
+    resolve case still matters then, since it is what gives the monitor a
+    chance to recover; a LockedHint flip on no watched session does not."""
+    if (session_path is not None and session_path in line
+            and "PropertiesChanged" in line):
+        if "'LockedHint': <true>" in line:
+            return "locked"
+        if "'LockedHint': <false>" in line:
+            return "unlocked"
+    session_new = "%s.SessionNew" % LOGIND_MANAGER_IFACE
+    session_removed = "%s.SessionRemoved" % LOGIND_MANAGER_IFACE
+    if session_new in line or session_removed in line:
+        return "resolve"
+    return None
+
+
 try:
     import ctypes
 except ImportError:
@@ -1621,6 +1644,163 @@ class GPasteWatcher:
         self._safety_net.stop()
         if self._process:
             self._process.terminate()
+
+
+# Backoff for the logind pump's self-heal (spec §3.2.3): doubles on each
+# respawn, reset the moment a line parses to something meaningful again.
+LOGIND_MONITOR_RESPAWN_SECONDS = 1.0
+LOGIND_MONITOR_RESPAWN_MAX_SECONDS = 30.0
+
+
+class LockMonitor:
+    """Caches logind's LockedHint for the one resolved graphical session,
+    kept current by a `gdbus monitor --system` pump. The TRANSPORT mirrors
+    GPasteWatcher's (gdbus monitor, a pump thread, pdeathsig, terminate on
+    stop) but the LIFECYCLE is deliberately its opposite. GPaste's pump is
+    born in watcher.start() and dies in watcher.stop(), which under v3.5
+    happens at every lock -- a lock monitor with that lifecycle would be
+    dead by the time the unlock it exists to observe arrives. This class is
+    instead a PROCESS SINGLETON: start() once from main()'s real-clipboard
+    branch, stop() only when run() returns, and never wired into
+    clipboard_lost (review blocker B2) -- it is the unlock's only observer.
+
+    Fail-open: an unresolved session (zero or several graphical candidates,
+    or any probe among them unanswered) or an unread LockedHint reports
+    locked() as None, never False -- None and False are opposite evidence,
+    the same rule resolve_graphical_session and session_locked_hint each
+    already carry one level down."""
+
+    def __init__(self, run=subprocess.run, popen=subprocess.Popen,
+                 now=time.monotonic):
+        self._run = run
+        self._popen = popen
+        self._now = now
+        # Leaf lock: guards only _locked/_session_path/_since (read or
+        # assigned), and is never held across a call to
+        # resolve_graphical_session, session_locked_hint, popen, or log --
+        # every one of those can block or shell out.
+        self._lock = threading.Lock()
+        self._locked = None
+        self._since = None
+        self._session_path = None
+        self._fail_open_logged = False
+        self._stop = threading.Event()
+        self._process = None
+        self._thread = None
+
+    def start(self):
+        # Resolve, THEN subscribe, THEN take the initial Get -- spec §3.2
+        # step 2 pins subscribe-before-Get specifically: a transition
+        # landing in the gap between them is still sitting in the
+        # monitor's own pipe once the reader thread gets to it, so it
+        # self-corrects rather than being lost.
+        path = self._resolve_session()
+        self._process = self._spawn()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+        self._read_hint(path)
+
+    def stop(self):
+        self._stop.set()
+        # NOT JOINED, mirroring GPasteWatcher.stop(): the caller may be the
+        # main protocol loop. terminate() plus the reader noticing EOF is
+        # what actually ends the thread, not this call.
+        if self._process is not None:
+            self._process.terminate()
+
+    def locked(self):
+        with self._lock:
+            return self._locked
+
+    def state(self):
+        """(locked, since) -- `since` is the monotonic stamp of the LAST
+        transition, from the injected clock. A plain tuple snapshot, safe
+        to read from any thread without the caller taking a lock."""
+        with self._lock:
+            return self._locked, self._since
+
+    def _spawn(self):
+        return self._popen(
+            ["gdbus", "monitor", "--system", "--dest", LOGIND_BUS_NAME],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, preexec_fn=_pdeathsig_preexec,
+        )
+
+    def _resolve_session(self):
+        """Which session to trust, or None -- never called with _lock held,
+        since resolve_graphical_session shells out. Logs the fail-open line
+        exactly on the transition into it: a resolver that keeps failing
+        stays silent after the first line, but a later success re-arms it,
+        so a SECOND, separate failure (spec §3.2: a relogin can pass
+        through a two-candidate moment more than once) is not mute."""
+        path = resolve_graphical_session(run=self._run)
+        log_now = False
+        with self._lock:
+            self._session_path = path
+            if path is None:
+                log_now = not self._fail_open_logged
+                self._fail_open_logged = True
+            else:
+                self._fail_open_logged = False
+        if log_now:
+            log("no unique graphical session: lock gate inactive, readiness is socket-only")
+        if path is None:
+            self._set_locked(None)
+        return path
+
+    def _read_hint(self, path):
+        """The initial (or post-re-resolve) LockedHint of `path`; a no-op
+        when resolution itself failed -- there is nothing to Get."""
+        if path is None:
+            return
+        self._set_locked(session_locked_hint(path, run=self._run))
+
+    def _reresolve(self):
+        """Re-resolve and re-read, back to back -- unlike start(), there is
+        no subscribe step to interleave here: the pump is already
+        running."""
+        self._read_hint(self._resolve_session())
+
+    def _set_locked(self, value):
+        with self._lock:
+            if value != self._locked:
+                self._locked = value
+                self._since = self._now()
+
+    def _watched_path(self):
+        with self._lock:
+            return self._session_path
+
+    def _pump(self):
+        """Reads the gdbus monitor's stdout for the life of the process,
+        self-healing on EOF (spec §3.2.3): a systemd-logind restart, or
+        anything else that ends the child, is covered by re-spawning and
+        re-resolving rather than by watching NameOwnerChanged (retracted in
+        review -- a monitor scoped to --dest org.freedesktop.login1 may
+        never see one)."""
+        delay = LOGIND_MONITOR_RESPAWN_SECONDS
+        while True:
+            for line in self._process.stdout:
+                if self._stop.is_set():
+                    return
+                outcome = parse_logind_monitor_line(line, self._watched_path())
+                if outcome is None:
+                    continue
+                if outcome == "locked":
+                    self._set_locked(True)
+                elif outcome == "unlocked":
+                    self._set_locked(False)
+                elif outcome == "resolve":
+                    self._reresolve()
+                delay = LOGIND_MONITOR_RESPAWN_SECONDS
+            # EOF: the child exited on its own. stop() sets the flag this
+            # honors, both before the wait (already requested) and during
+            # it (wait() returns early the instant set() runs elsewhere).
+            if self._stop.is_set() or self._stop.wait(delay):
+                return
+            delay = min(delay * 2, LOGIND_MONITOR_RESPAWN_MAX_SECONDS)
+            self._process = self._spawn()
+            self._reresolve()
 
 
 class PollingWatcher:
