@@ -211,16 +211,17 @@ instant `LockedHint` flips back; it waits for that to hold for about a second �
 against the screen-shield animation, which can bounce — and then applies whichever one clip is
 sitting in the slot. GPaste's history grows by at most one entry per locked stretch this way,
 not one per copy, and the log names what it held. For a lock much shorter than the one above:
-`session unlocked after 63s; 3 clips arrived while locked, applied the newest` when something
-was waiting, or `session unlocked after 63s; no clips arrived while locked` when nothing was.
+`session unlocked after 1m 3s; 3 clips arrived while locked, applied the newest` when something
+was waiting, or `session unlocked after 1m 3s; no clips arrived while locked` when nothing was.
 
-Applying a clip still blinks the same way it always has — `wl-copy` takes a focus grab to set
-the selection, images included — and that is outside what this gate touches: it decides
-whether an apply happens at all, not how one looks when it does. The cycle that would move
-text off that path has not shipped; images stay on it either way. And the gate only knows what
-logind reports, so the dark-monitor class from above — awake, unlocked, and still unable to
-answer a read — is invisible to it and unaffected by it: reads there hang exactly as before,
-and writes there were never broken in the first place.
+Applying an **image** clip still blinks the same way it always has — `wl-copy` takes a focus
+grab to set the selection — and that is outside what this gate touches: it decides whether an
+apply happens at all, not how one looks when it does. **Text no longer blinks either way, as of
+v3.4** (below): it moved off the `wl-copy` path entirely, so what this gate decides and what a
+text clip costs in focus are now independent questions. Images stay on `wl-copy` regardless. And
+the gate only knows what logind reports, so the dark-monitor class from above — awake, unlocked,
+and still unable to answer a read — is invisible to it and unaffected by it: reads there hang
+exactly as before, and writes there were never broken in the first place.
 
 Nothing degrades as a result: a read that fails proves nothing about whether the event
 source is alive, so it never counts toward the verdict that switches the agent to faster
@@ -281,6 +282,67 @@ What that changes, and what it does not:
   and signalling normally. The poll is the only detector left **in the state the verdict
   describes**, where the clipboard manager really has stopped recording; the verdict can also
   be reached when it has not.
+
+## Copying text no longer blinks, in either direction
+
+The section above stops **noticing** a PC-side copy from blinking — that was v3.3, and it is the
+five-second history check above. It says nothing about **fetching** that copy's body, which
+before v3.4 still meant a `wl-paste` call and still blinked, nor about **landing** a Mac's copy
+on the PC's clipboard, which still meant `wl-copy` and still blinked too. As of v3.4, text — and
+only text, on a machine where GPaste is available — closes both of those remaining gaps, so a
+copy on either machine now reaches the other without a blink on the PC.
+
+Writing a clip spawns `gpaste-client add` with the body on stdin, never on a command line or
+through a shell, and the write is not trusted on exit code alone: GPaste can drop an over-limit
+clip silently with exit 0, so the agent re-reads GPaste's own top-of-history afterward and only
+counts the write as done once that read-back is byte-equal to what was sent. Reading works the
+other way: the newest history item's kind is checked first — only `Text` takes this path — and
+its body comes back through GetRawElement (`gpaste-client --raw get <uuid>`), which hands back
+the raw bytes with no escaping and no added newline. Neither direction opens a Wayland surface,
+so neither one takes focus.
+
+**What still blinks:**
+
+- **Images, in both directions.** They stay on `wl-clipboard` outright; v3.4 is text-only.
+- **A clip larger than `max-text-item-size`** — 1 MiB − 1 on GPaste's own setting — because
+  GPaste drops an over-limit `add` silently, with exit 0 and no history movement. The read-back
+  check above catches that silent drop and falls back to `wl-copy`, logging it:
+
+  ```
+  the GPaste add was not confirmed; writing with wl-copy instead
+  ```
+
+- **The first read of a connection.** The connection seed, the become-ready read and the
+  reconcile send path all still call the plain clipboard read rather than routing through a
+  history uuid, by scope rather than by necessity.
+- **A machine with no GPaste**, which this cycle does not touch and which behaves exactly as
+  before.
+
+**The write-latency residual — both datings on record, neither one promised.** The measurement
+that shaped this design, taken 2026-08-05, found a novel `Add` costing ~1.4 s — a flat 1.37 s
+over six D-Bus runs, 1.41 s through the separate `gpaste-client` subprocess call — and that is
+the number the owner accepted: a clip typed on the Mac was expected to land on the PC up to
+about 1.4 s later than an instant write would. A later session, on 2026-08-17, measured the
+same call on the same machine at 14–35 ms flat across body sizes from 21 bytes to 921,600 bytes —
+three orders of magnitude with no size-dependent cost, and nothing recorded in between explains
+the gap. Both figures are written down because both were measured; neither is the number a given
+write is promised to hit.
+
+**A read regression, accepted rather than fixed.** GPaste ingests and normalises a PC-side clip
+before the agent ever asks for it, so a clip containing an embedded NUL or invalid UTF-8 reaches
+the Mac in GPaste's normalised form, not in the original bytes `wl-paste` would have handed
+over. This is the one place v3.4 is worse than what it replaced, and nothing on the read side
+can fix it — GPaste has already done the damage by the time the agent looks.
+
+**A write that races the lock is re-selected, not re-proven, once the screen comes back.** If a
+text write through the GPaste tier completes inside the same interval the session turns out to
+have been locked for, the agent re-selects that history item once the lock gate reopens, rather
+than trusting that GPaste's own selection survived the lock intact on its own. It logs the uuid
+it acted on:
+
+```
+re-selected <uuid>: tier write completed inside a locked interval
+```
 
 ## A clip GPaste refuses to record still syncs
 

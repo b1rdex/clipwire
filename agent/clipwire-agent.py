@@ -305,6 +305,23 @@ def skew_log_line(peer_sent_at, now):
     return "peer clock skew %.1fs" % skew
 
 
+def _describe_duration(seconds):
+    """'17h 30m', '1m 3s', '45s'. The unlock line is the incident report,
+    and its motivating incident is 17.5 HOURS -- raw seconds ('63000s') fail
+    'readable from this log alone' on the one case that matters."""
+    total = int(seconds)
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append("%dh" % hours)
+    if minutes:
+        parts.append("%dm" % minutes)
+    if secs or not parts:
+        parts.append("%ds" % secs)
+    return " ".join(parts)
+
+
 # ============================================================================
 # 5. class Agent — the protocol loop, with NeverReadyClipboard beside it
 # ============================================================================
@@ -345,6 +362,12 @@ class Agent:
         # Lock order: _observe_lock -> _echo_lock -> _write_lock, total and
         # acyclic -- keep any new acquisition consistent with it.
         self._observe_lock = threading.Lock()
+        # The v3.4 text tier (make_watcher's GPaste branch) and the last
+        # CONFIRMED tier write (uuid, monotonic stamp, sha256). Both survive
+        # clipboard_lost: the unlock flush and the reassert both run before
+        # the next watcher exists.
+        self._tier = None
+        self._last_tier_write = None
 
     # --- outbound -------------------------------------------------------
 
@@ -483,35 +506,56 @@ class Agent:
             # deliberately the only unlock line there is -- it says what was
             # held, not just that the gate reopened. ended_by picks which of
             # two pairs (spec §6): "unlocked" is a real LockedHint=false
-            # held past the debounce -- these two lines are BYTE-FOR-BYTE
-            # what shipped before ended_by existed, unchanged, because the
-            # README quotes them. "fell-open" is the monitor losing the
-            # session mid-lock -- a stretch that ends in fail-open still
-            # reports, the most incident-shaped event this feature has, and
-            # silence here would put this whole log's "readable from this
-            # alone" purpose out of reach exactly when it matters most.
-            # Never-locked flushes still see stretch is None above and stay
-            # silent, unchanged.
-            seconds, ended_by = stretch
+            # held past the debounce -- README.md quotes this pair,
+            # updated in the same commit as the duration format below.
+            # "fell-open" is the monitor losing the session mid-lock -- a
+            # stretch that ends in fail-open still reports, the most
+            # incident-shaped event this feature has, and silence here
+            # would put this whole log's "readable from this alone" purpose
+            # out of reach exactly when it matters most. Never-locked
+            # flushes still see stretch is None above and stay silent,
+            # unchanged.
+            seconds, ended_by, lock_edge, ended_at = stretch
+            held = _describe_duration(seconds)
             if ended_by == "unlocked":
                 if arrivals:
-                    log("session unlocked after %ds; %d clips arrived while locked,"
-                        " applied the newest" % (int(seconds), arrivals))
+                    log("session unlocked after %s; %d clips arrived while locked,"
+                        " applied the newest" % (held, arrivals))
                 else:
-                    log("session unlocked after %ds; no clips arrived while locked"
-                        % int(seconds))
+                    log("session unlocked after %s; no clips arrived while locked"
+                        % held)
             else:
                 if arrivals:
-                    log("lock gate fell open after %ds; %d clips arrived while locked,"
-                        " applied the newest" % (int(seconds), arrivals))
+                    log("lock gate fell open after %s; %d clips arrived while locked,"
+                        " applied the newest" % (held, arrivals))
                 else:
-                    log("lock gate fell open after %ds; no clips arrived while locked"
-                        % int(seconds))
+                    log("lock gate fell open after %s; no clips arrived while locked"
+                        % held)
         read = self.clipboard.read()
         seed = (read[0], sha256_hex(read[1])) if read is not None and read[1] else None
         with self._echo_lock:
             self._last_seen = seed
             self._expect_reoffer = None
+        if stretch is not None:
+            record = self._last_tier_write
+            if record is not None and lock_edge <= record[1] <= ended_at:
+                # After the seed read, not before: the seed's own
+                # `_last_seen = seed` above would clobber an earlier arm.
+                # Select: sub-ms, idempotent. Arming AFTER it (elsewhere in
+                # this file, before) is safe here only because no watcher
+                # is alive between the Select and the arm -- clipboard_lost
+                # discarded the last one, the next starts later in this
+                # method. Arms _last_seen alone -- a one-shot could go
+                # unconsumed and swallow the owner's next real copy (M4).
+                # Stored uuids are perishable (dedup-move re-mints one), so
+                # a dead uuid's Select fails rc=1 -> False: ordinary here.
+                self._last_tier_write = None
+                uuid, _, sha256 = record
+                if gpaste_select(uuid):
+                    log("re-selected %s: tier write completed inside a locked "
+                        "interval" % uuid)
+                    with self._echo_lock:
+                        self._last_seen = (KIND_TEXT, sha256)
         applied_pending = None
         if self.pending_clip is not None:
             applied_pending = self._write_clip(self.pending_clip, self.pending_clip_kind)
@@ -541,6 +585,7 @@ class Agent:
                 on_idle_tick=self._reoffer_pending,
             )
             self._watcher.start(self._local_change)
+            self._tier = getattr(self._watcher, "tier", None)
 
     @staticmethod
     def _reoffer_is_overdue(expectation):
@@ -563,6 +608,40 @@ class Agent:
             self._watcher.stop()
             self._watcher = None
 
+    def _tier_write(self, kind, body, sha256):
+        """The v3.4 write guard: uuid of a confirmed focus-free write, or
+        None -- the caller then runs today's wl-copy path unchanged. Declines
+        are silent (no tier, not text, NUL, non-UTF-8: routing, not failure);
+        a tier that TRIED and could not confirm logs the fallback."""
+        tier = self._tier
+        if tier is None or kind != KIND_TEXT:
+            return None
+        if b"\x00" in body:
+            return None
+        try:
+            body.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        with self._echo_lock:
+            self._last_written = body
+            self._write_gen += 1
+            self._last_seen = (KIND_TEXT, sha256)
+            self._expect_reoffer = None
+        uuid = tier.write_text(body)
+        if uuid is not None:
+            self._last_tier_write = tier.last_confirmed_write
+            return uuid
+        top = tier.last_mismatch_top
+        if top is not None:
+            # A failed Add can raise TWO Updates (move + rollback). The
+            # one-shot is spent on the first, so the second would read the
+            # rolled-back OLD top as a fresh local change and send it to the
+            # peer -- a failed write silently overwriting the Mac's clipboard.
+            with self._echo_lock:
+                self._last_seen = (KIND_TEXT, sha256_hex(top))
+        log("the GPaste add was not confirmed; writing with wl-copy instead")
+        return None
+
     def _write_clip(self, payload, kind=KIND_TEXT):
         """Decodes `payload` ([ts][body] wire format for `kind`) and applies it to the
         clipboard. Returns the (sha256, ts, kind, origin) record applied and persisted
@@ -576,17 +655,21 @@ class Agent:
         if not body:
             return None
         sha256 = sha256_hex(body)
-        with self._echo_lock:
-            self._last_written = body if kind == KIND_TEXT else None
-            self._write_gen += 1
-            self._last_seen = (kind, sha256)
-            self._expect_reoffer = (
-                (ts, sha256, time.time()) if kind == KIND_IMAGE else None
-            )
-        self.clipboard.write(kind, body)
-        # wl-copy is spawned detached; write() returns once its stdin pipe
-        # closes -- a hand-off, not confirmation. Re-reading right here
-        # would race it.
+        if self._tier_write(kind, body, sha256) is None:
+            # A fallback write supersedes the tier record; a reassert on the
+            # stale uuid would revert this newer clip (v3.5 §5).
+            self._last_tier_write = None
+            with self._echo_lock:
+                self._last_written = body if kind == KIND_TEXT else None
+                self._write_gen += 1
+                self._last_seen = (kind, sha256)
+                self._expect_reoffer = (
+                    (ts, sha256, time.time()) if kind == KIND_IMAGE else None
+                )
+            self.clipboard.write(kind, body)
+            # wl-copy is spawned detached; write() returns once its stdin pipe
+            # closes -- a hand-off, not confirmation. Re-reading right here
+            # would race it.
         try:
             save_clip_state(sha256, ts, kind, path=self._clip_state_path)
         except (OSError, ClipStateError) as error:
@@ -597,6 +680,36 @@ class Agent:
         with self._observe_lock:
             self._observe_local_change()
 
+    def _tier_read(self):
+        """The v3.4 read guard: (KIND_TEXT, bytes) through GPaste for a Text
+        top-of-history, else None and the caller runs today's wl-paste read.
+        The uuid is fetched fresh rather than borrowed from the fast tier:
+        its poll can trail the Update this read answers, and a stale uuid
+        fetches the PREVIOUS clip -- wrong, not missing.
+
+        And it is not fetched at all when the safety net says this
+        observation came from a selection that moved over a FROZEN history
+        uuid: GPaste recorded nothing, so its top is somebody else's older
+        clip and wl-paste is the only reader that can see this one (v3.3's
+        excluded-clip contract)."""
+        tier = self._tier
+        if tier is None:
+            return None
+        watcher = self._watcher
+        # getattr with a default, not hasattr or a type check: the polling and
+        # Upgrading watchers never grew this method, and neither did any of
+        # the suite's watcher doubles -- all of them must stay on today's path.
+        if (watcher is not None
+                and getattr(watcher, "consume_untracked_change", lambda: False)()):
+            return None
+        uuid = tier.current_uuid()
+        if uuid is None:
+            return None
+        body = tier.read_text(uuid)
+        if body is None:
+            return None
+        return KIND_TEXT, body
+
     def _observe_local_change(self):
         """Judges one observed clipboard change and sends whatever is genuinely new;
         every return path must resolve any armed image re-offer expectation first."""
@@ -605,7 +718,9 @@ class Agent:
             gen = self._write_gen
             last_seen = self._last_seen
 
-        read = self.clipboard.read()
+        read = self._tier_read()
+        if read is None:
+            read = self.clipboard.read()
         observed_at = time.time()
         if read is None:
             # Every return path here must still spend an overdue expectation,
@@ -776,9 +891,11 @@ READ_CONTENT = "content"
 READ_EMPTY = "empty"
 READ_UNKNOWN = "unknown"
 
-# SYNTHETIC: wl-clipboard's documented no-selection stderr text, expected but
-# not yet measured on the target machine -- a later measurement replaces it.
-WL_PASTE_NO_SELECTION = b"No selection"
+# Evidenced 2026-08-17 via `strings /usr/bin/wl-paste` (wl-clipboard 2.2.1).
+# The state that would send it is unreachable here -- GPaste refills <=1ms
+# of any clear, even track-changes=false -- so exit code/stream stay
+# expectation; wrong here falls to unknown, announcing from the store, not null.
+WL_PASTE_NO_SELECTION = b"Nothing is copied"
 
 
 def _xdg_dir(var_name, default, env=None):
@@ -981,7 +1098,9 @@ class LockGate:
                 # once per transition, the same shape the real-unlock
                 # branch below already has -- a second, third, ... None
                 # sample while still fail-open must not re-bank.
-                self._banked = (self._now() - self._lock_edge, "fell-open")
+                ended = self._now()
+                self._banked = (ended - self._lock_edge, "fell-open",
+                                self._lock_edge, ended)
             self._was_open = True
             return True
         if locked:
@@ -997,17 +1116,20 @@ class LockGate:
             self._was_open = True
             return True
         if self._now() - since >= UNLOCK_HOLD_SECONDS:
-            self._banked = (since - self._lock_edge, "unlocked")
+            self._banked = (since - self._lock_edge, "unlocked",
+                            self._lock_edge, since)
             self._was_open = True
             return True
         return False
 
     def stretch_just_ended(self):
-        """The just-banked (seconds, ended_by) of the stretch that just
-        ended, consumed -- None once already taken, or when no locked
-        stretch has ended yet. ended_by is "unlocked" for a real
-        LockedHint=false held past the debounce, or "fell-open" when the
-        monitor instead lost the session mid-lock (spec §6)."""
+        """The just-banked (seconds, ended_by, lock_edge, ended_at) of the
+        stretch that just ended, consumed -- None once already taken, or
+        when no locked stretch has ended yet. ended_by is "unlocked" for a
+        real LockedHint=false held past the debounce, or "fell-open" when
+        the monitor instead lost the session mid-lock (spec §6). lock_edge
+        and ended_at are the two transition stamps the duration was
+        measured between, on this object's own clock."""
         stretch, self._banked = self._banked, None
         return stretch
 
@@ -1027,10 +1149,11 @@ class WaylandClipboard:
                 and (self._lock_gate is None or self._lock_gate.open()))
 
     def lock_stretch_ended(self):
-        """(seconds, ended_by) of the stretch that just ended, consumed once
-        -- delegates to the gate; None with no gate (this connection predates
-        Task 5, or is a fake) or when no stretch just ended. See
-        LockGate.stretch_just_ended for what ended_by distinguishes."""
+        """(seconds, ended_by, lock_edge, ended_at) of the stretch that just
+        ended, consumed once -- delegates to the gate; None with no gate
+        (this connection predates Task 5, or is a fake) or when no stretch
+        just ended. See LockGate.stretch_just_ended for what ended_by,
+        lock_edge, and ended_at distinguish."""
         if self._lock_gate is None:
             return None
         return self._lock_gate.stretch_just_ended()
@@ -1301,6 +1424,136 @@ def gpaste_tracking(run=subprocess.run):
     if "false" in text:
         return False
     return None
+
+
+def gpaste_element_kind(uuid, run=subprocess.run):
+    """The item's GPaste kind ('Text', 'Image', 'Uris', 'Password'), or None
+    when NOT MEASURED -- only an answered 'Text' may route a body through the
+    text tier; every other answer, None included, is the wl-clipboard path."""
+    try:
+        result = run(
+            ["gdbus", "call", "--session", "--dest", GPASTE_BUS_NAME,
+             "--object-path", GPASTE_OBJECT_PATH,
+             "--method", "%s.GetElementKind" % GPASTE_INTERFACE, uuid],
+            capture_output=True, timeout=GPASTE_CALL_TIMEOUT, env=clipboard_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.decode("utf-8", "replace").split("'")
+    if len(parts) < 2 or not parts[1]:
+        return None
+    return parts[1]
+
+
+def gpaste_select(uuid, run=subprocess.run):
+    """True iff GPaste accepted Select(uuid). Every failure shape is False:
+    the caller has nothing to fall back to, only a log line not to write."""
+    try:
+        result = run(
+            ["gdbus", "call", "--session", "--dest", GPASTE_BUS_NAME,
+             "--object-path", GPASTE_OBJECT_PATH,
+             "--method", "%s.Select" % GPASTE_INTERFACE, uuid],
+            capture_output=True, timeout=GPASTE_CALL_TIMEOUT, env=clipboard_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+# The add's own timeout: the measured novel-Add cost was 1.37-1.41s flat on
+# 2026-08-05, and 14-35ms on 2026-08-17 on the same machine -- the two
+# readings are not reconciled, so the timeout stays sized to the worse day
+# rather than to either measured cost.
+GPASTE_ADD_TIMEOUT_SECONDS = 5
+
+
+class GPasteTextTier:
+    """v3.4: text bodies through GPaste's D-Bus instead of wl-clipboard, so
+    neither direction spawns the focus-taking surface. Fail-open everywhere:
+    read_text None / write_text None mean NOT DONE, and the caller runs the
+    wl-clipboard path unchanged."""
+
+    def __init__(self, run=subprocess.run, popen=subprocess.Popen,
+                 read_history_uuid=gpaste_history_uuid,
+                 read_element_kind=None, monotonic=time.monotonic):
+        self._run = run
+        self._popen = popen
+        self._read_history_uuid = read_history_uuid
+        self._read_element_kind = (gpaste_element_kind if read_element_kind is None
+                                   else read_element_kind)
+        self._monotonic = monotonic
+        self.last_confirmed_write = None   # (uuid, monotonic stamp, sha256 hex)
+        self.last_mismatch_top = None      # read-back bytes of the last mismatch
+
+    def current_uuid(self):
+        return self._read_history_uuid()
+
+    def read_text(self, uuid):
+        """Raw bytes of a Text item, or None. The kind gate is not decoration:
+        without it an image at the top would travel as the literal display
+        string '[Image, 1686 x 1182 (...)]' -- wrong, not missing."""
+        if self._read_element_kind(uuid) != "Text":
+            return None
+        return self._raw_get(uuid)
+
+    def _raw_get(self, uuid):
+        # stdin=DEVNULL: gpaste-client reads stdin to EOF before it even
+        # dispatches the verb whenever stdin is not a TTY, and under sshd it
+        # never is -- without EOF this call hangs forever.
+        try:
+            result = self._run(
+                ["gpaste-client", "--raw", "get", uuid],
+                capture_output=True, stdin=subprocess.DEVNULL,
+                timeout=GPASTE_CALL_TIMEOUT, env=clipboard_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    def write_text(self, body):
+        """uuid of a CONFIRMED write, or None for the caller to fall back.
+        Exit 0 alone is not confirmation -- GPaste drops an over-limit clip
+        silently with exit 0 -- only a byte-equal read-back is."""
+        self.last_mismatch_top = None
+        try:
+            process = self._popen(
+                ["gpaste-client", "add"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, env=clipboard_env(),
+            )
+        except OSError:
+            return None
+        try:
+            # communicate writes the body, CLOSES stdin, then waits: EOF is
+            # what STARTS the daemon's work, not what ends it -- a body
+            # written with stdin left open hangs to any timeout.
+            process.communicate(body, timeout=GPASTE_ADD_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Killing the client does not cancel an Add already inside the
+            # daemon; the caller's wl-copy fallback may then write the same
+            # content a second time.
+            process.kill()
+            process.communicate()
+            return None
+        except OSError:
+            process.kill()
+            process.communicate()
+            return None
+        if process.returncode != 0:
+            return None
+        uuid = self._read_history_uuid()
+        if uuid is None:
+            return None
+        top = self._raw_get(uuid)
+        if top != body:
+            self.last_mismatch_top = top
+            return None
+        self.last_confirmed_write = (uuid, self._monotonic(), sha256_hex(body))
+        return uuid
 
 
 LOGIND_BUS_NAME = "org.freedesktop.login1"
@@ -1599,6 +1852,7 @@ class GPasteWatcher:
         self._signals_at_last_tick = 0
         self._uuid_at_last_tick = None
         self._armed = False
+        self._untracked_change = threading.Event()
         # One-way latch for the connection: written once, never cleared,
         # deliberately SURVIVING a watcher rebuild (carried in via `degraded`).
         self._degraded = degraded
@@ -1652,6 +1906,23 @@ class GPasteWatcher:
                        and self._uuid_at_last_tick is not None
                        and last_uuid == self._uuid_at_last_tick)
         token_moved = previous != current
+        if read_ok and token_moved and uuid_frozen:
+            # The selection moved while GPaste's history top stood still:
+            # GPaste did not record this clip (an excluded app, a password
+            # manager, its own image re-offer). Only wl-paste can see it --
+            # the tier would serve the OLD top: wrong, not missing. v3.3 §4.2
+            # promised these still sync at the slow cadence; this is what
+            # keeps that true now that the read guard exists.
+            #
+            # RAISED AFTER THE WAKE, not before it: PollingWatcher's pump
+            # sets the shared event a few statements above this call, on the
+            # same tick, so the worker can in principle read the guard before
+            # this line runs. Nothing here can close that -- the ordering is
+            # the poller's. Losing that race leaves this one observation
+            # exactly as it was without the flag and spends it on the NEXT
+            # observation, which then takes wl-paste for a clip the tier
+            # could have answered: one extra fork, never wrong content.
+            self._untracked_change.set()
         if self._uuid_tier_failed:
             tracking_looks_dead = signals == self._signals_at_last_tick
         else:
@@ -1789,6 +2060,19 @@ class GPasteWatcher:
     def worker_alive(self):
         """True iff the worker thread is alive -- proves DEAD, not WEDGED: a worker blocked inside a hung clipboard read is still is_alive()."""
         return self._worker is not None and self._worker.is_alive()
+
+    def consume_untracked_change(self):
+        """One-shot: True iff the safety net saw the selection move while the
+        history uuid stood still since the last consume. The read guard
+        declines the tier on it -- wl-paste is the only reader that can see
+        a clip GPaste did not record (v3.3's excluded-clip contract).
+
+        is_set()-then-clear() is not atomic, and does not need to be: the
+        observer worker is the only consumer, by the same rule that lets it
+        be the only caller of on_change."""
+        was_set = self._untracked_change.is_set()
+        self._untracked_change.clear()
+        return was_set
 
     def stop(self):
         self._stop.set()
@@ -2205,6 +2489,7 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                             read_idle_gate=_user_recently_active,
                             read_tracking=gpaste_tracking)
     if watcher.available():
+        watcher.tier = GPasteTextTier()
         if degraded:
             log("watching the clipboard through GPaste, already diagnosed as silent "
                 "this connection, so polling every %.1fs" % fallback_interval_seconds)

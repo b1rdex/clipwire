@@ -527,3 +527,20 @@ class TestUpgradingWatcher(unittest.TestCase):
             watcher.interval, 2.5,
             "on the interval the caller asked for, promotion or not")
 
+
+class TestTierConstructionSiting(unittest.TestCase):
+    """v3.4 §2.3: the tier is constructed ONLY in the GPasteWatcher branch of
+    make_watcher, so on a machine without GPaste it does not exist at all --
+    the mirror of the disarm-in-a-never-constructed-watcher trap."""
+
+    def test_the_gpaste_branch_carries_a_tier(self):
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object())
+        self.assertIsInstance(getattr(watcher, "tier", None),
+                              clipwire_agent.GPasteTextTier)
+
+    def test_the_polling_branch_constructs_nothing_new(self):
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            watcher = make_watcher(clipboard=object())
+        self.assertIsNone(getattr(watcher, "tier", None))
+

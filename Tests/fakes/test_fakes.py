@@ -254,6 +254,27 @@ class ToolTestCase(unittest.TestCase):
         with open(self.state, "w") as handle:
             json.dump(state, handle)
 
+    def top_uuid(self):
+        """The uuid `history_uuid(state)` derives for the CURRENT state file
+        -- the same function gpaste-client imports directly to answer `add`
+        and `--raw get`, and that the fake gdbus's GetElementKind/Select
+        check their uuid argument against. Read straight from the state
+        file rather than by spawning `gdbus call GetElementAtIndex`, so a
+        test of "did the uuid move" does not also depend on a second
+        fake's argv parsing and text-truncation being correct."""
+        return load("fake_gdbus", HERE / "gdbus").history_uuid(fake.load(self.state))
+
+    def log_lines(self):
+        """Every line a fake has appended to the invocation log so far (see
+        fake_clipboard.note()). Some behaviour -- the monitor's baseline
+        note -- has no other observable trace: it is never printed to
+        stdout, only logged."""
+        try:
+            with open(self.state + ".log") as handle:
+                return handle.read().splitlines()
+        except FileNotFoundError:
+            return []
+
 
 class ClipboardTests(ToolTestCase):
     """The four invocations WaylandClipboard actually makes, verbatim."""
@@ -571,6 +592,53 @@ class EventSourceTests(ToolTestCase):
         fake.save(self.state, {"generation": "2", "types": ["image/png"], "body": ""})
         self.assertNotEqual(self.gdbus_uuid(), first, "a new copy did not move the uuid")
 
+    def test_get_element_kind_answers_text_for_a_text_state(self):
+        """The gate GPasteTextTier.read_text applies before ever calling
+        `--raw get` (agent/clipwire-agent.py): without it, an item that is
+        not Text would travel through the text tier as-is instead of being
+        left for the wl-clipboard path to handle."""
+        self.write_state(types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"hello").decode())
+        result = self.run_fake("gdbus", "call", *self.DEST, "--method",
+                               "org.gnome.GPaste2.GetElementKind", self.top_uuid())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(ast.literal_eval(result.stdout.decode()), ("Text",))
+
+    def test_get_element_kind_answers_image_for_an_image_state(self):
+        self.write_state(types=["image/png"],
+                         body=base64.b64encode(b"\x89PNG\r\n\x1a\n").decode())
+        result = self.run_fake("gdbus", "call", *self.DEST, "--method",
+                               "org.gnome.GPaste2.GetElementKind", self.top_uuid())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(ast.literal_eval(result.stdout.decode()), ("Image",))
+
+    def test_get_element_kind_an_unknown_uuid_is_exit_one(self):
+        self.write_state(types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"hello").decode())
+        result = self.run_fake("gdbus", "call", *self.DEST, "--method",
+                               "org.gnome.GPaste2.GetElementKind",
+                               "00000000-0000-0000-0000-000000000000")
+        self.assertEqual(result.returncode, 1)
+
+    def test_select_the_top_uuid_exits_zero(self):
+        """v3.4's write path: a confirmed Add already moved the selection
+        for real, so Select on the TOP uuid is a no-op there -- accepted,
+        not refused."""
+        self.write_state(types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"hello").decode())
+        result = self.run_fake("gdbus", "call", *self.DEST, "--method",
+                               "org.gnome.GPaste2.Select", self.top_uuid())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode().strip(), "()")
+
+    def test_select_an_unknown_uuid_is_exit_one(self):
+        self.write_state(types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"hello").decode())
+        result = self.run_fake("gdbus", "call", *self.DEST, "--method",
+                               "org.gnome.GPaste2.Select",
+                               "00000000-0000-0000-0000-000000000000")
+        self.assertEqual(result.returncode, 1)
+
     def test_the_update_line_is_the_one_the_agent_parses(self):
         line = load("fake_gdbus", HERE / "gdbus").UPDATE_LINE
         self.assertEqual(line, "/org/gnome/GPaste: org.gnome.GPaste2.Update "
@@ -649,6 +717,34 @@ class EventSourceTests(ToolTestCase):
                          "a real copy after a silent one emitted no Update")
         monitor.terminate()
 
+    def test_monitor_logs_the_baseline_digest_before_any_update(self):
+        """The line Task 6's harness settle wait blocks on, so it knows the
+        monitor has taken its baseline (and so is ready to notice the
+        harness's own next write) rather than still starting up. Nothing
+        about the baseline is ever printed to stdout -- only logged -- so
+        this test waits for the line with NO state change in flight yet: if
+        the note only fired on (or after) the first observed change, this
+        would time out rather than pass. The Update that follows a real
+        change afterward is the proof the log line did not come at the cost
+        of the monitor still working."""
+        self.write_state(types=["image/png"], body="")
+        monitor = subprocess.Popen([str(HERE / "gdbus"), "monitor"] + list(self.DEST),
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   text=True, env=self.env())
+        self.addCleanup(monitor.stdout.close)
+        self.addCleanup(monitor.wait)
+        self.addCleanup(monitor.kill)
+        self.assertIn("Monitoring signals", monitor.stdout.readline())
+        deadline = time.time() + 5
+        while not any("monitor baseline digested" in line for line in self.log_lines()):
+            if time.time() > deadline:
+                self.fail("the baseline note never appeared in the log")
+            time.sleep(0.02)
+        self.write_state(body=base64.b64encode(b"a change after the baseline").decode())
+        update = monitor.stdout.readline()
+        self.assertEqual(update.rstrip("\n"),
+                         load("fake_gdbus", HERE / "gdbus").UPDATE_LINE)
+
     def test_monitor_leaves_when_its_parent_does(self):
         """The Mac has no PR_SET_PDEATHSIG and the agent's normal exit path
         never calls stop(), so without this every harness run leaks one."""
@@ -668,6 +764,88 @@ class EventSourceTests(ToolTestCase):
                 return
             time.sleep(0.1)
         self.fail("the monitor outlived its parent")
+
+
+class GPasteClientTests(ToolTestCase):
+    """`gpaste-client add` / `--raw get` -- the v3.4 text tier's transport
+    (GPasteTextTier in agent/clipwire-agent.py). Run as subprocesses exactly
+    the way it invokes them: `add` through Popen with stdin=PIPE,
+    stdout/stderr=DEVNULL, its stdin closed by communicate(); `--raw get`
+    through run() with stdin=DEVNULL, capture_output=True. Every call here
+    passes an explicit `stdin=`, even `b""`, for the same reason the agent
+    always passes stdin=DEVNULL to this tool: it drains stdin to EOF before
+    dispatch regardless of subcommand, so a bare run_fake() call without one
+    would inherit this test process's own stdin instead of a controlled,
+    already-closed pipe."""
+
+    def test_add_stores_stdin_and_bumps_the_uuid(self):
+        """The whole point of routing a write through GPaste instead of
+        wl-copy: set_body() bumps `generation`, so the top of history moves
+        exactly like a real Add (v3.4 spec 1.3)."""
+        before = self.top_uuid()
+        result = self.run_fake("gpaste-client", "add", stdin=b"a fresh clip")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(self.top_uuid(), before)
+        self.assertEqual(base64.b64decode(self.state_now()["body"]), b"a fresh clip")
+
+    def test_add_over_the_cap_drops_silently(self):
+        """Measured on the real daemon: a body over max-text-item-size
+        returns exit 0 WITHOUT storing. A harness opts in with
+        "gpaste_max_text_bytes"; without honouring the cap this fake would
+        store anything, and write_text's byte-equal read-back check -- the
+        only thing standing between a silent drop and a false confirmation
+        -- would never see a mismatch to catch."""
+        self.write_state(gpaste_max_text_bytes=5, types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"orig").decode())
+        before = self.top_uuid()
+        result = self.run_fake("gpaste-client", "add", stdin=b"way too long for the cap")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.top_uuid(), before)
+        self.assertEqual(base64.b64decode(self.state_now()["body"]), b"orig")
+
+    def test_add_does_not_complete_until_stdin_is_closed(self):
+        """The real client drains stdin to EOF before it even looks at the
+        verb (v3.4 spec 4.1) -- EOF is what STARTS the work, not the verb name.
+        Pinned here because this is exactly the shape of hang
+        GPASTE_ADD_TIMEOUT_SECONDS exists to survive; a fake that began
+        before EOF would never reproduce it, and an agent bug that left the
+        pipe open would look fine against this fake and hang for real."""
+        process = subprocess.Popen(
+            [str(HERE / "gpaste-client"), "add"], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env())
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        process.stdin.write(b"stuck behind an open pipe")
+        process.stdin.flush()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+        process.stdin.close()
+        process.wait(timeout=5)
+        self.assertEqual(process.returncode, 0)
+
+    def test_raw_get_returns_the_exact_bytes_no_added_newline(self):
+        """`--raw` is the whole reason the agent uses this tool over the
+        display-formatted `get`: no escaping, no newline. A trailing-newline
+        body and a no-newline body must come back byte-identical to what was
+        stored, which a naive `print()` here would break for both."""
+        for body in (b"trailing newline\n", b"no trailing newline"):
+            with self.subTest(body=body):
+                self.write_state(types=list(fake.TEXT_ALIASES),
+                                 body=base64.b64encode(body).decode())
+                result = self.run_fake("gpaste-client", "--raw", "get", self.top_uuid(),
+                                       stdin=b"")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, body)
+
+    def test_raw_get_an_unknown_uuid_is_exit_one(self):
+        """Only the top of history is modelled, like the fake gdbus's
+        GetElementAtIndex -- an agent asking for anything else is asking
+        for something this fake does not represent."""
+        self.write_state(types=list(fake.TEXT_ALIASES),
+                         body=base64.b64encode(b"top").decode())
+        result = self.run_fake("gpaste-client", "--raw", "get",
+                               "00000000-0000-0000-0000-000000000000", stdin=b"")
+        self.assertEqual(result.returncode, 1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""A fake gpaste-client -- the v3.4 text tier's transport.
+
+    gpaste-client add                  stores stdin as the new top entry AND
+                                       the selection (the real Add moves both)
+    gpaste-client --raw get <uuid>     prints the item raw: no escaping, no
+                                       added newline
+
+STDIN IS READ TO EOF FIRST, before the verb is even looked at: the real
+client drains stdin whenever it is not a TTY (v3.4 §4.1), so an agent that
+leaves the pipe open hangs -- a behaviour the harness must reproduce, not
+paper over. Only the top of history is modelled, like the fake gdbus's
+GetElementAtIndex.
+
+The real daemon drops a body over max-text-item-size SILENTLY with exit 0
+(measured: 1.5 MiB, exit 0, history unmoved). A harness opts in by setting
+"gpaste_max_text_bytes" in the shared state; the read-back fallback is
+untestable end-to-end without it.
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import fake_clipboard as fake                                   # noqa: E402
+import importlib.machinery as _machinery                        # noqa: E402
+import importlib.util as _util                                  # noqa: E402
+# spec_from_file_location() alone can't be used here: with no loader given it
+# guesses one from the path's suffix, and "gdbus" (like this file) has none,
+# so it silently returns None. SourceFileLoader + spec_from_loader is the
+# same route test_fakes.py's own load() uses to import this same file.
+_loader = _machinery.SourceFileLoader(
+    "fake_gdbus", os.path.join(os.path.dirname(os.path.realpath(__file__)), "gdbus"))
+_spec = _util.spec_from_loader("fake_gdbus", _loader)
+_gdbus = _util.module_from_spec(_spec)
+_loader.exec_module(_gdbus)
+history_uuid = _gdbus.history_uuid
+
+PROGRAM = "gpaste-client"
+TEXT_MIME = "text/plain;charset=utf-8"
+
+
+def main(argv):
+    stdin_body = sys.stdin.buffer.read()        # to EOF, before the verb
+    raw = False
+    words = []
+    for argument in argv:
+        if argument == "--raw":
+            raw = True
+        elif argument.startswith("-"):
+            fake.die(PROGRAM, "unmodelled argument %r" % argument)
+        else:
+            words.append(argument)
+    path = fake.state_path(PROGRAM)
+    if words and words[0] == "add":
+        if len(words) > 1:
+            # Content on argv is the route the agent must never take
+            # (MAX_ARG_STRLEN, /proc-visible): loud, not accepted.
+            fake.die(PROGRAM, "add takes the body on stdin, not argv")
+        state = fake.load(path)
+        cap = state.get("gpaste_max_text_bytes")
+        if cap is not None and len(stdin_body) > int(cap):
+            fake.note(PROGRAM, "add <- %d bytes dropped silently (over the cap)"
+                      % len(stdin_body))
+            return 0
+        fake.save(path, fake.set_body(state, fake.offered_types_for(TEXT_MIME),
+                                      stdin_body))
+        fake.note(PROGRAM, "add <- %d bytes" % len(stdin_body))
+        return 0
+    if words and words[0] == "get":
+        if len(words) != 2:
+            fake.die(PROGRAM, "get wants exactly one uuid")
+        if not raw:
+            fake.die(PROGRAM, "the agent only ever uses --raw get")
+        state = fake.load(path)
+        if words[1] != history_uuid(state):
+            print("Cannot get item at index", file=sys.stderr, flush=True)
+            fake.note(PROGRAM, "--raw get %s -> exit 1, not the top" % words[1])
+            return 1
+        body = fake.body_bytes(state)
+        sys.stdout.buffer.write(body)
+        sys.stdout.buffer.flush()
+        fake.note(PROGRAM, "--raw get -> %d bytes" % len(body))
+        return 0
+    fake.die(PROGRAM, "unmodelled subcommand %r" % (words or argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

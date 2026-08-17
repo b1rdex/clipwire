@@ -1276,6 +1276,106 @@ class TestDivergenceReprobe(unittest.TestCase):
                          "a healthy connection was retuned by the re-probe")
 
 
+class TestUntrackedChangeSignal(unittest.TestCase):
+    """v3.3 §4.2's excluded-clip contract -- "the slow tier always feeds the
+    worker, so clips GPaste fails to track still sync at the slow cadence" --
+    kept alive through v3.4's read guard.
+
+    When the wl-paste token moves while GPaste's history uuid stands still,
+    GPaste did not record that clip: an excluded app, a password manager, its
+    own image re-offer. The history TOP is then somebody else's older clip,
+    so a tier read would answer with the wrong content rather than with
+    nothing -- either swallowed as an echo of what was already sent, or sent
+    as a stale clip. Only wl-paste can see the real selection. So the tick
+    raises a one-shot flag and Agent._tier_read declines the tier on it.
+
+    PLACED HERE beside TestDivergenceReprobe, by that class's own rule: the
+    split is by SUBJECT, and _observe_tick's non-verdict OUTPUTS live in this
+    file, while TestSlowTierVerdict (test_watcher_uuid_tier.py) owns whether
+    the degrade verdict itself arms, clears and confirms. That shard was
+    considered -- the flag's condition IS the uuid-vs-token divergence it
+    owns -- but this flag decides nothing about the verdict, and no test
+    below reads _degraded or an interval.
+
+    Every test drives _observe_tick DIRECTLY on a watcher that is never
+    started -- no thread, no gdbus, no clipboard -- so the flag's reading
+    cannot be raced by a poll tick landing between two lines."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def watcher(self, uuid="frozen", uuid_at_last_tick="frozen"):
+        watcher = GPasteWatcher(clipboard=None, safety_net_interval_seconds=30.0)
+        self.addCleanup(watcher.stop)
+        # Both fields primed, and by default to the SAME value: a brand-new
+        # watcher can never see uuid_frozen True on its first tick, because
+        # "frozen" is a DELTA against _uuid_at_last_tick and not a presence
+        # check. See TestGPasteSafetyNet.start_watcher for the full reasoning.
+        watcher._last_uuid = uuid
+        watcher._uuid_at_last_tick = uuid_at_last_tick
+        return watcher
+
+    def test_a_moved_token_over_a_frozen_uuid_raises_the_flag(self):
+        """THE CONTRACT. GPaste recorded nothing, so the read guard must not
+        be allowed to answer this observation out of GPaste's history."""
+        watcher = self.watcher()
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertTrue(
+            watcher.consume_untracked_change(),
+            "an unrecorded clip would be answered from the OLD history top: "
+            "either suppressed as an echo and silently lost, or sent stale")
+
+    def test_the_flag_is_one_shot(self):
+        """Spent on the observation it belongs to. A flag that stayed set
+        would put EVERY later copy back on wl-paste -- every one of them a
+        blink v3.4 exists to remove."""
+        watcher = self.watcher()
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertTrue(watcher.consume_untracked_change())
+        self.assertFalse(watcher.consume_untracked_change(),
+                         "the one-shot outlived the observation that raised it")
+
+    def test_a_uuid_that_moved_with_the_token_raises_nothing(self):
+        """The ordinary tracked copy, which is the whole point of v3.4: GPaste
+        recorded it, so the tier holds exactly this clip and must serve it."""
+        watcher = self.watcher(uuid="moved", uuid_at_last_tick="frozen")
+
+        watcher._observe_tick(("text", "a"), ("text", "b"))
+
+        self.assertFalse(watcher.consume_untracked_change(),
+                         "a tracked copy was pushed back onto wl-paste")
+
+    def test_an_unreadable_probe_raises_nothing(self):
+        """A hung or failed wl-paste is not evidence that anything moved: the
+        token pair is unknown, not different."""
+        for previous, current in ((("text", "a"), None), (None, ("text", "b"))):
+            with self.subTest(previous=previous, current=current):
+                watcher = self.watcher()
+
+                watcher._observe_tick(previous, current)
+
+                self.assertFalse(watcher.consume_untracked_change())
+
+    def test_a_settled_token_raises_nothing(self):
+        watcher = self.watcher()
+
+        watcher._observe_tick(("text", "a"), ("text", "a"))
+
+        self.assertFalse(watcher.consume_untracked_change(),
+                         "a quiet tick raised an untracked-clip signal")
+
+    def test_a_fresh_watcher_has_nothing_to_consume(self):
+        watcher = GPasteWatcher(clipboard=None)
+        self.addCleanup(watcher.stop)
+        self.assertFalse(watcher.consume_untracked_change())
+
+
 class TestVerdictNamesTheCause(unittest.TestCase):
     """Spec 5.3: "read GPaste's tracking-state property over D-Bus and put the
     observed value in the log line. The current verdict line blames a disabled

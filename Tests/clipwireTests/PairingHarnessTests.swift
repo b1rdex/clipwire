@@ -93,6 +93,13 @@ final class PairingHarnessTests: XCTestCase {
 
         try harness.waitForThePCsClipboard(toHold: Data("copied on the Mac ✓".utf8),
                                            offeredAs: "text/plain;charset=utf-8")
+
+        // §6.4: shown to travel THROUGH the tier, not around it -- a fallback
+        // to wl-copy would leave the clipboard identical and this green.
+        XCTAssertTrue(harness.invocationLog().contains("gpaste-client add <- "),
+                      "the Mac's text landed, but not through the GPaste tier")
+        XCTAssertFalse(harness.invocationLog().contains("wl-copy --type text/plain"),
+                       "the fallback ran: the tier was declined or unconfirmed")
     }
 
     /// PC -> Mac, text. Nobody writes through `wl-copy` here: the harness
@@ -107,6 +114,9 @@ final class PairingHarnessTests: XCTestCase {
 
         try harness.waitForTheMacsPasteboard(toHold: .text,
                                              Data("copied on the PC ✓".utf8))
+
+        XCTAssertTrue(harness.invocationLog().contains("--raw get -> "),
+                      "the PC's text arrived, but through wl-paste, not the tier")
     }
 
     /// Mac -> PC, image: a `.imageClip` frame (type 0x03), the codec that

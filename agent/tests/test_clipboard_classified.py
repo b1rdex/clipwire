@@ -30,9 +30,11 @@ class TestReadClassified(unittest.TestCase):
         """A genuinely empty clipboard is wl-paste exiting non-zero with the
         no-selection signature (spec §4.2 after review): it must announce and
         persist null, or the freshness recovery for a fresh login dies.
-        Signature SYNTHETIC until Task 8 measures it."""
+        String measured 2026-08-17 (M2, this cycle's ledger): evidenced from
+        the shipped binary; exit code and stream stay expectation, since the
+        live state was unproducible on the target."""
         with mock.patch.object(self.clipboard, "_run_wl_paste",
-                               return_value=_completed(1, stderr=b"No selection\n")):
+                               return_value=_completed(1, stderr=b"Nothing is copied\n")):
             self.assertEqual(self.clipboard.read_classified(), (READ_EMPTY, None))
 
     def test_listing_nonzero_exit_without_signature_is_unknown(self):

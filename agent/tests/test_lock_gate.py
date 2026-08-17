@@ -90,8 +90,25 @@ class TestLockGate(unittest.TestCase):
         self.session.flip(False)
         self.session.t += UNLOCK_HOLD_SECONDS
         self.assertTrue(self.gate.open())
-        self.assertEqual(self.gate.stretch_just_ended(), (90.0, "unlocked"))
+        self.assertEqual(self.gate.stretch_just_ended(),
+                          (90.0, "unlocked", 1000.0, 1090.0))
         self.assertIsNone(self.gate.stretch_just_ended())
+
+    def test_the_banked_interval_bounds_are_the_transition_stamps(self):
+        """The reassert (v3.5 §5) judges 'completed inside the locked
+        interval' against these two stamps -- run()-sample counting was
+        retired for this exact job (spec §3.3)."""
+        self.session.flip(True)
+        self.gate.open()
+        lock_since = self.session.since
+        self.session.t += 90.0
+        self.session.flip(False)
+        unlock_since = self.session.since
+        self.session.t += UNLOCK_HOLD_SECONDS
+        self.assertTrue(self.gate.open())
+        _, _, lock_edge, ended_at = self.gate.stretch_just_ended()
+        self.assertEqual(lock_edge, lock_since)
+        self.assertEqual(ended_at, unlock_since)
 
     def test_locked_to_none_mid_stretch_banks_a_fell_open_stretch(self):
         """F3(b) / spec §6: 'a stretch that ends in fail-open still
@@ -106,7 +123,8 @@ class TestLockGate(unittest.TestCase):
         self.session.t += 12.0
         self.session.locked = None       # the monitor stops answering, mid-lock
         self.assertTrue(self.gate.open())          # fail-open: immediate, no hold
-        self.assertEqual(self.gate.stretch_just_ended(), (12.0, "fell-open"))
+        self.assertEqual(self.gate.stretch_just_ended(),
+                          (12.0, "fell-open", 1000.0, 1012.0))
         self.assertIsNone(self.gate.stretch_just_ended())
 
     def test_a_second_locked_to_none_sample_does_not_bank_twice(self):
@@ -120,7 +138,8 @@ class TestLockGate(unittest.TestCase):
         self.assertTrue(self.gate.open())
         self.session.t += 5.0
         self.assertTrue(self.gate.open())          # still None: no NEW stretch to end
-        self.assertEqual(self.gate.stretch_just_ended(), (5.0, "fell-open"))
+        self.assertEqual(self.gate.stretch_just_ended(),
+                          (5.0, "fell-open", 1000.0, 1005.0))
         self.assertIsNone(self.gate.stretch_just_ended())
 
     def test_lock_edge_logs_once(self):

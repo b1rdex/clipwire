@@ -59,8 +59,10 @@ def parse(argv):
 
 def refuse(message, arguments):
     """Exit 1 the way the real tool does for an empty or unsuitable
-    selection. The wording is not load-bearing; the agent only ever looks at
-    the exit code."""
+    selection. The unsuitable-type wording is not load-bearing -- the agent
+    reads only the exit code there. The empty-selection wording IS
+    load-bearing: classify_read pattern-matches WL_PASTE_NO_SELECTION
+    against stderr to tell empty from unreadable."""
     print(message, file=sys.stderr, flush=True)
     fake.note(PROGRAM, "%s -> exit 1, %s" % (" ".join(arguments), message))
     return 1
@@ -71,7 +73,7 @@ def main(argv):
     state = fake.load(fake.state_path(PROGRAM))
     types = state.get("types") or []
     if not types:
-        return refuse("No selection", argv)
+        return refuse("Nothing is copied", argv)
 
     if list_types:
         sys.stdout.write("".join(offered + "\n" for offered in types))

@@ -332,6 +332,27 @@ final class PairingHarness {
 
     private var invocationLogPath: String { statePath + ".log" }
 
+    /// The exact line the fake `gdbus` logs when it starts monitoring the
+    /// RIGHT bus name (`org.gnome.GPaste`, at this harness's own
+    /// `statePath`) -- see `Tests/fakes/gdbus`'s `monitor()`. Built rather
+    /// than a bare literal because v3.5's `LockMonitor` starts a SECOND,
+    /// decoy `gdbus monitor --system --dest org.freedesktop.login1`. THAT
+    /// DECOY IS A PROCESS SINGLETON -- started once, from `main()` -- and not
+    /// per-connection in its own right; it forks once per connection here
+    /// only because THIS HARNESS spawns a brand new agent process for every
+    /// connection, the same way sshd does. (A harness that instead reused one
+    /// agent process across connections would break the settle's `+ 1`
+    /// below, but in the safe direction: fewer new baselines than expected
+    /// means the wait times out rather than passing falsely.) The fake
+    /// answers the decoy silently, but logs THE SAME "monitor baseline
+    /// digested" line for it that the real monitor logs, with nothing in
+    /// that second line telling the two apart. This exact line is the one
+    /// place they ARE distinguishable: the decoy's carries the "(silent,
+    /// wrong name)" suffix before its newline, the real one's does not. See
+    /// `assertTheAgentIsOnTheEventPath` for why counting the baseline line
+    /// alone is not enough.
+    private var realMonitorStartLine: String { "gdbus monitor started, watching \(statePath)\n" }
+
     // MARK: - starting, and refusing
 
     /// Spawns the agent, then asserts the world before returning. Every
@@ -433,7 +454,8 @@ final class PairingHarness {
     private struct Marks {
         var hellos = 0
         var watcherReports = 0
-        var monitorStarts = 0
+        var realMonitorStarts = 0
+        var baselines = 0
         var introspects = 0
         var pastes = 0
 
@@ -443,13 +465,14 @@ final class PairingHarness {
             hellos = harness.frames(ofType: .hello).count
             watcherReports = harness.agentLog().occurrences(of: PairingHarness.liveWatcherLine)
             let invocations = harness.invocationLog()
-            monitorStarts = invocations.occurrences(of: "monitor started")
+            realMonitorStarts = invocations.occurrences(of: harness.realMonitorStartLine)
+            baselines = invocations.occurrences(of: "monitor baseline digested")
             introspects = invocations.occurrences(of: "gdbus introspect -> available")
             pastes = invocations.occurrences(of: " wl-paste ")
         }
     }
 
-    /// The three tools the agent forks by name resolve to `Tests/fakes`.
+    /// The four tools the agent forks by name resolve to `Tests/fakes`.
     ///
     /// This asserts what WOULD be found. It is not redundant with the
     /// invocation-log check below, which asserts what the agent actually
@@ -458,7 +481,7 @@ final class PairingHarness {
     /// and drop the agent onto the polling fallback -- at the point where the
     /// message can still say so.
     private func assertTheFakesOnPathAreTheOnesInThisTree() throws {
-        for tool in ["wl-copy", "wl-paste", "gdbus"] {
+        for tool in ["wl-copy", "wl-paste", "gdbus", "gpaste-client"] {
             // What this configuration is SUPPOSED to have, not what a healthy
             // one has: the polling-fallback test deliberately puts a
             // monitor-only `gdbus` ahead of the fakes, and it must be the
@@ -587,16 +610,40 @@ final class PairingHarness {
 
         // The settle, and it is a SECOND signal for a second job. The line
         // above is logged by `make_watcher` before `start()` has forked
-        // `gdbus monitor`, let alone before that process has taken its
-        // baseline digest of the state file. A change written in that window
-        // is absorbed into the baseline, no `Update` follows, and the PC->Mac
-        // direction silently does not happen.
-        try wait(for: "the fake gdbus monitor to start") {
-            self.invocationLog().occurrences(of: "monitor started") > marks.monitorStarts
+        // `gdbus monitor`; a change written before that process has taken
+        // its baseline digest of the state file is absorbed into the
+        // baseline, no `Update` follows, and PC->Mac silently does not
+        // happen.
+        //
+        // TWO CONDITIONS, NOT ONE, and they are not equally evidenced. The
+        // `+ 1` IS measured: counting "monitor baseline digested" alone (no
+        // `+ 1`) made three PC->Mac tests time out on every run, against a
+        // control -- the pre-existing code -- that passed every time (see
+        // the task report for the A/B). v3.5's `LockMonitor` forks its own
+        // decoy `gdbus monitor --system --dest org.freedesktop.login1` (see
+        // `realMonitorStartLine` above for why this is once per connection
+        // in THIS harness and not in general); the fake answers it silently,
+        // but logs THE SAME "monitor baseline digested" line for it that the
+        // real GPaste monitor logs -- and the decoy's fires first, well
+        // before `introspect` even runs, so a plain count reaches
+        // `marks.baselines + 1` on the decoy alone and the wait returns with
+        // no settle at all. `+ 1` below is that decoy's, named rather than
+        // tuned away.
+        //
+        // `realMonitorStarts` IS NOT SIMILARLY MEASURED -- no run ever
+        // isolated it as the fix for an observed failure; it is defensive,
+        // added on reasoning rather than proven by a red test. It does two
+        // things the `+ 1` arithmetic alone does not: it keeps this wait
+        // from being satisfied by a STALE line left over from an earlier
+        // connection (the same stale-read hazard `Marks` exists to close for
+        // every other signal here), and it ties the wait to the
+        // correctly-named bus specifically, rather than to an assumed count
+        // of decoys that would silently go wrong if that count ever changed.
+        try wait(for: "the fake gdbus monitor to take its baseline") {
+            let text = self.invocationLog()
+            return text.occurrences(of: self.realMonitorStartLine) > marks.realMonitorStarts
+                && text.occurrences(of: "monitor baseline digested") > marks.baselines + 1
         }
-        // ... and the monitor logs that line immediately BEFORE taking the
-        // digest, so a few of its 0.05s poll intervals close the last gap.
-        Thread.sleep(forTimeInterval: 0.2)
     }
 
     /// What the agent actually forked, from the fakes' own invocation log.
@@ -664,9 +711,9 @@ final class PairingHarness {
 
     /// A PC that comes back holding nothing: a reboot, or the locked session
     /// the README documents. An empty `types` list is the fake's own spelling
-    /// of it -- `wl-paste` refuses with exit 1 ("No selection") for exactly
-    /// that state, which is what the agent reads as an empty clipboard and
-    /// announces as a null `sha256`.
+    /// of it -- `wl-paste` refuses with exit 1 ("Nothing is copied") for
+    /// exactly that state, which is what the agent reads as an empty
+    /// clipboard and announces as a null `sha256`.
     ///
     /// Deliberately not "delete the state file". That is also an empty
     /// selection as far as `fake.load` is concerned, but it takes the state
@@ -1075,7 +1122,12 @@ final class PairingHarness {
         return (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
     }
 
-    private func invocationLog() -> String {
+    /// Internal rather than private: the pairing tests read this directly to
+    /// pin that a clip travelled THROUGH the GPaste tier (`gpaste-client add
+    /// <- `, `--raw get -> `) rather than around it -- see
+    /// `testTextCopiedOnTheMacReachesThePCsClipboard` and
+    /// `testTextCopiedOnThePCReachesTheMacsPasteboard`.
+    func invocationLog() -> String {
         (try? String(contentsOfFile: invocationLogPath, encoding: .utf8)) ?? ""
     }
 
