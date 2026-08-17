@@ -320,6 +320,14 @@ class Agent:
         # a text payload decoded as an image would silently land in the
         # clipboard as image/png.
         self.pending_clip_kind = KIND_TEXT
+        # Counts every clip that coalesced into pending_clip, not just the
+        # one that survives -- the flush report is about what the user's
+        # peer SENT while this side couldn't apply it, not about the single
+        # payload that happened to still be pending when it could. Reset at
+        # every clipboard_became_ready flush regardless of what it finds
+        # (spec §6), so a plain reconnect with no lock involved never leaves
+        # a stale count for the next genuine stretch to inherit.
+        self._pending_arrivals = 0
         self._write_lock = threading.Lock()
         self._watcher = None
         self._last_written = None
@@ -393,6 +401,7 @@ class Agent:
         if self.phase != PHASE_READY:
             self.pending_clip = payload
             self.pending_clip_kind = kind
+            self._pending_arrivals += 1
             return
         self._write_clip(payload, kind)
 
@@ -455,6 +464,30 @@ class Agent:
 
     def clipboard_became_ready(self):
         self.phase = PHASE_READY
+        # getattr, not a direct call: every clipboard double predating Task 5,
+        # and NeverReadyClipboard, has no lock_stretch_ended at all and must
+        # keep working exactly as before rather than grow one just to answer
+        # this call.
+        stretch = getattr(self.clipboard, "lock_stretch_ended", lambda: None)()
+        # Reset unconditionally, not only when a stretch just ended: a plain
+        # flush with no lock involved must not leave a stale count for
+        # whatever locked stretch ends next to inherit -- pinned by
+        # test_a_flush_with_no_stretch_still_spends_the_count, which fails
+        # with a fabricated "N clips arrived" line if this moves inside the
+        # `if` below (verified: that mutation leaves the rest of the suite
+        # green).
+        arrivals, self._pending_arrivals = self._pending_arrivals, 0
+        if stretch is not None:
+            # LockGate.open() logs only the CLOSING edge (spec's lock line);
+            # stretch_just_ended() itself logs nothing. So this is
+            # deliberately the only unlock line there is -- it says what was
+            # held, not just that the gate reopened.
+            if arrivals:
+                log("session unlocked after %ds; %d clips arrived while locked,"
+                    " applied the newest" % (int(stretch), arrivals))
+            else:
+                log("session unlocked after %ds; no clips arrived while locked"
+                    % int(stretch))
         read = self.clipboard.read()
         seed = (read[0], sha256_hex(read[1])) if read is not None and read[1] else None
         with self._echo_lock:
