@@ -1155,6 +1155,112 @@ def gpaste_tracking(run=subprocess.run):
     return None
 
 
+LOGIND_BUS_NAME = "org.freedesktop.login1"
+LOGIND_OBJECT_PATH = "/org/freedesktop/login1"
+LOGIND_MANAGER_IFACE = "org.freedesktop.login1.Manager"
+LOGIND_SESSION_IFACE = "org.freedesktop.login1.Session"
+# wayland/x11 only -- "tty" is an ssh or console login, "unspecified" is the
+# manager's own bookkeeping session; neither one's LockedHint means anything.
+GRAPHICAL_SESSION_TYPES = ("wayland", "x11")
+
+
+def parse_logind_sessions(text):
+    """(object_path, seat) for every session in a ListSessions reply, or []
+    when the text isn't one -- gdbus prints a type annotation (`uint32`,
+    `objectpath`) on the FIRST array element only, so a parser keyed on a
+    token like `objectpath` sees just that one session on every later call."""
+    text = text.strip()
+    if not (text.startswith("([") and text.endswith("],)")):
+        return []
+    sessions = []
+    for entry in text[2:-3].split("), ("):
+        # Fields are (id, uid, user, seat, path); uid is the only unquoted
+        # one, so exactly 4 quoted strings survive regardless of which field
+        # carries an annotation prefix -- seat and path are always the last two.
+        quoted = entry.split("'")[1::2]
+        if len(quoted) < 2:
+            continue
+        sessions.append((quoted[-1], quoted[-2]))
+    return sessions
+
+
+def resolve_graphical_session(run=subprocess.run):
+    """Path of the one session a lock-state read should trust, or None when
+    the machine offers zero or several candidates -- guessing among several
+    is the exact mistake this exists to prevent (spec §3.2, §7.4)."""
+    try:
+        result = run(
+            ["gdbus", "call", "--system", "--dest", LOGIND_BUS_NAME,
+             "--object-path", LOGIND_OBJECT_PATH,
+             "--method", "%s.ListSessions" % LOGIND_MANAGER_IFACE],
+            capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.decode("utf-8", "replace")
+    sessions = parse_logind_sessions(text)
+    # Seat only orders the probes (seated sessions first, so the common case
+    # exits fast below) -- it never decides; Type and Class decide.
+    sessions.sort(key=lambda session: session[1] == "")
+    matches = []
+    for path, _seat in sessions:
+        if session_property(path, "Type", run=run) not in GRAPHICAL_SESSION_TYPES:
+            continue
+        if session_property(path, "Class", run=run) != "user":
+            continue
+        matches.append(path)
+        if len(matches) > 1:
+            break  # already several -- further probes can't undo that
+    return matches[0] if len(matches) == 1 else None
+
+
+def session_property(path, prop, run=subprocess.run):
+    """A Session object's string property (Type, Class, ...) with its
+    GVariant quoting stripped, or None when NOT MEASURED."""
+    try:
+        result = run(
+            ["gdbus", "call", "--system", "--dest", LOGIND_BUS_NAME,
+             "--object-path", path,
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             LOGIND_SESSION_IFACE, prop],
+            capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.decode("utf-8", "replace")
+    parts = text.split("'")
+    if len(parts) < 2:
+        return None
+    return parts[1]
+
+
+def session_locked_hint(path, run=subprocess.run):
+    """The session's LockedHint, or None when NOT MEASURED -- never render
+    None as False; they're opposite evidence (mirrors gpaste_tracking above)."""
+    try:
+        result = run(
+            ["gdbus", "call", "--system", "--dest", LOGIND_BUS_NAME,
+             "--object-path", path,
+             "--method", "org.freedesktop.DBus.Properties.Get",
+             LOGIND_SESSION_IFACE, "LockedHint"],
+            capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = result.stdout.decode("utf-8", "replace")
+    if "true" in text:
+        return True
+    if "false" in text:
+        return False
+    return None
+
+
 IDLE_MONITOR_BUS_NAME = "org.gnome.Mutter.IdleMonitor"
 IDLE_MONITOR_OBJECT_PATH = "/org/gnome/Mutter/IdleMonitor/Core"
 IDLE_MONITOR_INTERFACE = "org.gnome.Mutter.IdleMonitor"
