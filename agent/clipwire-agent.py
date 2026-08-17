@@ -883,13 +883,90 @@ def choose_kind(types):
     return None
 
 
+UNLOCK_HOLD_SECONDS = 1.0
+
+
+class LockGate:
+    """Folds LockMonitor.state() (Task 4) into the bool WaylandClipboard.ready()
+    consults, with a wall-time debounce on the UNLOCK edge only (spec §3.3). A
+    lock closes the gate the instant it is sampled; an unlock reopens it only
+    once LockedHint=false has been HELD for UNLOCK_HOLD_SECONDS on the
+    SUBSCRIBER's own monotonic clock -- never by counting run()-loop samples,
+    which collapse to milliseconds under frame traffic (run()'s select at
+    :667 returns instantly while frames are arriving).
+
+    Needs no timer of its own for the hold: LockMonitor's `since` does not
+    move on a repeated same-value observation (Task 4, pinned), so `now() -
+    since`, read fresh on every call, already measures how long THIS unlock
+    has been held.
+
+    All access is from the run()-loop thread, via ready() (:681-682) -- no
+    lock here: LockMonitor's own cache carries its own lock (Task 4) and
+    hands state() out as an immutable tuple, so nothing below is ever
+    shared across threads.
+    """
+
+    def __init__(self, state, now=time.monotonic):
+        self._state = state
+        self._now = now
+        self._saw_locked = False   # True once ANY lock has been observed
+        self._was_open = True      # drives both edges: True->closing, False->opening
+        self._lock_edge = None     # `since` of the most recent CLOSING transition
+        self._banked = None        # a just-ended stretch, waiting for stretch_just_ended()
+
+    def open(self):
+        locked, since = self._state()
+        if locked is None:
+            # Fail-open: unmeasurable is never locked, and never debounced
+            # either -- there is no trustworthy `since` to hold against.
+            self._was_open = True
+            return True
+        if locked:
+            self._saw_locked = True
+            if self._was_open:
+                log("session locked; holding clips (latest wins)")
+                self._lock_edge = since
+                self._was_open = False
+            return False
+        if not self._saw_locked or self._was_open:
+            # Never locked yet, or already past the hold for this unlock --
+            # either way, open with no further wait (spec §3.3 "Edges").
+            self._was_open = True
+            return True
+        if self._now() - since >= UNLOCK_HOLD_SECONDS:
+            self._banked = since - self._lock_edge
+            self._was_open = True
+            return True
+        return False
+
+    def stretch_just_ended(self):
+        """The just-banked stretch, consumed -- None once already taken, or
+        when no locked stretch has ended yet."""
+        stretch, self._banked = self._banked, None
+        return stretch
+
+
 class WaylandClipboard:
-    def __init__(self):
+    def __init__(self, lock_gate=None):
         self._read_timeout_logged = False
         self._first_read_done = False
+        self._lock_gate = lock_gate
 
     def ready(self):
-        return os.path.exists(wayland_socket_path())
+        # Socket first: the short-circuit means the gate's own edge
+        # bookkeeping (the lock-edge log, the debounce clock) only ever
+        # advances while the Wayland session actually exists -- a socket
+        # flap before login must not also count as a spurious lock edge.
+        return (os.path.exists(wayland_socket_path())
+                and (self._lock_gate is None or self._lock_gate.open()))
+
+    def lock_stretch_ended(self):
+        """Seconds the stretch that just ended was locked for, consumed once
+        -- delegates to the gate; None with no gate (this connection predates
+        Task 5, or is a fake) or when no stretch just ended."""
+        if self._lock_gate is None:
+            return None
+        return self._lock_gate.stretch_just_ended()
 
     def read(self):
         """(kind, bytes) for whatever the clipboard holds, or None when nothing
@@ -1047,10 +1124,14 @@ class WaylandClipboard:
 # 8. Selftest — _select_clipboard, selftest
 # ============================================================================
 
-def _select_clipboard():
-    if os.environ.get("CLIPWIRE_FAKE_CLIPBOARD") == "never-ready":
+def _fake_clipboard_requested():
+    return os.environ.get("CLIPWIRE_FAKE_CLIPBOARD") == "never-ready"
+
+
+def _select_clipboard(lock_gate=None):
+    if _fake_clipboard_requested():
         return NeverReadyClipboard()
-    return WaylandClipboard()
+    return WaylandClipboard(lock_gate=lock_gate)
 
 
 def selftest():
@@ -2026,14 +2107,37 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
 def main(argv):
     if "--selftest" in argv:
         return selftest()
+    # LockMonitor + LockGate are built HERE, beside this one call, and not
+    # inside _select_clipboard()'s real branch: selftest() above also calls
+    # _select_clipboard() (with no gate), and CI's `--selftest` step runs
+    # with CLIPWIRE_FAKE_CLIPBOARD unset -- so building the monitor inside
+    # _select_clipboard() would give every selftest run a live `gdbus
+    # monitor --system` subprocess and its self-healing reader thread, with
+    # no caller in a position to stop() either. Spec §3.2: "started once
+    # from main()'s real-clipboard branch."
+    monitor = None
+    lock_gate = None
+    if not _fake_clipboard_requested():
+        monitor = LockMonitor()
+        monitor.start()
+        lock_gate = LockGate(monitor.state)
     agent = Agent(
-        stdin=sys.stdin.buffer, stdout=sys.stdout.buffer, clipboard=_select_clipboard()
+        stdin=sys.stdin.buffer, stdout=sys.stdout.buffer,
+        clipboard=_select_clipboard(lock_gate=lock_gate),
     )
     try:
         return agent.run()
     except FrameError as error:
         log("protocol error: %s" % error)
         return 2
+    finally:
+        # The monitor must survive every lock -- it is the unlock's only
+        # observer (Task 4) -- so stop() belongs ONLY here, bounded to
+        # run() actually returning (by return OR by exception), and
+        # NOWHERE else: not in clipboard_lost, not beside the watcher's own
+        # teardown (review blocker B2).
+        if monitor is not None:
+            monitor.stop()
 
 
 if __name__ == "__main__":
