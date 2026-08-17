@@ -178,9 +178,10 @@ to keep trying.
 and a fresh copy normally just replaces the one before it. A lock blocks that hand-off the same
 way it blocks a read, so before v3.5 every copy sent while the PC was locked left its own
 `wl-copy` running, unable to take the selection, and the pile grew one process per copy. That
-is what the **2026-08-17** incident was at real scale: the session stayed locked for close to
-eighteen hours while the owner kept working from the Mac, each hung `wl-copy` leaving its own
-"Unknown" tile in the app panel, and unlock resolving the entire pile at once — flooding
+is what the **2026-08-17** incident was at real scale: the session stayed locked for up to
+seventeen and a half hours while the owner kept working from the Mac, each hung `wl-copy`
+leaving its own "Unknown" tile in the app panel, and unlock resolving the entire pile at once
+— flooding
 GPaste's history with the day's copies in the same breath, evicting whatever the owner had
 already put there. A smaller, controlled version of the same collapse was measured the same
 day: two clips sent into a deliberately locked session left two hung `wl-copy` processes that
