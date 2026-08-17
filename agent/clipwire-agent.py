@@ -698,6 +698,9 @@ class NeverReadyClipboard:
     def read(self):
         return None
 
+    def read_classified(self):
+        return READ_UNKNOWN, None
+
     def probe(self):
         return None
 
@@ -716,6 +719,14 @@ IMAGE_SUBPROCESS_TIMEOUT = 10
 
 SLOW_READ_SECONDS = 1.0
 SLOW_IMAGE_READ_SECONDS = 3.0
+
+READ_CONTENT = "content"
+READ_EMPTY = "empty"
+READ_UNKNOWN = "unknown"
+
+# SYNTHETIC: wl-clipboard's documented no-selection stderr text, expected but
+# not yet measured on the target machine -- a later measurement replaces it.
+WL_PASTE_NO_SELECTION = b"No selection"
 
 
 def _xdg_dir(var_name, default, env=None):
@@ -818,6 +829,19 @@ def announce_clip_state(send, clipboard, now=None, path=None):
     return resolved
 
 
+def classify_read(clipboard):
+    """Tri-state read for boundaries that must tell empty from unreadable.
+    Doubles predating v3.5 answer through read(): None meant empty then and
+    keeps meaning empty here."""
+    classified = getattr(clipboard, "read_classified", None)
+    if classified is not None:
+        return classified()
+    read = clipboard.read()
+    if read is None:
+        return READ_EMPTY, None
+    return READ_CONTENT, read
+
+
 # ============================================================================
 # 7. Wayland clipboard — choose_kind, WaylandClipboard, subprocess plumbing
 # ============================================================================
@@ -857,11 +881,52 @@ class WaylandClipboard:
     def read(self):
         """(kind, bytes) for whatever the clipboard holds, or None when nothing
         usable is offered."""
+        return self.read_classified()[1]
+
+    def read_classified(self):
+        """(outcome, payload): READ_CONTENT with (kind, bytes); READ_EMPTY or
+        READ_UNKNOWN with None. Empty means the compositor answered "nothing" --
+        including wl-paste's own no-selection exit; unknown means the question
+        could not be asked. The announce path persists the first and must never
+        persist the second: empty null-announcements are what the freshness
+        recovery re-seeds a fresh login from."""
         force_log = self._claim_first_call()
-        listed = self._list_kind(force_log)
-        if listed is None:
-            return None
-        return self._read_body(listed[0], force_log)
+        listed = self._run_wl_paste(["--list-types"], SUBPROCESS_TIMEOUT,
+                                    SLOW_READ_SECONDS, force_log)
+        outcome = self._classify_result(listed)
+        if outcome is not None:
+            return outcome, None
+        types = listed.stdout.decode("utf-8", "replace").splitlines()
+        kind = choose_kind(types)
+        if kind is None:
+            return READ_EMPTY, None
+        if kind == KIND_TEXT:
+            result = self._run_wl_paste(
+                ["-n", "--type", "text/plain;charset=utf-8"], SUBPROCESS_TIMEOUT,
+                SLOW_READ_SECONDS, force_log)
+        else:
+            result = self._run_wl_paste(
+                ["--type", "image/png"], IMAGE_SUBPROCESS_TIMEOUT,
+                SLOW_IMAGE_READ_SECONDS, force_log)
+        outcome = self._classify_result(result)
+        if outcome is not None:
+            return outcome, None
+        if not result.stdout:
+            return READ_EMPTY, None
+        return READ_CONTENT, (kind, result.stdout)
+
+    @staticmethod
+    def _classify_result(result):
+        """READ_UNKNOWN / READ_EMPTY for a failed CompletedProcess, None when
+        the call succeeded and the caller should look at stdout."""
+        if result is None:
+            return READ_UNKNOWN
+        if result.returncode != 0:
+            stderr = result.stderr or b""
+            if WL_PASTE_NO_SELECTION in stderr:
+                return READ_EMPTY
+            return READ_UNKNOWN
+        return None
 
     def probe(self):
         """A cheap CHANGE TOKEN for the poll loop, never content in its own right. For
