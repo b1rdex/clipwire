@@ -1343,8 +1343,15 @@ def parse_logind_monitor_line(line, session_path):
     lands (spec v3.5 §3.2 step 5) -- a real capture can only tighten this,
     never loosen it. `session_path` may be None (unresolved/fail-open): the
     resolve case still matters then, since it is what gives the monitor a
-    chance to recover; a LockedHint flip on no watched session does not."""
-    if (session_path is not None and session_path in line
+    chance to recover; a LockedHint flip on no watched session does not.
+
+    The path check requires the ": " that follows it in both the synthetic
+    fixture and real gdbus monitor output, not a bare substring test:
+    logind's bus_label_escape can produce one session's path as a strict
+    prefix of another's (session "1" -> .../_31, session "12" -> .../_312),
+    and a bare `session_path in line` lets a _312 line flip a monitor
+    watching _31 (review-caught false positive)."""
+    if (session_path is not None and (session_path + ": ") in line
             and "PropertiesChanged" in line):
         if "'LockedHint': <true>" in line:
             return "locked"
@@ -1689,16 +1696,31 @@ class LockMonitor:
         self._thread = None
 
     def start(self):
-        # Resolve, THEN subscribe, THEN take the initial Get -- spec §3.2
-        # step 2 pins subscribe-before-Get specifically: a transition
-        # landing in the gap between them is still sitting in the
-        # monitor's own pipe once the reader thread gets to it, so it
-        # self-corrects rather than being lost.
+        # Resolve, THEN subscribe, THEN take the initial Get, THEN start
+        # the reader thread that drains the subscription -- in that exact
+        # order. Subscribing before the Get (spec §3.2 step 2) is what
+        # lets a transition landing in the gap self-correct rather than
+        # being lost: the monitor is already capturing it into its own
+        # pipe. But that only holds ONE-WAY, and review caught the
+        # reverse: starting the reader thread before the Get let the two
+        # race, and whichever finished LAST won, even backwards -- the
+        # reader could apply a real transition and then the in-flight Get
+        # (answered from before the lock) would clobber it back to stale.
+        # Doing the Get on THIS thread before the reader thread exists at
+        # all makes the sequence single-threaded and total: nothing can
+        # land between "the Get returns" and "the reader starts draining
+        # whatever the pipe queued up meanwhile", because there is no
+        # reader yet to race it. This also removes the one other race a
+        # thread-order fix could have left behind: a churn-triggered
+        # _reresolve() on the reader thread swapping _session_path out
+        # from under this method's own stale local `path` -- with the
+        # reader not yet running, that swap cannot happen concurrently
+        # with the line below.
         path = self._resolve_session()
         self._process = self._spawn()
+        self._read_hint(path)
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
-        self._read_hint(path)
 
     def stop(self):
         self._stop.set()
@@ -1777,30 +1799,51 @@ class LockMonitor:
         anything else that ends the child, is covered by re-spawning and
         re-resolving rather than by watching NameOwnerChanged (retracted in
         review -- a monitor scoped to --dest org.freedesktop.login1 may
-        never see one)."""
+        never see one).
+
+        The whole iteration is wrapped: this thread is the unlock's SOLE
+        observer (unlike GPasteWatcher's pump, whose spawn runs on the
+        CALLER's thread and which has a polling tier behind it regardless),
+        so an unanticipated exception here -- e.g. a respawn's Popen
+        raising because gdbus went missing -- must not kill the thread and
+        freeze the cache at whatever it last held, including True: that is
+        the gate wedged closed, silently, forever. Falling open plus
+        letting the loop come back around is a deliberate choice over
+        parking: the respawn/backoff machinery below already exists and
+        already retries on ordinary EOF, so reusing it here for an
+        exception costs nothing new, and a transient failure (as opposed to
+        a standing one, which will just keep re-raising and re-logging
+        behind the same backoff) gets a real chance to self-heal instead of
+        wedging the gate for the rest of the process's life."""
         delay = LOGIND_MONITOR_RESPAWN_SECONDS
         while True:
-            for line in self._process.stdout:
-                if self._stop.is_set():
+            try:
+                for line in self._process.stdout:
+                    if self._stop.is_set():
+                        return
+                    outcome = parse_logind_monitor_line(line, self._watched_path())
+                    if outcome is None:
+                        continue
+                    if outcome == "locked":
+                        self._set_locked(True)
+                    elif outcome == "unlocked":
+                        self._set_locked(False)
+                    elif outcome == "resolve":
+                        self._reresolve()
+                    delay = LOGIND_MONITOR_RESPAWN_SECONDS
+                # EOF: the child exited on its own. stop() sets the flag
+                # this honors, both before the wait (already requested) and
+                # during it (wait() returns early the instant set() runs
+                # elsewhere).
+                if self._stop.is_set() or self._stop.wait(delay):
                     return
-                outcome = parse_logind_monitor_line(line, self._watched_path())
-                if outcome is None:
-                    continue
-                if outcome == "locked":
-                    self._set_locked(True)
-                elif outcome == "unlocked":
-                    self._set_locked(False)
-                elif outcome == "resolve":
-                    self._reresolve()
-                delay = LOGIND_MONITOR_RESPAWN_SECONDS
-            # EOF: the child exited on its own. stop() sets the flag this
-            # honors, both before the wait (already requested) and during
-            # it (wait() returns early the instant set() runs elsewhere).
-            if self._stop.is_set() or self._stop.wait(delay):
-                return
-            delay = min(delay * 2, LOGIND_MONITOR_RESPAWN_MAX_SECONDS)
-            self._process = self._spawn()
-            self._reresolve()
+                delay = min(delay * 2, LOGIND_MONITOR_RESPAWN_MAX_SECONDS)
+                self._process = self._spawn()
+                self._reresolve()
+            except Exception as error:
+                self._set_locked(None)
+                log("lock monitor pump hit an unexpected %s: %s -- falling open and retrying"
+                    % (type(error).__name__, error))
 
 
 class PollingWatcher:

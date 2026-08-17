@@ -4,6 +4,7 @@ session churn; fail-open is logged once and answers None, never False-as-a-
 default."""
 import subprocess
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -38,6 +39,22 @@ class TestParse(unittest.TestCase):
 
     def test_noise_is_none(self):
         self.assertIsNone(parse_logind_monitor_line("/foo: bar.Baz ()", PATH))
+
+    def test_a_session_path_that_is_a_prefix_of_another_does_not_false_positive(self):
+        """Review finding: logind's bus_label_escape can make one session's
+        path a strict prefix of another's -- session "1" -> .../_31,
+        session "12" -> .../_312 -- and "_31" IS a substring of "_312", so a
+        bare `session_path in line` lets a _312 PropertiesChanged line flip
+        a monitor watching _31. The existing _32/_99 test cannot catch this
+        (neither is a prefix of the other); this pins the prefix case
+        specifically."""
+        short_path = "/org/freedesktop/login1/session/_31"
+        long_path = "/org/freedesktop/login1/session/_312"
+        line_for_the_other_session = (
+            long_path + ": org.freedesktop.DBus.Properties.PropertiesChanged "
+            "('org.freedesktop.login1.Session', {'LockedHint': <true>}, @as [])")
+        self.assertIsNone(
+            parse_logind_monitor_line(line_for_the_other_session, short_path))
 
 
 class _ScriptedPump:
@@ -82,8 +99,23 @@ class _RecordingStop:
         return self._event.is_set()
 
 
+class _FakeClock:
+    """Stands in for time.monotonic: a plain float the test moves by hand,
+    so state()'s `since` can be pinned against a known value instead of
+    merely "some real number came out". Callable with no arguments, like
+    time.monotonic itself -- that is the only shape LockMonitor asks of
+    `now`."""
+    def __init__(self, start=1000.0):
+        self.t = start
+    def __call__(self):
+        return self.t
+    def tick(self, by):
+        self.t += by
+        return self.t
+
+
 class TestMonitor(unittest.TestCase):
-    def _monitor(self, lines, resolved=PATH, hint=False):
+    def _monitor(self, lines, resolved=PATH, hint=False, now=time.monotonic):
         released = threading.Event()
         order = []
         def popen(argv, **kwargs):
@@ -91,7 +123,7 @@ class TestMonitor(unittest.TestCase):
             return _ScriptedPump(lines, released)
         def run(argv, **kwargs):  # ListSessions/Get double via resolver patching below
             raise AssertionError("resolver is patched; run must not be called")
-        monitor = LockMonitor(run=run, popen=popen)
+        monitor = LockMonitor(run=run, popen=popen, now=now)
         with mock.patch("clipwire_agent.resolve_graphical_session",
                         return_value=resolved), \
              mock.patch("clipwire_agent.session_locked_hint",
@@ -124,6 +156,45 @@ class TestMonitor(unittest.TestCase):
             self.assertIsNone(monitor.locked())
         gate_lines = [m for m in logged if "lock gate inactive" in m]
         self.assertEqual(len(gate_lines), 1)
+
+    def test_state_stamps_the_bootstrap_transition_with_the_injected_clock(self):
+        """state()/`now` are the interface Task 5 freezes state() from --
+        pin them directly rather than leaving them exercised only as a
+        side effect of locked() assertions elsewhere in this file."""
+        clock = _FakeClock(1000.0)
+        monitor, order, released = self._monitor([], hint=True, now=clock)
+        self.addCleanup(monitor.stop)
+        self.assertEqual(monitor.state(), (True, 1000.0))
+
+    def test_state_stamps_a_flip_with_the_clocks_value_at_that_moment(self):
+        clock = _FakeClock(1000.0)
+        monitor, order, released = self._monitor([LOCKED_LINE], hint=False, now=clock)
+        self.addCleanup(monitor.stop)
+        self.assertEqual(monitor.state(), (False, 1000.0))
+        clock.tick(42.0)  # advance BEFORE the reader thread processes the flip
+        released.set()
+        deadline = threading.Event()
+        for _ in range(50):
+            if monitor.locked() is True:
+                break
+            deadline.wait(0.02)
+        self.assertEqual(monitor.state(), (True, 1042.0))
+
+    def test_state_does_not_restamp_on_a_repeated_same_value(self):
+        """The debounce and stretch duration Task 5's LockGate computes are
+        both measured from `since` -- if a duplicate line (or a duplicate
+        _set_locked call from any path) moved it, every hold/stretch
+        calculation downstream would be wrong. Calls _set_locked directly:
+        this pins ITS OWN guard deterministically, independent of pump/
+        thread timing already covered elsewhere in this file."""
+        clock = _FakeClock(1000.0)
+        monitor, order, released = self._monitor([], hint=True, now=clock)
+        self.addCleanup(monitor.stop)
+        self.assertEqual(monitor.state(), (True, 1000.0))
+        clock.tick(500.0)
+        monitor._set_locked(True)
+        self.assertEqual(monitor.state(), (True, 1000.0),
+                         "a repeated same value must not move `since`")
 
     def test_a_second_separate_fail_open_stretch_logs_again(self):
         """spec §6: 'a relogin can pass through a two-candidate moment more
@@ -283,6 +354,58 @@ class TestMonitor(unittest.TestCase):
                          "the free-running respawn loop must have finished its budget")
         self.assertEqual(stop.waits, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 1.0])
         self.assertEqual(len(popen_calls), 7)
+
+    def test_an_unexpected_exception_falls_open_and_keeps_retrying(self):
+        """Review finding: this thread is the unlock's SOLE observer
+        (unlike GPasteWatcher's pump), so an unanticipated exception --
+        reproduced here as a respawn's Popen raising FileNotFoundError --
+        must not kill it and freeze the cache at its last value, including
+        True. Falls open (locked() -> None) and keeps retrying via the
+        SAME backoff/respawn loop rather than parking: a standing failure
+        (this test never lets it succeed again) just keeps re-raising and
+        re-falling-open behind the existing backoff, proven here by the
+        thread staying alive and popen being called repeatedly, not by it
+        ever recovering."""
+        immediate = threading.Event()
+        immediate.set()
+        calls = []
+        def popen(argv, **kwargs):
+            calls.append(argv)
+            if len(calls) >= 2:
+                raise FileNotFoundError("gdbus")
+            return _ScriptedPump([], immediate)
+        logged = []
+        resolve_patch = mock.patch("clipwire_agent.resolve_graphical_session",
+                                   return_value=PATH)
+        hint_patch = mock.patch("clipwire_agent.session_locked_hint", return_value=True)
+        log_patch = mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m))
+        resolve_patch.start()
+        hint_patch.start()
+        log_patch.start()
+        self.addCleanup(resolve_patch.stop)
+        self.addCleanup(hint_patch.stop)
+        self.addCleanup(log_patch.stop)
+        stop = _RecordingStop(3)
+        monitor = LockMonitor(run=_unreachable_run, popen=popen)
+        monitor._stop = stop
+        self.addCleanup(monitor.stop)
+        monitor.start()
+        # No assertion on locked() here: with every pump immediate-EOF and
+        # _RecordingStop never blocking, the reader thread can race through
+        # its whole fall-open-and-retry sequence before this thread's next
+        # line runs -- the initial True is real (the same synchronous Get
+        # every other test in this file pins) but not OBSERVABLE without a
+        # synchronization point, so this test proves its claim only from
+        # the settled state after join(), below.
+        monitor._thread.join(timeout=JOIN_TIMEOUT)
+        self.assertFalse(monitor._thread.is_alive(),
+                         "an unexpected exception must not kill the sole observer")
+        self.assertIsNone(monitor.locked(),
+                          "must fall open, not freeze at the last value (here, True)")
+        self.assertEqual(len(calls), 4, "the loop must keep retrying (respawning), not park")
+        exception_lines = [m for m in logged if "FileNotFoundError" in m]
+        self.assertEqual(len(exception_lines), 3,
+                         "one log line naming the exception class per failed attempt")
 
     def test_subprocess_calls_never_run_with_the_cache_lock_held(self):
         """threading.Lock is non-reentrant, so a resolver/hint reader that
