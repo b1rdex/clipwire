@@ -31,12 +31,15 @@ import clipwire_agent
 CLIPKIND_FIXTURE = pathlib.Path(__file__).resolve().parents[2] / "fixtures" / "clipkind.json"
 
 
-def _completed(returncode=0, stdout=b""):
+def _completed(returncode=0, stdout=b"", stderr=b""):
     """A subprocess.CompletedProcess shaped like a real wl-paste result.
     Module-level so every class below shares one definition -- TestReadSubprocessBehavior
     used to keep its own copy as a bound method; folded into this one now that
-    TestCanonicalRead needs the same shape too."""
-    return subprocess.CompletedProcess(args=["wl-paste"], returncode=returncode, stdout=stdout, stderr=b"")
+    TestCanonicalRead needs the same shape too. stderr defaults empty because no
+    case in this file reads it; test_clipboard_classified.py's cases do, and
+    import this anchor rather than keep a second _completed (v3.2.1 split
+    convention: shared doubles are imported, never copied)."""
+    return subprocess.CompletedProcess(args=["wl-paste"], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 class TestEnvironment(unittest.TestCase):

@@ -1,6 +1,7 @@
 # agent/tests/test_clipboard_classified.py
 """The tri-state read boundary (v3.5 spec §4.2): a failed read is not an
-empty clipboard. Shard follows the v3.2.1 split convention."""
+empty clipboard. Shard follows the v3.2.1 split convention: _completed is
+imported from the anchor (test_clipboard.py), never copied."""
 import unittest
 from unittest import mock
 
@@ -12,14 +13,7 @@ from agent_under_test import (
     WaylandClipboard,
     classify_read,
 )
-
-
-def _completed(returncode, stdout=b"", stderr=b""):
-    proc = mock.Mock()
-    proc.returncode = returncode
-    proc.stdout = stdout
-    proc.stderr = stderr
-    return proc
+from test_clipboard import _completed
 
 
 class TestReadClassified(unittest.TestCase):
