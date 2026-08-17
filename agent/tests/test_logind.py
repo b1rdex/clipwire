@@ -86,6 +86,25 @@ class TestResolve(unittest.TestCase):
         props["/org/freedesktop/login1/session/_3245"] = {"Class": "user", "Type": "x11"}
         self.assertIsNone(resolve_graphical_session(run=_scripted_run(props)))
 
+    def test_a_failed_probe_among_two_graphical_candidates_fails_open(self):
+        """Controller ruling, spec §3.2 step 1 (amended 726a978): a probe
+        that never answers is not "definitely not a candidate" -- it may be
+        hiding the second graphical session, so a single confirmed match
+        under a probe failure is not "exactly one"."""
+        props = dict(SESSION_PROPS_REAL)
+        # _3245 reads as graphical, but its Class probe never answers (rc != 0).
+        props["/org/freedesktop/login1/session/_3245"] = {"Type": "x11"}
+        self.assertIsNone(resolve_graphical_session(run=_scripted_run(props)))
+
+    def test_a_failed_probe_on_an_unrelated_session_still_fails_open(self):
+        """Mirrors the above: the poison is global, not scoped to a
+        plausible candidate. _3194 was never going to qualify -- it's a tty
+        login -- but its Type probe failing outright is still enough to void
+        an otherwise-clean single match (spec §3.2 step 1, amended 726a978)."""
+        props = dict(SESSION_PROPS_REAL)
+        props["/org/freedesktop/login1/session/_3194"] = {"Class": "user"}
+        self.assertIsNone(resolve_graphical_session(run=_scripted_run(props)))
+
     def test_zero_candidates_fail_open(self):
         props = {p: {"Class": "user", "Type": "tty"} for p in SESSION_PROPS_REAL}
         self.assertIsNone(resolve_graphical_session(run=_scripted_run(props)))

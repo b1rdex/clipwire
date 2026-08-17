@@ -1205,15 +1205,28 @@ def resolve_graphical_session(run=subprocess.run):
     # exits fast below) -- it never decides; Type and Class decide.
     sessions.sort(key=lambda session: session[1] == "")
     matches = []
+    # A None probe is NOT "definitely not a candidate" -- it may be hiding
+    # the second session that would turn a clean match into "several", so it
+    # poisons the count instead of clearing it (spec §3.2 step 1, amended
+    # 726a978): a single match under a poisoned count is not "exactly one".
+    poisoned = False
     for path, _seat in sessions:
-        if session_property(path, "Type", run=run) not in GRAPHICAL_SESSION_TYPES:
+        session_type = session_property(path, "Type", run=run)
+        if session_type is None:
+            poisoned = True
             continue
-        if session_property(path, "Class", run=run) != "user":
+        if session_type not in GRAPHICAL_SESSION_TYPES:
+            continue
+        session_class = session_property(path, "Class", run=run)
+        if session_class is None:
+            poisoned = True
+            continue
+        if session_class != "user":
             continue
         matches.append(path)
         if len(matches) > 1:
             break  # already several -- further probes can't undo that
-    return matches[0] if len(matches) == 1 else None
+    return None if poisoned or len(matches) != 1 else matches[0]
 
 
 def session_property(path, prop, run=subprocess.run):
