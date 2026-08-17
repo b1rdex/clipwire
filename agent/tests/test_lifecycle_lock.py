@@ -51,7 +51,7 @@ class TestHeldClips(unittest.TestCase):
         agent._on_clip(encode_clip_payload(1755500002.0, b"three"))
         self.assertEqual(clipboard.written, [])
         self.assertEqual(sent, [])
-        clipboard.stretch = 63.0
+        clipboard.stretch = (63.0, "unlocked")
         logged = []
         with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
              mock.patch.object(clipwire_agent, "make_watcher",
@@ -67,7 +67,7 @@ class TestHeldClips(unittest.TestCase):
         clipboard = _GatedClipboard(ready=False)
         agent = self._agent(clipboard)
         agent.send = lambda t, p: None
-        clipboard.stretch = 5.0
+        clipboard.stretch = (5.0, "unlocked")
         logged = []
         with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
              mock.patch.object(clipwire_agent, "make_watcher",
@@ -76,12 +76,55 @@ class TestHeldClips(unittest.TestCase):
             agent.clipboard_became_ready()
         self.assertTrue(any("no clips arrived while locked" in m for m in logged))
 
+    def test_a_stretch_that_falls_open_reports_its_own_pair_of_lines(self):
+        """F3(b) / spec §6: 'a stretch that ends in fail-open still
+        reports' -- a locked stretch the GATE ends as ended_by="fell-open"
+        (the monitor losing the session, or its Get failing, mid-lock)
+        must not lose the clips-held report the way a silent fail-open
+        used to. Same shape as the real-unlock combined line, a different
+        verb -- and it must NOT say "session unlocked", which asserts a
+        fact (LockedHint=false was actually observed) this path never
+        has."""
+        clipboard = _GatedClipboard(ready=False)
+        agent = self._agent(clipboard)
+        sent = []
+        agent.send = lambda t, p: sent.append((t, p))
+        agent._on_clip(encode_clip_payload(1755500000.0, b"one"))
+        agent._on_clip(encode_clip_payload(1755500001.0, b"two"))
+        clipboard.stretch = (7.0, "fell-open")
+        logged = []
+        with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
+             mock.patch.object(clipwire_agent, "make_watcher",
+                               return_value=_NoOpWatcher()):
+            clipboard.become_ready()
+            agent.clipboard_became_ready()
+        self.assertEqual(clipboard.written, [(KIND_TEXT, b"two")])
+        combined = [m for m in logged if "lock gate fell open after 7s" in m]
+        self.assertEqual(len(combined), 1)
+        self.assertIn("2 clips arrived while locked, applied the newest", combined[0])
+        self.assertFalse(any("session unlocked" in m for m in logged))
+
+    def test_a_fell_open_stretch_with_no_clips_gets_the_no_clips_mirror(self):
+        clipboard = _GatedClipboard(ready=False)
+        agent = self._agent(clipboard)
+        agent.send = lambda t, p: None
+        clipboard.stretch = (9.0, "fell-open")
+        logged = []
+        with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
+             mock.patch.object(clipwire_agent, "make_watcher",
+                               return_value=_NoOpWatcher()):
+            clipboard.become_ready()
+            agent.clipboard_became_ready()
+        self.assertTrue(any(
+            "lock gate fell open after 9s; no clips arrived while locked" in m
+            for m in logged))
+
     def test_counter_resets_per_stretch(self):
         clipboard = _GatedClipboard(ready=False)
         agent = self._agent(clipboard)
         agent.send = lambda t, p: None
         agent._on_clip(encode_clip_payload(1755500000.0, b"one"))
-        clipboard.stretch = 1.0
+        clipboard.stretch = (1.0, "unlocked")
         # This first flush's own combined line isn't what the test below is
         # pinning (the second flush's is) -- patched anyway, or the real
         # log() sprays a genuine "1 clips arrived" line to stderr on every run.
@@ -91,7 +134,7 @@ class TestHeldClips(unittest.TestCase):
             clipboard.become_ready()
             agent.clipboard_became_ready()
         agent.clipboard_lost()
-        clipboard.stretch = 2.0
+        clipboard.stretch = (2.0, "unlocked")
         logged = []
         with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
              mock.patch.object(clipwire_agent, "make_watcher",
@@ -117,7 +160,7 @@ class TestHeldClips(unittest.TestCase):
             clipboard.become_ready()          # stretch stays None: no lock here
             agent.clipboard_became_ready()
         agent.clipboard_lost()
-        clipboard.stretch = 30.0
+        clipboard.stretch = (30.0, "unlocked")
         logged = []
         with mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)), \
              mock.patch.object(clipwire_agent, "make_watcher",

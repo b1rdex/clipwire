@@ -239,6 +239,78 @@ class TestMonitor(unittest.TestCase):
         gate_lines = [m for m in logged if "lock gate inactive" in m]
         self.assertEqual(len(gate_lines), 2)
 
+    def test_a_resolved_sessions_unreadable_hint_logs_once_and_rearms(self):
+        """spec §6 final bullet: the resolver's "no unique graphical
+        session" line is not the only fail-open door -- a LockedHint Get
+        that fails on a session that DID resolve is a second, separate one
+        (test_failed_resolution_answers_none_and_logs_once pins the first;
+        these are two different doors and each logs its own transition).
+        Get failing twice running logs once; a real answer in between
+        re-arms it, so a THIRD failure logs again rather than staying mute
+        forever the way a once-per-lifetime line would."""
+        logged = []
+        hint_queue = [None, None, True, None]
+        def hint(path, run=None):
+            return hint_queue.pop(0)
+        released = threading.Event()
+        def popen(argv, **kwargs):
+            return _ScriptedPump([], released)
+        resolve_patch = mock.patch("clipwire_agent.resolve_graphical_session",
+                                   return_value=PATH)
+        hint_patch = mock.patch("clipwire_agent.session_locked_hint", side_effect=hint)
+        log_patch = mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m))
+        resolve_patch.start()
+        hint_patch.start()
+        log_patch.start()
+        self.addCleanup(resolve_patch.stop)
+        self.addCleanup(hint_patch.stop)
+        self.addCleanup(log_patch.stop)
+        monitor = LockMonitor(run=_unreachable_run, popen=popen)
+        self.addCleanup(monitor.stop)
+        monitor.start()                      # hint_queue[0] -> None: unreadable
+        self.assertIsNone(monitor.locked())
+        # End the pump before driving _reresolve directly -- same reasoning
+        # as test_a_second_separate_fail_open_stretch_logs_again: isolates
+        # this from the pump's own EOF/backoff timing.
+        monitor.stop()
+        monitor._reresolve()                 # hint_queue[1] -> None: still unreadable, mute
+        self.assertIsNone(monitor.locked())
+        monitor._reresolve()                 # hint_queue[2] -> True: answers, re-arms
+        self.assertIs(monitor.locked(), True)
+        monitor._reresolve()                 # hint_queue[3] -> None: unreadable again
+        self.assertIsNone(monitor.locked())
+        unreadable_lines = [m for m in logged if "lock state unreadable" in m]
+        self.assertEqual(len(unreadable_lines), 2)
+        # The resolver's own door must stay silent throughout: this session
+        # resolved every time, only its Get ever failed.
+        self.assertEqual([m for m in logged if "no unique graphical session" in m], [])
+
+    def test_a_parsed_transition_rearms_the_unreadable_hint_door_too(self):
+        """The re-arm must not be scoped to Gets alone: a PropertiesChanged
+        line parsing on the pump thread is also "a later read or parse"
+        succeeding (spec §6), and _set_locked is the one funnel both a Get
+        and a parsed line go through. Without this, an unreadable Get
+        followed by a real LOCKED_LINE and then another unreadable Get
+        would wrongly stay mute on the second failure."""
+        logged = []
+        hint_queue = [None, None]
+        def hint(path, run=None):
+            return hint_queue.pop(0)
+        with mock.patch("clipwire_agent.resolve_graphical_session", return_value=PATH), \
+             mock.patch("clipwire_agent.session_locked_hint", side_effect=hint), \
+             mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m)):
+            monitor = LockMonitor(run=_unreachable_run,
+                                  popen=lambda argv, **k: _ScriptedPump([], threading.Event()))
+            self.addCleanup(monitor.stop)
+            monitor.start()                  # hint_queue[0] -> None: unreadable, logged
+            self.assertIsNone(monitor.locked())
+            monitor.stop()
+            monitor._set_locked(True)        # stands in for a parsed LOCKED_LINE
+            monitor._reresolve()             # hint_queue[1] -> None: unreadable AGAIN
+            self.assertIsNone(monitor.locked())
+        unreadable_lines = [m for m in logged if "lock state unreadable" in m]
+        self.assertEqual(len(unreadable_lines), 2)
+
     def test_stop_terminates_the_subprocess_and_ends_the_reader_thread(self):
         monitor, order, released = self._monitor([])
         monitor.stop()
@@ -406,6 +478,42 @@ class TestMonitor(unittest.TestCase):
         exception_lines = [m for m in logged if "FileNotFoundError" in m]
         self.assertEqual(len(exception_lines), 3,
                          "one log line naming the exception class per failed attempt")
+
+    def test_a_popen_that_cannot_start_falls_open_without_raising(self):
+        """F2 (final-review finding): start()'s OWN self._process =
+        self._spawn() runs on the CALLER's thread -- main(), before
+        send_hello -- with no reader thread yet built to catch anything,
+        unlike the already-covered respawn inside _pump() (test_an_
+        unexpected_exception_falls_open_and_keeps_retrying), which is
+        already wrapped. A missing/unstartable gdbus (FileNotFoundError
+        here, the shape Popen actually raises for a binary that is not on
+        PATH) must not raise out of start(): that would kill the agent
+        before the protocol even begins, and the Mac would reconnect
+        forever against a crashing peer -- violating spec §3.2's "a
+        machine where none of this works behaves exactly as today". Falls
+        open (cache stays at __init__'s None, never reads the hint) and
+        starts no reader thread -- there is nothing for it to read."""
+        logged = []
+        def popen(argv, **kwargs):
+            raise FileNotFoundError("gdbus")
+        resolve_patch = mock.patch("clipwire_agent.resolve_graphical_session",
+                                   return_value=PATH)
+        hint_patch = mock.patch("clipwire_agent.session_locked_hint", return_value=True)
+        log_patch = mock.patch("clipwire_agent.log", side_effect=lambda m: logged.append(m))
+        resolve_patch.start()
+        hint_patch.start()
+        log_patch.start()
+        self.addCleanup(resolve_patch.stop)
+        self.addCleanup(hint_patch.stop)
+        self.addCleanup(log_patch.stop)
+        monitor = LockMonitor(run=_unreachable_run, popen=popen)
+        self.addCleanup(monitor.stop)
+        monitor.start()   # must not raise
+        self.assertIsNone(monitor.locked(),
+                          "must fall open, not read the (unreachable) hint")
+        self.assertIsNone(monitor._thread, "no reader thread when there is nothing to read")
+        exception_lines = [m for m in logged if "FileNotFoundError" in m]
+        self.assertEqual(len(exception_lines), 1)
 
     def test_subprocess_calls_never_run_with_the_cache_lock_held(self):
         """threading.Lock is non-reentrant, so a resolver/hint reader that

@@ -377,6 +377,13 @@ class EventSourceTests(ToolTestCase):
     DEST = ("--session", "--dest", "org.gnome.GPaste",
             "--object-path", "/org/gnome/GPaste")
 
+    # v3.5's LockMonitor (agent/clipwire-agent.py): every call it makes --
+    # session resolution, LockedHint reads, its own pump -- goes out on the
+    # SYSTEM bus against org.freedesktop.login1, which this fake does not
+    # model. No --object-path here: LockMonitor's own `gdbus monitor
+    # --system --dest ...` (unlike its `call`s) never passes one either.
+    LOGIN1 = ("--system", "--dest", "org.freedesktop.login1")
+
     def gdbus_call(self):
         """(uuid, text) for the top of history, parsed as the Python tuple
         literal `call_get_element_at_index` prints. Safe to parse with
@@ -490,6 +497,50 @@ class EventSourceTests(ToolTestCase):
                 self.assertEqual(self.run_fake("gdbus", "call", *wrong, "--method",
                                                "org.gnome.GPaste2.GetElementAtIndex",
                                                "0").returncode, 1)
+
+    def test_the_system_bus_and_login1_are_refused_cleanly_not_a_crash(self):
+        """F1: before this fake learned `--system`, LockMonitor's every call
+        died in parse() as an unmodelled argument (exit 2) -- the agent's
+        callers read that the same as any other non-zero exit (fail-open,
+        None), so it never crashed, but the FAILURE SHAPE was wrong: a real
+        machine without a resolvable login1 session gives a clean
+        name-not-owned response, not an argv-parsing death. `--system` is
+        now accepted the same way `--session` always was, so a login1 `call`
+        reaches refuse_unowned_name() and is refused through the exact same
+        door a wrong GPaste name is (dest != BUS_NAME, unconditionally --
+        this fake owns no login1 session table to answer from, regardless of
+        object-path or method)."""
+        result = self.run_fake(
+            "gdbus", "call", *self.LOGIN1,
+            "--object-path", "/org/freedesktop/login1/session/_31",
+            "--method", "org.freedesktop.DBus.Properties.Get",
+            "org.freedesktop.login1.Session", "LockedHint")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"ServiceUnknown", result.stderr)
+        self.assertNotIn(b"unmodelled argument", result.stderr)
+
+    def test_the_login1_monitor_watches_silently_instead_of_dying(self):
+        """`monitor` (unlike `call`/`introspect`) never exits for a wrong
+        name -- refuse_unowned_name's own docstring says so, and main()
+        routes it around that function on purpose -- so LockMonitor's
+        `gdbus monitor --system --dest org.freedesktop.login1` pump must
+        start and keep running, silent, exactly like a GPaste monitor
+        pointed at a name nobody owns (test_monitor_emits_on_a_change_
+        nobody_asked_it_to_watch's own wrong-dest sibling). Before --system
+        was accepted this died in parse() before ever reaching monitor() at
+        all -- indistinguishable from here by exit code alone (both leave no
+        process), which is exactly why the LockMonitor pump used to
+        respawn it forever instead of settling into one long-lived watch."""
+        process = subprocess.Popen(
+            [str(HERE / "gdbus"), "monitor"] + list(self.LOGIN1),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=self.env())
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.wait)
+        self.addCleanup(process.terminate)
+        time.sleep(0.3)
+        self.assertIsNone(process.poll(),
+                          "the login1 monitor exited (rc=%s) instead of watching silently"
+                          % process.poll())
 
     def test_gdbus_call_returns_a_uuid_and_the_top_text(self):
         """The fast tier's whole input. Shape is byte-compatible with real gdbus:

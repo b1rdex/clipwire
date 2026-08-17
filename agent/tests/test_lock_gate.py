@@ -40,6 +40,11 @@ class TestLockGate(unittest.TestCase):
     def test_fail_open_is_open_immediately(self):
         self.session.locked = None
         self.assertTrue(self.gate.open())
+        # A fresh, never-locked gate that falls open banks nothing -- there
+        # was no stretch in progress to end. See
+        # test_locked_to_none_mid_stretch_banks_a_fell_open_stretch for the
+        # other half: falling open FROM a locked stretch does bank one.
+        self.assertIsNone(self.gate.stretch_just_ended())
 
     def test_lock_closes_on_the_first_sample(self):
         self.assertTrue(self.gate.open())
@@ -74,15 +79,48 @@ class TestLockGate(unittest.TestCase):
         self.assertTrue(self.gate.open())
 
     def test_stretch_duration_is_banked_once_and_measured_on_stamps(self):
-        """stretch = unlock stamp minus lock stamp -- the debounce hold is NOT
-        part of the locked duration."""
+        """stretch = (unlock stamp minus lock stamp, "unlocked") -- the
+        debounce hold is NOT part of the locked duration. F3(b): the tuple
+        is the frozen contract stretch_just_ended() now returns; ended_by
+        distinguishes a real unlock from a gate that fell open mid-stretch
+        (test_locked_to_none_mid_stretch_banks_a_fell_open_stretch)."""
         self.session.flip(True)
         self.gate.open()
         self.session.t += 90.0
         self.session.flip(False)
         self.session.t += UNLOCK_HOLD_SECONDS
         self.assertTrue(self.gate.open())
-        self.assertEqual(self.gate.stretch_just_ended(), 90.0)
+        self.assertEqual(self.gate.stretch_just_ended(), (90.0, "unlocked"))
+        self.assertIsNone(self.gate.stretch_just_ended())
+
+    def test_locked_to_none_mid_stretch_banks_a_fell_open_stretch(self):
+        """F3(b) / spec §6: 'a stretch that ends in fail-open still
+        reports' -- the monitor losing the session (or its Get failing)
+        mid-lock must not lose the clips-held report the way a silent
+        fail-open used to. Still opens immediately, no debounce, exactly
+        like test_fail_open_is_open_immediately -- there is no trustworthy
+        `since` on a None reading to hold against, so the stretch is
+        measured lock-edge to THIS moment (self._now()), not to `since`."""
+        self.session.flip(True)
+        self.assertFalse(self.gate.open())
+        self.session.t += 12.0
+        self.session.locked = None       # the monitor stops answering, mid-lock
+        self.assertTrue(self.gate.open())          # fail-open: immediate, no hold
+        self.assertEqual(self.gate.stretch_just_ended(), (12.0, "fell-open"))
+        self.assertIsNone(self.gate.stretch_just_ended())
+
+    def test_a_second_locked_to_none_sample_does_not_bank_twice(self):
+        """open() can be sampled repeatedly while the gate sits fail-open
+        (run()'s 1s cadence, §3.1) -- only the FIRST sample after the lock
+        edge is a transition; the rest must not re-bank or move the count."""
+        self.session.flip(True)
+        self.gate.open()
+        self.session.t += 5.0
+        self.session.locked = None
+        self.assertTrue(self.gate.open())
+        self.session.t += 5.0
+        self.assertTrue(self.gate.open())          # still None: no NEW stretch to end
+        self.assertEqual(self.gate.stretch_just_ended(), (5.0, "fell-open"))
         self.assertIsNone(self.gate.stretch_just_ended())
 
     def test_lock_edge_logs_once(self):
@@ -117,9 +155,9 @@ class TestClipboardLockStretchDelegation(unittest.TestCase):
 
     def test_delegates_to_the_gate(self):
         gate = mock.Mock()
-        gate.stretch_just_ended.return_value = 42.0
+        gate.stretch_just_ended.return_value = (42.0, "unlocked")
         clipboard = WaylandClipboard(lock_gate=gate)
-        self.assertEqual(clipboard.lock_stretch_ended(), 42.0)
+        self.assertEqual(clipboard.lock_stretch_ended(), (42.0, "unlocked"))
         gate.stretch_just_ended.assert_called_once_with()
 
     def test_none_without_a_gate(self):

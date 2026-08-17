@@ -33,6 +33,27 @@ on any other bus name exits 1, which is what a real gdbus does for a name
 with no owner -- and the agent has already shipped that exact mistake once,
 probing org.gnome.GPaste2 (the INTERFACE) and leaving the watcher on the
 polling fallback forever. A fake that answered anything would have hidden it.
+
+v3.5 adds a second caller with a second bus: LockMonitor's session
+resolution, its LockedHint reads, and its own `gdbus monitor` pump all go
+out `--system --dest org.freedesktop.login1` (agent/clipwire-agent.py).
+This fake does not model login1 -- it has no session table to answer
+ListSessions or Properties.Get from -- so `--system` is accepted as the
+same kind of bus-scope flag `--session` always was, and a login1 `call` or
+`introspect` is refused through the exact same refuse_unowned_name() door a
+wrong GPaste name already is: dest != BUS_NAME is dest != BUS_NAME
+regardless of which bus flag came with it. Before `--system` was accepted
+at all, every one of these calls instead died in parse() as an unmodelled
+argument -- LockMonitor's callers treat any non-zero exit as NOT MEASURED,
+so the agent never crashed, but the FAILURE SHAPE was wrong: a machine that
+cannot resolve a session gives a clean name-not-owned response, not an
+argv-parsing death, and the harness owes the agent that same clean failure.
+`monitor --system --dest org.freedesktop.login1` is deliberately NOT routed
+through refuse_unowned_name -- same as GPaste's own wrong-name monitor (see
+refuse_unowned_name's docstring) -- so it watches silently forever instead:
+a real `gdbus monitor` does not fail for an unowned name, it waits. That
+silence is also what stops LockMonitor's pump from respawning it in a
+tight, ever-backing-off loop for the rest of the process's life.
 """
 import hashlib
 import os
@@ -75,7 +96,12 @@ def parse(argv):
     index = 0
     while index < len(options):
         argument = options[index]
-        if argument == "--session":
+        if argument in ("--session", "--system"):
+            # Bus-scope flags. Neither is tracked past this point: this fake
+            # owns exactly one name total (BUS_NAME, on the session bus in
+            # reality), so anything else -- including the system bus's own
+            # org.freedesktop.login1, v3.5's LockMonitor -- falls through to
+            # refuse_unowned_name() on dest alone. See the module docstring.
             pass
         elif argument in ("--dest", "--object-path"):
             index += 1

@@ -481,13 +481,32 @@ class Agent:
             # LockGate.open() logs only the CLOSING edge (spec's lock line);
             # stretch_just_ended() itself logs nothing. So this is
             # deliberately the only unlock line there is -- it says what was
-            # held, not just that the gate reopened.
-            if arrivals:
-                log("session unlocked after %ds; %d clips arrived while locked,"
-                    " applied the newest" % (int(stretch), arrivals))
+            # held, not just that the gate reopened. ended_by picks which of
+            # two pairs (spec §6): "unlocked" is a real LockedHint=false
+            # held past the debounce -- these two lines are BYTE-FOR-BYTE
+            # what shipped before ended_by existed, unchanged, because the
+            # README quotes them. "fell-open" is the monitor losing the
+            # session mid-lock -- a stretch that ends in fail-open still
+            # reports, the most incident-shaped event this feature has, and
+            # silence here would put this whole log's "readable from this
+            # alone" purpose out of reach exactly when it matters most.
+            # Never-locked flushes still see stretch is None above and stay
+            # silent, unchanged.
+            seconds, ended_by = stretch
+            if ended_by == "unlocked":
+                if arrivals:
+                    log("session unlocked after %ds; %d clips arrived while locked,"
+                        " applied the newest" % (int(seconds), arrivals))
+                else:
+                    log("session unlocked after %ds; no clips arrived while locked"
+                        % int(seconds))
             else:
-                log("session unlocked after %ds; no clips arrived while locked"
-                    % int(stretch))
+                if arrivals:
+                    log("lock gate fell open after %ds; %d clips arrived while locked,"
+                        " applied the newest" % (int(seconds), arrivals))
+                else:
+                    log("lock gate fell open after %ds; no clips arrived while locked"
+                        % int(seconds))
         read = self.clipboard.read()
         seed = (read[0], sha256_hex(read[1])) if read is not None and read[1] else None
         with self._echo_lock:
@@ -952,6 +971,17 @@ class LockGate:
         if locked is None:
             # Fail-open: unmeasurable is never locked, and never debounced
             # either -- there is no trustworthy `since` to hold against.
+            if not self._was_open:
+                # Falling open FROM a locked stretch, not from already-open
+                # (spec §6: "a stretch that ends in fail-open still
+                # reports") -- bank it now, lock-edge to THIS moment: a
+                # None reading carries no trustworthy `since` of its own,
+                # so the wall clock is the only bound the stretch's end
+                # can be measured against. `_was_open` guards this to fire
+                # once per transition, the same shape the real-unlock
+                # branch below already has -- a second, third, ... None
+                # sample while still fail-open must not re-bank.
+                self._banked = (self._now() - self._lock_edge, "fell-open")
             self._was_open = True
             return True
         if locked:
@@ -967,14 +997,17 @@ class LockGate:
             self._was_open = True
             return True
         if self._now() - since >= UNLOCK_HOLD_SECONDS:
-            self._banked = since - self._lock_edge
+            self._banked = (since - self._lock_edge, "unlocked")
             self._was_open = True
             return True
         return False
 
     def stretch_just_ended(self):
-        """The just-banked stretch, consumed -- None once already taken, or
-        when no locked stretch has ended yet."""
+        """The just-banked (seconds, ended_by) of the stretch that just
+        ended, consumed -- None once already taken, or when no locked
+        stretch has ended yet. ended_by is "unlocked" for a real
+        LockedHint=false held past the debounce, or "fell-open" when the
+        monitor instead lost the session mid-lock (spec §6)."""
         stretch, self._banked = self._banked, None
         return stretch
 
@@ -994,9 +1027,10 @@ class WaylandClipboard:
                 and (self._lock_gate is None or self._lock_gate.open()))
 
     def lock_stretch_ended(self):
-        """Seconds the stretch that just ended was locked for, consumed once
+        """(seconds, ended_by) of the stretch that just ended, consumed once
         -- delegates to the gate; None with no gate (this connection predates
-        Task 5, or is a fake) or when no stretch just ended."""
+        Task 5, or is a fake) or when no stretch just ended. See
+        LockGate.stretch_just_ended for what ended_by distinguishes."""
         if self._lock_gate is None:
             return None
         return self._lock_gate.stretch_just_ended()
@@ -1796,15 +1830,22 @@ class LockMonitor:
         self._run = run
         self._popen = popen
         self._now = now
-        # Leaf lock: guards only _locked/_session_path/_since (read or
-        # assigned), and is never held across a call to
-        # resolve_graphical_session, session_locked_hint, popen, or log --
-        # every one of those can block or shell out.
+        # Leaf lock: guards only _locked/_session_path/_since/the two
+        # *_logged flags (read or assigned), and is never held across a
+        # call to resolve_graphical_session, session_locked_hint, popen, or
+        # log -- every one of those can block or shell out.
         self._lock = threading.Lock()
         self._locked = None
         self._since = None
         self._session_path = None
         self._fail_open_logged = False
+        # Fail-open's SECOND door (spec §6): a resolved session whose Get
+        # itself fails, as distinct from _fail_open_logged above (a session
+        # that never resolved at all). Cleared in _set_locked, not here or
+        # in _read_hint -- a later answer can arrive as either a fresh Get
+        # (this thread) or a parsed PropertiesChanged line (the pump
+        # thread), and _set_locked is the one funnel both go through.
+        self._hint_unreadable_logged = False
         self._stop = threading.Event()
         self._process = None
         self._thread = None
@@ -1831,7 +1872,22 @@ class LockMonitor:
         # reader not yet running, that swap cannot happen concurrently
         # with the line below.
         path = self._resolve_session()
-        self._process = self._spawn()
+        try:
+            self._process = self._spawn()
+        except OSError as error:
+            # Unlike _pump()'s own respawn (already wrapped, below), THIS
+            # spawn runs on the CALLER's thread -- main(), before
+            # send_hello -- with no reader thread built yet to catch
+            # anything. A missing/unstartable gdbus must not raise out of
+            # here: that would kill the agent before the protocol even
+            # begins, and the Mac would reconnect forever against a
+            # crashing peer (spec §3.2: "a machine where none of this
+            # works behaves exactly as today"). Cache stays at __init__'s
+            # None (fail-open) and no reader thread starts -- there is
+            # nothing for it to read.
+            log("lock monitor could not start gdbus (%s): lock gate inactive, "
+                "readiness is socket-only" % type(error).__name__)
+            return
         self._read_hint(path)
         self._thread = threading.Thread(target=self._pump, daemon=True)
         self._thread.start()
@@ -1886,10 +1942,30 @@ class LockMonitor:
 
     def _read_hint(self, path):
         """The initial (or post-re-resolve) LockedHint of `path`; a no-op
-        when resolution itself failed -- there is nothing to Get."""
+        when resolution itself failed -- there is nothing to Get.
+
+        A resolved session whose Get itself fails (timeout, non-zero exit,
+        an unparseable reply) is fail-open's SECOND door (spec §6): the
+        resolver's own "no unique graphical session" line names a
+        different fact and must stay silent here -- failing to resolve a
+        session and failing to read one that DID resolve are two things an
+        incident review needs told apart. Logged once per transition into
+        unreadable; the re-arm lives in _set_locked, not here, because the
+        transition OUT can arrive as either a later Get succeeding (this
+        thread) or a PropertiesChanged line parsing (the pump thread).
+        """
         if path is None:
             return
-        self._set_locked(session_locked_hint(path, run=self._run))
+        hint = session_locked_hint(path, run=self._run)
+        if hint is None:
+            log_now = False
+            with self._lock:
+                log_now = not self._hint_unreadable_logged
+                self._hint_unreadable_logged = True
+            if log_now:
+                log("lock state unreadable on the watched session: "
+                    "lock gate inactive until it answers")
+        self._set_locked(hint)
 
     def _reresolve(self):
         """Re-resolve and re-read, back to back -- unlike start(), there is
@@ -1899,6 +1975,13 @@ class LockMonitor:
 
     def _set_locked(self, value):
         with self._lock:
+            if value is not None:
+                # A real answer -- a Get or a parsed line alike -- re-arms
+                # the unreadable-hint door (spec §6) for its NEXT failure.
+                # Unconditional on whether `value` actually moves
+                # `_locked`: a repeated same-value answer is still a real
+                # answer, and must not leave a stale failure logged mute.
+                self._hint_unreadable_logged = False
             if value != self._locked:
                 self._locked = value
                 self._since = self._now()
