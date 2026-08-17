@@ -157,17 +157,69 @@ claim that does depend on which figure is right.
 *Why* a dark or locked screen has this effect
 was not established, and the GPaste daemon, the session bus and the compositor all keep
 answering normally throughout — so the usual health checks all pass while nothing works.
-Nothing syncs in either direction until the screen is back, and the Mac's log fills with
-lines like:
+Reads still don't sync until the screen is back — nothing about that changed — and the Mac's
+log fills with lines like:
 
 ```
 remote: wl-paste failed: TimeoutExpired(['wl-paste', '--list-types'], 3)
 ```
 
-This is a property of the desktop, not a fault in the sync, and it is why those timeouts
-appear in bursts overnight. Left-over `wl-copy` and `wl-paste` processes belonging to reads
-that could never finish are part of the same picture; they clear on their own once the
-screen is back and the selection can change hands again.
+This is a property of the desktop, not a fault in the sync. Before v3.5 it is also why those
+timeouts appeared in bursts overnight: nothing checked whether the session was locked, so the
+30-second safety poll kept trying anyway and kept failing the same way, tick after tick.
+Left-over `wl-paste` processes belonging to reads that could never finish are part of the same
+picture; they clear on their own once the screen is back and the selection can change hands
+again. **Since v3.5 the bursts stop:** the clipboard watcher that runs that poll is torn down
+for the whole of a locked stretch and rebuilt fresh at unlock, so there is nothing left running
+to keep trying.
+
+**A locked PC used to pile up one resident `wl-copy` per Mac-side copy, and no longer does.**
+`wl-copy` does not exit on its own — it stays running as the clipboard's next owner by design,
+and a fresh copy normally just replaces the one before it. A lock blocks that hand-off the same
+way it blocks a read, so before v3.5 every copy sent while the PC was locked left its own
+`wl-copy` running, unable to take the selection, and the pile grew one process per copy. That
+is what the **2026-08-17** incident was at real scale: the session stayed locked for close to
+eighteen hours while the owner kept working from the Mac, each hung `wl-copy` leaving its own
+"Unknown" tile in the app panel, and unlock resolving the entire pile at once — flooding
+GPaste's history with the day's copies in the same breath, evicting whatever the owner had
+already put there. A smaller, controlled version of the same collapse was measured the same
+day: two clips sent into a deliberately locked session left two hung `wl-copy` processes that
+both resolved within a second of unlock, the monitor still dark throughout, landing in GPaste's
+history in reverse spawn order. That is the write side's half of the asymmetry this section
+already measured for reads: a lock alone is enough to break a write; a read needs the screen
+lit again regardless of the lock. It is also why the fix below keys on the lock signal itself
+rather than on the screen.
+
+**Since v3.5, the agent watches for the lock directly instead of waiting to notice its
+effects.** It subscribes to logind's `LockedHint` for the session, over the system bus this
+time rather than the session bus every other D-Bus call here uses — event-driven, not polled.
+The subscription only trusts a session it can first prove is the single graphical one on the
+machine (`Class=user`, `Type` of `wayland` or `x11`); if the session table shows none, shows
+more than one, or a single probe among them goes unanswered, it will not guess. It reports
+unknown instead, readiness falls back to exactly today's rule — socket existence alone — and
+the log says so once per transition into that state: `no unique graphical session: lock gate
+inactive, readiness is socket-only`.
+
+When the session locks, the gate closes immediately and says so: `session locked; holding
+clips (latest wins)`. From that point, an incoming clip from the Mac lands in the same single
+latest-wins slot every connection has always used before its clipboard is ready — nothing new
+was built, the lock just reaches an off switch that was already there — and nothing is written
+to the PC's clipboard while it sits in that slot: no `wl-copy` spawns, no GPaste history entry,
+each new arrival just overwrites whatever was pending. Unlock does not reopen the gate the
+instant `LockedHint` flips back; it waits for that to hold for about a second — debounced
+against the screen-shield animation, which can bounce — and then applies whichever one clip is
+sitting in the slot. GPaste's history grows by at most one entry per locked stretch this way,
+not one per copy, and the log names what it held. For a lock much shorter than the one above:
+`session unlocked after 63s; 3 clips arrived while locked, applied the newest` when something
+was waiting, or `session unlocked after 63s; no clips arrived while locked` when nothing was.
+
+Applying a clip still blinks the same way it always has — `wl-copy` takes a focus grab to set
+the selection, images included — and that is outside what this gate touches: it decides
+whether an apply happens at all, not how one looks when it does. The cycle that would move
+text off that path has not shipped; images stay on it either way. And the gate only knows what
+logind reports, so the dark-monitor class from above — awake, unlocked, and still unable to
+answer a read — is invisible to it and unaffected by it: reads there hang exactly as before,
+and writes there were never broken in the first place.
 
 Nothing degrades as a result: a read that fails proves nothing about whether the event
 source is alive, so it never counts toward the verdict that switches the agent to faster
