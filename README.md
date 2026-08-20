@@ -267,21 +267,22 @@ What that changes, and what it does not:
   longer reaches a verdict.
 - 30-second poll ticks are skipped entirely once nobody has touched the keyboard or mouse for
   five minutes. With nobody copying there is nothing for them to find — with one exception,
-  which the excluded-clip section below states and bounds.
-- **Where the blinking survives, first:** the 30-second clipboard poll itself is **unchanged**
-  and still forks `wl-paste` on every tick it is not gated out of. It is the only thing that
-  can tell a clipboard manager that has stopped recording from a clipboard nobody is using,
-  so it stays.
-- **And second:** when a verdict *is* reached, that poll keeps running and keeps blinking.
-  What changed is the rate — it now starts at one second after each observed change and
+  which an earlier revision of this file stated and bounded here, and which v3.6 has since
+  closed the other way: see the excluded-clip section below.
+- **Where the blinking survived, through v3.5:** the 30-second clipboard poll kept forking
+  `wl-paste` on every tick it was not gated out of, because it was the only thing that
+  could tell a clipboard manager that has stopped recording from a clipboard nobody is
+  using. v3.6 retires that argument on a trusted connection — the poll's ticks stop touching
+  the clipboard at all, and what that buys and costs has its own section below.
+- **And when a verdict *is* reached,** the poll runs and blinks — that part stands.
+  What changed in v3.3 is the rate — it starts at one second after each observed change and
   doubles toward 30 seconds while nothing changes, instead of staying at one second forever.
   It is **not** true that the poll is then the connection's only way of seeing a change, and
   a first draft of this bullet said so: the agent goes on listening for GPaste's signals
-  through the switch and never tears that subscription down, and one of the two ways this
-  verdict can be reached — the excluded-clip case in the next section — leaves GPaste tracking
-  and signalling normally. The poll is the only detector left **in the state the verdict
-  describes**, where the clipboard manager really has stopped recording; the verdict can also
-  be reached when it has not.
+  through the switch and never tears that subscription down. The poll is the only detector
+  left **in the state the verdict describes**, where the clipboard manager really has
+  stopped recording; the verdict could also be reached when it had not — the excluded-clip
+  route, which v3.6 closes along with the looks it was built from.
 
 ## Copying text no longer blinks, in either direction
 
@@ -344,34 +345,56 @@ it acted on:
 re-selected <uuid>: tier write completed inside a locked interval
 ```
 
-## A clip GPaste refuses to record still syncs
+## The safety net stops looking while GPaste is trusted
+
+v3.6. The sections above kept the 30-second poll on one argument: it was the only detector
+for a tracker that records nothing. That argument lost, on the owner's report of 2026-08-20,
+to the price being paid for it daily. Each tick forked `wl-paste` — two forks for text, the
+type listing and the body — and on this GNOME every fork is a transient Wayland window,
+because mutter exposes no data-control protocol for a clipboard tool to use instead
+(verified against the compositor's own registry that day: no `ext_data_control_manager_v1`,
+no `zwlr_`). A window on a timer means focus blinking exactly while you work — the idle gate
+scopes the ticks to the minutes you are at the keyboard — and when mutter refuses the window
+focus, the read hangs to its three-second timeout and GNOME posts a "wl-paste is ready"
+banner over whatever you are doing. The production log for that one day shows three such
+timeouts; the judge those forks were feeding had reached its verdict zero times, ever.
+
+So, while the agent trusts GPaste — the connection is not degraded and the five-second
+history check is answering — the safety net's ticks now take no clipboard reads at all.
+No 30-second probe, and no baseline probe when the watcher is built, which used to land one
+fork on every reconnect: at wake, the worst possible moment for a three-second hang. The one
+duty a suppressed tick keeps is the image re-offer backstop, which can still force a full
+read when a written image's re-offer never announced itself — rare, image-path, and visible
+by necessity. The moment trust ends — the degradation verdict, or the history check failing
+outright — the poll comes back exactly as the sections above describe it. The log line says
+which world the connection is in from the start:
+
+```
+remote: watching the clipboard through GPaste; no timed clipboard reads while healthy, safety-net poll every 30s on fallback
+```
+
+What v3.6 deliberately repeals to get there is the next section's old promise.
+
+## A clip GPaste refuses to record no longer syncs, by design
 
 GPaste does not add everything to its history. A password manager can mark its selection
 sensitive, and GPaste can be configured to exclude clips outright. Nothing is broken when
-that happens — GPaste simply records nothing and signals nothing for that clip, by design.
+that happens — GPaste records nothing and signals nothing for that clip, by design.
 
-Before v3.3 that was indistinguishable from a broken clipboard manager: the clipboard had
-changed, no signal had arrived, and a single such copy at the wrong moment could tip the
-agent into the permanent one-second polling described above. Now the two are told apart by
-GPaste's own history, which moves for a recorded clip and stands still for an excluded one.
-A single excluded copy raises a suspicion that the next look drops, because by then the
-clipboard has settled.
+Through v3.5 the agent's poll read the clipboard directly anyway, so an excluded clip still
+reached the Mac within a poll tick. v3.6 repeals that on a trusted connection, on purpose
+rather than as a side effect of removing the poll. An exclusion is a privacy decision made
+by the thing that copied: the poll was overriding GPaste's exclusions and shipping to the
+Mac precisely the clips that had asked not to be recorded. Worse, a *run* of excluded
+copies landing on consecutive ticks looked exactly like a tracker that had stopped
+recording and could produce the fallback verdict — after which the agent polled the
+clipboard at one-second rate for the rest of the connection, turning the privacy shield
+into the trigger for the most aggressive syncing it has. Both paths are closed while GPaste
+is trusted: no probe, no judge, nothing to override.
 
-The clip itself still reaches the Mac, through the same 30-second clipboard poll that
-carried it before — that part is unchanged, **once you touch the keyboard again.** This is
-the one class of clip for which that poll is the *only* detector: GPaste records nothing for
-it, so neither the signal nor the history identifier ever moves. And poll ticks are skipped
-while nobody has touched an input device for five minutes, per the bullet above. Copying with
-your own hands resets that timer, so the ordinary case is still caught within 30 seconds;
-what waits is an excluded clip put on the clipboard by something that is not a keystroke — a
-script, a build — while you are away. Deferred, not lost: a skipped tick advances nothing, so
-the first tick after you come back compares across the whole gap and still sees the change.
-
-What is worth knowing next is that a *run* of
-excluded copies, landing on consecutive poll ticks with the clipboard moving each
-time, still looks exactly like a clipboard manager that has stopped recording, and still
-produces the fallback. Nothing is lost when it does; the clips keep syncing, the poll just
-runs faster for that connection.
+The old behaviour survives exactly where the poll does — a degraded connection, or one
+whose five-second history check has died. There the poll runs for its own reasons, and an
+excluded clip is indistinguishable from any other change it sees.
 
 ## After a GNOME upgrade
 
@@ -386,11 +409,12 @@ Nothing looks broken when it happens: the GPaste daemon keeps running and keeps 
 on the session bus, so every liveness check that probes the bus still passes — but the
 `Update` signal the agent watches for never fires again.
 
-The agent notices on its own and keeps working, and since v3.3 it has two independent ways
-of noticing, which behave very differently. Which one applies turns on whether GPaste is
-still *recording* clips or only failing to *announce* them — a disabled extension stops
-both, so it lands in the second case, but the two are worth telling apart because the log
-lines are different and only one of them changes how the agent behaves.
+Since v3.3 the agent had two independent ways of noticing, and which one applies turns on
+whether GPaste is still *recording* clips or only failing to *announce* them. A disabled
+extension stops both, so it lands in the second case — and that second case is the one
+v3.6 knowingly gave up on a trusted connection, in trade for retiring the poll it depended
+on. The two are still worth telling apart, because the first way is untouched and the
+second still exists wherever the poll still runs.
 
 **If GPaste is still recording clips and only the signal is missing,** the agent sees it
 within five seconds and changes nothing else. It asks GPaste over D-Bus for the identifier
@@ -402,14 +426,23 @@ polling speeds up, and the Mac's log gets one line:
 remote: the uuid tier saw the clipboard history move while the accepted-signal count held at 0; the signal path may be silent, but tracking itself is alive -- the fast tier is already this connection's sync, every 5s, at zero focus cost. Informational only; no interval changes because of this line.
 ```
 
-**If GPaste has stopped recording clips at all,** that identifier stops moving too, so the
-only thing left that can tell is a direct look at the clipboard. That is the 30-second
-clipboard poll — the safety net, and the same one the two sections above describe. When it sees the clipboard change twice running while GPaste's history
-stands still, it concludes the tracker is dead and falls back to polling — starting one
-second after each change it observes and doubling toward 30 seconds while nothing changes,
-for the rest of the connection. It says so in the Mac's log
-(`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than guessing
-why:
+**If GPaste has stopped recording clips at all,** that identifier stops moving too, and the
+only thing that could ever tell was a direct look at the clipboard — the 30-second poll.
+Since v3.6 a trusted connection takes no such looks, so this state is a **known blind
+spot, accepted with eyes open** when the poll was retired: PC→Mac sync stops silently and
+stays stopped, and reconnecting does not clear it, because the daemon still answers every
+liveness probe a fresh connection makes. It had been caught by the poll's judge exactly
+zero times in the production log when the trade was made. The check at the top of this
+section is the mitigation — worth running whenever PC→Mac sync goes quiet with nothing in
+the log to explain it.
+
+Where the poll still runs — a degraded connection, or one whose five-second history check
+has died — the v3.3 verdict machinery is unchanged: when the poll sees the clipboard change
+twice running while GPaste's history stands still, it concludes the tracker is dead and
+falls back to polling — starting one second after each change it observes and doubling
+toward 30 seconds while nothing changes, for the rest of the connection. It says so in the
+Mac's log (`~/.local/state/clipwire/clipwire.log`), reporting what it observed rather than
+guessing why:
 
 ```
 remote: GPaste reported no clipboard change while the content changed (signals=0 signals_at_last_tick=0 pump_alive=True worker_alive=True gpaste_Active=true). Polling every 1s after each observed change and doubling to at most 30s while nothing changes, for the rest of this connection.
@@ -449,8 +482,8 @@ One thing that poll deliberately does *not* do is read images. Copied text it co
 byte for byte; for an image it compares only the list of formats the clipboard is offering,
 and fetches the picture itself only once that list changes. Pulling a 4 MiB screenshot back
 out of the clipboard on every tick is not a price worth paying to notice a copy a little
-sooner — every 30 seconds on a healthy connection, where this poll is only a safety net, and
-between one and 30 seconds once it has fallen back. The trade is that while the tracker is
+sooner — every 30 seconds at the poll's resting rate, and between one and 30 seconds once
+it has fallen back. The trade is that while the tracker is
 dead, one image replacing another is noticed when the offered formats change rather than the
 instant the pixels do. That only bites while the tracker is dead, which is the one state
 nothing else covers: in normal operation the `Update` signal carries the change and nothing

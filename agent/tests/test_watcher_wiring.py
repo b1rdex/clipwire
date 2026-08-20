@@ -125,6 +125,59 @@ class TestMakeWatcher(unittest.TestCase):
                 "and the poller must actually be on it, or the line above is "
                 "agreeing with a number nothing runs at")
 
+    def test_make_watcher_wires_the_healthy_suppression(self):
+        """v3.6: make_watcher is the one production assembly point (the same
+        argument test_make_watcher_is_what_wires_the_idle_gate makes), so it
+        is where the healthy-probe suppression must be switched on -- the
+        constructor defaults it OFF so the judge's own tests keep driving
+        probes. Wired means the safety net's gate is the watcher's own
+        trust predicate; a fresh healthy watcher must come up suppressed."""
+        with mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object())
+        watcher.stop()
+        self.assertEqual(
+            watcher._safety_net._probe_suppressed, watcher._wl_probe_suppressed,
+            "the production watcher's safety net must consult the watcher's "
+            "own trust predicate, or healthy mode keeps forking wl-paste")
+        self.assertTrue(
+            watcher._wl_probe_suppressed(),
+            "a fresh healthy watcher must start suppressed")
+
+        with mock.patch.object(GPasteWatcher, "available", return_value=False):
+            fallback = make_watcher(clipboard=object())
+        fallback.stop()
+        self.assertIsNone(
+            fallback._probe_suppressed,
+            "the no-GPaste fallback has no healthy tier to trust: its poll "
+            "IS the sync and must never be suppressed")
+        self.assertEqual(
+            fallback._gpaste._safety_net._probe_suppressed,
+            fallback._gpaste._wl_probe_suppressed,
+            "but the promotion target it carries must be wired suppressed: "
+            "a late GPaste hands observation to THIS watcher, and an "
+            "unwired one would run the timed forks for the rest of the "
+            "connection")
+
+    def test_the_healthy_line_promises_no_timed_reads(self):
+        """The log line is the contract a person reads first, and v3.6
+        changes what is true: a healthy connection takes no timed clipboard
+        reads at all. A line still promising a safety-net poll as a live
+        30-second reader would be the pre-v3.6 statement -- false the
+        moment this wiring lands."""
+        lines = []
+        with mock.patch.object(clipwire_agent, "log", lines.append), \
+                mock.patch.object(GPasteWatcher, "available", return_value=True):
+            watcher = make_watcher(clipboard=object())
+        watcher.stop()
+        built = [line for line in lines
+                 if "watching the clipboard through GPaste" in line]
+        self.assertEqual(
+            len(built), 1,
+            "make_watcher must say once which watcher it built: %r" % lines)
+        self.assertIn(
+            "no timed clipboard reads", built[0],
+            "the healthy line must state the new contract in so many words")
+
     def test_falls_back_to_polling_when_gpaste_unavailable(self):
         with mock.patch.object(GPasteWatcher, "available", return_value=False):
             watcher = make_watcher(clipboard=object(), fallback_interval_seconds=2.5)

@@ -987,3 +987,161 @@ class TestSlowTierIdleGate(unittest.TestCase):
             clipboard.calls, 1,
             "probe() ran on a gated tick: the gate is being asked after the "
             "fork it exists to prevent")
+
+
+class TestHealthyProbeSuppression(unittest.TestCase):
+    """v3.6's gate, composed with the poll loop the way TestSlowTierIdleGate
+    is. While GPaste is trusted, every probe() is a wl-paste fork whose
+    transient Wayland window blinks focus on GNOME (and raises the
+    "wl-paste is ready" banner when mutter denies it focus) -- and the
+    signal path plus the uuid tier already see everything GPaste sees. So a
+    suppressed tick forks nothing and judges nothing, but keeps servicing
+    the reoffer backstop: that is the one duty the slow loop still owes a
+    healthy connection.
+
+    A SECOND gate beside the idle gate, deliberately never merged with it:
+    the idle gate's skip covers the whole tick INCLUDING the backstop (a
+    forced read against an idle or dark session is what it exists to
+    prevent), while this gate must leave the backstop alive. Merged, one of
+    those two regressions is the price."""
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    def quiesce(self, watcher):
+        watcher.stop()
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+        self.assertFalse(watcher._thread.is_alive(),
+                         "the poll thread must be joined before its state is read")
+
+    def suppressed_watcher(self, suppressed_answers, on_idle_tick=None,
+                           should_probe=None, script=(b"a", b"z")):
+        """A composed-shape poller whose probe_suppressed replays
+        `suppressed_answers` and then repeats the last one, counting asks.
+        Returns (watcher, clipboard, observations, asked)."""
+        replies = list(suppressed_answers)
+        asked = []
+
+        def probe_suppressed():
+            asked.append(True)
+            return replies[min(len(asked) - 1, len(replies) - 1)]
+
+        clipboard = ProbeOnlyClipboard(script)
+        observations = []
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005,
+                                 on_tick=lambda p, c: observations.append((p, c)),
+                                 on_idle_tick=on_idle_tick,
+                                 should_probe=should_probe,
+                                 probe_suppressed=probe_suppressed)
+        self.addCleanup(watcher.stop)
+        return watcher, clipboard, observations, asked
+
+    def test_a_suppressed_loop_forks_nothing_not_even_the_baseline(self):
+        """BOTH zeros matter. Zero probes on the ticks is the 30-second
+        blink this gate exists to remove; zero at the START is the baseline
+        probe, which used to run unconditionally before the loop -- and the
+        watcher is rebuilt on every reconnect, so that one fork landed at
+        wake, the worst possible moment for a 3s hang and its banner."""
+        watcher, clipboard, observations, asked = self.suppressed_watcher([True])
+        watcher.start(lambda: None)
+        self.wait_until(lambda: len(asked) >= 5)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(len(asked), 5,
+                                "the suppression must be re-asked on every tick")
+        self.assertEqual(
+            clipboard.calls, 0,
+            "a suppressed loop forked wl-paste anyway -- 0 means suppressed "
+            "ticks AND the pre-loop baseline, which is under the same gate")
+        self.assertEqual(
+            observations, [],
+            "a suppressed tick must reach no observer: there is no token to "
+            "judge, and a judged None would look like a failed read")
+
+    def test_an_overdue_reoffer_still_fires_through_a_suppressed_tick(self):
+        """The one duty a suppressed tick keeps. The backstop's forced read
+        is the image path -- rare, and visible by necessity -- but the
+        DECISION to force it must survive the suppression, or an image
+        write whose re-offer signal never came stays unresolved forever."""
+        fired = threading.Event()
+        watcher, clipboard, _, _ = self.suppressed_watcher(
+            [True], on_idle_tick=lambda: True)
+        watcher.start(fired.set)
+        self.wait_until(fired.is_set)
+        self.quiesce(watcher)
+
+        self.assertTrue(
+            fired.is_set(),
+            "an overdue reoffer must still signal through a suppressed tick")
+        self.assertEqual(
+            clipboard.calls, 0,
+            "the backstop DECISION must cost no fork; the forced read it "
+            "provokes runs on the observer, not here")
+
+    def test_the_idle_gate_still_outranks_the_suppressed_backstop(self):
+        """Ordering between the two gates, pinned. The idle gate's skip
+        covers the backstop today because a forced read against an idle or
+        dark session hangs -- the suppression must not open that hole by
+        servicing the backstop on a tick the idle gate already refused."""
+        backstop_asked = []
+        gate_calls = []
+
+        def idle_gate():
+            gate_calls.append(True)
+            return False
+
+        watcher, clipboard, observations, _ = self.suppressed_watcher(
+            [True], on_idle_tick=lambda: backstop_asked.append(True) or True,
+            should_probe=idle_gate)
+        watcher.start(lambda: None)
+        self.wait_until(lambda: len(gate_calls) >= 5)
+        self.quiesce(watcher)
+
+        self.assertEqual(
+            backstop_asked, [],
+            "an idle-gated tick serviced the backstop: the forced read it "
+            "triggers is exactly the idle/dark fork the idle gate prevents")
+        self.assertEqual(clipboard.calls, 0,
+                         "no fork on a tick both gates refused")
+
+    def test_a_lifted_suppression_resumes_probing_and_the_first_probe_signals(self):
+        """The recovery direction, and its one deliberate cost. The
+        suppressed stretch skipped the baseline, so the first probe after
+        the lift compares against None and MUST signal: one extra full
+        read, absorbed upstream by the content dedup -- never a swallowed
+        change. A lift that waited for a second probe to establish a
+        baseline would eat the very divergence that lifted it."""
+        fired = threading.Event()
+        watcher, clipboard, observations, _ = self.suppressed_watcher(
+            [True, True, True, False], script=[b"z"])
+        watcher.start(fired.set)
+        self.wait_until(fired.is_set)
+        self.quiesce(watcher)
+
+        self.assertGreaterEqual(
+            clipboard.calls, 1,
+            "lifting the suppression must bring the forks back: the poll is "
+            "the only detector left once GPaste cannot be trusted")
+        self.assertTrue(observations, "the first probe must reach the observer")
+        self.assertEqual(
+            observations[0], (None, b"z"),
+            "the first post-lift tick judges against the None baseline and "
+            "signals -- one extra read, never a swallowed change")
+
+    def test_the_standalone_poller_has_no_suppression_to_consult(self):
+        """Spec 2's machine, untouched again: with no GPaste there is no
+        healthy tier to trust -- the poll IS the sync, and make_watcher's
+        fallback branch passes nothing."""
+        clipboard = ProbeOnlyClipboard([b"a", b"b"])
+        watcher = PollingWatcher(clipboard, interval_seconds=0.005)
+        self.addCleanup(watcher.stop)
+        self.assertIsNone(
+            watcher._probe_suppressed,
+            "the standalone poller must default to unsuppressed")
+        observed = []
+        watcher.start(lambda: observed.append(clipboard.take()))
+        self.wait_until(lambda: observed)
+        self.quiesce(watcher)
+        self.assertTrue(observed, "the unsuppressed path stopped observing")

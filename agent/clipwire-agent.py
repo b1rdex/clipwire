@@ -691,7 +691,8 @@ class Agent:
         observation came from a selection that moved over a FROZEN history
         uuid: GPaste recorded nothing, so its top is somebody else's older
         clip and wl-paste is the only reader that can see this one (v3.3's
-        excluded-clip contract)."""
+        excluded-clip contract -- alive only where the probe still runs;
+        v3.6 suppresses both while GPaste is trusted)."""
         tier = self._tier
         if tier is None:
             return None
@@ -1832,7 +1833,11 @@ def _start_observer(event, stop, on_change):
 
 
 class GPasteWatcher:
-    """Event-driven: shells out to `gdbus monitor` (no stdlib D-Bus binding), backed by a fast-tier uuid poll and a slow-tier PollingWatcher safety net."""
+    """Event-driven: shells out to `gdbus monitor` (no stdlib D-Bus binding),
+    backed by a fast-tier uuid poll and a slow-tier PollingWatcher safety net.
+    v3.6: with suppress_healthy_probes on (make_watcher always passes it), the
+    safety net stops forking wl-paste while GPaste is trusted -- see
+    _wl_probe_suppressed for the contract and its accepted blind spot."""
 
     def __init__(self, clipboard,
                  safety_net_interval_seconds=None,
@@ -1841,7 +1846,8 @@ class GPasteWatcher:
                  read_history_uuid=gpaste_history_uuid,
                  fast_interval_seconds=None, slow_interval_seconds=None,
                  read_idle_gate=None, read_tracking=None,
-                 reprobe_interval_seconds=DIVERGENCE_REPROBE_SECONDS):
+                 reprobe_interval_seconds=DIVERGENCE_REPROBE_SECONDS,
+                 suppress_healthy_probes=False):
         self.clipboard = clipboard
         self._process = None
         self._thread = None
@@ -1880,18 +1886,36 @@ class GPasteWatcher:
         self._fast_thread = None
         self._signal_path_silence_logged = False
         self._signals_at_last_fast_tick = 0
+        # OFF by default so the judge's own tests keep driving probes
+        # through healthy watchers; make_watcher -- the one production
+        # assembly point -- always switches it on.
         self._safety_net = PollingWatcher(
             clipboard,
             degraded_interval_seconds if degraded else self._safety_net_interval,
             on_tick=self._observe_tick, event=self._event,
             on_idle_tick=on_idle_tick,
-            should_probe=None if read_idle_gate is None else self._slow_tier_should_probe)
+            should_probe=None if read_idle_gate is None else self._slow_tier_should_probe,
+            probe_suppressed=self._wl_probe_suppressed if suppress_healthy_probes else None)
 
     def _slow_tier_should_probe(self):
         """Idle gate for a slow tick: False skips the probe, None (not measured) proceeds. Always True once degraded, when this tier is the only detector left."""
         if self._degraded:
             return True
         return self._read_idle_gate() is not False
+
+    def _wl_probe_suppressed(self):
+        """v3.6: while GPaste is trusted, the safety net must not fork
+        wl-paste -- on GNOME every fork is a transient Wayland window, a
+        focus blink on a timer (and an "is ready" banner when mutter
+        denies it focus). Trust ends when the connection is degraded or
+        the uuid tier has given up; both flips already retune the safety
+        net's interval, and this predicate is re-read on every tick, so
+        the change needs no extra plumbing. The price, accepted by design:
+        while suppressed the token-vs-uuid judge cannot run, so clips
+        GPaste refuses to track (password managers, excluded apps, the
+        shield) no longer sync at the slow cadence -- v3.3 §4.2's promise,
+        repealed: the old probe was BYPASSING those privacy mechanisms."""
+        return not self._degraded and not self._uuid_tier_failed
 
     def _observe_tick(self, previous, current):
         """Judge whether GPaste is still tracking the clipboard, from one safety-net tick (`previous`/`current` are probe() tokens, never content)."""
@@ -1912,7 +1936,10 @@ class GPasteWatcher:
             # manager, its own image re-offer). Only wl-paste can see it --
             # the tier would serve the OLD top: wrong, not missing. v3.3 §4.2
             # promised these still sync at the slow cadence; this is what
-            # keeps that true now that the read guard exists.
+            # kept that true while the probe ran. v3.6 repeals §4.2 on a
+            # trusted connection -- no probe, so no tick reaches this judge
+            # -- and this branch stays live only where the probe does:
+            # degraded, or after the uuid tier has given up.
             #
             # RAISED AFTER THE WAKE, not before it: PollingWatcher's pump
             # sets the shared event a few statements above this call, on the
@@ -1998,6 +2025,11 @@ class GPasteWatcher:
             if (not self._uuid_tier_failed
                     and self._uuid_failures >= self._uuid_failures_before_fallback):
                 self._uuid_tier_failed = True
+                # Stamped AT the flip: this lifts the healthy suppression,
+                # and the judge's first comparison must not span the
+                # suppressed stretch, where signals accumulated with no
+                # slow ticks to absorb them.
+                self._signals_at_last_tick = self._signals
                 log("the GPaste history uuid call has failed %d times in a "
                     "row (%gs); falling back to polling every %gs"
                     % (self._uuid_failures,
@@ -2330,15 +2362,22 @@ class LockMonitor:
 class PollingWatcher:
     """Compare-and-notify against the clipboard: fork wl-paste, take a probe()
     token, signal on change. One `pump` loop serves three roles: GPasteWatcher's
-    slow tier, its degraded backoff, and the standalone no-GPaste poller."""
+    slow tier, its degraded backoff, and the standalone no-GPaste poller.
+
+    Two independent gates, never merged: `should_probe` (the idle gate) skips
+    the whole tick, backstop included; `probe_suppressed` (v3.6, GPasteWatcher's
+    trust predicate) skips the fork and the judge but keeps servicing
+    on_idle_tick -- while GPaste is trusted the reoffer backstop is the only
+    thing a tick still owes."""
 
     def __init__(self, clipboard, interval_seconds, on_tick=None, event=None,
-                 on_idle_tick=None, should_probe=None):
+                 on_idle_tick=None, should_probe=None, probe_suppressed=None):
         self.clipboard = clipboard
         self.interval = interval_seconds
         self._on_tick = on_tick
         self._on_idle_tick = on_idle_tick
         self._should_probe = should_probe
+        self._probe_suppressed = probe_suppressed
         self._stop = threading.Event()
         self._thread = None
         self._event = threading.Event() if event is None else event
@@ -2349,6 +2388,9 @@ class PollingWatcher:
     def available(self):
         return True
 
+    def _probing_suppressed(self):
+        return self._probe_suppressed is not None and self._probe_suppressed()
+
     def start(self, on_change=None):
         """`on_change` is required standalone; ignored when this poller shares someone else's event (that owner's worker calls the handler)."""
         if self._owns_the_worker:
@@ -2358,12 +2400,29 @@ class PollingWatcher:
             """Poll loop: probe() on a timer, signal the event on change (or recovery from an unresolved run), and forward tokens to on_tick."""
             previous = None
             try:
-                previous = self.clipboard.probe()
+                # The baseline is under the suppression too: the watcher is
+                # rebuilt on every reconnect, so an ungated baseline is a
+                # fork at wake -- the worst moment for a hang and its banner.
+                if not self._probing_suppressed():
+                    previous = self.clipboard.probe()
             except Exception as error:
                 _handle_observer_error(error, "poll")
             while not self._stop.wait(self._retry_interval or self.interval):
                 try:
                     if self._should_probe is not None and not self._should_probe():
+                        continue
+                    if self._probing_suppressed():
+                        # AFTER the idle gate, which still skips the whole
+                        # tick, backstop included -- a forced read against an
+                        # idle/dark session is what it exists to prevent. A
+                        # suppressed tick keeps only the backstop: the one
+                        # forced read healthy mode still owes, run on the
+                        # observer, not here. No probe, no judge -- `previous`
+                        # stays None, so the first probe after the suppression
+                        # lifts always signals: one extra full read, absorbed
+                        # by the content dedup, never a swallowed change.
+                        if self._on_idle_tick is not None and self._on_idle_tick():
+                            self._event.set()
                         continue
                     current = self.clipboard.probe()
                     before = previous
@@ -2487,14 +2546,16 @@ def make_watcher(clipboard, fallback_interval_seconds=DEGRADED_POLL_SECONDS,
                             degraded=degraded, on_degrade=on_degrade,
                             on_idle_tick=on_idle_tick,
                             read_idle_gate=_user_recently_active,
-                            read_tracking=gpaste_tracking)
+                            read_tracking=gpaste_tracking,
+                            suppress_healthy_probes=True)
     if watcher.available():
         watcher.tier = GPasteTextTier()
         if degraded:
             log("watching the clipboard through GPaste, already diagnosed as silent "
                 "this connection, so polling every %.1fs" % fallback_interval_seconds)
         else:
-            log("watching the clipboard through GPaste, with a safety-net poll every %gs"
+            log("watching the clipboard through GPaste; no timed clipboard reads "
+                "while healthy, safety-net poll every %gs on fallback"
                 % watcher._safety_net_interval)
         return watcher
     log("GPaste unavailable, falling back to polling every %.1fs" % fallback_interval_seconds)

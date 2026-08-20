@@ -1602,5 +1602,113 @@ class TestVerdictNamesTheCause(unittest.TestCase):
         self.assertIn("gpaste_Active=unavailable", line)
 
 
+class TestHealthyProbeSuppressionComposition(unittest.TestCase):
+    """v3.6 at the GPasteWatcher level: trust is the predicate. While the
+    connection is healthy -- not degraded, uuid tier answering -- the safety
+    net ticks but never touches the clipboard, because on GNOME every probe
+    is a wl-paste fork with a focus-blinking window behind it. The moment
+    the uuid tier gives up, the suppression lifts and the forks come back at
+    the safety net's own cadence: failure is visible by necessity.
+
+    Suppression is OPT-IN (`suppress_healthy_probes`, make_watcher passes
+    it): every test in this file that drives the judge through healthy
+    probes keeps doing so unsuppressed, because the judge is still shipped
+    code -- it is what runs once the suppression lifts."""
+
+    def setUp(self):
+        original_log = clipwire_agent.log
+        self.log_lines = []
+        clipwire_agent.log = self.log_lines.append
+        self.addCleanup(setattr, clipwire_agent, "log", original_log)
+
+    def wait_until(self, predicate):
+        deadline = time.monotonic() + JOIN_TIMEOUT
+        while not predicate() and time.monotonic() < deadline:
+            time.sleep(0.001)
+
+    def test_a_suppressed_healthy_watcher_never_touches_the_clipboard(self):
+        """The whole point, composed: ticks happen (the idle gate is
+        consulted), a real Update line still reaches the observer, and the
+        clipboard is asked for nothing at all -- not even the baseline."""
+        clipboard = ScriptedReadClipboard([b"a"])
+        gate_calls = []
+
+        def active_user():
+            gate_calls.append(True)
+            return True
+
+        fake_process = FakeGPasteProcess()
+        patcher = mock.patch("subprocess.Popen", return_value=fake_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(fake_process.close)
+        reports = []
+        watcher = GPasteWatcher(clipboard,
+                                safety_net_interval_seconds=0.005,
+                                read_idle_gate=active_user,
+                                suppress_healthy_probes=True)
+        self.addCleanup(watcher.stop)
+        watcher.start(lambda: reports.append(True))
+
+        self.wait_until(lambda: len(gate_calls) >= 5)
+        fake_process.emit(GPASTE_UPDATE_LINE)
+        self.wait_until(lambda: reports)
+        watcher.stop()
+        watcher._safety_net._thread.join(timeout=JOIN_TIMEOUT)
+        watcher._thread.join(timeout=JOIN_TIMEOUT)
+
+        self.assertGreaterEqual(len(gate_calls), 5,
+                                "the safety net must still be ticking")
+        self.assertTrue(reports, "the signal path must still deliver")
+        self.assertEqual(
+            clipboard.calls, 0,
+            "a healthy suppressed watcher forked wl-paste: the 30-second "
+            "focus blink this release removes")
+
+    def test_a_dead_uuid_tier_lifts_the_suppression_and_stamps_the_judge(self):
+        """The way back, driven deterministically through _fast_tick. The
+        flip must both lift the suppression (the poll is the only detector
+        left) and stamp _signals_at_last_tick with the CURRENT count: the
+        judge's first comparison after the flip must not span the whole
+        suppressed stretch, where signals accumulated with no ticks to
+        absorb them -- a stale baseline there reads as 'signals moved, so
+        tracking is alive' no matter what just happened."""
+        watcher = GPasteWatcher(clipboard=None,
+                                read_history_uuid=lambda: None,
+                                fast_interval_seconds=0.005,
+                                slow_interval_seconds=0.01)
+        self.addCleanup(watcher.stop)
+        self.assertTrue(
+            watcher._wl_probe_suppressed(),
+            "a healthy watcher must start suppressed")
+        watcher._signals = 7
+
+        for _ in range(50):
+            if watcher._uuid_tier_failed:
+                break
+            watcher._fast_tick()
+
+        self.assertTrue(watcher._uuid_tier_failed,
+                        "the uuid tier never gave up under a reader that "
+                        "always fails")
+        self.assertFalse(
+            watcher._wl_probe_suppressed(),
+            "a dead uuid tier must lift the suppression: with GPaste "
+            "unreadable the poll is the only detector left")
+        self.assertEqual(
+            watcher._signals_at_last_tick, 7,
+            "the judge's baseline must be stamped AT the flip, not left "
+            "where the last pre-suppression tick put it")
+
+    def test_a_degraded_watcher_is_never_suppressed(self):
+        """Degraded mode's poll IS the sync; suppressing it would be
+        silence. The predicate answers for both the constructor's latch and
+        the judge's mid-connection verdict, so degraded=True alone must
+        already read as unsuppressed."""
+        watcher = GPasteWatcher(clipboard=None, degraded=True)
+        self.addCleanup(watcher.stop)
+        self.assertFalse(watcher._wl_probe_suppressed())
+
+
 def _raise_gdbus_exploded():
     raise RuntimeError("gdbus exploded")
