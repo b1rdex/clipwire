@@ -600,36 +600,32 @@ final class PairingHarnessTests: XCTestCase {
         try harness.copyOnThePC(png: PairingHarness.png)
         try harness.waitForTheMacsPasteboard(toHold: .image, PairingHarness.png)
 
-        // The agent's slow tier takes its baseline, and BOTH halves of that
-        // are waited for, in this order, because the scenario is unstageable
-        // without either.
-        //
-        // First the fast tier must have read a uuid at all: the slow tier's
-        // `uuid_frozen` is a delta between two of its own ticks, and the
-        // earlier one records whatever the fast tier had by then -- `None`
-        // included. Measured at about one run in six before this wait
-        // existed: the warm-up tick landed first, the divergence tick then
-        // read "unmeasured", no verdict could be reached, and this test
-        // passed WITH THE FIX DELETED FROM THE AGENT. See
-        // `waitForTheAgentsFastTierToReadAHistoryUuid`.
+        // v3.6's own contract line, pinned end-to-end: the unit suite proves
+        // make_watcher passes the suppression, this proves the AGENT THIS
+        // HARNESS RAN was built that way -- the zero-probe count below is a
+        // claim about the trusted mode and would be vacuous in any other.
+        XCTAssertTrue(harness.logHolds("no timed clipboard reads"),
+                      "the agent is not in v3.6's trusted mode, so a zero probe count below " +
+                      "would be evidence about the wrong agent")
+
+        // The fast tier is alive and reading uuids -- the positive half of
+        // "trusted": the suppression holds exactly while this tier answers,
+        // so a run where it never read would be staging the wrong mode and
+        // the zero below would again be evidence about silence.
         try harness.waitForTheAgentsFastTierToReadAHistoryUuid()
-        // Then a slow tick has to happen AFTER that reading -- hence a
-        // baseline taken here rather than an absolute count, which the probes
-        // already past would have satisfied on their own.
-        let baselineProbes = harness.probesThatSaw(["image/png"])
-        try harness.waitForTheAgentToProbeAndSee(["image/png"], atLeast: baselineProbes + 1)
 
         // --- GPaste takes the selection back, silently --------------------
         let entryBefore = harness.pcsClipboardGeneration()
         try harness.silentTakeover(types: PairingHarness.gpasteImageTypes)
         // The fixture's own invariant, pinned because breaking it leaves
         // everything below passing while staging a different scenario: a
-        // re-offer creates NO history entry, which is what keeps the agent's
-        // uuid frozen and the slow tier's discriminator meaningful. A
-        // takeover that stamped a fresh `generation` would be a COPY wearing
-        // a re-offer's name, the uuid would move, no verdict could be reached
-        // for a reason that has nothing to do with the fix, and this test
-        // would go on reporting success.
+        // re-offer creates NO history entry. Through v3.5 that frozen uuid
+        // was what kept the slow tier's discriminator meaningful; under v3.6
+        // it is what keeps the connection QUIET -- a takeover that stamped a
+        // fresh `generation` would move the uuid, the fast tier would
+        // signal, the worker would legitimately fork a read of the new
+        // offer, and the zero-probe assertion below would fail against an
+        // agent doing exactly what it should.
         XCTAssertEqual(harness.pcsClipboardGeneration(), entryBefore,
                        "the re-offer created a new clipboard entry, so this is a copy and not " +
                        "the takeover spec 1.2 measured")
@@ -637,31 +633,36 @@ final class PairingHarnessTests: XCTestCase {
                         "the PC's clipboard has no change token at all, so the assertion above " +
                         "compared two absences and proved nothing")
 
-        // Two ticks have to land here: the one that sees the divergence and
-        // arms, and the one that would have confirmed it. Three probes would
-        // guarantee both -- the worker's read inflates the count by at most
-        // one, so `n` probes of a newly-offered selection are at least `n - 1`
-        // ticks -- and four is asked for anyway. The extra tick is margin
-        // against fork pressure, measured rather than decorative: see this
-        // test's own note on why the answer to a flake here is a longer
-        // interval and never a retry.
-        try harness.waitForTheAgentToProbeAndSee(PairingHarness.gpasteImageTypes, atLeast: 4)
+        // The quiet window, paced by the agent's own clock rather than this
+        // side's: eight further fast-tier reads at 0.1s span at least two
+        // full 0.4s safety-net periods. Through v3.5 the slow tier probed in
+        // every window this shape -- the old revision of this test WAITED on
+        // exactly that cadence -- so a suppression that were off gets every
+        // opportunity this file can give it to fork before the count is
+        // read. Each call baselines afresh (see its doc), so eight calls are
+        // eight distinct reads, not one read counted eight times.
+        for _ in 0..<8 {
+            try harness.waitForTheAgentsFastTierToReadAHistoryUuid()
+        }
 
-        // --- and the verdict that must not have been reached --------------
+        // --- and the looks that must never have happened ------------------
         //
-        // The agent is hung up FIRST, and this is the difference between a
-        // regression test and a decoration. Counting the agent's own probes
-        // proves the ticks happened; it cannot prove a line the agent wrote
-        // has crossed the pipe this side reads it through. Measured with the
-        // fix removed from the agent: without this drain the assertion below
-        // reported success on one run in three, against an agent that had
-        // logged the verdict. See `hangUpAndDrainTheAgentsLog`.
+        // The agent is hung up FIRST: the verdict-absence check reads a pipe
+        // a line can still be crossing, and hanging up is what puts every
+        // line the agent ever wrote ahead of the assertions -- see
+        // `hangUpAndDrainTheAgentsLog` for the run-in-three this ordering
+        // was measured to close.
         try harness.hangUpAndDrainTheAgentsLog()
 
+        XCTAssertEqual(
+            harness.probesThatSaw(PairingHarness.gpasteImageTypes), 0,
+            "a trusted connection forked wl-paste at the re-offered selection: v3.6's " +
+            "suppression is not reaching the production wiring, and every such fork is " +
+            "the timed focus blink the release removed")
         XCTAssertFalse(harness.logHolds("GPaste reported no clipboard change"),
-                       "GPaste's own re-offer was diagnosed as a dead event source. The PC is " +
-                       "now polling wl-paste for the rest of this connection, taking keyboard " +
-                       "focus every tick, on a machine whose clipboard is working perfectly")
+                       "GPaste's own re-offer was diagnosed as a dead event source -- a verdict " +
+                       "v3.6 makes unreachable on a trusted connection, where the judge never " +
+                       "runs because the probes it judges never do")
         // The Mac still holds what the PC sent it. A degrade is not the only
         // way this scenario can hurt: an agent that read the re-offer as a
         // fresh copy would send the same picture back, and on this fixture

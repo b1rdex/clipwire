@@ -743,12 +743,13 @@ final class PairingHarness {
     /// ticking at all, and that a tick observed the divergence rather than a
     /// test merely having written one to a file.
     ///
-    /// IT COUNTS PROBES, NOT TICKS, and the gap is not closable from here:
-    /// the worker's own clipboard read forks `--list-types` too, so a tick
-    /// that signals the worker contributes two. Every caller therefore asks
-    /// for a count that is safe under that inflation -- see
-    /// `waitForTheAgentToProbeAndSee`, which documents the arithmetic at the
-    /// one place it is relied on.
+    /// IT COUNTS FORKS, NOT TICKS, and the gap is not closable from here:
+    /// the worker's own clipboard read forks `--list-types` too, so the
+    /// number conflates the slow tier's probes with the worker's reads.
+    /// v3.6's one caller leans on that rather than fighting it: asserting
+    /// ZERO against the takeover's own type list means no slow tick probed
+    /// AND no worker read fired -- a fork of either kind at that selection
+    /// is the regression, so the inflation only widens the net.
     func probesThatSaw(_ types: [String]) -> Int {
         invocationLog().occurrences(of: "wl-paste --list-types -> "
                                     + types.joined(separator: " ") + "\n")
@@ -803,41 +804,6 @@ final class PairingHarness {
         let asked = invocationLog().occurrences(of: PairingHarness.historyUuidCall)
         try wait(for: "the agent's fast tier to ask gdbus for a history uuid") {
             self.invocationLog().occurrences(of: PairingHarness.historyUuidCall) > asked
-        }
-    }
-
-    /// Waits until `count` of the agent's probes have come back offering
-    /// exactly this list, AND one further probe has followed them -- so the
-    /// predicate below waits for `count + 1`, and the tick that made the
-    /// `count`-th probe has provably finished judging it.
-    ///
-    /// `count` is a number of PROBES and callers want a number of TICKS, so
-    /// the arithmetic lives here rather than at each call site. In a quiet
-    /// stretch every probe is a tick; the inflation is bounded, because the
-    /// only other thing that forks `--list-types` is the worker's clipboard
-    /// read, and the worker runs at most once per selection change (the tick
-    /// that observes a moved token signals it; the ticks that see a settled
-    /// one do not). So for a selection the agent has just STARTED offering,
-    /// `count` probes guarantee at least `count - 1` ticks; for one it has
-    /// been offering all along there is no worker read to absorb and the two
-    /// numbers are equal.
-    ///
-    /// THE `+ 1` BELOW IS NOT SLACK, and it was measured rather than
-    /// reasoned into existence: without it this wait returns too early and
-    /// the test above it goes GREEN AGAINST AN AGENT WITH THE FIX REMOVED.
-    /// The fake writes its invocation-log line while it is SERVING the probe,
-    /// which is strictly before the agent has read the result, let alone
-    /// judged it -- so the count reaching its target says the probe happened,
-    /// never that a verdict followed. Waiting for one further probe is what
-    /// closes it, and it closes it exactly rather than probably: the poll
-    /// thread is strictly sequential -- probe, `_on_tick`, wait, probe -- so
-    /// a LATER probe existing is proof that the previous one's verdict has
-    /// already been reached and logged. A sleep would have been a guess about
-    /// the same thing.
-    func waitForTheAgentToProbeAndSee(_ types: [String], atLeast count: Int) throws {
-        try wait(for: "\(count) of the agent's own probes to see \(types.count) offered types, "
-                 + "and a further probe proving the last of them was judged") {
-            self.probesThatSaw(types) >= count + 1
         }
     }
 
