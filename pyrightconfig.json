@@ -1,0 +1,16 @@
+{
+    // The one file production runs. Tests are OUT deliberately: they reach
+    // the agent through agent/tests/agent_under_test.py, a globals().update
+    // re-export shim pyright cannot see through (~464 phantom errors), and
+    // the shim is settled policy -- no package, no facade. scripts/ and
+    // Tests/fakes are unscanned too (41 + 19 real findings, parked; 4 of
+    // the 6 fakes have no .py extension and are invisible to pyright
+    // regardless).
+    "include": ["agent/clipwire-agent.py"],
+    // The floor the design doc promises and the python CI matrix enforces;
+    // pyright models it from bundled typeshed, no interpreter involved.
+    "pythonVersion": "3.11",
+    // The agent is PC-side only (wl-clipboard, GPaste, gdbus).
+    "pythonPlatform": "Linux",
+    "typeCheckingMode": "standard"
+}

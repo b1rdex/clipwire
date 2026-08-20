@@ -79,3 +79,22 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y wl-clipboard
       - name: Agent self-test
         run: python3 agent/clipwire-agent.py --selftest
+
+  pyright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # One run, not a matrix leg: the floor lives as pythonVersion in
+      # pyrightconfig.json (typeshed stubs are selected by that flag, not
+      # by an interpreter -- no setup-python either, the agent is
+      # stdlib-only), so extra legs would re-prove the same thing. The
+      # config file is the single source of truth shared with editors and
+      # a bare `pyright` locally; the only pin living here is the tool
+      # itself, because an unpinned checker changes its mind on someone
+      # else's schedule. A box running 3.14 can be green on tests and
+      # still go red here on 3.12+ syntax: that is the floor doing its
+      # job, not a flake.
+      - uses: jakebailey/pyright-action@v3
+        with:
+          version: "1.1.413"

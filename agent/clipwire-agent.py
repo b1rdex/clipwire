@@ -515,7 +515,7 @@ class Agent:
             # out of reach exactly when it matters most. Never-locked
             # flushes still see stretch is None above and stay silent,
             # unchanged.
-            seconds, ended_by, lock_edge, ended_at = stretch
+            seconds, ended_by = stretch[0], stretch[1]
             held = _describe_duration(seconds)
             if ended_by == "unlocked":
                 if arrivals:
@@ -537,6 +537,11 @@ class Agent:
             self._last_seen = seed
             self._expect_reoffer = None
         if stretch is not None:
+            # Unpacked here, not carried down from the log block: pyright
+            # reads bindings made under one `if stretch is not None` as
+            # possibly unbound under the next, and the split itself is
+            # deliberate (the seed read sits between them).
+            _, _, lock_edge, ended_at = stretch
             record = self._last_tier_write
             if record is not None and lock_edge <= record[1] <= ended_at:
                 # After the seed read, not before: the seed's own
@@ -815,6 +820,16 @@ class Agent:
                 "nothing on this machine is re-encoding the clipboard"
                 % SAFETY_NET_POLL_SECONDS)
             return True
+        # Non-None by the branch logic above: the echo-match arm either
+        # returned or disarmed, the disarmed exit returned just before this
+        # line, and the only arm left null-checked expectation before
+        # falling through. pyright cannot correlate the disarmed flag with
+        # that binding, so the invariant is stated as an assert. First
+        # assert in this file, so the ground rule it sets: the comment
+        # carries the invariant, the assert only enforces it -- `python3 -O`
+        # would strip every assert silently, and production runs plain
+        # python3.
+        assert expectation is not None
         ts, origin, _written_at = expectation
         if len(png) > MAX_IMAGE_BYTES:
             log("the clipboard re-offered an image of %d bytes: over the image limit"
@@ -1177,6 +1192,10 @@ class WaylandClipboard:
         outcome = self._classify_result(listed)
         if outcome is not None:
             return outcome, None
+        # _classify_result returning None IS the None check: a None result
+        # maps to READ_UNKNOWN and returned above. pyright cannot see that
+        # across the call, hence the assert.
+        assert listed is not None
         types = listed.stdout.decode("utf-8", "replace").splitlines()
         kind = choose_kind(types)
         if kind is None:
@@ -1192,6 +1211,7 @@ class WaylandClipboard:
         outcome = self._classify_result(result)
         if outcome is not None:
             return outcome, None
+        assert result is not None  # same gate as above
         if not result.stdout:
             return READ_EMPTY, None
         return READ_CONTENT, (kind, result.stdout)
@@ -1300,6 +1320,9 @@ class WaylandClipboard:
         except OSError as error:
             log("wl-copy could not be started: %r" % error)
             return
+        # stdin=PIPE above means Popen set .stdin; typeshed types it
+        # Optional anyway.
+        assert process.stdin is not None
         try:
             process.stdin.write(data)
         except BrokenPipeError:
@@ -1839,6 +1862,14 @@ class GPasteWatcher:
     safety net stops forking wl-paste while GPaste is trusted -- see
     _wl_probe_suppressed for the contract and its accepted blind spot."""
 
+    # Declared for pyright alone. A bare annotation puts nothing on the
+    # class, so hasattr()/vars() on instances stay exactly as the tests
+    # pin them (test_watcher_wiring: the attribute "does not exist at
+    # all" until make_watcher raises it on a promoted instance); every
+    # consumer keeps reading it through getattr with a default. Quoted so
+    # nothing is evaluated at class-creation time either.
+    tier: "GPasteTextTier | None"
+
     def __init__(self, clipboard,
                  safety_net_interval_seconds=None,
                  degraded_interval_seconds=DEGRADED_POLL_SECONDS,
@@ -1901,6 +1932,9 @@ class GPasteWatcher:
         """Idle gate for a slow tick: False skips the probe, None (not measured) proceeds. Always True once degraded, when this tier is the only detector left."""
         if self._degraded:
             return True
+        # Wired as should_probe only when read_idle_gate came in non-None
+        # (see __init__), so this cannot be None by construction.
+        assert self._read_idle_gate is not None
         return self._read_idle_gate() is not False
 
     def _wl_probe_suppressed(self):
@@ -2074,6 +2108,11 @@ class GPasteWatcher:
         )
 
         def pump():
+            # start() assigned _process (stdout=PIPE) just above, and
+            # nothing reassigns it while the pump lives; pyright cannot
+            # carry that across the closure boundary.
+            assert self._process is not None
+            assert self._process.stdout is not None
             for line in self._process.stdout:
                 if self._stop.is_set():
                     return
@@ -2331,6 +2370,11 @@ class LockMonitor:
         delay = LOGIND_MONITOR_RESPAWN_SECONDS
         while True:
             try:
+                # Assigned by start() before this thread exists, then only
+                # by the respawn below -- stdout=PIPE both times. Asserted
+                # per iteration; pyright sees Optional either way.
+                assert self._process is not None
+                assert self._process.stdout is not None
                 for line in self._process.stdout:
                     if self._stop.is_set():
                         return
